@@ -1,6 +1,7 @@
 package terminals
 
 import (
+	"runtime"
 	"os"
 	"testing"
 )
@@ -30,6 +31,9 @@ func TestSessionFromCmdline(t *testing.T) {
 }
 
 func TestPidCmdline(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("/proc-based cmdline lookup is Linux-only (GOOS=%s)", runtime.GOOS)
+	}
 	// Unser eigener Testprozess hat eine cmdline. NUL-Split muss sie liefern.
 	got := pidCmdline(os.Getpid())
 	if len(got) == 0 || got[0] == "" {

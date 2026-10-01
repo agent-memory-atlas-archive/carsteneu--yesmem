@@ -1,5 +1,6 @@
 package daemon
 
+
 import (
 	"net"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestSkillCheck_Freeze_WhileSubagentActive(t *testing.T) {
 	t.Cleanup(func() { opencodeChildActiveFn = origFn })
 
 	h, s := mustHandler(t)
-	dir := t.TempDir()
+	dir := shortSockDir(t)
 	sockPath := filepath.Join(dir, "sc-freeze.sock")
 	relays := startInjectSocketListener(t, sockPath+".inject")
 
@@ -109,7 +110,7 @@ func TestSkillCheck_Freeze_BlocksTransitionAndRelay(t *testing.T) {
 	t.Cleanup(func() { opencodeChildActiveFn = origFn })
 
 	h, s := mustHandler(t)
-	dir := t.TempDir()
+	dir := shortSockDir(t)
 	sockPath := filepath.Join(dir, "sc-blocked.sock")
 	relays := startInjectSocketListener(t, sockPath+".inject")
 
@@ -146,7 +147,7 @@ func TestSkillCheck_Freeze_BlocksTransitionAndRelay(t *testing.T) {
 func TestSkillCheck_NoRelayWithinInterval(t *testing.T) {
 	resetYesloopSkillCheckState()
 	h, s := mustHandler(t)
-	dir := t.TempDir()
+	dir := shortSockDir(t)
 	sockPath := filepath.Join(dir, "sc-flood.sock")
 	relays := startInjectSocketListener(t, sockPath+".inject")
 

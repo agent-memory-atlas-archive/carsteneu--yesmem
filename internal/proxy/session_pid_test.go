@@ -3,6 +3,7 @@ package proxy
 import (
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -11,6 +12,9 @@ import (
 // The resolver must identify the peer endpoint's owning process — which, in
 // this test, is the test process itself (client socket and resolver share /proc).
 func TestPeerSessionPID_ResolvesDialerPID(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("/proc-based pid resolution is Linux-only (GOOS=%s)", runtime.GOOS)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("no loopback listen: %v", err)

@@ -154,10 +154,23 @@ func seedActiveStream(sessionID string) {
 	sessionToThread[sessionID] = sessionID
 }
 
+// shortSockDir keeps the unix socket path under UNIX_PATH_MAX (104): macOS
+// t.TempDir() returns /var/folders/... paths that make net.Listen fail with
+// "bind: invalid argument" (see handler_agents_test.go relay tests).
+func shortSockDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "pk")
+	if err != nil {
+		t.Fatalf("mkdir tmp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 // 1. Kein Kick wenn stream aktiv.
 func TestPermissionKick_StreamActiveNoKick(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-active", sockPath, "")
 	seedActiveStream(agent.SessionID)
@@ -177,7 +190,7 @@ func TestPermissionKick_StreamActiveNoKick(t *testing.T) {
 // 2. Kein Kick vor 3 Min Idle.
 func TestPermissionKick_NoKickBeforeDelay(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-early", sockPath, "")
 	seedKickStateNeverKicked(t, agent.ID, 1*time.Minute)
@@ -190,7 +203,7 @@ func TestPermissionKick_NoKickBeforeDelay(t *testing.T) {
 // 3. Kick bei >=3 Min Idle, Payload "\r" auf Conn1 + "\r" auf Conn2.
 func TestPermissionKick_KickAfterDelay(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-kick", sockPath, "")
 	seedKickStateNeverKicked(t, agent.ID, 4*time.Minute)
@@ -214,7 +227,7 @@ func TestPermissionKick_KickAfterDelay(t *testing.T) {
 // 4. Kein Re-Kick vor 5 Min (Flut-Schutz, Lektion #89414).
 func TestPermissionKick_NoReKickBeforeInterval(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-flood", sockPath, "")
 	seedKickState(t, agent.ID, 10*time.Minute, 1*time.Minute)
@@ -227,7 +240,7 @@ func TestPermissionKick_NoReKickBeforeInterval(t *testing.T) {
 // 5. Re-Kick >=5 Min.
 func TestPermissionKick_ReKickAfterInterval(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-rekick", sockPath, "")
 	seedKickState(t, agent.ID, 10*time.Minute, 6*time.Minute)
@@ -240,7 +253,7 @@ func TestPermissionKick_ReKickAfterInterval(t *testing.T) {
 // 6. permission_kick="off" blockt.
 func TestPermissionKick_AgentOffBlocks(t *testing.T) {
 	h, s := newPermKickHandler(t, true) // Config-Default aktiv
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-off", sockPath, "off")
 	seedKickStateNeverKicked(t, agent.ID, 10*time.Minute)
@@ -252,14 +265,14 @@ func TestPermissionKick_AgentOffBlocks(t *testing.T) {
 
 // 7. Vererbung: Spalte "" + Config true -> Kick; Config false -> kein Kick.
 func TestPermissionKick_Inheritance(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "agent-on.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent-on.sock")
 	recOn := startFakeInjectSocket(t, sockPath+".inject")
 	h1, s1 := newPermKickHandler(t, true)
 	agent1 := createKickAgent(t, s1, "agent-pk-inh-on", sockPath, "")
 	seedKickStateNeverKicked(t, agent1.ID, 10*time.Minute)
 	h1.checkPermissionKick()
 
-	sockPath2 := filepath.Join(t.TempDir(), "agent-off.sock")
+	sockPath2 := filepath.Join(shortSockDir(t), "agent-off.sock")
 	recOff := startFakeInjectSocket(t, sockPath2+".inject")
 	h2, s2 := newPermKickHandler(t, false)
 	agent2 := createKickAgent(t, s2, "agent-pk-inh-off", sockPath2, "")
@@ -305,7 +318,7 @@ func TestPermissionKick_Gates(t *testing.T) {
 // 9. Paused Agent mit lebendem PID wird gekickt — Status-Markierung ist egal.
 func TestPermissionKick_PausedAgentGetsKicked(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-paused", sockPath, "")
 	if err := s.AgentUpdate(agent.ID, map[string]any{"status": "paused"}); err != nil {
@@ -322,7 +335,7 @@ func TestPermissionKick_PausedAgentGetsKicked(t *testing.T) {
 // Stream wird zurück auf running geflippt — Beweis von Leben statt Markierung.
 func TestPermissionKick_PausedAutoUnpauseOnRecovery(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-unpause", sockPath, "")
 	if err := s.AgentUpdate(agent.ID, map[string]any{"status": "paused"}); err != nil {
