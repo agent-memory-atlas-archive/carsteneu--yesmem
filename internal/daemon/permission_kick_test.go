@@ -287,7 +287,7 @@ func TestPermissionKick_Inheritance(t *testing.T) {
 // toter PID blockt; eine Markierung wie "stopped" bei lebendem Prozess nicht.
 func TestPermissionKick_Gates(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	tmp := t.TempDir()
+	tmp := shortSockDir(t)
 	sockPath := filepath.Join(tmp, "agent-gates.sock")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 
