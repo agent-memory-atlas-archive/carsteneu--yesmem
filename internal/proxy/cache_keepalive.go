@@ -29,6 +29,7 @@ type CacheKeepaliveConfig struct {
 type threadState struct {
 	body           []byte
 	apiKey         string
+	anthropicBeta  string // original anthropic-beta header; beta-gated body fields need it
 	lastUsed       time.Time
 	timer          *time.Timer
 	pingsRemaining int
@@ -99,7 +100,9 @@ func (ka *CacheKeepalive) effectivePings() int {
 
 // Reset stores the request body for a thread and starts/resets only that thread's timer.
 // Skips internal/automated threads (UUID format) — only real user sessions get keepalive.
-func (ka *CacheKeepalive) Reset(threadID string, requestBody []byte, apiKey string) {
+// anthropicBeta is the original request's anthropic-beta header; the ping must
+// resend it, otherwise beta-gated body fields are rejected as extra inputs.
+func (ka *CacheKeepalive) Reset(threadID string, requestBody []byte, apiKey, anthropicBeta string) {
 	if !isRealUserSession(threadID) {
 		return
 	}
@@ -122,6 +125,7 @@ func (ka *CacheKeepalive) Reset(threadID string, requestBody []byte, apiKey stri
 	ts.body = make([]byte, len(requestBody))
 	copy(ts.body, requestBody)
 	ts.apiKey = apiKey
+	ts.anthropicBeta = anthropicBeta
 	ts.lastUsed = time.Now()
 
 	ka.evictStaleLocked()
@@ -224,10 +228,11 @@ func (ka *CacheKeepalive) sendPingForThread(threadID string, expectedGen uint64)
 	body := make([]byte, len(ts.body))
 	copy(body, ts.body)
 	apiKey := ts.apiKey
+	anthropicBeta := ts.anthropicBeta
 	ka.mu.Unlock()
 
 	pingBody := buildPingBody(body)
-	cacheRead, cacheWrite, outputTokens := ka.doHTTPPing(pingBody, apiKey)
+	cacheRead, cacheWrite, outputTokens := ka.doHTTPPing(pingBody, apiKey, anthropicBeta)
 
 	if ka.cfg.OnPing != nil {
 		ka.cfg.OnPing(threadID, cacheRead, cacheWrite)
@@ -260,7 +265,7 @@ func (ka *CacheKeepalive) evictStaleLocked() {
 	}
 }
 
-func (ka *CacheKeepalive) doHTTPPing(body []byte, apiKey string) (cacheRead, cacheWrite, outputTokens int) {
+func (ka *CacheKeepalive) doHTTPPing(body []byte, apiKey, anthropicBeta string) (cacheRead, cacheWrite, outputTokens int) {
 	endpoint := ka.resolveTarget(body) + "/v1/messages"
 	req, err := http.NewRequest("POST", endpoint, nil)
 	if err != nil {
@@ -269,6 +274,9 @@ func (ka *CacheKeepalive) doHTTPPing(body []byte, apiKey string) (cacheRead, cac
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	if anthropicBeta != "" {
+		req.Header.Set("anthropic-beta", anthropicBeta)
+	}
 	req.Body = io.NopCloser(bytesReader(body))
 	req.ContentLength = int64(len(body))
 

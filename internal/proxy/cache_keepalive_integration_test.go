@@ -34,7 +34,7 @@ func TestKeepaliveWithTTLDetector_Integration(t *testing.T) {
 	defer ka.Stop()
 
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(300 * time.Millisecond)
 
 	if int(pingCount.Load()) < 1 {
@@ -75,7 +75,7 @@ func TestKeepaliveOnPingFeedsDetector(t *testing.T) {
 	defer ka.Stop()
 
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(80 * time.Millisecond)
 
 	// Ping results don't carry ephemeral_1h, so detector state shouldn't flip to 1h

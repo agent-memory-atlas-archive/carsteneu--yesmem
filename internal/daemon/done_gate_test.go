@@ -69,20 +69,26 @@ const validV3Content = `### Phase 1: ANALYZE
 **Issues:** Critical (0) / Important (0) / Minor (1)
 **Recommendations:** n/a
 **Assessment:** Yes
+self-review: done
 
-**Stage 2: Cold Review via task()**
-**task() dispatched:** yes
+**Stage 2: Cold Review**
+cold-review: ses_coldfix
+**Stufe:** 2 - behavior change, no high-risk triggers
+**Modules:** A, B, C, D, E, F, Q, R | N/A: G, H, I, J, K, L, M, N, O, P
 **Subagent ID:** agent-235
 **Findings:** none
 **Merged assessment:** Yes
 **Fix commits:** none needed
 
 **Stage 3: Consequence & Intent**
-**consequence dispatched:** yes
+consequence: ses_consfix
 **Subagent ID:** agent-236
 **Findings:** none
 
-**Security:** none — diff reviewed, no HIGH/MEDIUM/LOW findings
+**Stage 4: Security Review**
+security: ses_secfix
+**Subagent ID:** agent-237
+**Findings:** none — no HIGH/MEDIUM/LOW findings
 
 **REVIEW→VERIFY cycles used:** 1/3
 
@@ -222,7 +228,10 @@ func TestValidatePhaseBlocks_PartialProgress(t *testing.T) {
 	}
 }
 
-func TestValidatePhaseBlocks_MissingPhase5Stage2(t *testing.T) {
+// TestValidatePhaseBlocks_Phase5OldFormat_Fails: the retired task() dispatched
+// line no longer counts. An old-format Phase 5 fails and the relay names the
+// new field (hard cut, no backward compatibility).
+func TestValidatePhaseBlocks_Phase5OldFormat_Fails(t *testing.T) {
 	content := `### Phase 1: ANALYZE
 **Status:** COMPLETE
 **Goal understood:** test
@@ -254,15 +263,23 @@ func TestValidatePhaseBlocks_MissingPhase5Stage2(t *testing.T) {
 **Status:** COMPLETE
 **Deploy required:** no
 **send_to orchestrator:** yes`
-	// Note: Phase 5 is missing **Stage 2: Cold Review** subsection header
+	// Note: Phase 5 uses the retired task() dispatched line without any
+	// cold-review/consequence/security session ids.
 	result := ValidatePhaseBlocks(content)
 	if result.Compliant {
-		t.Error("content missing Phase 5 Stage 2 header should not be compliant")
+		t.Error("old-format Phase 5 should not be compliant")
 	}
-	if len(result.FieldErrors) == 0 {
-		t.Error("expected field error for missing Stage 2 header")
+	found := false
+	for _, fe := range result.FieldErrors {
+		if fe.Phase == 5 && strings.Contains(fe.Field, "cold-review") {
+			found = true
+			break
+		}
 	}
-	t.Logf("Missing Stage 2:\n%s", result.String())
+	if !found {
+		t.Errorf("expected field error naming cold-review, got: %v", result.FieldErrors)
+	}
+	t.Logf("Old format:\n%s", result.String())
 }
 
 // TestValidatePhaseBlocks_MissingPhase5Security: Phase 5 without **Security:**
@@ -290,25 +307,31 @@ func TestValidatePhaseBlocks_MissingPhase5Security(t *testing.T) {
 
 ### Phase 5: REVIEW
 **Status:** COMPLETE
-**Stage 2: Cold Review via task()**
-**task() dispatched:** yes
+self-review: done
+**Stage 2: Cold Review**
+cold-review: ses_coldfix
 **Subagent ID:** agent-x
 **Findings:** none
 **Merged assessment:** Yes
 **Fix commits:** none needed
 
+**Stage 3: Consequence & Intent**
+consequence: ses_consfix
+**Subagent ID:** agent-y
+**Findings:** none
+
 ### Phase 6: FINISH
 **Status:** COMPLETE
 **Deploy required:** no
 **send_to orchestrator:** yes`
-	// Note: Phase 5 has Stage 2 but is missing **Security:** field
+	// Note: Phase 5 has all dispatch lines except security:
 	result := ValidatePhaseBlocks(content)
 	if result.Compliant {
-		t.Error("content missing Phase 5 **Security:** field should not be compliant")
+		t.Error("content missing Phase 5 security dispatch should not be compliant")
 	}
 	found := false
 	for _, fe := range result.FieldErrors {
-		if fe.Phase == 5 && strings.Contains(fe.Field, "Security") {
+		if fe.Phase == 5 && strings.Contains(fe.Field, "security") {
 			found = true
 			break
 		}
@@ -346,13 +369,10 @@ func TestValidatePhaseBlocks_Phase5SecurityEdgeCases(t *testing.T) {
 
 ### Phase 5: REVIEW
 **Status:** COMPLETE
-**Stage 2: Cold Review via task()**
-**task() dispatched:** yes
-**Subagent ID:** agent-x
-**Findings:** none
+self-review: done
+cold-review: ses_coldfix
+consequence: ses_consfix
 ` + securityLine + `
-**Merged assessment:** Yes
-
 ### Phase 6: FINISH
 **Status:** COMPLETE
 **Deploy required:** no
@@ -360,26 +380,26 @@ func TestValidatePhaseBlocks_Phase5SecurityEdgeCases(t *testing.T) {
 	}
 
 	t.Run("whitespace_only_value_rejected", func(t *testing.T) {
-		// **Security:** followed by only spaces/tabs then newline — \S must reject.
-		result := ValidatePhaseBlocks(base("**Security:**   "))
+		// security: followed by only spaces/tabs then newline — ses_\S+ must reject.
+		result := ValidatePhaseBlocks(base("security:   "))
 		if result.Compliant {
-			t.Error("whitespace-only **Security:** value should not be compliant")
+			t.Error("whitespace-only security dispatch should not be compliant")
 		}
 	})
 
 	t.Run("indented_placement_rejected", func(t *testing.T) {
-		// Leading whitespace before **Security:** breaks the (?m)^ anchor.
-		result := ValidatePhaseBlocks(base("  **Security:** none"))
+		// Leading whitespace before security: breaks the (?m)^ anchor.
+		result := ValidatePhaseBlocks(base("  security: ses_secfix"))
 		if result.Compliant {
-			t.Error("indented **Security:** line should not be compliant (anchor is ^)")
+			t.Error("indented security dispatch line should not be compliant (anchor is ^)")
 		}
 	})
 
 	t.Run("inline_prefixed_rejected", func(t *testing.T) {
-		// Text before **Security:** on same line — must not false-positive.
-		result := ValidatePhaseBlocks(base("note: **Security:** none"))
+		// Text before security: on same line — must not false-positive.
+		result := ValidatePhaseBlocks(base("note: security: ses_secfix"))
 		if result.Compliant {
-			t.Error("inline-prefixed **Security:** should not be compliant")
+			t.Error("inline-prefixed security dispatch should not be compliant")
 		}
 	})
 }
@@ -451,19 +471,17 @@ func scaffoldScratchpad(taskType, depthLock, redProof string) string {
 
 ### Phase 5: REVIEW
 **Status:** COMPLETE
-**Stage 2: Cold Review via task()**
-**task() dispatched:** yes
-**Subagent ID:** agent-x
-**Findings:** none
-**Merged assessment:** Yes
-**Fix commits:** none needed
-
+**Stage 1: Self-Review**
+self-review: done
+**Stage 2: Cold Review**
+cold-review: ses_coldfix
+**Stufe:** 2 - behavior change, no high-risk triggers
+**Modules:** A, B, C, D, E, F, Q, R | N/A: G, H, I, J, K, L, M, N, O, P
 **Stage 3: Consequence & Intent**
-**consequence dispatched:** yes
-**Subagent ID:** agent-y
+consequence: ses_consfix
+**Stage 4: Security Review**
+security: ses_secfix
 **Findings:** none
-
-**Security:** none — diff reviewed, no findings
 
 ### Phase 6: FINISH
 **Status:** COMPLETE
@@ -572,20 +590,123 @@ func TestValidatePhaseBlocks_RegressionBaselineRequired(t *testing.T) {
 	}
 }
 
-// TestValidatePhaseBlocks_Stage3ConsequenceRequired: Phase 5 must carry the
-// Stage 3 Consequence & Intent sub-section with a yes|blocked dispatch value.
+// TestValidatePhaseBlocks_Stage3ConsequenceRequired: Phase 5 must carry a
+// consequence: ses_<id> dispatch line pointing at a task() subagent session.
 func TestValidatePhaseBlocks_Stage3ConsequenceRequired(t *testing.T) {
-	noStage3 := strings.Replace(validV3Content, "**Stage 3: Consequence & Intent", "**Stage 2b: something else", 1)
-	if r := ValidatePhaseBlocks(noStage3); r.Compliant {
-		t.Error("Phase 5 without Stage 3 Consequence & Intent header must be non-compliant")
-	}
-
-	noDispatch := strings.Replace(validV3Content, "**consequence dispatched:** yes", "**consequence dispatched:**", 1)
+	noDispatch := strings.Replace(validV3Content, "consequence: ses_consfix\n", "", 1)
 	if r := ValidatePhaseBlocks(noDispatch); r.Compliant {
-		t.Error("Phase 5 without consequence dispatched value must be non-compliant")
+		t.Error("Phase 5 without consequence session id must be non-compliant")
 	}
 
 	if r := ValidatePhaseBlocks(validV3Content); !r.Compliant {
 		t.Errorf("full block set must be compliant, errors: %v", r.FieldErrors)
+	}
+}
+
+// TestValidatePhaseBlocks_StufeModulesRequired: Phase 5 must carry the
+// risk-based-code-review classification from the 5.2 cold reviewer — a
+// **Stufe:** 1-3 line with a same-line rationale and a non-empty **Modules:**
+// value (format check; substance is reviewed against the skill's trigger
+// table). Stale in-flight agents pause at the guard and fix the block.
+func TestValidatePhaseBlocks_StufeModulesRequired(t *testing.T) {
+	noStufe := strings.Replace(validV3Content,
+		"**Stufe:** 2 - behavior change, no high-risk triggers\n", "", 1)
+	if r := ValidatePhaseBlocks(noStufe); r.Compliant {
+		t.Error("Phase 5 without **Stufe:** classification must be non-compliant")
+	}
+	if !phase5HasFieldError(t, noStufe, "Stufe") {
+		t.Errorf("expected field error naming Stufe, got: %v", ValidatePhaseBlocks(noStufe).FieldErrors)
+	}
+
+	noModules := strings.Replace(validV3Content,
+		"**Modules:** A, B, C, D, E, F, Q, R | N/A: G, H, I, J, K, L, M, N, O, P\n", "", 1)
+	if r := ValidatePhaseBlocks(noModules); r.Compliant {
+		t.Error("Phase 5 without **Modules:** value must be non-compliant")
+	}
+	if !phase5HasFieldError(t, noModules, "Modules") {
+		t.Errorf("expected field error naming Modules, got: %v", ValidatePhaseBlocks(noModules).FieldErrors)
+	}
+
+	// Whitespace-only value must not satisfy the requirement (same strictness
+	// as **Regression baseline:** — value on the same line, [ \t] blocks the
+	// \s+\S newline bypass).
+	wsOnly := strings.Replace(validV3Content,
+		"**Modules:** A, B, C, D, E, F, Q, R | N/A: G, H, I, J, K, L, M, N, O, P",
+		"**Modules:**   ", 1)
+	if r := ValidatePhaseBlocks(wsOnly); r.Compliant {
+		t.Error("whitespace-only **Modules:** value must be non-compliant")
+	}
+
+	// Stufe enum: only 1-3 are valid classification values.
+	badStufe := strings.Replace(validV3Content,
+		"**Stufe:** 2 - behavior change, no high-risk triggers", "**Stufe:** 4 - over-the-top", 1)
+	if r := ValidatePhaseBlocks(badStufe); r.Compliant {
+		t.Error("**Stufe:** outside 1-3 must be non-compliant")
+	}
+
+	// Bare digit without same-line rationale fails the template format.
+	noRationale := strings.Replace(validV3Content,
+		"**Stufe:** 2 - behavior change, no high-risk triggers", "**Stufe:** 2", 1)
+	if r := ValidatePhaseBlocks(noRationale); r.Compliant {
+		t.Error("**Stufe:** without same-line rationale must be non-compliant")
+	}
+
+	// Full block set stays compliant.
+	if r := ValidatePhaseBlocks(validV3Content); !r.Compliant {
+		t.Errorf("validV3Content with Stufe + Modules must be compliant, errors: %v", r.FieldErrors)
+	}
+}
+
+// phase5HasFieldError reports whether the content produces a Phase 5
+// FieldError whose pattern mentions the given field snippet.
+func phase5HasFieldError(t *testing.T, content, needle string) bool {
+	t.Helper()
+	for _, fe := range ValidatePhaseBlocks(content).FieldErrors {
+		if fe.Phase == 5 && strings.Contains(fe.Field, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestValidatePhaseBlocks_Phase5EvidenceExtraction: the ses_ ids from the
+// mandatory dispatch lines land in ValidationResult.Phase5Evidence so the
+// DONE-guard can verify them against opencode's session DB.
+func TestValidatePhaseBlocks_Phase5EvidenceExtraction(t *testing.T) {
+	result := ValidatePhaseBlocks(validV3Content)
+	want := map[string]string{"cold-review": "ses_coldfix", "consequence": "ses_consfix", "security": "ses_secfix"}
+	if len(result.Phase5Evidence) != 3 {
+		t.Fatalf("expected 3 evidence ids, got: %v", result.Phase5Evidence)
+	}
+	for k, v := range want {
+		if result.Phase5Evidence[k] != v {
+			t.Errorf("evidence[%s] = %q, want %q", k, result.Phase5Evidence[k], v)
+		}
+	}
+
+	// Evidence ids are extracted even when the rest of the block is incomplete —
+	// the guard skips verification on incompliant format, but the extraction
+	// itself must not eat errors elsewhere.
+	missing := ValidatePhaseBlocks(strings.Replace(validV3Content, "**Tests run:** test\n", "", 1))
+	if len(missing.Phase5Evidence) != 3 {
+		t.Errorf("expected evidence extraction alongside format errors, got: %v", missing.Phase5Evidence)
+	}
+}
+
+// TestSummarizeErrors_IncludesDetail: evidence FieldErrors carry their reason
+// in Detail — the guard relay must name it so the agent can act (bare field
+// names are un-actionable on a format-compliant block).
+func TestSummarizeErrors_IncludesDetail(t *testing.T) {
+	r := ValidationResult{FieldErrors: []FieldError{{
+		Phase:  5,
+		Field:  "security",
+		Detail: "subagent session ses_secfix has parent_id \"ses_other\", expected the agent's own session \"ses_loop\"",
+	}}}
+	got := summarizeErrors(r)
+	if !strings.Contains(got, "parent_id") {
+		t.Errorf("summarizeErrors must include the error detail, got: %s", got)
+	}
+	if !strings.Contains(got, "Phase5:security") {
+		t.Errorf("summarizeErrors must keep the Phase:Field prefix, got: %s", got)
 	}
 }

@@ -89,6 +89,11 @@ type Config struct {
 	HTTPEnabled      bool   // --http flag or config: start HTTP API server
 	HTTPListen       string // from config, default "127.0.0.1:9377"
 	CapsDir          string // CAP.md file directory — defaults to DataDir/../caps
+
+	// TerminalsSave, if set, runs 1 minute after daemon start and then every
+	// 15 minutes to keep terminals.json resume-ready. Wired in main (main.go)
+	// because internal/terminals imports this package back.
+	TerminalsSave func()
 }
 
 // Run starts the daemon: socket-first for instant MCP availability, then index async.
@@ -188,6 +193,13 @@ func Run(cfg Config) error {
 		if ac.Agents.DefaultBackend != "" {
 			handler.agentDefaultBackend = ac.Agents.DefaultBackend
 		}
+		handler.agentPermissionKick = ac.Agents.PermissionKick
+		if d, err := time.ParseDuration(ac.Agents.PermissionKickDelay); err == nil && d > 0 {
+			handler.agentPermissionKickDelay = d
+		}
+		if d, err := time.ParseDuration(ac.Agents.PermissionKickInterval); err == nil && d > 0 {
+			handler.agentPermissionKickInterval = d
+		}
 		if ac.DefaultSandboxProfile != "" {
 			if p, err := ParseSandboxProfile(ac.DefaultSandboxProfile); err == nil {
 				handler.defaultSandboxProfile = p
@@ -207,6 +219,7 @@ func Run(cfg Config) error {
 	if ocDBPath == "" {
 		ocDBPath = filepath.Join(os.Getenv("HOME"), ".local", "share", "opencode", "opencode.db")
 	}
+	handler.SetOpencodeDBPath(ocDBPath)
 	if _, err := os.Stat(ocDBPath); err == nil {
 		ocScanner := indexer.NewOpencodeScanner(ocDBPath, store, log.Default(), batchExtractNotify, ac.ExcludeProjects)
 		handler.SetOpencodeScanner(ocScanner)
@@ -274,6 +287,19 @@ func Run(cfg Config) error {
 			}
 		}
 	}()
+
+	// Periodic terminal snapshot — keeps terminals.json resume-ready even
+	// when windows never fire hooks (idle opencode/codex sessions).
+	if cfg.TerminalsSave != nil {
+		go func() {
+			time.AfterFunc(time.Minute, cfg.TerminalsSave)
+			ticker := time.NewTicker(15 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				cfg.TerminalsSave()
+			}
+		}()
+	}
 
 	// ━━━ Scheduler ━━━
 	var sched *Scheduler
@@ -394,6 +420,12 @@ func Run(cfg Config) error {
 
 	// Wiki render ticker — rebuilds wiki for all active projects every 5min
 	startWikiTicker(daemonCtx, store)
+
+	// CBM daemon keeper — attach CLI calls to one permanent CBM daemon
+	startCBMDaemonKeeper(daemonCtx, store)
+
+	// CBM GC task — daily cleanup of orphaned worktree index DBs
+	startCBMGCTask(daemonCtx)
 
 	// Extractor holder — set asynchronously after config is loaded
 	var (

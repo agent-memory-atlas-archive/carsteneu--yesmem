@@ -50,10 +50,7 @@ func (s *Server) handleOpenAICompletions(w http.ResponseWriter, r *http.Request)
 	s.logger.Printf("%s FWD-TRANSLATE: input=%d output=%d", fmtReq(reqIdx, s.version), len(oaiReq.Messages), len(msgsAfterTrans))
 	s.logger.Printf("%s OPENAI-PIPE: after-translate msgs=%d", fmtReq(reqIdx, s.version), len(msgsAfterTrans))
 
-	ocSessionID := r.Header.Get("x-opencode-session")
-	if ocSessionID == "" {
-		ocSessionID = r.Header.Get("x-session-affinity")
-	}
+	ocSessionID := opencodeSessionID(r.Header)
 	if ocSessionID != "" {
 		s.logger.Printf("%s %sopencode session=%s%s", fmtReq(reqIdx, s.version), colorGreen, ocSessionID, colorReset)
 	}
@@ -67,6 +64,16 @@ func (s *Server) handleOpenAICompletions(w http.ResponseWriter, r *http.Request)
 			"key":   "active_session_opencode",
 			"value": "opencode:" + ocSessionID,
 		})
+		// Deterministische Instanz-Identität: Peer-Socket → PID → register_pid.
+		// Füllt pidMap/PID-Files, damit resolveSessionID nicht auf den globalen
+		// Last-Writer-Wins-Fallback zurückfällt (siehe Learning #89986).
+		if pid := peerSessionPID(s.cfg.ListenAddr, r.RemoteAddr); pid > 0 {
+			s.queryDaemon("register_pid", map[string]any{
+				"session_id":   "opencode:" + ocSessionID,
+				"pid":          float64(pid),
+				"source_agent": "opencode",
+			})
+		}
 	}
 
 	// Non-interactive requests (CLI tools, extraction pipeline) have no session headers.

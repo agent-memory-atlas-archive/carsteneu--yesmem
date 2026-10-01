@@ -46,11 +46,11 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 		stubThreshold = 30000
 	}
 
-	// Phase 0: Compress old thinking blocks and tool_results
+	// Phase 0: Drop old thinking blocks, compress old tool_results (see CompressContext)
 	compressResult := CompressContext(messages, s.cfg.KeepRecent, threadID, estimateFn)
 	if compressResult.TokensSaved > 0 {
-		s.logger.Printf("[req %d] COMPRESS: %d thinking, %d tool_results compressed, ~%dk tokens saved",
-			reqIdx, compressResult.ThinkingCompressed, compressResult.ToolResultsCompressed, compressResult.TokensSaved/1000)
+		s.logger.Printf("[req %d] COMPRESS: %d thinking dropped, %d tool_results compressed, ~%dk tokens saved",
+			reqIdx, compressResult.ThinkingDropped, compressResult.ToolResultsCompressed, compressResult.TokensSaved/1000)
 	}
 
 	// === Phase 1: Budget-based cutoff ===

@@ -242,8 +242,10 @@ func phase5ColdReviewPresent(content string) bool {
 	if dispatchVetoRe.MatchString(block) {
 		return false
 	}
-	// Phase 5 block must contain at least one of these positive trace markers.
-	stage2Re := regexp.MustCompile(`(?i)\b(stage 2|cold review|task\(\)|subagent)\b`)
+	// Phase 5 block must contain at least one of these positive trace markers:
+	// the legacy Stage-2 vocabulary or the new sub-phase dispatch lines
+	// (cold-review/consequence/security: ses_<id>, "Sub-phase 5.2: Cold Code Review").
+	stage2Re := regexp.MustCompile(`(?i)\b(stage 2|cold review|cold code review|cold-review|consequence|security|task\(\)|subagent)\b`)
 	return stage2Re.MatchString(block)
 }
 
@@ -254,7 +256,7 @@ func (h *Handler) sendIdleRelay(agent storage.Agent, state *yesloopIdleState, re
 	var msg string
 	switch relayNum {
 	case 1:
-		msg = "Have you completed all 6 phases? If not do it now. For each phase prove you have done each, IF you have proven mark each phase in scratchpad with [x] showing it is done. MANDATORY: Make sure that you have also done phase 5 with all code reviews including Stage 2 cold review and Stage 3 consequence check via task subagents. REVIEW BLOCKED without subagent trace is not acceptable. Mandatory: only mark as PROVEN if it IS proven."
+		msg = "Have you completed all 6 phases? If not do it now. For each phase prove you have done each, IF you have proven mark each phase in scratchpad with [x] showing it is done. MANDATORY: Make sure that you have also done phase 5 with all code reviews including Sub-phase 5.2 cold review, 5.3 consequence check and 5.4 security review via task subagents. REVIEW BLOCKED without subagent trace is not acceptable. Mandatory: only mark as PROVEN if it IS proven."
 	case 2:
 		msg = "Mark all 6 phases as done with x in scratchpad."
 	case 3:

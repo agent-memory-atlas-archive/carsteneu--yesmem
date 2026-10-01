@@ -29,11 +29,13 @@ func makeToolResult(toolUseID, text string) map[string]any {
 	}
 }
 
-// makeThinking creates a thinking content block.
+// makeThinking creates a thinking content block. Real clients stamp a
+// signature on every thinking block; the API validates it against the text.
 func makeThinking(text string) map[string]any {
 	return map[string]any{
-		"type":     "thinking",
-		"thinking": text,
+		"type":      "thinking",
+		"thinking":  text,
+		"signature": "sig-test",
 	}
 }
 
@@ -87,16 +89,18 @@ func buildConversation(toolPairs int, toolResultSize int) []any {
 	return msgs
 }
 
-func TestCompressContext_NoCompressionUnderThreshold(t *testing.T) {
-	// Small tool results (<500 tokens) should never be compressed
+func TestCompressContext_ToolResultsUnderThresholdUntouched(t *testing.T) {
+	// Small tool results (<500 tokens) should never be compressed; old
+	// thinking blocks are dropped regardless of size (dead weight at any size,
+	// same as Claude Code's own history stripping).
 	msgs := buildConversation(3, 100) // 100 tokens — under threshold
 	result := CompressContext(msgs, 5, "", testEstimator)
 
-	if result.ThinkingCompressed > 0 {
-		t.Errorf("expected no thinking compression, got %d", result.ThinkingCompressed)
-	}
 	if result.ToolResultsCompressed > 0 {
 		t.Errorf("expected no tool_result compression, got %d", result.ToolResultsCompressed)
+	}
+	if result.ThinkingDropped == 0 {
+		t.Error("expected old thinking blocks to be dropped even under 500 tokens")
 	}
 }
 
@@ -106,9 +110,6 @@ func TestCompressContext_NoCompressionRecentTurns(t *testing.T) {
 	msgs := buildConversation(2, 600)
 	result := CompressContext(msgs, len(msgs), "", testEstimator)
 
-	if result.ThinkingCompressed > 0 {
-		t.Errorf("expected no thinking compression for recent turns, got %d", result.ThinkingCompressed)
-	}
 	if result.ToolResultsCompressed > 0 {
 		t.Errorf("expected no tool_result compression for recent turns, got %d", result.ToolResultsCompressed)
 	}
@@ -125,12 +126,12 @@ func TestCompressContext_TruncatesAtTurn5(t *testing.T) {
 		t.Errorf("expected %d messages, got %d", origLen, len(result.Messages))
 	}
 
-	// Some compressions should have happened
-	if result.ThinkingCompressed == 0 {
-		t.Error("expected some thinking blocks to be compressed")
-	}
+	// Tool_results compressed, old thinking dropped
 	if result.ToolResultsCompressed == 0 {
 		t.Error("expected some tool_results to be compressed")
+	}
+	if result.ThinkingDropped == 0 {
+		t.Error("expected some thinking blocks to be dropped")
 	}
 
 	// Compressed content should be smaller than original
@@ -166,14 +167,6 @@ func TestCompressContext_SummaryAtTurn8(t *testing.T) {
 			if b["type"] == "tool_result" {
 				if content, ok := b["content"].(string); ok {
 					if strings.Contains(content, "[context compressed") {
-						foundSummary = true
-					}
-				}
-			}
-			// Check thinking blocks
-			if b["type"] == "thinking" {
-				if thinking, ok := b["thinking"].(string); ok {
-					if strings.Contains(thinking, "[context compressed") {
 						foundSummary = true
 					}
 				}
@@ -222,37 +215,70 @@ func TestCompressContext_PreservesDeepSearchHint(t *testing.T) {
 	}
 }
 
-func TestCompressContext_ThinkingBlocksCompressed(t *testing.T) {
-	msgs := buildConversation(15, 800)
+// Old thinking blocks are DROPPED, never rewritten: the API validates each
+// thinking block's signature against its text, so any rewrite (unsigned stub
+// or copied signature) produces requests rejected with
+// "messages.N.content.M.thinking.signature: Field required". Dropping old
+// thinking matches what Claude Code does client-side. Thinking inside the
+// keepRecent window — including the current tool loop — is never touched.
+func TestCompressContext_DropsOldThinkingBlocks(t *testing.T) {
+	msgs := buildConversation(15, 800) // 61 messages, thinking signed via makeThinking
 	result := CompressContext(msgs, 5, "", testEstimator)
 
-	// Check that thinking blocks in old messages are compressed
-	// They should be truncated or summarized, not full size
-	for i := 1; i < 10; i++ {
+	protectedTail := len(msgs) - 5
+	if result.ThinkingDropped == 0 {
+		t.Fatal("expected old thinking blocks to be dropped")
+	}
+	for i := 1; i < len(result.Messages); i++ {
 		msg, ok := result.Messages[i].(map[string]any)
-		if !ok {
-			continue
-		}
-		if msg["role"] != "assistant" {
+		if !ok || msg["role"] != "assistant" {
 			continue
 		}
 		blocks, ok := msg["content"].([]any)
 		if !ok {
 			continue
 		}
-		for _, block := range blocks {
-			b, ok := block.(map[string]any)
-			if !ok {
+		for _, b := range blocks {
+			blk, ok := b.(map[string]any)
+			if !ok || blk["type"] != "thinking" {
 				continue
 			}
-			if b["type"] == "thinking" {
-				thinking, _ := b["thinking"].(string)
-				// Original was 800 tokens ≈ 4000 bytes. Should be much smaller now.
-				if len(thinking) > 2500 {
-					t.Errorf("expected compressed thinking block, got %d bytes", len(thinking))
-				}
+			if i < protectedTail {
+				t.Errorf("message %d (old region): thinking block should have been dropped", i)
+			}
+			if _, ok := blk["signature"]; !ok {
+				t.Errorf("message %d (recent region): kept thinking block lost its signature", i)
 			}
 		}
+	}
+}
+
+// A message whose only content is a thinking block must not end up with empty
+// content (invalid request). It gets a minimal text placeholder instead.
+func TestCompressContext_ThinkingOnlyMessageGetsFallback(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "user", "content": "system context"},
+		map[string]any{"role": "assistant", "content": []any{
+			makeThinking(bigText(800)),
+		}},
+		map[string]any{"role": "user", "content": "follow-up"},
+		map[string]any{"role": "assistant", "content": "answer"},
+		map[string]any{"role": "user", "content": "and now?"},
+		map[string]any{"role": "assistant", "content": "answer 2"},
+	}
+	result := CompressContext(msgs, 2, "", testEstimator)
+
+	msg, _ := result.Messages[1].(map[string]any)
+	blocks, ok := msg["content"].([]any)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("expected exactly one fallback block, got %v", msg["content"])
+	}
+	blk, _ := blocks[0].(map[string]any)
+	if blk["type"] != "text" {
+		t.Errorf("expected text fallback block, got type=%v", blk["type"])
+	}
+	if txt, _ := blk["text"].(string); txt == "" {
+		t.Error("fallback text block must not be empty")
 	}
 }
 

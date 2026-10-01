@@ -110,3 +110,35 @@ func TestPreAdmissionStats(t *testing.T) {
 		t.Errorf("expected 1 inserted, got %d", inserted)
 	}
 }
+
+func TestTwoPassExtractor_SkipsExactDuplicates(t *testing.T) {
+	store := mustOpenStore(t)
+	insertTestLearningFTS(store, "Immer Deutsch verwenden im TUI-Flow", "explicit_teaching")
+
+	summarizeClient := &mockLLMClient{
+		completeFunc: func(system, user string) (string, error) {
+			return "User bespricht TUI-Sprache.", nil
+		},
+		model: "haiku",
+	}
+	extractClient := &mockLLMClient{
+		completeJSONFunc: func(system, user string, schema map[string]any) (string, error) {
+			return `{"domain": "code", "learnings": [{"category": "explicit_teaching", "content": "Immer Deutsch verwenden im TUI-Flow", "context": "", "entities": [], "actions": [], "keywords": [], "trigger": "", "importance": 3}], "session_emotional_intensity": 0.1, "session_flavor": "test"}`, nil
+		},
+		model: "sonnet",
+	}
+
+	ext := NewTwoPassExtractor(summarizeClient, extractClient, store)
+	msgs := []models.Message{{Role: "user", MessageType: "text", Content: "Merke: immer Deutsch."}}
+	if err := ext.ExtractAndStore("test-session-id", "testproj", msgs, false); err != nil {
+		t.Fatalf("extract and store: %v", err)
+	}
+
+	actives, err := store.GetActiveLearnings("explicit_teaching", "testproj", "", "", 0)
+	if err != nil {
+		t.Fatalf("get actives: %v", err)
+	}
+	if len(actives) != 1 {
+		t.Errorf("expected 1 active learning after pre-admission dedup, got %d", len(actives))
+	}
+}

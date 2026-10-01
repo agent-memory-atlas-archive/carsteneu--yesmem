@@ -71,6 +71,12 @@ CONSOLIDATION — but not at the cost of specificity:
 - GOOD: "Anthropic API returns HTTP 400 with 'tool_use_id mismatch' after collapse of tool-result messages."
 Fewer learnings with more substance > many splinter learnings. But NEVER omit specific details to consolidate.
 
+VOLATILE STATE — do not archive live-derivable values:
+- Skip learnings whose point is a current-state value: tool/session/file counts, health states ("degraded", restarts), cache-hit ratios, uptime, pings
+- These values are derivable from the live system at query time — an archived copy rots silently
+- Instead extract the DURABLE insight behind the state observation (if any)
+- Dated research reference points ("X had 77.7k stars as of May 2026") stay extractable
+
 Categories:
 1. fact: Concrete facts with specific details — names, places, dates, numbers, URLs, versions, titles. Examples: "Server runs on port 8443", "Meeting on March 28", "Client uses OAuth2 with PKCE", "Deployment on staging.example.com". NO abstractions — only verifiable individual facts. IMPORTANT: Also extract casually mentioned facts — a place name, a filename, a version that only appears once is still a fact.
 2. explicit_teachings: Things the user explicitly said ("remember this", "important", "always", "never")

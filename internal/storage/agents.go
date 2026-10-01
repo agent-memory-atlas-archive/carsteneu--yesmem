@@ -39,7 +39,8 @@ const tableAgents = `CREATE TABLE IF NOT EXISTS agents (
 	last_restart_at  TEXT    DEFAULT '',
 	proxy_thread_id  TEXT    DEFAULT '',
 	codex_session_id TEXT    DEFAULT '',
-	opencode_session_id TEXT    DEFAULT ''
+	opencode_session_id TEXT    DEFAULT '',
+	permission_kick  TEXT DEFAULT ''
 )`
 
 // Agent represents a spawned agent process.
@@ -75,6 +76,7 @@ type Agent struct {
 	ProxyThreadID   string `json:"proxy_thread_id,omitempty"`
 	CodexSessionID    string `json:"codex_session_id,omitempty"`
 	OpencodeSessionID string `json:"opencode_session_id,omitempty"`
+	PermissionKick    string `json:"permission_kick,omitempty"`
 }
 
 // AgentCreate inserts a new agent record.
@@ -90,9 +92,9 @@ func (s *Store) AgentCreate(a Agent) error {
 	if createdAt == "" {
 		createdAt = time.Now().Format(time.RFC3339)
 	}
-	_, err := s.db.Exec(`INSERT INTO agents (id, project, section, session_id, pid, sock_path, status, caller_session, depth, token_budget, backend, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, proxy_thread_id, codex_session_id, opencode_session_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.Project, a.Section, a.SessionID, a.PID, a.SockPath, a.Status, a.CallerSession, a.Depth, a.TokenBudget, backend, a.RestartStrategy, a.RestartCount, a.MaxRestarts, a.LivenessPingAt, a.LastRestartAt, a.ProxyThreadID, a.CodexSessionID, a.OpencodeSessionID, createdAt)
+	_, err := s.db.Exec(`INSERT INTO agents (id, project, section, session_id, pid, sock_path, status, caller_session, depth, token_budget, backend, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, proxy_thread_id, codex_session_id, opencode_session_id, permission_kick, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.Project, a.Section, a.SessionID, a.PID, a.SockPath, a.Status, a.CallerSession, a.Depth, a.TokenBudget, backend, a.RestartStrategy, a.RestartCount, a.MaxRestarts, a.LivenessPingAt, a.LastRestartAt, a.ProxyThreadID, a.CodexSessionID, a.OpencodeSessionID, a.PermissionKick, createdAt)
 	return err
 }
 
@@ -121,6 +123,7 @@ var agentAllowedFields = map[string]bool{
 	"proxy_thread_id":  true,
 	"codex_session_id":    true,
 	"opencode_session_id": true,
+	"permission_kick":     true,
 }
 
 // AgentUpdate updates specific fields of an agent record.
@@ -146,14 +149,14 @@ func (s *Store) AgentUpdate(id string, fields map[string]any) error {
 // AgentGet returns an agent by ID.
 func (s *Store) AgentGet(id string) (*Agent, error) {
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE id = ?`, id))
 }
 
 // AgentGetBySection returns the most recent agent for a project+section combo.
 func (s *Store) AgentGetBySection(project, section string) (*Agent, error) {
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE project = ? AND section = ? ORDER BY created_at DESC LIMIT 1`, project, section))
 }
 
@@ -161,7 +164,7 @@ func (s *Store) AgentGetBySection(project, section string) (*Agent, error) {
 // Active means the agent still owns the section and blocks spawning a new one.
 func (s *Store) AgentGetActiveBySection(project, section string) (*Agent, error) {
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents
 		WHERE project = ? AND section = ? AND status IN ('running', 'pending', 'spawning', 'paused', 'frozen')
 		ORDER BY created_at DESC LIMIT 1`, project, section))
@@ -171,7 +174,7 @@ func (s *Store) AgentGetActiveBySection(project, section string) (*Agent, error)
 func (s *Store) AgentList(project string) ([]Agent, error) {
 	var rows *sql.Rows
 	var err error
-	const q = `SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '') FROM agents`
+	const q = `SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '') FROM agents`
 	if project != "" {
 		rows, err = s.readerDB().Query(q+` WHERE project = ? ORDER BY created_at DESC`, project)
 	} else {
@@ -254,7 +257,7 @@ func stripAgentPrefix(sid string) string {
 func (s *Store) AgentGetBySession(sessionID string) (*Agent, error) {
 	lookupID := stripAgentPrefix(sessionID)
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE (session_id = ? OR (opencode_session_id != '' AND opencode_session_id = ?) OR (codex_session_id != '' AND codex_session_id = ?)) AND status = 'running' ORDER BY created_at DESC LIMIT 1`, lookupID, lookupID, lookupID))
 }
 
@@ -265,7 +268,7 @@ func (s *Store) AgentGetBySession(sessionID string) (*Agent, error) {
 func (s *Store) AgentGetAnyBySession(sessionID string) (*Agent, error) {
 	lookupID := stripAgentPrefix(sessionID)
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE session_id = ? OR (opencode_session_id != '' AND opencode_session_id = ?) OR (codex_session_id != '' AND codex_session_id = ?) ORDER BY created_at DESC LIMIT 1`, lookupID, lookupID, lookupID))
 }
 
@@ -277,7 +280,7 @@ func (s *Store) AgentGetAnyBySession(sessionID string) (*Agent, error) {
 // mapping after an agent process exits.
 func (s *Store) AgentGetByPID(pid int) (*Agent, error) {
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE pid = ? AND status = 'running' ORDER BY created_at DESC LIMIT 1`, pid))
 }
 
@@ -286,7 +289,7 @@ func (s *Store) AgentGetByPID(pid int) (*Agent, error) {
 // differs from the daemon-generated session_id.
 func (s *Store) AgentGetByProxyThreadID(proxyThreadID string) (*Agent, error) {
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE proxy_thread_id = ? AND status = 'running' ORDER BY created_at DESC LIMIT 1`, proxyThreadID))
 }
 
@@ -295,7 +298,7 @@ func (s *Store) AgentGetByProxyThreadID(proxyThreadID string) (*Agent, error) {
 // most recently created running agent in the same project that hasn't been mapped yet.
 func (s *Store) AgentGetRunningInProject(project string) (*Agent, error) {
 	return s.scanAgent(s.readerDB().QueryRow(
-		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, '')
+		`SELECT id, project, section, session_id, pid, sock_path, status, caller_session, error, heartbeat_at, progress, relay_count, depth, token_budget, retry_count, COALESCE(backend, 'claude') as backend, COALESCE(turns_used, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(last_activity_at, ''), COALESCE(phase, 'idle'), created_at, stopped_at, restart_strategy, restart_count, max_restarts, liveness_ping_at, last_restart_at, COALESCE(proxy_thread_id, ''), COALESCE(codex_session_id, ''), COALESCE(opencode_session_id, ''), COALESCE(permission_kick, '')
 		FROM agents WHERE project = ? AND status = 'running' AND (proxy_thread_id IS NULL OR proxy_thread_id = '') ORDER BY created_at DESC LIMIT 1`, project))
 }
 
@@ -370,6 +373,7 @@ func (s *Store) MigrateAgentsSchema() error {
 		`ALTER TABLE agents ADD COLUMN proxy_thread_id   TEXT    DEFAULT ''`,
 		`ALTER TABLE agents ADD COLUMN codex_session_id   TEXT    DEFAULT ''`,
 		`ALTER TABLE agents ADD COLUMN opencode_session_id TEXT    DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN permission_kick    TEXT    DEFAULT ''`,
 	}
 	for _, m := range migrations {
 		_, err := s.db.Exec(m)
@@ -440,11 +444,12 @@ func (s *Store) scanAgent(row *sql.Row) (*Agent, error) {
 	var sessionID, sockPath, callerSession, errStr, heartbeat, progress, stoppedAt, lastActivityAt, restartStrategy, livenessPingAt, lastRestartAt, proxyThreadID, codexSessionID, opencodeSessionID sql.NullString
 	var pid sql.NullInt64
 	var restartCount, maxRestarts sql.NullInt64
+	var permKick sql.NullString
 	err := row.Scan(&a.ID, &a.Project, &a.Section, &sessionID, &pid, &sockPath,
 		&a.Status, &callerSession, &errStr, &heartbeat, &progress,
 		&a.RelayCount, &a.Depth, &a.TokenBudget, &a.RetryCount, &a.Backend,
 		&a.TurnsUsed, &a.InputTokens, &a.OutputTokens, &lastActivityAt, &a.Phase,
-		&a.CreatedAt, &stoppedAt, &restartStrategy, &restartCount, &maxRestarts, &livenessPingAt, &lastRestartAt, &proxyThreadID, &codexSessionID, &opencodeSessionID)
+		&a.CreatedAt, &stoppedAt, &restartStrategy, &restartCount, &maxRestarts, &livenessPingAt, &lastRestartAt, &proxyThreadID, &codexSessionID, &opencodeSessionID, &permKick)
 	if err != nil {
 		return nil, err
 	}
@@ -465,6 +470,7 @@ func (s *Store) scanAgent(row *sql.Row) (*Agent, error) {
 	a.ProxyThreadID = proxyThreadID.String
 	a.CodexSessionID = codexSessionID.String
 	a.OpencodeSessionID = opencodeSessionID.String
+	a.PermissionKick = permKick.String
 	a.Status = normalizeAgentStatus(a.Status)
 	return a, nil
 }
@@ -475,11 +481,12 @@ func (s *Store) scanAgentRow(rows *sql.Rows) (Agent, error) {
 	var sessionID, sockPath, callerSession, errStr, heartbeat, progress, stoppedAt, lastActivityAt, restartStrategy, livenessPingAt, lastRestartAt, proxyThreadID, codexSessionID, opencodeSessionID sql.NullString
 	var pid sql.NullInt64
 	var restartCount, maxRestarts sql.NullInt64
+	var permKick sql.NullString
 	err := rows.Scan(&a.ID, &a.Project, &a.Section, &sessionID, &pid, &sockPath,
 		&a.Status, &callerSession, &errStr, &heartbeat, &progress,
 		&a.RelayCount, &a.Depth, &a.TokenBudget, &a.RetryCount, &a.Backend,
 		&a.TurnsUsed, &a.InputTokens, &a.OutputTokens, &lastActivityAt, &a.Phase,
-		&a.CreatedAt, &stoppedAt, &restartStrategy, &restartCount, &maxRestarts, &livenessPingAt, &lastRestartAt, &proxyThreadID, &codexSessionID, &opencodeSessionID)
+		&a.CreatedAt, &stoppedAt, &restartStrategy, &restartCount, &maxRestarts, &livenessPingAt, &lastRestartAt, &proxyThreadID, &codexSessionID, &opencodeSessionID, &permKick)
 	if err != nil {
 		return a, err
 	}
@@ -500,6 +507,7 @@ func (s *Store) scanAgentRow(rows *sql.Rows) (Agent, error) {
 	a.ProxyThreadID = proxyThreadID.String
 	a.CodexSessionID = codexSessionID.String
 	a.OpencodeSessionID = opencodeSessionID.String
+	a.PermissionKick = permKick.String
 	a.Status = normalizeAgentStatus(a.Status)
 	return a, nil
 }

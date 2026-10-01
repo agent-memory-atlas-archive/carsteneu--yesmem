@@ -135,6 +135,32 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 		l.EmbeddingText = l.BuildEmbeddingText()
 	}
 
+	// Reject raw bash transcripts — session artifacts, never durable knowledge.
+	if textutil.IsRawBashTranscript(text) {
+		return jsonResponse(map[string]any{
+			"rejected": true,
+			"message":  "Raw bash transcript without durable insight — not saved.",
+		})
+	}
+
+	// Volatile sentinel: live-derivable state snapshots are not durable knowledge.
+	// Fail-open — sentinel errors never block remembering.
+	if h.CommitEvalClient != nil && extraction.LooksLikeStateSnapshot(text) {
+		verdicts, vErr := extraction.ClassifyVolatileBatch(h.CommitEvalClient, []models.Learning{{Content: text}})
+		if vErr == nil && len(verdicts) == 1 {
+			switch verdicts[0].Verdict {
+			case "volatile":
+				return jsonResponse(map[string]any{
+					"rejected": true,
+					"message": fmt.Sprintf("Volatile state snapshot — not saved (%s). Live queries answer this correctly; extract the durable insight instead.", verdicts[0].Reason),
+				})
+			case "bounded":
+				ttl := time.Now().AddDate(0, 0, 30)
+				l.ExpiresAt = &ttl
+			}
+		}
+	}
+
 	// Phase 0: exact content hash dedup (O(1), deterministic)
 	hash := textutil.ContentHash(text)
 	l.ContentHash = hash

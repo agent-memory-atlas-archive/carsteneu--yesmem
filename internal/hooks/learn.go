@@ -7,9 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
 	"github.com/carsteneu/yesmem/internal/textutil"
 )
@@ -79,16 +77,9 @@ func RunLearn(dataDir string) {
 		}
 	}
 
-	learning := &models.Learning{
-		SessionID:  hook.SessionID,
-		Category:   "gotcha",
-		Content:    content,
-		Confidence: 0.7,
-		CreatedAt:  time.Now(),
-		ModelUsed:  "hook-auto",
-		Source:     "hook_auto_learned",
-	}
-	store.InsertLearning(learning)
+	// Content is by construction a raw transcript (command + stderr excerpt),
+	// not durable knowledge: bump similar existing gotchas, never insert.
+	return
 }
 
 func truncateCmd(cmd string, maxLen int) string {

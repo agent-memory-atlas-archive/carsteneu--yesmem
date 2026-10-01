@@ -117,6 +117,9 @@ func TestResumeCommand(t *testing.T) {
 		kind, sid, want string
 	}{
 		{"opencode", "ses_abc", "opencode --session ses_abc"},
+		// Daemon-UUIDs sind keine opencode-Session-Ids; Resume würde sofort
+		// beenden. Fallback: frisches opencode.
+		{"opencode", "01f4eb72-43c8-435c-801c-432ea6c9db43", "opencode"},
 		{"claude", "u-2026-xyz", "claude --resume u-2026-xyz"},
 		{"shell", "", ""},
 		{"", "ses_x", ""},
@@ -141,14 +144,19 @@ func TestLaunchArgs(t *testing.T) {
 			[]string{"-e", "opencode", "--session", "ses_abc"},
 		},
 		{
-			"shell with workdir -> +new-window",
-			Window{Kind: "shell", WorkDir: "/home/chief/x"},
-			[]string{"+new-window", "--working-directory=/home/chief/x"},
+			"opencode fresh fallback -> workdir + -e",
+			Window{Kind: "opencode", SessionID: "01f4eb72-43c8-435c-801c-432ea6c9db43", WorkDir: "/w/m"},
+			[]string{"--working-directory=/w/m", "-e", "opencode"},
 		},
 		{
-			"shell no workdir -> +new-window",
+			"shell with workdir -> working-directory only",
+			Window{Kind: "shell", WorkDir: "/home/chief/x"},
+			[]string{"--working-directory=/home/chief/x"},
+		},
+		{
+			"shell no workdir -> plain",
 			Window{Kind: "shell"},
-			[]string{"+new-window"},
+			[]string{},
 		},
 	}
 	for _, tc := range tests {

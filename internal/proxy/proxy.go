@@ -49,6 +49,11 @@ type Config struct {
 	SawtoothEnabled bool   // use sawtooth instead of progressive decay (default: true)
 	CacheTTL        string // "ephemeral" (5m) or "1h" (extended)
 
+	// Eager stubbing of closed-turn tool_results in the fresh tail. Default
+	// false: correlated with upstream 400s (cache_control landing on thinking
+	// blocks) and cache-miss cascades (A/B test ecb7aee: 99% hit without it).
+	EagerStubEnabled bool
+
 	// Usage deflation: scale down input_tokens reported to CC to suppress "Context low" warning.
 	// 0 = disabled, 0.7 = report 70% of actual tokens. Real values kept for internal tracking.
 	UsageDeflationFactor float64
@@ -188,8 +193,8 @@ type Server struct {
 	briefingMu    sync.RWMutex
 	briefingCache map[string]briefingEntry
 
-	// briefingLoader is an optional test-only seam for refreshBriefing.
-	// Nil in production → refreshBriefing falls back to s.loadBriefing.
+	// briefingLoader is an optional test-only seam for refreshBriefing and
+	// injectBriefingTurn. Nil in production → both fall back to s.loadBriefing.
 	briefingLoader func(project, projectDir string) briefingData
 
 	// Cognitive signal bus — routes _signal_* tool calls to handlers
@@ -215,6 +220,12 @@ type Server struct {
 
 	channelMu          sync.Mutex
 	channelInjectCount map[string]int // sessionID → injection turn count
+
+	// Routing fallback warnings: one-shot per model. Makes silent misroutes
+	// (model without provider_target entry → fallback upstream → cryptic
+	// upstream auth errors) visible in the log. See resolveOpenAITarget.
+	routingWarnedMu sync.Mutex
+	routingWarned   map[string]bool
 
 	// Prompt cache gating — enables cache_control breakpoints when requests are frequent
 	cacheGate *CacheGate
@@ -298,6 +309,7 @@ func Run(cfg Config) error {
 		responseTimes:         make(map[string]time.Time),
 		thinkCounters:         make(map[string]int),
 		channelInjectCount:    make(map[string]int),
+		routingWarned:         make(map[string]bool),
 		rewriteMissLog:        make(map[string]time.Time),
 		cacheGate:             NewCacheGate(cacheGapForTTL(cfg.CacheTTL)),
 		frozenStubs:           NewFrozenStubsWithTTL(sawtoothTTLForCacheTTL(cfg.CacheTTL)),
@@ -838,11 +850,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// for the entire session (CC sends all messages, proxy compacts later).
 	rawMsgCount := len(messages)
 
-	// Use session_id directly as thread ID (unique per CC session).
-	// Prefer X-Claude-Code-Session-Id header (CC v2.1.86+), fallback to body metadata.
-	threadID := extractSessionID(req, r.Header.Get("X-Claude-Code-Session-Id"), "")
-	if threadID == "" {
-		threadID = DeriveThreadID(req)
+	// Thread ID: CC header > opencode session header > CC metadata > derived hash.
+	threadID := anthropicThreadID(req, r.Header)
+	if ocSessionID := opencodeSessionID(r.Header); ocSessionID != "" {
+		s.logger.Printf("[req %d] %sopencode session=%s tid=%s%s", reqIdx, colorGreen, ocSessionID, threadID, colorReset)
 	}
 	proj := extractProjectName(req)
 	// projPath is what goes to the daemon; proj stays the short log/display form.
@@ -1252,10 +1263,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 				combined := make([]any, 0, len(frozen.Messages)+len(freshMessages))
 				combined = append(combined, frozen.Messages...)
 				combined = append(combined, freshMessages...)
-				// Eager-stub large tool_results in fresh tail (model already processed them)
+				// Eager-stub large tool_results in fresh tail (turn already closed by a real user prompt)
 				beforeEager := s.countMessageTokens(combined[len(frozen.Messages):])
 				var stubSticky, stubFresh int
-				combined = EagerStubToolResults(combined, len(frozen.Messages), s.countTokens, WithStubMemory(s.eagerStubMemory, threadID), WithStubCounters(&stubSticky, &stubFresh))
+				if s.cfg.EagerStubEnabled {
+					combined = EagerStubToolResults(combined, len(frozen.Messages), s.countTokens, WithStubMemory(s.eagerStubMemory, threadID), WithStubCounters(&stubSticky, &stubFresh))
+				}
 				afterEager := s.countMessageTokens(combined[len(frozen.Messages):])
 				if beforeEager != afterEager {
 					s.logger.Printf("[req %d %s tid=%s] EAGER-STUB: fresh %dk → %dk (saved %dk) [sticky=%d fresh=%d]", reqIdx, proj, threadID, beforeEager/1000, afterEager/1000, (beforeEager-afterEager)/1000, stubSticky, stubFresh)
@@ -1324,10 +1337,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 				}
 				needsReserialization = true
 			} else {
-				// No trigger, no frozen stubs — eager-stub to delay first collapse
+				// No trigger, no frozen stubs — eager-stub closed-turn tool_results to delay first collapse
 				beforeEager := s.countMessageTokens(messages)
 				var stubSticky, stubFresh int
-				messages = EagerStubToolResults(messages, 0, s.countTokens, WithStubMemory(s.eagerStubMemory, threadID), WithStubCounters(&stubSticky, &stubFresh))
+				if s.cfg.EagerStubEnabled {
+					messages = EagerStubToolResults(messages, 0, s.countTokens, WithStubMemory(s.eagerStubMemory, threadID), WithStubCounters(&stubSticky, &stubFresh))
+				}
 				afterEager := s.countMessageTokens(messages)
 				if beforeEager != afterEager {
 					s.logger.Printf("[req %d %s tid=%s] EAGER-STUB: %dk → %dk (saved %dk) [sticky=%d fresh=%d]", reqIdx, proj, threadID, beforeEager/1000, afterEager/1000, (beforeEager-afterEager)/1000, stubSticky, stubFresh)
@@ -1902,9 +1917,29 @@ func (s *Server) resolveOpenAITarget(model string) string {
 	}
 
 	if s.cfg.OpenAITargetURL != "" {
+		s.warnRoutingFallback(model, s.cfg.OpenAITargetURL)
 		return s.cfg.OpenAITargetURL
 	}
+	s.warnRoutingFallback(model, s.cfg.TargetURL)
 	return s.cfg.TargetURL
+}
+
+// warnRoutingFallback logs a one-shot warning per model when its OpenAI-format
+// request resolves via the fallback target instead of an explicit or
+// auto-discovered provider route. Makes silent misroutes (e.g. glm-5.3 hit the
+// OpenAI target and surfaced at the TUI as a keys-related error) greppable.
+// Flood-guarded: one warning per model per process lifetime.
+func (s *Server) warnRoutingFallback(model, target string) {
+	s.routingWarnedMu.Lock()
+	defer s.routingWarnedMu.Unlock()
+	if s.routingWarned == nil {
+		s.routingWarned = make(map[string]bool)
+	}
+	if s.routingWarned[model] {
+		return
+	}
+	s.routingWarned[model] = true
+	log.Printf("[routing] model %q has no provider route — falling back to %s. Add a provider_targets entry if this is unintentional.", model, target)
 }
 
 // resolveAnthropicTarget returns the upstream URL for an Anthropic-format request.

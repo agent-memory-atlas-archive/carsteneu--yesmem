@@ -534,6 +534,9 @@ func TestSecretsSanitization_FromYAML(t *testing.T) {
 
 func TestDefault_ProxyDirectiveFlags_DefaultTrue(t *testing.T) {
 	cfg := Default()
+	if cfg.Proxy.EagerStubEnabled {
+		t.Error("EagerStubEnabled should default to false: eager stubbing produced upstream 400s (cache_control on thinking blocks) and cache-miss cascades")
+	}
 	if !cfg.Proxy.PromptToolPrefs {
 		t.Error("PromptToolPrefs should default to true")
 	}
@@ -554,6 +557,24 @@ func TestDefault_ProxyDirectiveFlags_DefaultTrue(t *testing.T) {
 	}
 	if !cfg.Proxy.PromptClarifyFirst {
 		t.Error("PromptClarifyFirst should default to true")
+	}
+}
+
+func TestDefault_EagerStubEnabled_YAMLOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte(`
+proxy:
+  eager_stub_enabled: true
+`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Proxy.EagerStubEnabled {
+		t.Error("EagerStubEnabled should be overridable to true via YAML")
 	}
 }
 

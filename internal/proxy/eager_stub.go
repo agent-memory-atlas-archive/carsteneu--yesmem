@@ -10,8 +10,12 @@ const eagerStubTokenThreshold = 500
 
 // EagerStubToolResults walks the fresh tail (messages after frozenBoundary)
 // and replaces large tool_result content with rule-based summaries.
-// Only stubs tool_results that (a) exceed the token threshold and (b) have a
-// following assistant turn (meaning Claude already processed them).
+// Only stubs tool_results that (a) exceed the token threshold and (b) sit in a
+// finished user turn: a turn is closed by a role=user message WITHOUT any
+// tool_result block (the Anthropic API requires every tool_use to be answered
+// by tool_result blocks in the next user message, so a user message without
+// them is a new prompt). Within the still-running turn nothing is stubbed;
+// sticky-marked results (WasStubbed) stay stubbed regardless.
 // Operates in the uncached zone — zero prompt cache cost.
 func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens TokenEstimateFunc, opts ...EagerStubOption) []any {
 	cfg := &eagerStubConfig{}
@@ -20,6 +24,33 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 	}
 	result := make([]any, len(messages))
 	copy(result, messages)
+
+	toolIndex := eagerIndexToolUses(result)
+
+	// Index of the last real turn boundary. tool_results may only be (newly)
+	// stubbed at indices below it. Boundaries inside the frozen prefix cannot
+	// enable stubbing of fresh results because i >= frozenBoundary always.
+	lastBoundary := -1
+	for i := len(result) - 1; i >= 0; i-- {
+		msg, ok := result[i].(map[string]any)
+		if !ok || msg["role"] != "user" {
+			continue
+		}
+		if blocks, ok := msg["content"].([]any); ok {
+			hasToolResult := false
+			for _, block := range blocks {
+				if b, ok := block.(map[string]any); ok && b["type"] == "tool_result" {
+					hasToolResult = true
+					break
+				}
+			}
+			if hasToolResult {
+				continue
+			}
+		}
+		lastBoundary = i
+		break
+	}
 
 	for i := frozenBoundary; i < len(result); i++ {
 		msg, ok := result[i].(map[string]any)
@@ -32,13 +63,7 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 			continue
 		}
 
-		hasFollowingAssistant := false
-		for j := i + 1; j < len(result); j++ {
-			if m, ok := result[j].(map[string]any); ok && m["role"] == "assistant" {
-				hasFollowingAssistant = true
-				break
-			}
-		}
+		turnClosed := i < lastBoundary
 
 		hasMemoryStub := false
 		if cfg.memory != nil && cfg.threadID != "" {
@@ -55,17 +80,8 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 			}
 		}
 
-		if !hasFollowingAssistant && !hasMemoryStub {
+		if !turnClosed && !hasMemoryStub {
 			continue
-		}
-
-		// Find the matching tool_use in the previous assistant message
-		var toolName string
-		var toolInput map[string]any
-		if i > 0 {
-			if prev, ok := result[i-1].(map[string]any); ok && prev["role"] == "assistant" {
-				toolName, toolInput = eagerExtractToolInfo(prev["content"])
-			}
 		}
 
 		anyChanged := false
@@ -84,7 +100,7 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 				cfg.memory.WasStubbed(cfg.threadID, toolUseID)
 
 			if !memoryHit {
-				if !hasFollowingAssistant {
+				if !turnClosed {
 					newBlocks = append(newBlocks, block)
 					continue
 				}
@@ -94,7 +110,9 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 				}
 			}
 
-			stub := buildEagerStub(toolName, toolInput, content)
+			// Label each stub by its own tool_use (parallel calls included).
+			call := toolIndex[toolUseID]
+			stub := buildEagerStub(call.name, call.input, content)
 			newBlock := make(map[string]any)
 			for k, v := range b {
 				newBlock[k] = v
@@ -130,28 +148,48 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 	return result
 }
 
-func eagerExtractToolInfo(content any) (string, map[string]any) {
-	blocks, ok := content.([]any)
-	if !ok {
-		return "", nil
-	}
-	for _, block := range blocks {
-		b, ok := block.(map[string]any)
+type eagerToolCall struct {
+	name  string
+	input map[string]any
+}
+
+// eagerIndexToolUses maps every tool_use_id to its tool name and input so each
+// tool_result resolves its own call — including parallel calls in one message.
+func eagerIndexToolUses(messages []any) map[string]eagerToolCall {
+	index := make(map[string]eagerToolCall)
+	for _, msgAny := range messages {
+		msg, ok := msgAny.(map[string]any)
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		blocks, ok := msg["content"].([]any)
 		if !ok {
 			continue
 		}
-		if b["type"] == "tool_use" {
+		for _, block := range blocks {
+			b, ok := block.(map[string]any)
+			if !ok || b["type"] != "tool_use" {
+				continue
+			}
+			id, _ := b["id"].(string)
+			if id == "" {
+				continue
+			}
 			name, _ := b["name"].(string)
 			input, _ := b["input"].(map[string]any)
-			return name, input
+			index[id] = eagerToolCall{name: name, input: input}
 		}
 	}
-	return "", nil
+	return index
 }
 
 func buildEagerStub(toolName string, input map[string]any, content string) string {
 	lines := strings.Split(content, "\n")
 	lineCount := len(lines)
+
+	if toolName == "" {
+		return fmt.Sprintf("[tool_result — %d lines archived]", lineCount)
+	}
 
 	switch toolName {
 	case "Read":

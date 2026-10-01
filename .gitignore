@@ -39,3 +39,4 @@ yesmem_demo*.cast
 --help/
 backfill_state.json
 scripts/__pycache__/
+.superpowers/

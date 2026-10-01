@@ -51,6 +51,10 @@ func (h *Handler) handleSpawnAgent(params map[string]any) Response {
 	}
 	model, _ := params["model"].(string)
 	workDir, _ := params["work_dir"].(string)
+	permissionKick, _ := params["permission_kick"].(string)
+	if permissionKick != "" && permissionKick != "on" && permissionKick != "off" {
+		permissionKick = "" // ungültige Werte erben vom Config-Default
+	}
 
 	// Auto-resolve caller session from MCP context if not explicitly set
 	if callerSession == "" {
@@ -97,15 +101,16 @@ func (h *Handler) handleSpawnAgent(params map[string]any) Response {
 	}
 
 	agent := storage.Agent{
-		ID:            id,
-		Project:       project,
-		Section:       section,
-		SessionID:     sessionID,
-		Status:        "pending",
-		CallerSession: callerSession,
-		Depth:         depth,
-		TokenBudget:   tokenBudget,
-		Backend:       backend,
+		ID:             id,
+		Project:        project,
+		Section:        section,
+		SessionID:      sessionID,
+		Status:         "pending",
+		CallerSession:  callerSession,
+		Depth:          depth,
+		TokenBudget:    tokenBudget,
+		Backend:        backend,
+		PermissionKick: permissionKick,
 	}
 
 	if err := h.store.AgentCreate(agent); err != nil {
@@ -896,6 +901,12 @@ func (h *Handler) handleStopAgent(params map[string]any) Response {
 	})
 }
 
+// stopAllPause is the pause between two agent exits in the stop-all run:
+// every process death tears down its terminal surface, and in a mass teardown
+// the GTK/Mesa main loop of a single-instance terminal deadlocks
+// (incident 2026-09-02 09:24). Individual teardown runs do not trigger this.
+const stopAllPause = 250 * time.Millisecond
+
 // handleStopAllAgents stops all running agents in a project.
 func (h *Handler) handleStopAllAgents(params map[string]any) Response {
 	project, _ := params["project"].(string)
@@ -909,7 +920,7 @@ func (h *Handler) handleStopAllAgents(params map[string]any) Response {
 	}
 
 	stopped := 0
-	for _, a := range agents {
+	for i, a := range agents {
 		if a.Status != "running" && a.Status != "paused" && a.Status != "spawning" {
 			continue
 		}
@@ -941,6 +952,12 @@ func (h *Handler) handleStopAllAgents(params map[string]any) Response {
 			os.Remove(a.SockPath + ".inject")
 		}
 		stopped++
+
+		// Pause between stops: the next surface teardown must be processed
+		// individually by the terminal, see stopAllPause.
+		if i < len(agents)-1 {
+			time.Sleep(stopAllPause)
+		}
 	}
 
 	return jsonResponse(map[string]any{
@@ -1276,6 +1293,7 @@ func agentToMap(a *storage.Agent) map[string]any {
 		"max_restarts":       a.MaxRestarts,
 		"liveness_ping_at":   a.LivenessPingAt,
 		"last_restart_at":    a.LastRestartAt,
+		"permission_kick":    a.PermissionKick,
 	}
 }
 

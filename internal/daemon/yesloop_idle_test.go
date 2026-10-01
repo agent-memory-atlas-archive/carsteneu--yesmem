@@ -577,3 +577,13 @@ task() dispatched: yes
 **send_to orchestrator:** yes
 `
 }
+
+// TestPhase5ColdReviewPresent_NewFormat: the canonical new-format Phase 5
+// block (dispatch lines, Sub-phase headers) must satisfy the positive trace
+// check — the DONE-gate accepts exactly these blocks, so the idle checker
+// must not later pause them as DEAD_AGENT.
+func TestPhase5ColdReviewPresent_NewFormat(t *testing.T) {
+	if !phase5ColdReviewPresent(validV3Content) {
+		t.Error("new-format Phase 5 block (dispatch lines, Sub-phase headers) must satisfy the idle positive trace check")
+	}
+}

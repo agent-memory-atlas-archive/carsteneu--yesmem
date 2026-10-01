@@ -157,10 +157,11 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 		return
 	}
 
-	content := h.readSkillCheckScratchpad(agent)
-
+	// Register the tracking state BEFORE the freeze check so the token/turn
+	// baseline covers volume produced while frozen — otherwise the first
+	// tick after the subagent returns would re-baseline and silently absorb
+	// that work.
 	yesloopSkillCheckAgentsMu.Lock()
-
 	state, exists := yesloopSkillCheckAgents[agent.ID]
 	if !exists {
 		// Start tracking from the current counters so the threshold measures
@@ -172,8 +173,26 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 		}
 		yesloopSkillCheckAgents[agent.ID] = state
 	}
+	yesloopSkillCheckAgentsMu.Unlock()
+
+	// Freeze while the agent is blocked in a task() subagent: opencode child
+	// sessions queue injected relays as pending user messages, so no relay,
+	// refire count, escalation or interval advancement may happen this tick.
+	// The freeze shifts lastRelayAt forward by the tick, so the refire
+	// interval restarts when the subagent returns.
+	if opencodeChildActiveFn(agent.OpencodeSessionID) {
+		yesloopSkillCheckAgentsMu.Lock()
+		if state.state == yesloopSkillCheckStateRemind {
+			state.lastRelayAt = time.Now()
+		}
+		yesloopSkillCheckAgentsMu.Unlock()
+		return
+	}
+
+	content := h.readSkillCheckScratchpad(agent)
 
 	// Decisions are computed under the lock; I/O is deferred past the unlock.
+	yesloopSkillCheckAgentsMu.Lock()
 	var sendRelay bool
 	var escalate bool
 	switch state.state {
@@ -193,10 +212,10 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 			log.Printf("[yesloop-skillcheck] agent %s (%s) confirmed SKILL-RELOAD round %d",
 				agent.ID, agent.Section, state.round)
 		} else {
-			escalate = h.maybeSkillCheckRefireLocked(agent, state, "no current-round SKILL-RELOAD marker in scratchpad")
-			if !escalate {
-				sendRelay = true
-			}
+			// Relay ONLY when a refire is actually counted (interval elapsed,
+			// max not reached). Ticks inside the interval must send nothing,
+			// otherwise every ~30s heartbeat floods the agent.
+			sendRelay, escalate = h.maybeSkillCheckRefireLocked(agent, state, "no current-round SKILL-RELOAD marker in scratchpad")
 		}
 
 	case yesloopSkillCheckStateConfirmed:
@@ -211,6 +230,8 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 		yesloopSkillCheckAgentsMu.Unlock()
 		return
 	}
+	// Relay metadata is read under the lock; state is NOT read after unlock.
+	relayRound := state.round
 	yesloopSkillCheckAgentsMu.Unlock()
 
 	if escalate {
@@ -221,7 +242,7 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 		return
 	}
 	if sendRelay {
-		h.sendSkillCheckRelay(agent, state.round)
+		h.sendSkillCheckRelay(agent, relayRound)
 	}
 }
 
@@ -245,12 +266,13 @@ func (h *Handler) transitionSkillCheckLocked(agent storage.Agent, state *yesloop
 	state.transitionedAt = time.Now()
 }
 
-// maybeSkillCheckRefireLocked re-fires the reminder decision: increments the
-// refire counter when the interval has elapsed and reports whether the max has
-// been reached (escalation). Caller must hold yesloopSkillCheckAgentsMu.
-func (h *Handler) maybeSkillCheckRefireLocked(agent storage.Agent, state *yesloopSkillCheckState, reason string) bool {
+// maybeSkillCheckRefireLocked re-fires the reminder decision: counts a refire
+// when the interval has elapsed and reports (refired, escalate). Ticks inside
+// the interval report neither — no relay may be sent for them. Caller must
+// hold yesloopSkillCheckAgentsMu.
+func (h *Handler) maybeSkillCheckRefireLocked(agent storage.Agent, state *yesloopSkillCheckState, reason string) (refired bool, escalate bool) {
 	if time.Since(state.lastRelayAt) < yesloopSkillCheckRefireInterval {
-		return false
+		return false, false
 	}
 	state.refireCount++
 	if state.refireCount >= yesloopSkillCheckMaxRefires {
@@ -258,10 +280,10 @@ func (h *Handler) maybeSkillCheckRefireLocked(agent storage.Agent, state *yesloo
 			agent.ID, agent.Section, reason, state.refireCount, yesloopSkillCheckMaxRefires)
 		state.state = yesloopSkillCheckStateDeadAgentEscalation
 		state.transitionedAt = time.Now()
-		return true
+		return false, true
 	}
 	state.lastRelayAt = time.Now()
-	return false
+	return true, false
 }
 
 // sendSkillCheckRelay sends the skill-check relay for the current round to a

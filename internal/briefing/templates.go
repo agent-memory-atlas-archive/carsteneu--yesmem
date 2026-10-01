@@ -82,7 +82,7 @@ const tmplProject = `{{if or .D.Profile .D.Sessions}}
 ({{.S.LabelMoreVia}} get_project_profile("{{.D.Name}}"))
 
 {{end}}{{if .D.Sessions}}{{.S.RecentSessions}}
-{{range .D.Sessions}}- [{{.Ago}}] {{.FirstMessage}}{{if .Branch}} ({{.Branch}}){{end}}{{if eq .SubagentCount 1}} [1 agent]{{else if gt .SubagentCount 1}} [{{.SubagentCount}} agents]{{end}}
+{{range .D.Sessions}}- [{{.Ago}}] {{.FirstMessage}}{{if .Branch}} ({{.Branch}}){{end}}{{if eq .SubagentCount 1}} [1 agent]{{else if gt .SubagentCount 1}} [{{.SubagentCount}} agents]{{end}}{{if eq .Marks 1}} [1 mark]{{else if gt .Marks 1}} [{{.Marks}} marks]{{end}}
 {{end}}{{if gt .D.TotalSessions .D.ShownCount}}({{.D.TotalSessions}} {{.S.SessionsTotal}} — project_summary("{{.D.Name}}"))
 {{end}}
 {{end}}`
@@ -201,6 +201,7 @@ type SessionSummary struct {
 	FirstMessage  string
 	Branch        string
 	SubagentCount int
+	Marks         int // learnings this session left behind
 }
 
 // OpenWorkData holds unfinished task items.

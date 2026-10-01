@@ -328,7 +328,7 @@ func TestCacheStatusWriter_KeepaliveRemainingCountsDown(t *testing.T) {
 		Pings5m: 6,
 	})
 	// Seed a thread so Status() returns values
-	ka.Reset("thread-aaa", []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`), "key")
+	ka.Reset("thread-aaa", []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`), "key", "")
 
 	w := &CacheStatusWriter{
 		dataDir:               dir,

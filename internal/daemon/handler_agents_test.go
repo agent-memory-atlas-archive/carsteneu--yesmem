@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/carsteneu/yesmem/internal/storage"
 )
@@ -626,6 +627,49 @@ func TestHandleStopAllAgents_MixedStatuses(t *testing.T) {
 	stopped, _ := m["stopped"].(float64)
 	if stopped != 3 {
 		t.Errorf("stopped = %v, want 3 (running+paused+spawning)", stopped)
+	}
+}
+
+func TestHandleStopAllAgents_SequentialPause(t *testing.T) {
+	// Drei Agenten mit echten Prozessen: Der Stop-Run muss nacheinander
+	// stopen (Pause zwischen den Exits), damit das Terminal jeden
+	// Surface-Teardown einzeln verarbeitet statt als Massen-Teardown
+	// (GTK/Mesa-Deadlock bei gleichzeitiger close-Welle).
+	h, s := mustHandler(t)
+
+	var cmds []*exec.Cmd
+	for _, id := range []string{"seq-1", "seq-2", "seq-3"} {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start sleep: %v", err)
+		}
+		defer func() { _ = cmd.Process.Kill() }()
+		cmds = append(cmds, cmd)
+		s.AgentCreate(storage.Agent{
+			ID: id, Project: "proj", Section: id, Status: "running",
+			PID: cmd.Process.Pid, Backend: "claude",
+		})
+	}
+
+	start := time.Now()
+	resp := h.handleStopAllAgents(map[string]any{"project": "proj"})
+	elapsed := time.Since(start)
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+
+	if want := 2 * stopAllPause; elapsed < want {
+		t.Errorf("stop-all returned after %v; expected sequential pause of at least %v between stops", elapsed, want)
+	}
+
+	for i, cmd := range cmds {
+		err := cmd.Wait()
+		if err == nil {
+			t.Fatalf("agent %d: process exited cleanly, want SIGTERM", i)
+		}
+		if !strings.Contains(err.Error(), "signal: terminated") {
+			t.Fatalf("agent %d: exit = %v, want signal: terminated", i, err)
+		}
 	}
 }
 
