@@ -65,12 +65,15 @@ func runBriefing() {
 	}
 	text := gen.Generate(project)
 
-	// Post-process: use cached refined briefing if available, otherwise raw
-	projectShort := filepath.Base(project)
-	text = briefing.RefineBriefing(text, store, projectShort, nil)
+	// Post-process: use cached refined briefing if available, otherwise raw.
+	// Project-scoped lookups key on the project path (sessions.project_short,
+	// learnings.project, refined_briefings.project); canonical_project is a basename.
+	projectID := gen.ProjectKey(project)
+	projectName := filepath.Base(project)
+	text = briefing.RefineBriefing(text, store, projectID, nil)
 
 	// Metamemory (post-refine so it survives refinement)
-	if mm := gen.GenerateMetamemory(projectShort); mm != "" {
+	if mm := gen.GenerateMetamemory(projectName); mm != "" {
 		text = mm + "\n" + text
 	}
 
@@ -80,8 +83,8 @@ func runBriefing() {
 	}
 
 	// Inject pinned learnings (refinement-resistant, verbatim)
-	sessionPins, _ := store.GetPinnedLearnings("session", projectShort)
-	permanentPins, _ := store.GetPinnedLearnings("permanent", projectShort)
+	sessionPins, _ := store.GetPinnedLearnings("session", projectID)
+	permanentPins, _ := store.GetPinnedLearnings("permanent", projectID)
 	pinnedBlock := briefing.FormatPinnedBlock(sessionPins, permanentPins)
 	if pinnedBlock != "" {
 		text = briefing.InjectPinnedBlock(text, pinnedBlock)
@@ -89,9 +92,9 @@ func runBriefing() {
 
 	// Inject open work reminder instruction (refinement-resistant, after refine pass)
 	if cfg.Briefing.RemindOpenWork {
-		if count, _ := store.CountActiveUnfinished(projectShort); count > 0 {
+		if count, _ := store.CountActiveUnfinished(projectID); count > 0 {
 			s := briefing.ResolveStrings(filepath.Join(dataDir, "strings.yaml"))
-			lastAtKey := "last_openwork_remind_full_at:" + projectShort
+			lastAtKey := "last_openwork_remind_full_at:" + projectID
 			lastAtStr, _ := store.GetProxyState(lastAtKey)
 			useFull := true
 			if lastAtStr != "" {
@@ -102,10 +105,10 @@ func runBriefing() {
 				}
 			}
 			if useFull && s.OpenWorkRemind != "" {
-				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemind, projectShort) + "\n"
+				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemind, projectName) + "\n"
 				store.SetProxyState(lastAtKey, time.Now().Format(time.RFC3339))
 			} else if !useFull && s.OpenWorkRemindAsk != "" {
-				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemindAsk, projectShort) + "\n"
+				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemindAsk, projectName) + "\n"
 			}
 		}
 	}

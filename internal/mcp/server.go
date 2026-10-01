@@ -1331,6 +1331,7 @@ func (s *Server) registerTools() {
 			mcplib.WithString("model", mcplib.Description("Model override")),
 			mcplib.WithString("work_dir", mcplib.Description("Working directory")),
 			mcplib.WithString("backend", mcplib.Description("claude|codex|opencode")),
+			mcplib.WithString("permission_kick", mcplib.Description("Permission-kick setting for the agent: on|off (empty = inherit config default)")),
 		), s.proxyCall("spawn_agent"))
 
 	s.srv.AddTool(

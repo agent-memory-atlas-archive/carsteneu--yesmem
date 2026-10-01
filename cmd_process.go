@@ -71,6 +71,7 @@ func runProxy() {
 		CacheKeepalivePings5m:     cfg.Proxy.CacheKeepalivePings5m,
 		CacheKeepalivePings1h:     cfg.Proxy.CacheKeepalivePings1h,
 		CacheKeepaliveMinMessages: cfg.Proxy.CacheKeepaliveMinMessages,
+		EagerStubEnabled:          cfg.Proxy.EagerStubEnabled,
 		// Forked agents
 		ForkedAgentsEnabled:            cfg.ForkedAgents.Enabled,
 		ForkedAgentsModel:              cfg.ForkedAgentsModelID(),

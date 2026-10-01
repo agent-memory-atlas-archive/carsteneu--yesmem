@@ -44,10 +44,17 @@ func CBMIndexMtime(rootDir string) time.Time {
 
 // CBMScanner uses the codebase-memory-mcp CLI to extract code intelligence.
 // Requires the codebase-memory-mcp binary to be installed and the project to be indexed.
-type CBMScanner struct{}
+type CBMScanner struct {
+	bin                string // test override; empty resolves via FindCBMBinary
+	ensureIndex        func(rootDir string)
+	ensureIndexIfStale func(rootDir, head string)
+}
 
 func NewCBMScanner() *CBMScanner {
-	return &CBMScanner{}
+	return &CBMScanner{
+		ensureIndex:        EnsureIndex,
+		ensureIndexIfStale: EnsureIndexIfStale,
+	}
 }
 
 // FindCBMBinary returns the path to codebase-memory-mcp binary, or empty if not found.
@@ -72,7 +79,10 @@ func (s *CBMScanner) Scan(rootDir string) (*ScanResult, error) {
 		return nil, fmt.Errorf("cbm: directory %s is blacklisted (too large or system path)", rootDir)
 	}
 
-	bin := FindCBMBinary()
+	bin := s.bin
+	if bin == "" {
+		bin = FindCBMBinary()
+	}
 	if bin == "" {
 		return nil, fmt.Errorf("codebase-memory-mcp binary not found")
 	}
@@ -84,18 +94,16 @@ func (s *CBMScanner) Scan(rootDir string) (*ScanResult, error) {
 		MATCH (folder:Folder)-[:CONTAINS_FILE]->(f:File)
 		RETURN f.file_path AS path, f.name AS name, f.end_line AS loc, folder.file_path AS pkg
 		ORDER BY f.file_path`)
-	if err != nil || len(files) == 0 {
-		// Project not indexed — trigger indexing, then retry
-		if indexErr := cbmIndexRepository(bin, rootDir); indexErr == nil {
-			project = cbmProjectName(rootDir)
-			files, err = cbmQuery(bin, project, `
-				MATCH (folder:Folder)-[:CONTAINS_FILE]->(f:File)
-				RETURN f.file_path AS path, f.name AS name, f.end_line AS loc, folder.file_path AS pkg
-				ORDER BY f.file_path`)
+	if err != nil {
+		// A query error may be a timeout — never treat it as "not indexed".
+		// Indexing happens exclusively in the background (bg_index.go).
+		return nil, fmt.Errorf("query files: %w", err)
+	}
+	if len(files) == 0 {
+		if s.ensureIndex != nil {
+			s.ensureIndex(rootDir)
 		}
-		if err != nil {
-			return nil, fmt.Errorf("query files: %w", err)
-		}
+		return nil, fmt.Errorf("cbm: project %s not indexed (background indexing triggered)", project)
 	}
 
 	// CBM labels some files as Module instead of File (inconsistent).
@@ -244,6 +252,10 @@ func (s *CBMScanner) Scan(rootDir string) (*ScanResult, error) {
 		return packages[i].Name < packages[j].Name
 	})
 
+	if s.ensureIndexIfStale != nil {
+		s.ensureIndexIfStale(rootDir, ReadGitHead(rootDir))
+	}
+
 	return &ScanResult{
 		RootDir:        rootDir,
 		Tier:           classifyTier(stats),
@@ -257,49 +269,48 @@ func (s *CBMScanner) Scan(rootDir string) (*ScanResult, error) {
 	}, nil
 }
 
+// projectIndexed reports whether CBM has an index with at least one file
+// for rootDir. Query errors also report false — capacity for reindexing
+// decisions is handled by the background job.
+func projectIndexed(rootDir string) bool {
+	bin := FindCBMBinary()
+	if bin == "" {
+		return false
+	}
+	rows, err := cbmQuery(bin, cbmProjectName(rootDir), `MATCH (f:File) RETURN f.file_path LIMIT 1`)
+	return err == nil && len(rows) > 0
+}
+
+// cbmQueryTimeout bounds each CBM CLI query. Valid queries on large graphs can
+// take well over the former 15s limit; with a persistent CBM daemon answering
+// them, 60s is a safe ceiling (decision: yesloop-cbm-load-fix D2).
+const cbmQueryTimeout = 60 * time.Second
+
 // cbmQuery executes a Cypher query via codebase-memory-mcp CLI and returns rows.
 func cbmQuery(bin, project, cypher string) ([][]interface{}, error) {
-	params, _ := json.Marshal(map[string]string{
-		"project": project,
-		"query":   cypher,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cbmQueryTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, bin, "cli", "query_graph", string(params), "--raw")
+	cmd := exec.CommandContext(ctx, bin, "cli", "query_graph", "--project", project, "--query", cypher, "--json")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("cbm cli: %w", err)
 	}
 
-	// Parse MCP content wrapper: {"content":[{"type":"text","text":"..."}]}
-	var mcpResp struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
+	text, err := parseCBMResponse(out)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(out, &mcpResp); err != nil {
-		return nil, fmt.Errorf("parse mcp response: %w", err)
-	}
-	if len(mcpResp.Content) == 0 {
-		return nil, fmt.Errorf("empty mcp response")
-	}
-
-	var queryResp struct {
-		Columns []string        `json:"columns"`
-		Rows    [][]interface{} `json:"rows"`
-		Total   int             `json:"total"`
-	}
-	if err := json.Unmarshal([]byte(mcpResp.Content[0].Text), &queryResp); err != nil {
+	rows, err := parseQueryTable(text)
+	if err != nil {
 		return nil, fmt.Errorf("parse query response: %w", err)
 	}
 
-	return queryResp.Rows, nil
+	return rows, nil
 }
 
-// cbmProjectName converts a directory path to the codebase-memory-mcp project name.
-// Resolves git worktree paths to the main repo path.
+// cbmProjectName converts a directory path to the codebase-memory-mcp project name
+// (leading "/" stripped, "/" → "-").
 func cbmProjectName(rootDir string) string {
 	clean := filepath.Clean(rootDir)
 	clean = strings.TrimPrefix(clean, "/")
@@ -307,68 +318,17 @@ func cbmProjectName(rootDir string) string {
 }
 
 // cbmIndexRepository indexes a project directory in codebase-memory-mcp.
-// Called automatically when search_graph finds no data for a project.
-func cbmIndexRepository(bin, repoPath string) error {
-	args, _ := json.Marshal(map[string]string{"repo_path": repoPath})
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+// Called by the background indexer when the index is missing or stale.
+func cbmIndexRepository(bin, repoPath string, budget time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "cli", "index_repository", string(args), "--raw")
-	return withWorktreeGitSymlink(repoPath, func() error {
-		_, err := cmd.Output()
+	cmd := exec.CommandContext(ctx, bin, "cli", "index_repository", "--repo-path", repoPath, "--json")
+	out, err := cmd.Output()
+	if err != nil {
 		return err
-	})
-}
-
-// withWorktreeGitSymlink ensures a git worktree's .git file appears as a
-// directory (via symlink to the real gitdir) for the duration of fn. Tools
-// like CBM that check for .git/ presence to enable .gitignore-aware scanning
-// would otherwise fall back to scanning the entire filesystem (including
-// gopath/gocache with thousands of vendored files).
-// Non-worktrees (.git is already a dir/symlink or missing) run fn unchanged.
-// On any setup failure, fn still runs (best effort). The original .git file
-// is always restored on return.
-func withWorktreeGitSymlink(repoPath string, fn func() error) error {
-	dotGit := filepath.Join(repoPath, ".git")
-	info, err := os.Lstat(dotGit)
-	if err != nil {
-		return fn()
 	}
-	if info.Mode()&os.ModeSymlink != 0 || info.IsDir() {
-		return fn()
-	}
-
-	data, err := os.ReadFile(dotGit)
-	if err != nil {
-		return fn()
-	}
-	line := strings.TrimSpace(string(data))
-	const prefix = "gitdir:"
-	if !strings.HasPrefix(line, prefix) {
-		return fn()
-	}
-	gitdir := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(repoPath, gitdir)
-	}
-	if gdInfo, err := os.Stat(gitdir); err != nil || !gdInfo.IsDir() {
-		return fn()
-	}
-
-	backup := dotGit + ".yesmem-bak"
-	_ = os.Remove(backup)
-	if err := os.Rename(dotGit, backup); err != nil {
-		return fn()
-	}
-	defer func() {
-		_ = os.Remove(dotGit)
-		_ = os.Rename(backup, dotGit)
-	}()
-
-	if err := os.Symlink(gitdir, dotGit); err != nil {
-		return fn()
-	}
-
-	return fn()
+	_, err = parseCBMResponse(out)
+	return err
 }
 
 // isBlacklistedPath returns true if rootDir should not be indexed by CBM.

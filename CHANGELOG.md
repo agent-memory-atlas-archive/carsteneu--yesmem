@@ -9,6 +9,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Stale-index background refresh with per-HEAD guard, Layer-1 cache invalidates on CBM mtime change
+- Cbm-gc CLI + daily daemon GC task for orphaned worktree index DBs
+- Permanent CBM daemon keeper (spike: attach instead of spawn)
+- Background single-flight CBM reindexer, 15min budget
+- Per-session marks in session lines and deterministic state-brief pointer
+- Session flavors from the narrative worker (CC and opencode)
+- Per-session mark counts and deterministic latest-state-brief query
+- Config gate for eager stubbing, default off
+- Risk-based-code-review — bundled review-depth skill
+- Recovery-source attribution for unpause — done-guard + permission-kick
+- V0.10.8 protocol support — --json envelope + human-table parser
+- One-shot routing fallback warning per model — makes silent misroutes greppable
+- Permission-kick for agents stuck in permission dialogs
+- Volatile sentinel, volatile-sweep cmd, bash-transcript detection
+- 10-min cooldown after failed scans to stop CBM query storm
+- Layer-5 stagnation monitor, learning attribution, resume bootstrap per sessions
+- Register opencode session per peer pid — deterministic instance identity
+- Periodic terminals replay snapshot every 15 min
+- Restore codex sessions as managed agents
+- Codex resume support in procKind and ResumeCommand
+- Enrich snapshot from live /proc sessions
+- Codex session id from open rollout fd
+- Opencode session id from /proc cmdline
+- DONE-guard verifies Phase 5 subagent evidence against opencode.db
+- Phase 5 gate expects self-review/cold-review/consequence/security dispatch lines
+- VerifySubagentEvidence — Phase 5 subagent id evidence check against opencode.db
+
+### Changed
+
+- Ignore .superpowers/ (brainstorm server state blocks public sync)
+
+### Fixed
+
+- Review hardening — CBM daemon output parsed across all lines, promotion garbage label, symlink-safe git swap recovery
+- Remove .git worktree swap (CBM 0.10.8 needs none), add legacy crash recovery at daemon boot
+- Keeper verifies permanent CBM daemon, promotes session-managed with 30s backoff
+- GC eligibility for Claude Code worktree DBs (-.claude-worktrees- marker)
+- Harden CBM GC eligibility per review — index_status gate, stat guard, slug round-trip, DFS cap; log wiki-tick scan errors
+- No inline CBM reindex on query error, 60s query timeout
+- State-brief line carries a fixed date for byte stability
+- State brief resolves local-first with global fallback
+- State-brief resolution follows the global supersede chain
+- Drop old thinking blocks instead of never touching them
+- Never rewrite thinking blocks in CompressContext
+- Forward anthropic-beta in keepalive pings and fork calls
+- Retry briefing load instead of caching a failed load forever
+- Per-session thread ID for opencode on the Anthropic path
+- Eager-stub only after real user turns + per-id tool labels
+- Resolve project key for refine cache, pins and unfinished count
+- Permission-kick review fixes
+- Match mirrored client socket row so register_pid gets the opencode pid
+- Classify gnome-terminal so PruneMissing keeps its windows
+- Require hex segments in codex rollout uuid
+- Dedupe session entries, prune dead proc-scan sessions
+- Align Phase 5 wording with sub-phase checklist, add idle checker new-format test
+- Skillcheck relay only on refire, freeze while subagent active
+- Review findings — idle trace check, infra-failure semantics, relay details
+
+### Documentation
+
+- Neutralize user path in deploy cap doc for public sync
+- Spec for eager-stub turn boundary + tool_use_id resolution
+- Deploy cap — dir requirement + cooldown gotcha
+- Periodic terminal save implementation plan
+- Periodic terminal save with session mapping (opencode/claude/codex)
+- Phase 5 as evidence-gated sub-phase checklist
+
+### Testing
+
+- Neutralize hardcoded  paths for CI portability
+- Disable stale-refresh trigger in integration scans (no real background reindex under test)
+- Restore pre-existing cbm_scanner_test.go tests lost in merge, keep new bg-index tests
+- Eager-stub turn-boundary + tool_use_id tests (RED on unpatched code)
+- FormatInt for ms epoch, settle listener before relay assertions
+- RED tests for skillcheck relay flood and subagent freeze
+
+## [2.3.16] - 2026-09-02
+
+### Added
+
+- Get_caps summary mode by default, strip legacy handler fields
 - Attribution for extraction pipeline learnings
 - Remember() uses repo/content-based project attribution
 - AttributeLearningProject — repo+content based project attribution
@@ -33,6 +114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sequential stop-all with 250ms per-agent pause
+- Ghostty direct spawn + resume guards for gtk-single-instance=false
+- Repo.Root coalescing only for absolute-path session projects — mirrors 3ec8ea67 from public PR branch
 - Cold-review fixes — punctuation-tolerant tokens, known-path coalescing, fork embed project, error logging
 - Restore handler_fork_test.go tests clobbered by earlier commit
 - Restore handler_learnings_test.go tests clobbered by attribution test addition
@@ -46,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- MANDATORY marker on TUI spawn step — inline is exception-only
 - Agent survival reattach plan (archived)
 - Quality stage-2 contract fields in phase-guard doc
 - Quality stage-2 implementation plan + code-anchor finding mandate
@@ -6952,7 +7037,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add comprehensive tests for generator and storage
 
 
-[Unreleased]: https://github.com/carsteneu/yesmem/compare/v2.3.15...HEAD
+[Unreleased]: https://github.com/carsteneu/yesmem/compare/v2.3.16...HEAD
+[2.3.16]: https://github.com/carsteneu/yesmem/compare/v2.3.15...v2.3.16
 [2.3.15]: https://github.com/carsteneu/yesmem/compare/v2.3.14...v2.3.15
 [2.3.14]: https://github.com/carsteneu/yesmem/compare/v2.3.13...v2.3.14
 [2.3.13]: https://github.com/carsteneu/yesmem/compare/v2.3.12...v2.3.13

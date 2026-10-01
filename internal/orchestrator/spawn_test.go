@@ -14,8 +14,8 @@ func TestBuildSpawnCommand_Ghostty(t *testing.T) {
 	if len(args) == 0 {
 		t.Error("args must not be empty")
 	}
-	if args[0] != "+new-window" {
-		t.Errorf("ghostty spawn must use +new-window (single-instance), got args[0]=%q", args[0])
+	if args[0] != "-e" {
+		t.Errorf("ghostty spawn must use direct -e (works with and without single-instance; +new-window needs a running broker), got args[0]=%q", args[0])
 	}
 }
 

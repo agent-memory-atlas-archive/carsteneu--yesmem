@@ -55,6 +55,9 @@ type AgentsConfig struct {
 	MaxTurns       int    `yaml:"max_turns"`        // Max relay turns per agent. 0 = 30 default.
 	MaxDepth       int    `yaml:"max_depth"`        // Max spawn depth (agent→sub-agent). 0 = 3 default.
 	TokenBudget    int    `yaml:"token_budget"`     // Max tokens per agent (input+output combined). 0 = 500000 default. Overridable per spawn.
+	PermissionKick bool   `yaml:"permission_kick"`  // Kick agents stuck in permission dialogs via double-Enter. Default true.
+	PermissionKickDelay    string `yaml:"permission_kick_delay"`    // Stream-inactivity before first kick (Go duration). Empty = 3m default.
+	PermissionKickInterval string `yaml:"permission_kick_interval"` // Re-kick interval (Go duration). Empty = 5m default.
 }
 
 // SecretsSanitizationConfig konfiguriert die SecretRedactor-Pipeline.
@@ -136,6 +139,7 @@ type ProxyConfig struct {
 	CacheKeepalivePings5m    int                 `yaml:"cache_keepalive_pings_5m"`
 	CacheKeepalivePings1h    int                 `yaml:"cache_keepalive_pings_1h"`
 	CacheKeepaliveMinMessages int                `yaml:"cache_keepalive_min_messages"`
+	EagerStubEnabled           bool               `yaml:"eager_stub_enabled"` // eager-stub closed-turn tool_results; default false (upstream 400s + cache-miss cascades)
 	ResetCache               bool                `yaml:"reset_cache"`
 	CodeNavMode              string              `yaml:"code_nav_mode"`
 	CodeNavDismissCount      int                 `yaml:"code_nav_dismiss_count"`
@@ -512,6 +516,7 @@ func Default() *Config {
 		},
 		Agents: AgentsConfig{
 			DefaultBackend: "claude",
+			PermissionKick: true,
 		},
 		ForkedAgents: ForkedAgentsConfig{
 			Enabled:            false,

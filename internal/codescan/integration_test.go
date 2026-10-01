@@ -15,7 +15,16 @@ func TestIntegration_ScanOwnRepo(t *testing.T) {
 
 	repoRoot := findRepoRoot(t)
 
+	// Inline reindexing was removed (decision: yesloop-cbm-load-fix D4).
+	// Scanning requires an existing index; the background job indexes projects.
+	if !projectIndexed(repoRoot) {
+		t.Skipf("project %s not indexed — background indexing required", cbmProjectName(repoRoot))
+	}
+
 	scanner := NewCBMScanner()
+	// Integration test must not trigger a real background reindex of the
+	// live repo when the F2 staleness check deems the index stale.
+	scanner.ensureIndexIfStale = nil
 	result, err := scanner.Scan(repoRoot)
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)

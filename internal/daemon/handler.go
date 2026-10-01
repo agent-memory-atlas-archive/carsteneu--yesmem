@@ -32,21 +32,25 @@ func (h *Handler) onMutation() {
 
 // Handler processes socket requests using the daemon's resources.
 type Handler struct {
-	store                 *storage.Store
-	bloom                 *bloom.Manager
-	dataDir               string        // ~/.claude/yesmem/ — set by daemon after construction
-	agentTerminal         string        // preferred terminal for agent windows — set by daemon from config
-	agentMaxRuntime       time.Duration // max runtime per agent — set by daemon from config
-	scheduler             *Scheduler
-	agentMaxTurns         int                // max relay turns per agent — set by daemon from config
-	agentMaxDepth         int                // max spawn depth — set by daemon from config
-	agentTokenBudget      int                // max tokens per agent — set by daemon from config
-	agentDefaultBackend   string             // default agent backend — set by daemon from config
-	disableAgentProcesses bool               // test guard; production default remains false
-	defaultSandboxProfile SandboxProfile     // default sandbox for scheduled jobs — set by daemon from config
-	httpRPCAddr           string             // HTTP API listen address for bun MCP polyfill (e.g. 127.0.0.1:9377)
-	httpAuthToken         string             // bearer token for HTTP API authentication
-	redactor              sanitize.Sanitizer // optional; nil = passthrough
+	store                       *storage.Store
+	bloom                       *bloom.Manager
+	dataDir                     string        // ~/.claude/yesmem/ — set by daemon after construction
+	agentTerminal               string        // preferred terminal for agent windows — set by daemon from config
+	agentMaxRuntime             time.Duration // max runtime per agent — set by daemon from config
+	scheduler                   *Scheduler
+	agentMaxTurns               int                // max relay turns per agent — set by daemon from config
+	agentMaxDepth               int                // max spawn depth — set by daemon from config
+	agentTokenBudget            int                // max tokens per agent — set by daemon from config
+	agentDefaultBackend         string             // default agent backend — set by daemon from config
+	agentPermissionKick         bool               // kick agents stuck in permission dialogs via double-Enter — set by daemon from config
+	agentPermissionKickDelay    time.Duration      // stream-idle before first kick — set by daemon from config
+	agentPermissionKickInterval time.Duration      // re-kick interval after first kick — set by daemon from config
+	disableAgentProcesses       bool               // test guard; production default remains false
+	defaultSandboxProfile       SandboxProfile     // default sandbox for scheduled jobs — set by daemon from config
+	httpRPCAddr                 string             // HTTP API listen address for bun MCP polyfill (e.g. 127.0.0.1:9377)
+	httpAuthToken               string             // bearer token for HTTP API authentication
+	redactor                    sanitize.Sanitizer // optional; nil = passthrough
+	ocDBPath                    string             // opencode session DB for Phase 5 evidence checks — set by daemon from config
 
 	// Optional: vector search (set via SetEmbedding)
 	indexer             *embedding.Indexer
@@ -353,6 +357,12 @@ func NewHandler(store *storage.Store, bloomMgr *bloom.Manager) *Handler {
 // SetOpencodeScanner sets the opencode DB scanner for periodic indexing.
 func (h *Handler) SetOpencodeScanner(scanner *indexer.OpencodeScanner) {
 	h.opencodeScanner = scanner
+}
+
+// SetOpencodeDBPath sets the opencode session DB path used by the Phase 5
+// DONE-guard evidence check.
+func (h *Handler) SetOpencodeDBPath(dbPath string) {
+	h.ocDBPath = dbPath
 }
 
 func (h *Handler) initIdleState() {

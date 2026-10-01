@@ -12,20 +12,32 @@ type briefingData struct {
 	CodeMap string
 }
 
+// briefingRetryBackoff is how long an empty briefing entry (failed or empty
+// daemon load) is served from cache before the next request retries the load.
+// Long enough that a hung daemon does not block every request for the full
+// RPC timeout, short enough that a transient failure heals quickly.
+const briefingRetryBackoff = 60 * time.Second
+
 // briefingEntry is a per-thread cache slot that remembers which project the
 // snapshot was loaded for. A thread may switch working directory mid-session
 // (e.g. when the user moves into a worktree), so we evict on project change.
 type briefingEntry struct {
-	project string
-	text    string
-	codeMap string
+	project  string
+	text     string
+	codeMap  string
+	loadedAt time.Time
 }
 
 // getCachedBriefing returns the cached briefing + code map for a given thread.
 // A miss (ok=false) happens when:
 //   - the thread has no entry yet,
 //   - the threadID or project is empty (we refuse to cache unattributable data),
-//   - the cached entry was loaded for a different project (thread switched CWD).
+//   - the cached entry was loaded for a different project (thread switched CWD),
+//   - the cached entry is fully empty (no text, no code map — the shape of a
+//     failed daemon load) and older than briefingRetryBackoff, so a transient
+//     daemon error does not disable the briefing for the rest of the thread.
+//     Non-empty entries never expire: the injected turns must stay
+//     byte-stable for the prompt cache.
 //
 // Keying by threadID is deliberate: frozenStubs and capsCache are both per-thread,
 // so the briefing cache MUST follow the same scope. A project-scoped cache would
@@ -40,13 +52,22 @@ func (s *Server) getCachedBriefing(threadID, project string) (text, codeMap stri
 	if !exists || entry.project != project {
 		return "", "", false
 	}
+	if entry.isEmpty() && time.Since(entry.loadedAt) >= briefingRetryBackoff {
+		return "", "", false
+	}
 	return entry.text, entry.codeMap, true
+}
+
+func (e briefingEntry) isEmpty() bool {
+	return e.text == "" && e.codeMap == ""
 }
 
 // setCachedBriefing stores the briefing + code map for a specific thread.
 // Empty threadID or project is ignored — we refuse to cache briefings we could
 // not attribute. Writing a new (threadID, project) pair overwrites any previous
-// entry for THAT thread (project switch eviction for the same thread).
+// entry for THAT thread (project switch eviction for the same thread), except
+// that a fully empty write never replaces a non-empty entry of the same
+// project (a late failed load must not downgrade a good briefing).
 func (s *Server) setCachedBriefing(threadID, project, text, codeMap string) {
 	if threadID == "" || project == "" {
 		return
@@ -56,11 +77,16 @@ func (s *Server) setCachedBriefing(threadID, project, text, codeMap string) {
 	if s.briefingCache == nil {
 		s.briefingCache = make(map[string]briefingEntry)
 	}
-	s.briefingCache[threadID] = briefingEntry{
-		project: project,
-		text:    text,
-		codeMap: codeMap,
+	next := briefingEntry{
+		project:  project,
+		text:     text,
+		codeMap:  codeMap,
+		loadedAt: time.Now(),
 	}
+	if prev, exists := s.briefingCache[threadID]; exists && prev.project == project && !prev.isEmpty() && next.isEmpty() {
+		return
+	}
+	s.briefingCache[threadID] = next
 }
 
 // invalidateBriefingForThread drops the cached briefing+codemap for one thread
@@ -127,16 +153,21 @@ func (s *Server) loadBriefing(project, projectDir string) briefingData {
 	return briefingData{Text: composedText, CodeMap: resp.CodeMap}
 }
 
+// loadBriefingData loads via the briefingLoader test seam when set, otherwise
+// from the daemon.
+func (s *Server) loadBriefingData(project, projectDir string) briefingData {
+	if s.briefingLoader != nil {
+		return s.briefingLoader(project, projectDir)
+	}
+	return s.loadBriefing(project, projectDir)
+}
+
 // refreshBriefing forces a briefing reload for one thread only. Called during
 // sawtooth stub-cycles via invalidateThreadCaches: when thread X refreezes
 // we reload its briefing+codemap so the next request rebuilds its cached
 // prefix from scratch. Other threads sharing this project are untouched.
 func (s *Server) refreshBriefing(threadID, project, projectDir string) {
-	loader := s.briefingLoader
-	if loader == nil {
-		loader = s.loadBriefing
-	}
-	if data := loader(project, projectDir); data.Text != "" {
+	if data := s.loadBriefingData(project, projectDir); data.Text != "" {
 		s.setCachedBriefing(threadID, project, data.Text, data.CodeMap)
 		s.logger.Printf("[briefing] refreshed during stub-cycle: tid=%s %db text + %db codemap", threadID, len(data.Text), len(data.CodeMap))
 	}
@@ -159,7 +190,7 @@ func (s *Server) injectBriefingTurn(req map[string]any, reqIdx int, proj, thread
 	// Per-thread scoping prevents sawtooth refreezes on one thread from
 	// invalidating another thread's cached message prefix.
 	if !ok && proj != "" && threadID != "" {
-		data := s.loadBriefing(proj, extractWorkingDirectory(req))
+		data := s.loadBriefingData(proj, extractWorkingDirectory(req))
 		s.setCachedBriefing(threadID, proj, data.Text, data.CodeMap)
 		text = data.Text
 	}

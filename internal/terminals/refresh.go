@@ -68,6 +68,10 @@ func Save(dataDir string) error {
 	// without recent interaction; their PIDs keep living until closed.
 	enrichFromDaemon(dataDir, snap, ws)
 
+	// Live-Prozesse ohne Daemon-Registrierung (opencode -s, codex rollout-fd).
+	enrichFromProc(snap, ws)
+	dedupeSessionEntries(snap)
+
 	// Known windows: refresh geometry/workspace/title only, keep session info.
 	for i := range snap.Windows {
 		w := &snap.Windows[i]
@@ -109,7 +113,7 @@ func Restore(dataDir string) error {
 	}
 	before := windowIDs()
 	for _, w := range snap.Windows {
-		if (w.Kind == "opencode" || w.Kind == "claude") && w.SessionID != "" {
+		if (w.Kind == "opencode" || w.Kind == "claude" || w.Kind == "codex") && w.SessionID != "" {
 			// Bevorzugt als verwalteten Agenten starten (relay-fähig).
 			if agentID, err := launchAsAgent(dataDir, w); err == nil {
 				if xid := waitNewWindowAndPlace(before, w); xid != "" {

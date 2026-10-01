@@ -140,6 +140,14 @@ func (g *Generator) Generate(projectDir string) string {
 	var b strings.Builder
 	b.WriteString(g.renderAwakening(s, allLearnings, totalSessions, narratives, sessions, projectShort, docSources))
 
+	// Latest state brief — resolved local-first with global fallback. The
+	// line carries the brief's fixed DATE (never a relative time): identical
+	// DB state must render identical bytes, or the briefing prefix busts the
+	// prompt cache across regenerations.
+	if brief := g.loadLatestStateBrief(projectShort); brief != nil {
+		b.WriteString(fmt.Sprintf("\nState brief #%d (%s): get_learnings(id=%d)\n", brief.ID, brief.CreatedAt.Format("2006-01-02"), brief.ID))
+	}
+
 	// User profile (full Entwicklerprofil) OR standard persona directive + preferences — mutually exclusive
 	// Graceful fallback: if userProfile is enabled but no profile exists yet, show standard path
 	showStandardPersona := true
@@ -239,6 +247,15 @@ func (g *Generator) resolveProject(projectDir string) string {
 	}
 	// Fallback to original
 	return models.ProjectShortFromPath(projectDir)
+}
+
+// ProjectKey exposes the resolved project identifier used by Generate.
+// Callers running project-scoped lookups after Generate (refine cache, pins,
+// unfinished count) must key them the same way, which is the project path —
+// sessions.project_short, learnings.project and refined_briefings.project all
+// store the path, never a basename.
+func (g *Generator) ProjectKey(projectDir string) string {
+	return g.resolveProject(projectDir)
 }
 
 // loadLearnings fetches project-specific and global learnings.
@@ -541,6 +558,7 @@ func (g *Generator) renderProject(s Strings, projectShort, profile string, sessi
 		sessionIDs[i] = sessions[i].ID
 	}
 	subagentCounts, _ := g.store.GetSubagentCounts(sessionIDs)
+	marksCounts, _ := g.store.GetLearningsCounts(sessionIDs)
 
 	var summaries []SessionSummary
 	for i := 0; i < limit; i++ {
@@ -554,6 +572,7 @@ func (g *Generator) renderProject(s Strings, projectShort, profile string, sessi
 			FirstMessage:  msg,
 			Branch:        sess.GitBranch,
 			SubagentCount: subagentCounts[sess.ID],
+			Marks:         marksCounts[sess.ID],
 		})
 	}
 
@@ -565,6 +584,17 @@ func (g *Generator) renderProject(s Strings, projectShort, profile string, sessi
 		TotalSessions: len(sessions),
 		ShownCount:    limit,
 	})
+}
+
+// loadLatestStateBrief returns the Zustandsbrief for this project: the
+// project's own active head, or the global fallback. See
+// Store.GetLatestStateBrief for the marker convention.
+func (g *Generator) loadLatestStateBrief(projectShort string) *models.Learning {
+	brief, err := g.store.GetLatestStateBrief(projectShort)
+	if err != nil {
+		return nil
+	}
+	return brief
 }
 
 // loadRecurrenceAlerts fetches active recurrence alerts for the current project.

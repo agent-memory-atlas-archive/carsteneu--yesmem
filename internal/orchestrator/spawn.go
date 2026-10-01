@@ -14,10 +14,12 @@ func BuildSpawnCommand(terminal, innerCmd, title string, innerArgs ...string) (b
 
 	switch terminal {
 	case "ghostty":
-		// +new-window statt plain `-e`: Ghostty ist eine Single-Instance-App;
-		// ohne +new-window geht der CLI-Aufruf an die laufende Instanz und
-		// öffnet (in systemd-/Headless-Kontexten) kein neues Fenster.
-		return "ghostty", []string{"+new-window", "-e", "bash", "-ic", shellCmd}
+		// Plain `-e` statt +new-window, kompatibel zu beiden Betriebsarten:
+		// gtk-single-instance=true delegiert den CLI-Aufruf an die laufende
+		// Instanz;=false macht den Prozess selbst zum Fenster. +new-window
+		// hingegen braucht zwingend eine laufende Instanz und öffnet sonst
+		// gar kein Fenster.
+		return "ghostty", []string{"-e", "bash", "-ic", shellCmd}
 	case "kitty":
 		return "kitty", []string{"bash", "-ic", shellCmd}
 	case "gnome-terminal":

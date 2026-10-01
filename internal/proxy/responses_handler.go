@@ -50,10 +50,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ocSessionID := r.Header.Get("x-opencode-session")
-	if ocSessionID == "" {
-		ocSessionID = r.Header.Get("x-session-affinity")
-	}
+	ocSessionID := opencodeSessionID(r.Header)
 	if ocSessionID != "" {
 		s.logger.Printf("[req %d] %sopencode session=%s%s", reqIdx, colorGreen, ocSessionID, colorReset)
 	}
@@ -67,6 +64,14 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			"key":   "active_session_opencode",
 			"value": "opencode:" + ocSessionID,
 		})
+		// Deterministische Instanz-Identität: Peer-Socket → PID → register_pid.
+		if pid := peerSessionPID(s.cfg.ListenAddr, r.RemoteAddr); pid > 0 {
+			s.queryDaemon("register_pid", map[string]any{
+				"session_id":   "opencode:" + ocSessionID,
+				"pid":          float64(pid),
+				"source_agent": "opencode",
+			})
+		}
 	}
 
 	// Non-interactive requests (CLI tools, extraction pipeline) have no session headers.

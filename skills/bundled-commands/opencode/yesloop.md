@@ -122,7 +122,7 @@ Free-form string, canonical format. Single source of truth for live progress.
 - Manual fallback: Read scratchpad section
 - Check `### Phase 1` through `### Phase 6` headers exist
 - Each has `**Status:** COMPLETE` (or `BLOCKED — <reason>` for genuinely blocked phases)
-- Phase 5 Stage 2 has `task() dispatched: yes` or `REVIEW BLOCKED: <reason>`
+- Phase 5 has `self-review: done` plus evidence-backed `cold-review: ses_<id>`, `consequence: ses_<id>`, `security: ses_<id>` dispatch lines
 - Phase 6 has `Deploy executed: yes` or `Deploy required: no`
 
 Missing evidence → guard fires automatically (freeze + notify orchestrator).
@@ -136,9 +136,9 @@ Since yesmem v2.1.21, the heartbeat scheduler enforces the DONE contract **autom
 1. All 6 phase blocks (`### Phase 1` through `### Phase 6`) must be present in scratchpad
 2. Each block must have `**Status:**` on its own line with valid value (COMPLETE|BLOCKED|IN PROGRESS)
 3. Per-phase required fields (see Phase Pipeline below)
-4. Phase 5 must contain `**Stage 2: Cold Review` subsection header AND `task() dispatched: yes|blocked`
+4. Phase 5 must contain `self-review: done` AND a `cold-review: ses_<id>` dispatch line
 5. Phase 4 must contain `**Regression baseline:**` with a non-empty value and `**RED proof:**`
-6. Phase 5 must contain `**Stage 3: Consequence & Intent` subsection header AND `**consequence dispatched:** yes|blocked`
+6. Phase 5 must contain `consequence: ses_<id>` AND `security: ses_<id>` dispatch lines — after the format check, the daemon verifies each reported id against opencode's session DB (row exists, parent session matches the agent's own session, agent type allowed per sub-phase, ids pairwise distinct)
 7. Phase 6 must contain `send_to orchestrator:` and deploy evidence
 
 **When the guard fires:**
@@ -155,13 +155,15 @@ These patterns cause the guard to reject the DONE claim:
 | Pattern | Detection | Why it fails |
 |---|---|---|
 | Status on same line as header | `### Phase N: → **Status:**` inline | Status must be on its own `**Status:**` line |
-| Missing Stage 2 header | No `**Stage 2: Cold Review` in Phase 5 | Stage 2 is mandatory per Learning #75412 |
-| Missing Stage 3 header | No `**Stage 3: Consequence & Intent` in Phase 5 | Stage 3 consequence check is mandatory (quality stage-2) |
-| Missing consequence dispatch | No `**consequence dispatched:** yes|blocked` in Phase 5 | Stage 3 dispatch must be evidenced |
+| Old-format Phase 5 | Retired `task() dispatched:` / `consequence dispatched:` lines, new dispatch lines missing | Hard cut — the relay names the new field (`cold-review: ses_<id>`) |
+| Missing self-review dispatch | No `self-review: done` in Phase 5 | Sub-phase 5.1 is mandatory |
+| Missing cold-review dispatch | No `cold-review: ses_<id>` in Phase 5 | Sub-phase 5.2 is mandatory (supersedes the old Stage 2 header check) |
+| Missing consequence dispatch | No `consequence: ses_<id>` in Phase 5 | Sub-phase 5.3 is mandatory |
+| Missing security dispatch | No `security: ses_<id>` in Phase 5 | Sub-phase 5.4 is mandatory |
+| Invalid evidence session ids | Reported id absent from opencode.db, parent session mismatch, duplicated id, or agent type not in the allowed set | Daemon evidence layer verifies substance, not just format (internal/daemon/done_gate_evidence.go) |
 | Missing regression baseline | No `**Regression baseline:**` with a non-empty value in Phase 4 | Deterministic base-vs-head test diff is mandatory (quality stage-2) |
 | Missing orchestrator notification | No `send_to orchestrator:` in Phase 6 | Orchestrator must be notified for DONE |
-| Missing **Security:** field in Phase 5 | No `**Security:**` line in Phase 5 block | Security review (item 6) is mandatory per security-review skill integration |
-| Partial fields in Phase 5 | No issue breakdown, no Subagent ID | Self-Review must be structured |
+| Partial fields in Phase 5 | No issue breakdown, no findings per sub-phase | Self-Review must be structured |
 | No deploy evidence in Phase 6 | No `Deploy executed:` or `Deploy required:` | Must document deployment outcome |
 | Missing status line | Phase block exists but no `**Status:**` | Every phase needs a status |
 | Missing session id note | Phase 1 has no `**Session id:**` field and no "session id missing" note | `whoami()` must be called at Phase 1 start; backend session id (or retry-failure note) must appear in Phase 1 block |
@@ -172,7 +174,7 @@ When the DONE-guard rejects a claim, its findings are structured as:
 
 | Phase | Missing/Invalid Field | Detail |
 |---|---|---|
-| 5 | `**Stage 2: Cold Review` | required field not found in phase block |
+| 5 | `cold-review:` | required field not found in phase block |
 | 6 | `send_to orchestrator:` | required field not found in phase block |
 
 **DISMISSAL → DONE is rejected. Fix fields → resume agent.**
@@ -305,62 +307,85 @@ update_agent_status(phase="Phase 4/6 VERIFY")
 
 If issues found → fix and re-verify (max 5 cycles, see CONVERGENCE GATE).
 
-### Phase 5: REVIEW (Three-Stage: Self + Cold + Consequence)
+### Phase 5: REVIEW (Checklist: 5.1 Self + 5.2 Cold + 5.3 Consequence + 5.4 Security)
+
+Phase 5 is a checklist of four separately checkable sub-phases, each reviewed with
+its own task() subagent (5.1 by the agent itself). The daemon's DONE-guard verifies
+every reported subagent session id against opencode's own session DB — the id is
+the `ses_<id>` the task tool returns. Old lines `task() dispatched:` and
+`consequence dispatched:` are retired (hard cut): blocks using them fail the gate.
+`blocked` is NOT a valid value anywhere in Phase 5. If task() is truly unavailable,
+`send_to` the orchestrator `BLOCKED Phase 5.x: <reason>` and stay in Phase 5 — never
+claim DONE.
+
+| # | Sub-phase | Execution | Mandatory line in Phase 5 block | Gate check |
+|---|---|---|---|---|
+| 5.1 | Self-Review | agent itself | `self-review: done` | format |
+| 5.2 | Cold Code Review | task(reviewer or silent-bob) | `cold-review: ses_<id>` | row exists in opencode.db, parent_id == agent session, agent in {reviewer, silent-bob} |
+| 5.3 | Consequence & Intent | task(general or reviewer) | `consequence: ses_<id>` | like 5.2, agent in {general, reviewer}, id distinct from 5.2 |
+| 5.4 | Security Review | task(reviewer); the subagent loads the security-review skill | `security: ses_<id>` | like 5.2, agent in {reviewer}, id distinct from 5.2 and 5.3 |
+
 ```
 update_agent_status(phase="Phase 5/6 REVIEW")
 
 ### Phase 5: REVIEW
 **Status:** COMPLETE
-**Stage 1: Self-Review**
+
+**Sub-phase 5.1: Self-Review** (agent itself)
+self-review: done
 - Strengths: <list with file:line refs>
 - Issues: Critical (N) / Important (N) / Minor (N), with file:line + reasoning
 - Recommendations: <list>
 - Assessment: Yes | With fixes | No
 
-**Stage 2: Cold Review via task()**
-**task() dispatched:** yes | blocked — <error>
-**Subagent ID:** <id>
+**Sub-phase 5.2: Cold Code Review**
+cold-review: ses_<id>
 **Findings:** <list or "none">
 **Merged assessment:** Yes | With fixes | No — <reasoning>
 **Fix commits:** <hashes or "none needed">
 
-**Stage 3: Consequence & Intent**
-**consequence dispatched:** yes
-**Subagent ID:** <id>
+**Sub-phase 5.3: Consequence & Intent**
+consequence: ses_<id>
 **Findings:** <intended-vs-actual list or "none">
 
-**Security:** <findings list with NEW/MODIFIED distinction per security-review skill, OR "none — diff reviewed, no findings", OR "skipped — diff is docs-only">
+**Sub-phase 5.4: Security Review**
+security: ses_<id>
+**Findings:** <list with NEW/MODIFIED distinction, or "none — diff reviewed, no findings">
 
 **REVIEW→VERIFY cycles used:** N/5
 ```
 
-**Stage 1 — Self-Review** (catches mechanical issues): Get full delta `git diff origin/main` + `git log origin/main..HEAD --oneline`. Checklist: Plan alignment, Code quality, Architecture, Testing, Production readiness, **Security (item 6 — MANDATORY)**, Second-order effects ("if this ships, what happens next? trace 2+ levels"), Assumption surfacing ("what must be TRUE for this to work?").
+**Stage 1 — Self-Review (Sub-phase 5.1)** (catches mechanical issues): Get full delta `git diff origin/main` + `git log origin/main..HEAD --oneline`. Checklist: Plan alignment, Code quality, Architecture, Testing, Production readiness, **security (dispatched in 5.4)**, Second-order effects ("if this ships, what happens next? trace 2+ levels"), Assumption surfacing ("what must be TRUE for this to work?").
 
-**Stage 1 Item 6 — Security (MANDATORY):** INVOKE the `security-review` skill via the Skill tool when the diff contains ANY executable code (`.go/.py/.js/.ts/.tsx/.jsx/.java/.rs/.php/.rb`). Apply the NEW/MODIFIED doctrine: for NEW code (diff-added), fix ALL findings HIGH/MEDIUM/LOW; for MODIFIED code (existing function touched), fix issues the diff introduces and document pre-existing issues as OUT OF SCOPE with a Learning reference. Skip ONLY if the diff is docs/config/comments-only — then record `skipped — diff is docs-only` in `**Security:**`. Every finding line carries either a fix-commit-hash, a "not exploitable because X" note, or an OUT-OF-SCOPE annotation.
+**Sub-phase 5.4 doctrine — Security (MANDATORY):** The 5.4 subagent (never the loop agent itself) INVOKES the `security-review` skill via the Skill tool when the diff contains ANY executable code (`.go/.py/.js/.ts/.tsx/.jsx/.java/.rs/.php/.rb`). Apply the NEW/MODIFIED doctrine: for NEW code (diff-added), fix ALL findings HIGH/MEDIUM/LOW; for MODIFIED code (existing function touched), fix issues the diff introduces and document pre-existing issues as OUT OF SCOPE with a Learning reference. Even for docs/config-only diffs the 5.4 subagent is dispatched and verifies docs-only — no self-issued `security:` line. Every finding line carries either a fix-commit-hash, a "not exploitable because X" note, or an OUT-OF-SCOPE annotation.
 
-**Stage 2 — Cold Review via task()** (fresh eyes, catches architectural blind spots):
+**Sub-phase 5.2 — Cold Code Review via task()** (fresh eyes, catches architectural blind spots):
 - Dispatch focused task()-subagent with code-reviewer template (superpowers requesting-code-review)
 - Input: `git diff origin/main` + Phase 2 plan only (no exploration, for speed)
-- **MANDATORY — Cold Review is NOT optional.** Phase 5 is only complete when Stage 2 has actually run. Empirically verified (2026-06-20, Learning #75412): agents skip Stage 2 silently if framed as additive. Required evidence: `task() dispatched: yes` + Subagent ID in scratchpad.
+- **MANDATORY — Cold Review is NOT optional.** Phase 5 is only complete when 5.2 has actually run. Empirically verified (2026-06-20, Learning #75412): agents skip review subagents silently if framed as additive. Required evidence: `cold-review: ses_<id>` — the daemon checks the row in opencode.db.
 - **ALL subagent findings must be PROVEN ON CODE.** Every finding requires code-anchored evidence: file line refs, a call path (graph_traverse output), or a reproducing command/failing test. A finding without a code anchor is INVALID and must be reworked by the subagent.
-- **If task() truly fails:** status must be `REVIEW BLOCKED: task() unavailable — <error>`, NOT `DONE`. Orchestrator spawns separate TUI reviewer as fallback.
+- **If task() truly fails:** send_to orchestrator `BLOCKED Phase 5.2: <error>` and stay in Phase 5. Orchestrator spawns separate TUI reviewer as fallback.
 
-**Stage 3 — Consequence & Intent Check via task()** (fresh subagent, MANDATORY):
-- Dispatch a focused task()-subagent (separate from Stage 2's reviewer) with:
+**Sub-phase 5.3 — Consequence & Intent Check via task()** (fresh subagent, MANDATORY):
+- Dispatch a focused task()-subagent (separate session from 5.2's reviewer) with:
   `git diff origin/main`, the Phase 2 **Decisions resolved** block, and this mandate:
   (a) trace second-order consequences: callers, exposed contracts, defaults, schema,
   dependent behavior — what breaks or changes that the diff does not show?
   (b) intent fidelity: does the landed behavior match what Phase 2 decided?
   Anything drifting into an unwanted direction?
-- **ALL Stage-3 findings must be PROVEN ON CODE** — same evidence bar as Stage 2:
+- **ALL 5.3 findings must be PROVEN ON CODE** — same evidence bar as 5.2:
   file line refs, call path, or a reproducing command/failing test. Unanchored
   findings are INVALID and must be reworked by the subagent.
-- Evidence in the Phase 5 block: `**Stage 3: Consequence & Intent` header,
-  `**consequence dispatched:** yes`, `**Subagent ID:**`, `**Findings:**`
-- If task() truly fails: `**consequence dispatched:** blocked — <error>` (NOT COMPLETE)
+- Evidence in the Phase 5 block: `consequence: ses_<id>`, `**Findings:**`
+- **If task() truly fails:** send_to orchestrator `BLOCKED Phase 5.3: <error>` and stay in Phase 5 — never claim DONE.
+
+**Sub-phase 5.4 — Security Review via task()** (fresh reviewer subagent, MANDATORY):
+- Dispatch a focused task(reviewer)-subagent (distinct session from 5.2 and 5.3) that loads the `security-review` skill and reviews `git diff origin/main`.
+- Evidence in the Phase 5 block: `security: ses_<id>`, `**Findings:**` with NEW/MODIFIED distinction per the doctrine above.
+- The agent may NOT skip by writing findings itself — the gate verifies a real reviewer session.
 
 **Double-loop exit criteria (REVIEW→VERIFY):** the loop exits only when ALL of
-these hold: Stages 1-3 complete, Security field clean-or-annotated, and Phase 4
+these hold: Sub-phases 5.1-5.4 complete with daemon-verified evidence, and Phase 4
 Regression baseline shows `diff=none` (or all new failures fixed + re-run). If a
 check that must be clean stays red after 2 fix cycles → REVIEW BLOCKED
 escalation.
@@ -462,19 +487,23 @@ update_agent_status(phase="Phase 6/6 FINISH")
 - Strengths: clean API, good test coverage
 - Issues: Important (2) / Minor (4), with file:line
 - Assessment: With fixes
-**Stage 2: Cold Review via task()**
-**task() dispatched:** yes
-**Subagent ID:** agent-234
+self-review: done
+
+**Sub-phase 5.2: Cold Code Review**
+cold-review: ses_235
 **Findings:** same 2 Important + 4 Minor
 **Merged assessment:** With fixes — ALL 6 findings (2 Important + 4 Minor) fixed before merge
 **Fix commits:** cd2ba04 fix(config): proxy_state dual-write, type coercion + all 4 minors
 
-**Stage 3: Consequence & Intent**
-**consequence dispatched:** yes
-**Subagent ID:** agent-237
+**Sub-phase 5.3: Consequence & Intent**
+consequence: ses_236
 **Findings:** none
 
-**Security:** none — diff reviewed, no HIGH/MEDIUM/LOW findings
+**Sub-phase 5.4: Security Review**
+security: ses_237
+**Findings:** none — diff reviewed, no HIGH/MEDIUM/LOW findings
+
+**REVIEW→VERIFY cycles used:** 2/5
 
 ### Phase 6: FINISH
 **Status:** COMPLETE
@@ -609,7 +638,7 @@ Layer 2 of the yesloop guarantee: **Idle Detection** for yesloop agents with a l
 
 The daemon sends these exact messages (metachar-free, no markdown, no backticks):
 
-1. **State 0 → 1:** `Have you completed all 6 phases? If not do it now. For each phase prove you have done each, IF you have proven mark each phase in scratchpad with [x] showing it is done. MANDATORY: Make sure that you have also done phase 5 with all code reviews including Stage 2 cold review and Stage 3 consequence check via task subagents. REVIEW BLOCKED without subagent trace is not acceptable. Mandatory: only mark as PROVEN if it IS proven.`
+1. **State 0 → 1:** `Have you completed all 6 phases? If not do it now. For each phase prove you have done each, IF you have proven mark each phase in scratchpad with [x] showing it is done. MANDATORY: Make sure that you have also done phase 5 with all code reviews including Sub-phase 5.2 cold review, 5.3 consequence check and 5.4 security review via task subagents. REVIEW BLOCKED without subagent trace is not acceptable. Mandatory: only mark as PROVEN if it IS proven.`
 2. **State 1 → 2:** `Mark all 6 phases as done with x in scratchpad.`
 3. **State 2 → 3:** `If 1 through 6 are ok commit and send_to to caller.`
 
@@ -682,7 +711,7 @@ The done-verify checker reads the agent's scratchpad section to detect progress:
 ### Boundary with other layers
 
 - **Idle Detection (Layer 2)** triggers on stream inactivity; Done-Verify (Layer 3) triggers on DONE-claims. They are complementary and can both fire for the same agent.
-- **DONE-Guard (Layer 3 regex validator)** freezes agents that claim DONE with malformed phase blocks. Done-Verify catches the case where phase blocks look valid but Phase 5 Cold Review was silently skipped — the agent must actively BEWEISEN it ran Stage 2.
+- **DONE-Guard (Layer 3 regex validator)** freezes agents that claim DONE with malformed phase blocks. Done-Verify catches the case where phase blocks look valid but Phase 5 Cold Review was silently skipped — the agent must actively BEWEISEN it ran Sub-phase 5.2 (verified subagent session id).
 
 ## Anti-Patterns
 

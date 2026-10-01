@@ -179,27 +179,7 @@ func (e *Extractor) ExtractAndStore(sessionID, project string, msgs []models.Mes
 	}
 
 	// Pre-admission dedup: check each learning against existing corpus
-	var toInsert []*models.Learning
-	var preSkipped, preUpdated int
-	for _, l := range valid {
-		result := CheckPreAdmission(e.store, l)
-		switch result.Action {
-		case PreAdmissionSkip:
-			preSkipped++
-		case PreAdmissionUpdate:
-			if err := e.store.UpdateLearningContent(result.ExistingID, l.Content); err == nil {
-				e.store.IncrementMatchCounts([]int64{result.ExistingID})
-				preUpdated++
-			} else {
-				toInsert = append(toInsert, l)
-			}
-		case PreAdmissionInsert:
-			toInsert = append(toInsert, l)
-		}
-	}
-	if preSkipped > 0 || preUpdated > 0 {
-		log.Printf("Pre-admission: %d skipped, %d updated, %d new (session %s)", preSkipped, preUpdated, len(toInsert), truncID(sessionID))
-	}
+	toInsert := ApplyPreAdmission(e.store, valid, sessionID)
 
 	// Single transaction for genuinely new learnings
 	ids, err := e.store.InsertLearningBatch(toInsert)
@@ -960,8 +940,11 @@ func (e *TwoPassExtractor) ExtractAndStore(sessionID, project string, msgs []mod
 		valid = append(valid, &learnings[i])
 	}
 
+	// Pre-admission dedup — same contract as single-pass ExtractAndStore
+	toInsert := ApplyPreAdmission(e.store, valid, sessionID)
+
 	// Single transaction for all learnings from this session
-	ids, err := e.store.InsertLearningBatch(valid)
+	ids, err := e.store.InsertLearningBatch(toInsert)
 	if err != nil {
 		log.Printf("warn: batch store learnings: %v", err)
 	}

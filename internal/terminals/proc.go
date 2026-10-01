@@ -22,6 +22,8 @@ func procKind(pid int) string {
 		return "opencode"
 	case strings.Contains(comm, "claude"):
 		return "claude"
+	case strings.Contains(comm, "codex"):
+		return "codex"
 	}
 	return ""
 }

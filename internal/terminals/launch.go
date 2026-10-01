@@ -25,7 +25,7 @@ func displayScale() float64 {
 
 func measureScale() float64 {
 	const want = 100
-	cmd := exec.Command("ghostty", "+new-window", "--title=YMSSCALE")
+	cmd := exec.Command("ghostty", "--title=YMSSCALE")
 	if err := cmd.Start(); err != nil {
 		return 1
 	}
@@ -69,15 +69,22 @@ func restoreWindow(w Window, before []string) error {
 }
 
 // launchArgs builds the ghostty invocation for a window. Sessions (opencode/
-// claude) are started directly with -e; plain shell windows use +new-window.
+// claude) are started directly with -e; plain shell windows get their
+// working directory as direct spawn. Bewusst KEIN +new-window: das setzt eine
+// laufende Single-Instance-Instanz voraus (gtk-single-instance=false seit
+// 2026-09-02) und würde sonst still kein Fenster öffnen.
 func launchArgs(w Window) []string {
 	if ra := resumeArgs(w); len(ra) > 0 {
+		// Frisches opencode (unresumable/falsche Session-Id) im Workdir starten
+		if len(ra) == 1 && ra[0] == "opencode" && w.WorkDir != "" {
+			return []string{"--working-directory=" + w.WorkDir, "-e", "opencode"}
+		}
 		return append([]string{"-e"}, ra...)
 	}
 	if w.WorkDir != "" {
-		return []string{"+new-window", "--working-directory=" + w.WorkDir}
+		return []string{"--working-directory=" + w.WorkDir}
 	}
-	return []string{"+new-window"}
+	return []string{}
 }
 
 // waitNewWindow polls the window list until a window id appears that was not

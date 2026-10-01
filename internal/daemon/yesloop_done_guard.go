@@ -61,6 +61,22 @@ func resetDoneGuardState() {
 // It is released around pauseAgent/notifyOrchestrator/sendDoneGuardRelay
 // (which may block on DB or socket I/O) to avoid blocking concurrent agents.
 func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationResult) {
+	// Phase 5 evidence verification: when the format is compliant, verify the
+	// reported review subagent session ids against opencode's own session DB.
+	// Agents without a captured opencode session id skip verification. A
+	// failure downgrades to a non-compliant result that feeds the same
+	// refire/pause machine as a format failure, naming the invalid field.
+	if result.Compliant && agent.OpencodeSessionID != "" && len(result.Phase5Evidence) > 0 {
+		if evErrs := VerifySubagentEvidence(h.ocDBPath, agent.OpencodeSessionID, result.Phase5Evidence); len(evErrs) > 0 {
+			result = ValidationResult{
+				Compliant:      false,
+				PhaseCount:     6,
+				FieldErrors:    evErrs,
+				Phase5Evidence: result.Phase5Evidence,
+			}
+		}
+	}
+
 	yesloopDoneGuardAgentsMu.Lock()
 
 	state, exists := yesloopDoneGuardAgents[agent.ID]
@@ -79,7 +95,7 @@ func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationR
 			log.Printf("[done-guard] agent %s (%s) RECOVERED: scratchpad now compliant — unpausing (was: %s)",
 				agent.ID, agent.Section, agent.Progress)
 			yesloopDoneGuardAgentsMu.Unlock()
-			h.unpauseAgent(agent.ID, fmt.Sprintf("scratchpad now compliant (was: %s)", agent.Progress))
+			h.unpauseAgent(agent.ID, "DONE-GUARD", fmt.Sprintf("scratchpad now compliant (was: %s)", agent.Progress))
 			h.notifyOrchestrator(agent, fmt.Sprintf(
 				"RECOVERED: agent %s (%s) unpaused by DONE-GUARD — scratchpad now compliant (was: %s)",
 				agent.ID, agent.Section, agent.Progress))

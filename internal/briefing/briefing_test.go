@@ -101,6 +101,65 @@ func TestGenerateContainsSessions(t *testing.T) {
 	}
 }
 
+// Marks: each session line must show how many learnings that session left
+// behind, so the state-letter composer can see traces instead of bare
+// timestamps ("left nothing but the timestamp" bug, 2026-09-28).
+func TestGenerateShowsMarksPerSession(t *testing.T) {
+	store := setupStore(t)
+	for i := 0; i < 2; i++ {
+		store.InsertLearning(&models.Learning{
+			Category: "gotcha", Content: "marked", SessionID: "s1", Project: "/var/www/myproject",
+			Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "self",
+		})
+	}
+	gen := New(store, 3)
+	text := gen.Generate("/var/www/myproject")
+
+	s1Line := "Fix the cookie scanner timeout"
+	idx := strings.Index(text, s1Line)
+	if idx < 0 {
+		t.Fatal("session s1 not rendered")
+	}
+	lineEnd := strings.Index(text[idx:], "\n")
+	if lineEnd < 0 {
+		lineEnd = len(text) - idx
+	}
+	line := text[idx : idx+lineEnd]
+	if !strings.Contains(line, "[2 marks]") {
+		t.Errorf("session s1 line should show [2 marks], got: %q", line)
+	}
+	s2Idx := strings.Index(text, "Refactor auth module")
+	s2End := strings.Index(text[s2Idx:], "\n")
+	s2Line := text[s2Idx : s2Idx+s2End]
+	if strings.Contains(s2Line, "mark") {
+		t.Errorf("session s2 has no learnings, must not show marks: %q", s2Line)
+	}
+}
+
+func TestGenerateShowsLatestStateBrief(t *testing.T) {
+	store := setupStore(t)
+	created := time.Now().Add(-2 * time.Hour).Truncate(24 * time.Hour)
+	id, err := store.InsertLearning(&models.Learning{
+		Category: "strategic", Content: "State brief, yesterday: the test arc is closed.", Project: "/var/www/myproject",
+		Confidence: 1.0, CreatedAt: created, ModelUsed: "self",
+	})
+	if err != nil {
+		t.Fatalf("insert brief: %v", err)
+	}
+	gen := New(store, 3)
+	text := gen.Generate("/var/www/myproject")
+
+	if !strings.Contains(text, fmt.Sprintf("get_learnings(id=%d)", id)) {
+		t.Errorf("briefing should reference latest state brief via get_learnings(id=%d)", id)
+	}
+	// Cache safety: the line carries the brief's fixed date, never a relative
+	// time — identical DB state must render identical bytes on every request.
+	want := fmt.Sprintf("State brief #%d (%s)", id, created.Format("2006-01-02"))
+	if !strings.Contains(text, want) {
+		t.Errorf("briefing should carry stable date form %q", want)
+	}
+}
+
 func TestGenerateEmpty(t *testing.T) {
 	store, _ := storage.Open(":memory:")
 	defer store.Close()
@@ -727,7 +786,7 @@ func TestSetSkipUnfinished_SuppressesDeadlineTriggers(t *testing.T) {
 		Category: "unfinished", Content: "Release cutoff task",
 		Project: "/home/user/proj", Confidence: 1.0,
 		TriggerRule: "deadline:" + tomorrow,
-		CreatedAt: time.Now(), ModelUsed: "haiku",
+		CreatedAt:   time.Now(), ModelUsed: "haiku",
 	})
 
 	// skip=true: deadline-triggered item must NOT appear (no baseline call to avoid cooldown side-effect)

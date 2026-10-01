@@ -41,6 +41,7 @@ func (h *Handler) startAgentHeartbeat(ctx context.Context) {
 			if tick%30 == 0 {
 				h.checkYesloopDoneGuard()
 				h.checkYesloopIdle()
+				h.checkPermissionKick()
 				h.checkYesloopSkillCheck()
 				h.checkYesloopStagnation()
 			}
@@ -340,13 +341,13 @@ func (h *Handler) pauseAgent(id, reason string) {
 }
 
 // unpauseAgent mirrors pauseAgent: flips status back to running with a
-// recovery note. Only for agents paused by DONE-GUARD whose scratchpad
-// later became compliant — no process spawn, pure DB flip.
-func (h *Handler) unpauseAgent(id, reason string) {
+// recovery note. Pure DB flip, no process spawn — used after proven recovery
+// (done-guard compliant scratchpad, perm-kick revived the stream).
+func (h *Handler) unpauseAgent(id, source, reason string) {
 	h.store.AgentUpdate(id, map[string]any{
 		"status": "running",
-		"progress": fmt.Sprintf("recovered by DONE-GUARD at %s: %s",
-			time.Now().Format("2006-01-02 15:04:05"), reason),
+		"progress": fmt.Sprintf("recovered by %s at %s: %s",
+			source, time.Now().Format("2006-01-02 15:04:05"), reason),
 	})
 }
 
@@ -651,13 +652,23 @@ func (h *Handler) checkYesloopDoneGuard() {
 }
 
 // summarizeErrors produces a compact one-line summary of validation errors.
+// Evidence errors carry their reason in Detail — truncated to keep the relay
+// actionable but one-line.
 func summarizeErrors(r ValidationResult) string {
 	if r.Compliant {
 		return "compliant"
 	}
 	var parts []string
 	for _, fe := range r.FieldErrors {
-		parts = append(parts, fmt.Sprintf("Phase%d:%s", fe.Phase, fe.Field))
+		part := fmt.Sprintf("Phase%d:%s", fe.Phase, fe.Field)
+		if fe.Detail != "" {
+			detail := fe.Detail
+			if len(detail) > 140 {
+				detail = detail[:140]
+			}
+			part += ": " + detail
+		}
+		parts = append(parts, part)
 	}
 	if len(parts) == 0 {
 		return fmt.Sprintf("missing phase blocks: %v", r.MissingPhases)

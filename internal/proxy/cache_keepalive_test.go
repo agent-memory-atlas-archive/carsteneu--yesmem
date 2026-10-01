@@ -25,7 +25,7 @@ func TestCacheKeepalive_SendsPing(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 2, IntervalOverride: 50 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(200 * time.Millisecond)
 	ka.Stop()
 
@@ -46,7 +46,7 @@ func TestCacheKeepalive_StopsAfterMaxPings(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 2, IntervalOverride: 30 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(300 * time.Millisecond)
 	ka.Stop()
 
@@ -71,9 +71,9 @@ func TestCacheKeepalive_ResetCancelsOld(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 5, IntervalOverride: 50 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(30 * time.Millisecond)
-	ka.Reset("opencode:ses_test", body, "test-key") // should cancel first timer
+	ka.Reset("opencode:ses_test", body, "test-key", "") // should cancel first timer
 	time.Sleep(200 * time.Millisecond)
 	ka.Stop()
 
@@ -87,7 +87,7 @@ func TestCacheKeepalive_DisabledWhenZeroPings(t *testing.T) {
 		Mode: "5m", Pings5m: 0, IntervalOverride: 50 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(100 * time.Millisecond)
 	ka.Stop()
 	// No panic, no pings — just verifying it doesn't crash
@@ -109,7 +109,7 @@ func TestCacheKeepalive_PingModifiesMaxTokens(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 1, IntervalOverride: 10 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":4096,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(80 * time.Millisecond)
 	ka.Stop()
 
@@ -139,7 +139,7 @@ func TestCacheKeepalive_Retrigger(t *testing.T) {
 
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
 	// Reset while detection unknown → 0 pings, timer not started
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(100 * time.Millisecond)
 	if pingCount.Load() != 0 {
 		t.Errorf("should have 0 pings during unknown detection, got %d", pingCount.Load())
@@ -226,7 +226,7 @@ func TestCacheKeepalive_PerThreadTimerIndependence(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
 
 	// Thread A sends one request, then goes quiet (user thinking)
-	ka.Reset("opencode:ses_thread-A", body, "key-a")
+	ka.Reset("opencode:ses_thread-A", body, "key-a", "")
 
 	// Thread B resets every 20ms for 300ms — keeps the shared timer from ever firing
 	// (interval=80ms, reset every 20ms → timer never reaches 80ms)
@@ -234,7 +234,7 @@ func TestCacheKeepalive_PerThreadTimerIndependence(t *testing.T) {
 	go func() {
 		for i := 0; i < 15; i++ {
 			time.Sleep(20 * time.Millisecond)
-			ka.Reset("opencode:ses_thread-B", body, "key-b")
+			ka.Reset("opencode:ses_thread-B", body, "key-b", "")
 		}
 		close(done)
 	}()
@@ -310,7 +310,7 @@ func TestCacheKeepalive_PingLogsErrorResponse(t *testing.T) {
 		Logger: logger,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(80 * time.Millisecond)
 	ka.Stop()
 
@@ -332,7 +332,7 @@ func TestCacheKeepalive_PingStripsThinkingEndToEnd(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 1, IntervalOverride: 10 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64000,"thinking":{"type":"adaptive"},"tools":[{"name":"bash"}],"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_test", body, "test-key")
+	ka.Reset("opencode:ses_test", body, "test-key", "")
 	time.Sleep(80 * time.Millisecond)
 	ka.Stop()
 
@@ -363,7 +363,7 @@ func TestCacheKeepalive_SkipsUUIDThread(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 2, IntervalOverride: 50 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("503485dc-b636-4c53-909a-00ed1374a31b", body, "test-key") // UUID format
+	ka.Reset("503485dc-b636-4c53-909a-00ed1374a31b", body, "test-key", "") // UUID format
 	time.Sleep(200 * time.Millisecond)
 	ka.Stop()
 
@@ -384,7 +384,7 @@ func TestCacheKeepalive_SkipsDeepSeekModel(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 2, IntervalOverride: 50 * time.Millisecond,
 	})
 	body := []byte(`{"model":"deepseek-v4-pro","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("opencode:ses_deepseek_test", body, "test-key")
+	ka.Reset("opencode:ses_deepseek_test", body, "test-key", "")
 	time.Sleep(200 * time.Millisecond)
 	ka.Stop()
 
@@ -427,5 +427,59 @@ func TestCacheKeepalive_EffectivePings(t *testing.T) {
 	det.RecordResponse(0, 15000, 0)
 	if got := kaAuto.effectivePings(); got != 3 {
 		t.Errorf("auto 5m: expected 3, got %d", got)
+	}
+}
+
+// Regression: the ping dropped the original anthropic-beta header, so any
+// beta-gated body field (e.g. thinking.block_binding sent by @ai-sdk/anthropic
+// with "thinking-binding-controls-2026-08-01") was rejected with HTTP 400
+// "Extra inputs are not permitted" while the real request succeeded.
+func TestCacheKeepalive_PingForwardsAnthropicBeta(t *testing.T) {
+	var gotBeta atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta.Store(r.Header.Get("anthropic-beta"))
+		fmt.Fprintf(w, `{"type":"message","usage":{"cache_read_input_tokens":100}}`)
+	}))
+	defer srv.Close()
+
+	ka := NewCacheKeepalive(CacheKeepaliveConfig{
+		Target: srv.URL, Mode: "5m", Pings5m: 1, IntervalOverride: 10 * time.Millisecond,
+	})
+	body := []byte(`{"model":"claude-opus-4-8","max_tokens":1024,"thinking":{"type":"adaptive","block_binding":{"prefix_mismatch_behavior":"error"}},"messages":[{"role":"user","content":"test"}]}`)
+	beta := "interleaved-thinking-2025-05-14,thinking-binding-controls-2026-08-01"
+	ka.Reset("opencode:ses_test", body, "test-key", beta)
+	time.Sleep(80 * time.Millisecond)
+	ka.Stop()
+
+	got, _ := gotBeta.Load().(string)
+	if got != beta {
+		t.Errorf("ping must forward anthropic-beta %q, got %q", beta, got)
+	}
+}
+
+func TestCacheKeepalive_PingOmitsAnthropicBetaWhenAbsent(t *testing.T) {
+	var sawRequest atomic.Bool
+	var hasBeta atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest.Store(true)
+		_, present := r.Header["Anthropic-Beta"]
+		hasBeta.Store(present)
+		fmt.Fprintf(w, `{"type":"message","usage":{"cache_read_input_tokens":100}}`)
+	}))
+	defer srv.Close()
+
+	ka := NewCacheKeepalive(CacheKeepaliveConfig{
+		Target: srv.URL, Mode: "5m", Pings5m: 1, IntervalOverride: 10 * time.Millisecond,
+	})
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
+	ka.Reset("opencode:ses_test", body, "test-key", "")
+	time.Sleep(80 * time.Millisecond)
+	ka.Stop()
+
+	if !sawRequest.Load() {
+		t.Fatal("server received no ping request")
+	}
+	if hasBeta.Load() {
+		t.Error("ping must not send an empty anthropic-beta header")
 	}
 }

@@ -81,14 +81,17 @@ func compileValidations() []PhaseValidation {
 			IsStatusField: true,
 			RequiredFields: []*regexp.Regexp{
 				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
-				regexp.MustCompile(`\*\*Stage 2: Cold Review`),
-				regexp.MustCompile(`task\(\) dispatched:\*{0,2}\s+(yes|blocked)`),
-				regexp.MustCompile(`(?m)^\*\*Security:\*\*[ \t]+\S`),
-				// Stage 3 Consequence & Intent: fresh task()-subagent traces second-order
-				// effects and intent fidelity (see SKILL.md). Format check only; substance
-				// is evidenced by the Subagent ID per BEWEISEN discipline.
-				regexp.MustCompile(`\*\*Stage 3: Consequence & Intent`),
-				regexp.MustCompile(`(?m)^\*\*consequence dispatched:\*{0,2}\s+(yes|blocked)`),
+			regexp.MustCompile(`(?m)^\*{0,2}self-review:\*{0,2}[ \t]+done\b`),
+			// One task() subagent per review sub-phase; the ses_ id is
+			// verified against opencode's session DB by VerifySubagentEvidence.
+			regexp.MustCompile(`(?m)^\*{0,2}cold-review:\*{0,2}[ \t]+ses_\S+`),
+			regexp.MustCompile(`(?m)^\*{0,2}consequence:\*{0,2}[ \t]+ses_\S+`),
+			regexp.MustCompile(`(?m)^\*{0,2}security:\*{0,2}[ \t]+ses_\S+`),
+			// risk-based-code-review classification from the 5.2 cold reviewer:
+			// Stufe 1-3 with a same-line rationale, plus the active module
+			// selection (value on the same line, as with Regression baseline).
+			regexp.MustCompile(`(?m)^\*\*Stufe:\*\*[ \t]+[123][ \t]+\S`),
+			regexp.MustCompile(`(?m)^\*\*Modules:\*\*[ \t]+\S`),
 			},
 		},
 		{
@@ -170,6 +173,11 @@ type ValidationResult struct {
 	PhaseCount    int          // how many of 6 phase blocks were found
 	MissingPhases []int        // phase numbers missing from the content
 	FieldErrors   []FieldError // individual field validation failures
+	// Phase5Evidence maps the review sub-phase key (cold-review, consequence,
+	// security) to the reported task() subagent session id. Populated when a
+	// Phase 5 block exists; verified against opencode's session DB by
+	// VerifySubagentEvidence in the DONE-guard.
+	Phase5Evidence map[string]string
 }
 
 func (r ValidationResult) String() string {
@@ -248,12 +256,41 @@ func ValidatePhaseBlocks(content string) ValidationResult {
 	}
 
 	compliant := len(missing) == 0 && len(errors) == 0
-	return ValidationResult{
+	result := ValidationResult{
 		Compliant:     compliant,
 		PhaseCount:    len(phases),
 		MissingPhases: missing,
 		FieldErrors:   errors,
 	}
+	if p5, ok := phases[5]; ok {
+		result.Phase5Evidence = extractPhase5Evidence(p5)
+	}
+	return result
+}
+
+// phase5EvidenceRes extracts the ses_ ids from the mandatory Phase 5 dispatch
+// lines. Same shape as the presence regexes plus a capture group.
+var phase5EvidenceRes = map[string]*regexp.Regexp{
+	"cold-review": regexp.MustCompile(`(?m)^\*{0,2}cold-review:\*{0,2}[ \t]+(ses_\S+)`),
+	"consequence": regexp.MustCompile(`(?m)^\*{0,2}consequence:\*{0,2}[ \t]+(ses_\S+)`),
+	"security":    regexp.MustCompile(`(?m)^\*{0,2}security:\*{0,2}[ \t]+(ses_\S+)`),
+}
+
+// extractPhase5Evidence pulls the reported task() subagent session ids out of
+// a Phase 5 block. Returns nil when no evidence line is present (format
+// errors for those lines are already reported separately).
+func extractPhase5Evidence(phase5 string) map[string]string {
+	var evidence map[string]string
+	for key, re := range phase5EvidenceRes {
+		m := re.FindStringSubmatch(phase5)
+		if len(m) >= 2 {
+			if evidence == nil {
+				evidence = make(map[string]string, len(phase5EvidenceRes))
+			}
+			evidence[key] = m[1]
+		}
+	}
+	return evidence
 }
 
 // completedPhaseRe matches a phase block line with **Status:** COMPLETE.

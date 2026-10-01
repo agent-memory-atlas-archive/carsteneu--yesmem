@@ -56,6 +56,7 @@ func (s *Store) createSchema() error {
 		tableTokenUsage,
 		tableCodeDescriptions,
 		tableProjectScan,
+		tableScanCooldown,
 		tableSessionActiveCaps,
 		tableReplPatternObservations,
 		tableScheduledJobs,
@@ -520,6 +521,8 @@ var migrations = []string{
 	// v0.69: project_source records the attribution basis of a learning
 	// (explicit|repo|session|content|ambiguous). Empty for legacy rows.
 	`ALTER TABLE learnings ADD COLUMN project_source TEXT NOT NULL DEFAULT ''`,
+	// v0.70: Agent permission-kick setting — ''=inherit config default, on/off override
+	`ALTER TABLE agents ADD COLUMN permission_kick TEXT DEFAULT ''`,
 }
 
 // messagesMigrations runs against messages.db (separate from yesmem.db migrations).
@@ -946,6 +949,12 @@ const tableProjectScan = `CREATE TABLE IF NOT EXISTS project_scan (
 	git_head   TEXT NOT NULL,
 	cbm_mtime  INTEGER NOT NULL DEFAULT 0,
 	scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`
+
+const tableScanCooldown = `CREATE TABLE IF NOT EXISTS scan_cooldown (
+	project   TEXT PRIMARY KEY,
+	failed_at INTEGER NOT NULL,
+	error     TEXT NOT NULL DEFAULT ''
 )`
 
 const tableSessionActiveCaps = `CREATE TABLE IF NOT EXISTS session_active_caps (

@@ -7,10 +7,10 @@ import (
 
 // CompressResult holds the outcome of context compression.
 type CompressResult struct {
-	Messages             []any
-	ThinkingCompressed   int
+	Messages              []any
+	ThinkingDropped       int
 	ToolResultsCompressed int
-	TokensSaved          int
+	TokensSaved           int
 }
 
 // turnAge constants for compression thresholds.
@@ -18,14 +18,22 @@ const (
 	compressMinTokens = 500 // minimum tokens to consider for compression
 )
 
-// CompressContext proactively compresses old thinking blocks and tool_results
-// before the budget-based cutoff runs. This recovers context window space from
+// CompressContext proactively compresses old tool_results before the
+// budget-based cutoff runs. This recovers context window space from
 // content that has been processed and summarized in assistant responses.
 //
 // Messages within the keepRecent window are never touched.
-// All older messages get thinking blocks removed and tool_results summarized.
+// All older messages get thinking blocks DROPPED and tool_results summarized.
 //
-// Only blocks > 500 tokens are compressed. Messages are modified in-place.
+// Thinking blocks are dropped, not rewritten, at any age outside keepRecent:
+// the Anthropic API validates each thinking block's signature against its
+// text, so any rewrite produces requests rejected with
+// "messages.N.content.M.thinking.signature: Field required" (observed
+// 2026-09-27 on opencode sessions). Claude Code strips old thinking
+// client-side for the same reason. The current tool loop's thinking always
+// sits inside keepRecent and is never touched.
+//
+// Only tool_results > 500 tokens are compressed. Messages are modified in-place.
 func CompressContext(messages []any, keepRecent int, threadID string, estimateTokens TokenEstimateFunc) CompressResult {
 	result := CompressResult{
 		Messages: messages,
@@ -77,21 +85,14 @@ func CompressContext(messages []any, keepRecent int, threadID string, estimateTo
 
 			switch blockType {
 			case "thinking":
+				// Old thinking blocks are dropped, never rewritten: the API
+				// validates each thinking block's signature against its text,
+				// so ANY rewrite produces invalid requests ("thinking.signature:
+				// Field required"). Dropping matches Claude Code's own history
+				// stripping. No size threshold — old thinking is dead weight.
 				thinking, _ := b["thinking"].(string)
-				tokens := estimateTokens(thinking)
-				if tokens < compressMinTokens {
-					newBlocks = append(newBlocks, block)
-					continue
-				}
-
-				// All messages outside keepRecent: summary stub
-				compressed := "[context compressed: thinking block]"
-				newBlocks = append(newBlocks, map[string]any{
-					"type":     "thinking",
-					"thinking": compressed,
-				})
-				result.TokensSaved += tokens - estimateTokens(compressed)
-				result.ThinkingCompressed++
+				result.TokensSaved += estimateTokens(thinking)
+				result.ThinkingDropped++
 				modified = true
 
 			case "tool_result":
@@ -121,6 +122,15 @@ func CompressContext(messages []any, keepRecent int, threadID string, estimateTo
 		}
 
 		if modified {
+			// Dropping thinking can empty a thinking-only message; empty
+			// content is an invalid request. Keep the message with a minimal
+			// text placeholder instead.
+			if len(newBlocks) == 0 {
+				newBlocks = append(newBlocks, map[string]any{
+					"type": "text",
+					"text": "[thinking removed]",
+				})
+			}
 			newMsg := shallowCopyMap(msg)
 			newMsg["content"] = newBlocks
 			messages[i] = newMsg

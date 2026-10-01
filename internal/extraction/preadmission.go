@@ -27,6 +27,11 @@ type PreAdmissionResult struct {
 
 // CheckPreAdmission checks a learning against existing active learnings.
 func CheckPreAdmission(store *storage.Store, learning *models.Learning) PreAdmissionResult {
+	// Raw bash transcripts are session artifacts, not durable knowledge.
+	if textutil.IsRawBashTranscript(learning.Content) {
+		return PreAdmissionResult{Action: PreAdmissionSkip, Reason: "raw bash transcript"}
+	}
+
 	// Phase 0: Exact content hash check
 	if existing, err := store.GetLearningByContentHash(textutil.ContentHash(learning.Content)); err == nil && existing != nil {
 		return PreAdmissionResult{Action: PreAdmissionSkip, ExistingID: existing.ID, Reason: "exact duplicate"}
@@ -64,6 +69,34 @@ func CheckPreAdmission(store *storage.Store, learning *models.Learning) PreAdmis
 	}
 
 	return PreAdmissionResult{Action: PreAdmissionInsert}
+}
+
+// ApplyPreAdmission runs CheckPreAdmission for each candidate and returns the
+// batch to insert. Single-pass and two-pass ExtractAndStore share this path so
+// both write flows dedup identically.
+func ApplyPreAdmission(store *storage.Store, valid []*models.Learning, sessionID string) []*models.Learning {
+	var toInsert []*models.Learning
+	var preSkipped, preUpdated int
+	for _, l := range valid {
+		result := CheckPreAdmission(store, l)
+		switch result.Action {
+		case PreAdmissionSkip:
+			preSkipped++
+		case PreAdmissionUpdate:
+			if err := store.UpdateLearningContent(result.ExistingID, l.Content); err == nil {
+				store.IncrementMatchCounts([]int64{result.ExistingID})
+				preUpdated++
+			} else {
+				toInsert = append(toInsert, l)
+			}
+		case PreAdmissionInsert:
+			toInsert = append(toInsert, l)
+		}
+	}
+	if preSkipped > 0 || preUpdated > 0 {
+		log.Printf("Pre-admission: %d skipped, %d updated, %d new (session %s)", preSkipped, preUpdated, len(toInsert), truncID(sessionID))
+	}
+	return toInsert
 }
 
 // checkCandidates evaluates a list of candidates against a new learning.

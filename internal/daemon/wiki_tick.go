@@ -82,6 +82,8 @@ func runWikiOnce(ctx context.Context, store *storage.Store, outRoot string, scan
 				if graph == nil {
 					graph = codescan.BuildCodeGraph(sr)
 				}
+			} else {
+				log.Printf("wiki-tick: %s scan failed, rendering without code graph: %v", p, err)
 			}
 			graphMs = time.Since(gStart).Milliseconds()
 		}

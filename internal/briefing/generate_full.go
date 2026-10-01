@@ -58,11 +58,13 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 	codeMap := gen.CodeMap()
 
 	// LLM refinement (uses cached version if available)
-	projectShort := filepath.Base(project)
-	text = RefineBriefing(text, store, projectShort, nil)
+	projectID := gen.ProjectKey(project)
+	projectName := filepath.Base(project)
+	text = RefineBriefing(text, store, projectID, nil)
 
-	// Metamemory (post-refine so it survives refinement)
-	if mm := gen.GenerateMetamemory(projectShort); mm != "" {
+	// Metamemory (post-refine so it survives refinement).
+	// loadMetamemory filters on learnings.canonical_project, which is the basename.
+	if mm := gen.GenerateMetamemory(projectName); mm != "" {
 		text = mm + "\n" + text
 	}
 
@@ -72,8 +74,8 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 	}
 
 	// Inject pinned learnings between prose and tools block
-	sessionPins, _ := store.GetPinnedLearnings("session", projectShort)
-	permanentPins, _ := store.GetPinnedLearnings("permanent", projectShort)
+	sessionPins, _ := store.GetPinnedLearnings("session", projectID)
+	permanentPins, _ := store.GetPinnedLearnings("permanent", projectID)
 	pinnedBlock := FormatPinnedBlock(sessionPins, permanentPins)
 	if pinnedBlock != "" {
 		text = InjectPinnedBlock(text, pinnedBlock)
@@ -86,9 +88,9 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 		isNonClaudeAgent = true
 	}
 	if cfg.Briefing.RemindOpenWork && !isAgentSession && !isNonClaudeAgent {
-		if count, _ := store.CountActiveUnfinished(projectShort); count > 0 {
+		if count, _ := store.CountActiveUnfinished(projectID); count > 0 {
 			s := ResolveStrings(filepath.Join(dataDir, "strings.yaml"))
-			lastAtKey := "last_openwork_remind_full_at:" + projectShort
+			lastAtKey := "last_openwork_remind_full_at:" + projectID
 			lastAtStr, _ := store.GetProxyState(lastAtKey)
 			useFull := true
 			if lastAtStr != "" {
@@ -99,10 +101,10 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 				}
 			}
 			if useFull && s.OpenWorkRemind != "" {
-				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemind, projectShort) + "\n"
+				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemind, projectName) + "\n"
 				store.SetProxyState(lastAtKey, time.Now().Format(time.RFC3339))
 			} else if !useFull && s.OpenWorkRemindAsk != "" {
-				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemindAsk, projectShort) + "\n"
+				text += "\n\n" + fmt.Sprintf(s.OpenWorkRemindAsk, projectName) + "\n"
 			}
 		}
 	}

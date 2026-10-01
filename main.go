@@ -17,6 +17,7 @@ import (
 	yesmcp "github.com/carsteneu/yesmem/internal/mcp"
 	"github.com/carsteneu/yesmem/internal/setup"
 	"github.com/carsteneu/yesmem/internal/storage"
+	"github.com/carsteneu/yesmem/internal/terminals"
 )
 
 // version is set at build time via: go build -ldflags "-X main.version=..."
@@ -151,6 +152,8 @@ func main() {
 		runStatusline()
 	case "backup":
 		runBackup()
+	case "volatile-sweep":
+		runVolatileSweep()
 	case "migrate-project":
 		runMigrateProject()
 	case "migrate-messages":
@@ -191,6 +194,8 @@ func main() {
 		runAgentTTY()
 	case "relay":
 		runRelay()
+	case "cbm-gc":
+		runCBMGc(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -254,6 +259,11 @@ func runDaemon() {
 		HTTPEnabled:      enableHTTP || appCfg.HTTP.Enabled,
 		HTTPListen:       appCfg.HTTP.Listen,
 		CapsDir:          appCfg.CapsDir,
+		TerminalsSave: func() {
+			if err := terminals.Save(dataDir); err != nil {
+				log.Printf("[terminals] periodic save: %v", err)
+			}
+		},
 	}); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
@@ -319,6 +329,7 @@ func printUsage() {
 	fmt.Println("  restart-terminals  Reopen saved terminal windows after a reboot")
 	fmt.Println("  spawn-terminal [dir]  Start a new terminal session as a managed (relayable) agent; default: current dir")
 	fmt.Println("  version         Show version")
+	fmt.Println("  cbm-gc [--dry-run]  Delete CBM index DBs of removed worktrees [--dry-run]")
 	fmt.Println()
 	fmt.Println("Hooks (called by Claude Code, not directly):")
 	fmt.Println("  briefing-hook   SessionStart hook (briefing generation)")

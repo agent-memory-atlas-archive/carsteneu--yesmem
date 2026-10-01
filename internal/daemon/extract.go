@@ -714,6 +714,19 @@ func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, 
 				}
 				store.MarkSessionNarrative(s.ID)
 
+				// Session flavor from the narrative — every extracted session
+				// (CC and opencode) carries one, independent of the fork
+				// pipeline. Marks count = real learnings of this session
+				// (narrative/pulse excluded; 0 keeps the flavor gated).
+				if flavor := deriveSessionFlavor(narrative); flavor != "" {
+					marks, err := store.CountLearningsForSession(s.ID)
+					if err != nil {
+						log.Printf("  Flavor: count learnings for %s failed: %v", s.ID, err)
+					} else if _, err := store.UpdateSessionFlavorOnlyEmpty(s.ID, flavor, marks); err != nil {
+						log.Printf("  Flavor: stamp for %s failed: %v", s.ID, err)
+					}
+				}
+
 				mu.Lock()
 				generated++
 				g := generated

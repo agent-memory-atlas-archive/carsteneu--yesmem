@@ -305,6 +305,14 @@ func (s *Server) doForkCall(endpoint, apiKey string, origHeaders http.Header, re
 		}
 	} else {
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		// The fork body keeps beta-gated fields of the original request (e.g.
+		// thinking.block_binding); without the original anthropic-beta header
+		// the API rejects them as extra inputs (HTTP 400).
+		if origHeaders != nil {
+			if beta := origHeaders.Get("anthropic-beta"); beta != "" {
+				httpReq.Header.Set("anthropic-beta", beta)
+			}
+		}
 		if apiKey != "" {
 			httpReq.Header.Set("x-api-key", apiKey)
 		} else if origHeaders != nil {

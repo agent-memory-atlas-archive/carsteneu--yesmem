@@ -182,7 +182,7 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 				if apiKey == "" {
 					apiKey = origReq.Header.Get("Authorization")
 				}
-				s.cacheKeepalive.Reset(threadID, body, apiKey)
+				s.cacheKeepalive.Reset(threadID, body, apiKey, origReq.Header.Get("anthropic-beta"))
 			}
 			// Store response timestamp (non-streaming path)
 			if threadID != "" {
@@ -353,7 +353,7 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 			if apiKey == "" {
 				apiKey = origReq.Header.Get("Authorization")
 			}
-			s.cacheKeepalive.Reset(threadID, body, apiKey)
+			s.cacheKeepalive.Reset(threadID, body, apiKey, origReq.Header.Get("anthropic-beta"))
 		}
 
 		// Store response timestamp for next-request annotation

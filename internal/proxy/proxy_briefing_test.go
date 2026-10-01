@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Cache is keyed by (threadID, project). Each Claude Code session thread
@@ -211,5 +212,128 @@ func TestComposeBriefingText_NilNarrativeSafe(t *testing.T) {
 	got := composeBriefingText("BASE", nil)
 	if got != "BASE" {
 		t.Errorf("nil narrative should return base unchanged, got: %q", got)
+	}
+}
+
+func briefingTestRequest() map[string]any {
+	return map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+}
+
+// ageBriefingEntry moves a thread's cache entry into the past, as if it was
+// loaded `age` ago.
+func ageBriefingEntry(s *Server, threadID string, age time.Duration) {
+	s.briefingMu.Lock()
+	defer s.briefingMu.Unlock()
+	e := s.briefingCache[threadID]
+	e.loadedAt = time.Now().Add(-age)
+	s.briefingCache[threadID] = e
+}
+
+// Regression: a failed first load (e.g. daemon i/o timeout right after deploy)
+// was cached as a valid empty entry, so the thread never got a briefing again.
+// Within the backoff window no reload happens (a hung daemon must not block
+// every request for the full RPC timeout); after it, the load is retried.
+func TestInjectBriefingTurn_RetriesAfterFailedLoad(t *testing.T) {
+	calls := 0
+	s := &Server{
+		logger: log.New(io.Discard, "", 0),
+		briefingLoader: func(project, projectDir string) briefingData {
+			calls++
+			if calls == 1 {
+				return briefingData{} // simulated daemon timeout
+			}
+			return briefingData{Text: "BRIEF-TEXT", CodeMap: "BRIEF-CM"}
+		},
+	}
+
+	if s.injectBriefingTurn(briefingTestRequest(), 1, "yesmem", "tid-A") {
+		t.Fatalf("first request: no injection expected on failed load")
+	}
+	if s.injectBriefingTurn(briefingTestRequest(), 2, "yesmem", "tid-A") {
+		t.Fatalf("second request within backoff: no injection expected")
+	}
+	if calls != 1 {
+		t.Fatalf("within backoff the loader must not be called again, got %d calls", calls)
+	}
+
+	ageBriefingEntry(s, "tid-A", briefingRetryBackoff+time.Second)
+
+	req := briefingTestRequest()
+	if !s.injectBriefingTurn(req, 3, "yesmem", "tid-A") {
+		t.Fatalf("after backoff the briefing must be reloaded and injected")
+	}
+	if calls != 2 {
+		t.Errorf("expected exactly one retry, got %d loader calls", calls)
+	}
+	msgs := req["messages"].([]any)
+	first, _ := msgs[0].(map[string]any)["content"].(string)
+	if !strings.Contains(first, "BRIEF-TEXT") {
+		t.Errorf("injected turn missing briefing text: %q", first)
+	}
+	if _, cm, ok := s.getCachedBriefing("tid-A", "yesmem"); !ok || cm != "BRIEF-CM" {
+		t.Errorf("retry must cache code map too: ok=%v cm=%q", ok, cm)
+	}
+}
+
+// A successfully loaded briefing stays cached for the thread's lifetime —
+// expiring it would change the message prefix and bust the prompt cache.
+func TestInjectBriefingTurn_SuccessfulLoadDoesNotExpire(t *testing.T) {
+	calls := 0
+	s := &Server{
+		logger: log.New(io.Discard, "", 0),
+		briefingLoader: func(project, projectDir string) briefingData {
+			calls++
+			return briefingData{Text: "BRIEF-TEXT"}
+		},
+	}
+
+	if !s.injectBriefingTurn(briefingTestRequest(), 1, "yesmem", "tid-A") {
+		t.Fatalf("first request: injection expected")
+	}
+	ageBriefingEntry(s, "tid-A", briefingRetryBackoff+time.Hour)
+	if !s.injectBriefingTurn(briefingTestRequest(), 2, "yesmem", "tid-A") {
+		t.Fatalf("second request: injection from cache expected")
+	}
+	if calls != 1 {
+		t.Errorf("successful briefing must not be reloaded, got %d loader calls", calls)
+	}
+}
+
+// Only a fully empty entry (the shape of a failed daemon load) is retried.
+// An entry with a code map but empty text is a valid daemon answer; reloading
+// it every backoff period could change the injected code-map bytes and bust
+// the prompt cache.
+func TestInjectBriefingTurn_CodeMapOnlyEntryDoesNotExpire(t *testing.T) {
+	calls := 0
+	s := &Server{
+		logger: log.New(io.Discard, "", 0),
+		briefingLoader: func(project, projectDir string) briefingData {
+			calls++
+			return briefingData{CodeMap: "CM-ONLY"}
+		},
+	}
+
+	s.injectBriefingTurn(briefingTestRequest(), 1, "yesmem", "tid-A")
+	ageBriefingEntry(s, "tid-A", briefingRetryBackoff+time.Second)
+	s.injectBriefingTurn(briefingTestRequest(), 2, "yesmem", "tid-A")
+
+	if calls != 1 {
+		t.Errorf("code-map-only entry must not be reloaded, got %d loader calls", calls)
+	}
+}
+
+// A late failed load (e.g. a 30s daemon timeout finishing after a concurrent
+// refresh stored a good briefing) must not downgrade the entry to empty.
+func TestBriefingCache_EmptyWriteDoesNotReplaceGoodEntry(t *testing.T) {
+	s := &Server{}
+	s.setCachedBriefing("tid-A", "yesmem", "GOOD", "GOOD-CM")
+
+	s.setCachedBriefing("tid-A", "yesmem", "", "")
+
+	text, cm, ok := s.getCachedBriefing("tid-A", "yesmem")
+	if !ok || text != "GOOD" || cm != "GOOD-CM" {
+		t.Errorf("empty write must not replace good entry: ok=%v text=%q cm=%q", ok, text, cm)
 	}
 }

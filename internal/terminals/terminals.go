@@ -166,6 +166,8 @@ func ClassifyEmulator(cls []string) string {
 			return "ghostty"
 		case strings.Contains(c, "warp"):
 			return "warp"
+		case strings.Contains(c, "gnome-terminal"):
+			return "gnome-terminal"
 		}
 	}
 	return ""
@@ -176,7 +178,10 @@ func ClassifyEmulator(cls []string) string {
 func ResumeCommand(kind, sessionID string) string {
 	switch kind {
 	case "opencode":
-		if sessionID == "" {
+		// Nur echte opencode-Session-Ids (ses_-Präfix) resumen; Snapshot-
+		// Einträge mit Daemon-UUID statt opencode_session_id würden mit
+		// --session sofort beenden. → frisches opencode.
+		if sessionID == "" || !strings.HasPrefix(sessionID, "ses_") {
 			return "opencode"
 		}
 		return "opencode --session " + sessionID
@@ -185,6 +190,11 @@ func ResumeCommand(kind, sessionID string) string {
 			return "claude"
 		}
 		return "claude --resume " + sessionID
+	case "codex":
+		if sessionID == "" {
+			return "codex"
+		}
+		return "codex resume " + sessionID
 	}
 	return ""
 }
