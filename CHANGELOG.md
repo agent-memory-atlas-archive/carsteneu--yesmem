@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Terracotta code blocks and darker thinking surface in yesmem-light
+
+## [2.3.19] - 2026-10-15
+
+### Added
+
 - Session-rename convention for yesloop/yesresearch agents
 - Subtle per-hue background tint for the agent themes
 - Stronger text contrast for yesmem-light muted family
@@ -123,6 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- V2.3.19
 - Opencode v2 API agent ideas and yesmem integration brainstorm
 - Add reverse-steering (agent wakes its orchestrator) to the profile
 - Multi-loop top-results profile (wave plan for the API capabilities)
@@ -7178,7 +7185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add comprehensive tests for generator and storage
 
 
-[Unreleased]: https://github.com/carsteneu/yesmem/compare/v2.3.18...HEAD
+[Unreleased]: https://github.com/carsteneu/yesmem/compare/v2.3.19...HEAD
+[2.3.19]: https://github.com/carsteneu/yesmem/compare/v2.3.18...v2.3.19
 [2.3.18]: https://github.com/carsteneu/yesmem/compare/v2.3.16...v2.3.18
 [2.3.16]: https://github.com/carsteneu/yesmem/compare/v2.3.15...v2.3.16
 [2.3.15]: https://github.com/carsteneu/yesmem/compare/v2.3.14...v2.3.15
