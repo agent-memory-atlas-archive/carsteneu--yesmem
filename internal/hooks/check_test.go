@@ -27,11 +27,11 @@ func newTestStore(t *testing.T) *storage.Store {
 // insertTestLearning inserts a gotcha learning and returns its ID.
 func insertTestLearning(store *storage.Store, content, category string) int64 {
 	id, err := store.InsertLearning(&models.Learning{
-		Category:  category,
-		Content:   content,
+		Category:   category,
+		Content:    content,
 		Confidence: 1.0,
-		CreatedAt: time.Now(),
-		ModelUsed: "test",
+		CreatedAt:  time.Now(),
+		ModelUsed:  "test",
 	})
 	if err != nil {
 		panic("insertTestLearning: " + err.Error())
@@ -411,6 +411,7 @@ func TestRunCheckWebFetchProducesKeywords(t *testing.T) {
 		t.Errorf("buildWebFetchKeywords(%q) = %v — no reddit-related keyword found", rawURL, kw)
 	}
 }
+
 // TestWebFetchKeywordsNotMatchedByOldDefault verifies that BEFORE the WebFetch case
 // was added, the default: return branch would have dropped the call entirely.
 // This is a regression guard: WebFetch must NOT fall through to the default return.
@@ -853,8 +854,345 @@ func TestRunCheckWorktreeCWDSeesCanonicalProject(t *testing.T) {
 	}
 }
 
+// insertGotcha inserts a gotcha with source and origin_tool set, mimicking a
+// hook-auto-learned row. Returns the learning ID.
+func insertGotcha(t *testing.T, store *storage.Store, content, source, originTool string) int64 {
+	t.Helper()
+	id, err := store.InsertLearning(&models.Learning{
+		Category:   "gotcha",
+		Content:    content,
+		Source:     source,
+		OriginTool: originTool,
+		Confidence: 0.7,
+		CreatedAt:  time.Now(),
+		ModelUsed:  "test",
+	})
+	if err != nil {
+		t.Fatalf("insert gotcha %q: %v", content, err)
+	}
+	return id
+}
+
+// openTempStore creates a temp dataDir with a seeded yesmem.db and returns the
+// dataDir. The store is closed before RunCheck reopens it, matching production.
+func openTempStore(t *testing.T, seed func(*storage.Store)) string {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dir, "yesmem.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	seed(store)
+	insertNullProjectRow(t, store)
+	store.Close()
+	return dir
+}
+
+// TestRunCheckBashGotchaNotInjectedOnFileOpByFilenameAlone is the regression
+// guard for issue #151. A gotcha auto-learned from a Bash failure that merely
+// mentions a filename must not be injected during Write/Edit of that file —
+// the pending operation does not run the failed command.
+func TestRunCheckBashGotchaNotInjectedOnFileOpByFilenameAlone(t *testing.T) {
+	tests := []struct {
+		name    string
+		tool    string
+		file    string
+		content string
+	}{
+		{
+			name:    "Write short-stem filename",
+			tool:    "Write",
+			file:    "/x/data/ab.txt",
+			content: "Bash error: `cat ab.txt` → cat: ab.txt: No such file or directory",
+		},
+		{
+			name:    "Write filename with stem keyword",
+			tool:    "Edit",
+			file:    "/x/data/notes.txt",
+			content: "Bash error: `cat notes.txt` → No such file",
+		},
+		{
+			name:    "Edit echoed absolute path",
+			tool:    "Edit",
+			file:    "/x/data/ab.txt",
+			content: "Bash error: `cat /x/data/ab.txt` → cat: /x/data/ab.txt: No such file or directory",
+		},
+		{
+			name:    "Write shell-tool transcript",
+			tool:    "Write",
+			file:    "/x/data/ab.txt",
+			content: "shell error: Unable to execute command: cat ab.txt → No such file or directory",
+		},
+		{
+			name:    "Edit echoed directory only",
+			tool:    "Edit",
+			file:    "/x/data/ab.txt",
+			content: "Bash error: `ls -la /x/data` → Permission denied",
+		},
+		{
+			name:    "Write hidden-directory echo",
+			tool:    "Write",
+			file:    "/x/.yesmem/tmp/report.md",
+			content: "Bash error: `rm -rf .yesmem/tmp/report.md` → Operation not permitted",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := openTempStore(t, func(s *storage.Store) {
+				insertGotcha(t, s, tt.content, "hook_auto_learned", "")
+			})
+			out := runCheckWithHook(t, dir, HookInput{
+				ToolName:  tt.tool,
+				CWD:       "/x/data",
+				ToolInput: json.RawMessage(`{"file_path":"` + tt.file + `"}`),
+			})
+			if out != "" {
+				t.Errorf("Bash-origin gotcha injected on %s by filename alone, got: %s", tt.tool, out)
+			}
+		})
+	}
+}
+
+// TestRunCheckExtensionlessFilenameNotInjectedByFilenameAlone is the regression
+// guard for the MED-1 finding on top of issue #151. The file-op guard recognised
+// the file name only by a "." inside the keyword, so for Makefile/Dockerfile/
+// README the name itself stayed counted as overlap outside the file name and the
+// Bash transcript was injected again — the exact #151 error class.
+func TestRunCheckExtensionlessFilenameNotInjectedByFilenameAlone(t *testing.T) {
+	tests := []struct {
+		name    string
+		tool    string
+		file    string
+		content string
+	}{
+		{
+			name:    "Write Makefile",
+			tool:    "Write",
+			file:    "/home/u/yesmem/Makefile",
+			content: "Bash error: `make deploy` in /home/u/yesmem → make: *** [Makefile:12: deploy] Error 1",
+		},
+		{
+			name:    "Edit Dockerfile",
+			tool:    "Edit",
+			file:    "/home/u/yesmem/Dockerfile",
+			content: "Bash error: `docker build .` in /home/u/yesmem → ERROR: failed to solve: Dockerfile:7: unknown instruction",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := openTempStore(t, func(s *storage.Store) {
+				insertGotcha(t, s, tt.content, "hook_auto_learned", "")
+			})
+			out := runCheckWithHook(t, dir, HookInput{
+				ToolName:  tt.tool,
+				CWD:       "/home/u/yesmem",
+				ToolInput: json.RawMessage(`{"file_path":"` + tt.file + `"}`),
+			})
+			if out != "" {
+				t.Errorf("Bash-origin gotcha injected on %s of an extension-less file by file name alone, got: %s", tt.tool, out)
+			}
+		})
+	}
+}
+
+// TestRunCheckBashGotchaNotInjectedOnEditOfItsOwnFile pins the deliberate
+// behaviour change of issue #151 for the file a Bash failure transcript talks
+// about. The transcript echoes the path and the file name, so neither counts as
+// overlap outside the file name — a known #151 trade-off, accepted knowingly.
+func TestRunCheckBashGotchaNotInjectedOnEditOfItsOwnFile(t *testing.T) {
+	dir := openTempStore(t, func(s *storage.Store) {
+		insertGotcha(t, s, "Bash error: `go test ./internal/hooks` → check.go:42: undefined: foo",
+			"hook_auto_learned", "")
+	})
+	out := runCheckWithHook(t, dir, HookInput{
+		ToolName:  "Edit",
+		CWD:       "/workspaces/yesmem",
+		ToolInput: json.RawMessage(`{"file_path":"/workspaces/yesmem/internal/hooks/check.go"}`),
+	})
+	if out != "" {
+		t.Errorf("Bash transcript naming only the file name and path must not be injected on Edit, got: %s", out)
+	}
+}
+
+// TestRunCheckBashGotchaInjectedOnFileOpWithContentOverlap verifies the fix is
+// not a blanket suppression: a Bash-origin gotcha that overlaps with the file
+// path beyond the filename itself still fires on Write/Edit.
+func TestRunCheckBashGotchaInjectedOnFileOpWithContentOverlap(t *testing.T) {
+	dir := openTempStore(t, func(s *storage.Store) {
+		insertGotcha(t, s, "Bash error: `go test ./hooks/` in yesmem → build failed",
+			"hook_auto_learned", "")
+	})
+	out := runCheckWithHook(t, dir, HookInput{
+		ToolName:  "Write",
+		CWD:       "/workspaces/yesmem",
+		ToolInput: json.RawMessage(`{"file_path":"/workspaces/yesmem/internal/hooks/check.go"}`),
+	})
+	if !strings.Contains(out, "build failed") {
+		t.Errorf("Bash-origin gotcha with real content overlap should still fire on Write, got: %s", out)
+	}
+}
+
+// TestRunCheckBashGotchaInjectedOnBashUnchanged verifies the Bash path keeps
+// full match power — the file-op guard must not weaken Bash injection.
+func TestRunCheckBashGotchaInjectedOnBashUnchanged(t *testing.T) {
+	dir := openTempStore(t, func(s *storage.Store) {
+		insertGotcha(t, s, "Bash error: `cat ab.txt` → No such file", "hook_auto_learned", "")
+	})
+	out := runCheckWithHook(t, dir, HookInput{
+		ToolName:  "Bash",
+		CWD:       "/x/data",
+		ToolInput: json.RawMessage(`{"command":"cat ab.txt"}`),
+	})
+	if !strings.Contains(out, "Bash error") {
+		t.Errorf("Bash-origin gotcha must still fire on a Bash call, got: %s", out)
+	}
+}
+
+// TestRunCheckBashOriginFileOpV2EntityStillMatches pins the Phase 2 decision that
+// the guard narrows only the keyword shortcut: the V2 entity/action path stays
+// open for file ops (issue #151 asks for no blanket origin-tool exclusion). The
+// consequence, accepted knowingly: a Bash-origin gotcha that explicitly carries
+// the file as an entity can still fire on a file op. Hook-learned rows carry no
+// entities today, so this fixes the intended behaviour rather than live data.
+func TestRunCheckBashOriginFileOpV2EntityStillMatches(t *testing.T) {
+	dir := openTempStore(t, func(s *storage.Store) {
+		if _, err := s.InsertLearning(&models.Learning{
+			Category:   "gotcha",
+			Content:    "Bash error: `make regen` → rebuild failed",
+			Source:     "hook_auto_learned",
+			Confidence: 0.7,
+			CreatedAt:  time.Now(),
+			ModelUsed:  "test",
+			Entities:   []string{"check.go"},
+		}); err != nil {
+			t.Fatalf("insert V2 gotcha: %v", err)
+		}
+	})
+	out := runCheckWithHook(t, dir, HookInput{
+		ToolName:  "Write",
+		CWD:       "/workspaces/yesmem",
+		ToolInput: json.RawMessage(`{"file_path":"/workspaces/yesmem/internal/hooks/check.go"}`),
+	})
+	if !strings.Contains(out, "rebuild failed") {
+		t.Errorf("V2 entity match should still inject on a file op, got: %s", out)
+	}
+}
+
+// TestRunCheckNonBashOriginFileOpShortcutUnchanged verifies the fix stays scoped:
+// gotchas that are not Bash-origin keep the file-op filename shortcut.
+func TestRunCheckNonBashOriginFileOpShortcutUnchanged(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     string
+		originTool string
+		content    string
+	}{
+		{"user_stated", "user_stated", "", "Never write ab.txt directly (generated)"},
+		{"empty source", "", "", "ab.txt is regenerated by the build"},
+		{"hook_auto_learned read-origin", "hook_auto_learned", "", "Read error: `ab.txt` → No such file"},
+		{"hook_auto_learned web-origin", "hook_auto_learned", "web_external", "WebFetch error: `ab.txt` → blocked"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := openTempStore(t, func(s *storage.Store) {
+				insertGotcha(t, s, tt.content, tt.source, tt.originTool)
+			})
+			out := runCheckWithHook(t, dir, HookInput{
+				ToolName:  "Write",
+				CWD:       "/x/data",
+				ToolInput: json.RawMessage(`{"file_path":"/x/data/ab.txt"}`),
+			})
+			if !strings.Contains(out, "ab.txt") {
+				t.Errorf("non-Bash-origin gotcha should still use the file-op shortcut, got: %s", out)
+			}
+		})
+	}
+}
+
+// TestRunCheckBashGotchaNotInjectedWithExplicitOriginTool pins the origin branch
+// of the predicate: an explicit Bash/bash_command_input origin, or the German
+// content-prefix variant, is treated as Bash-origin too.
+func TestRunCheckBashGotchaNotInjectedWithExplicitOriginTool(t *testing.T) {
+	tests := []struct {
+		name       string
+		originTool string
+		content    string
+	}{
+		{"origin_tool Bash", "Bash", "command failed while scanning ab.txt"},
+		{"origin_tool bash_command_input", "bash_command_input", "command failed while scanning ab.txt"},
+		{"german content prefix", "", "Bash-Fehler: `cat ab.txt` → Datei nicht gefunden"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := openTempStore(t, func(s *storage.Store) {
+				insertGotcha(t, s, tt.content, "hook_auto_learned", tt.originTool)
+			})
+			out := runCheckWithHook(t, dir, HookInput{
+				ToolName:  "Write",
+				CWD:       "/x/data",
+				ToolInput: json.RawMessage(`{"file_path":"/x/data/ab.txt"}`),
+			})
+			if strings.Contains(out, "ab.txt") {
+				t.Errorf("Bash-origin gotcha injected on Write by filename alone, got: %s", out)
+			}
+		})
+	}
+}
+
+// TestRunCheckBashOriginFileOpBlockUsesTheSameAdmission pins the second-order
+// consequence of the #151/MED-1 admission for the hard-block path. A gotcha
+// whose file-op overlap is nothing but the target file name is not admitted, so
+// findBlockableGotcha never sees it and the escalated Bash-origin gotcha no
+// longer denies an Edit of that file. Accepted deliberately: the block sits
+// downstream of the same "does this gotcha belong to this file op?" question,
+// and the admission verdict is what that question now answers.
+//
+// The positive half (an admitted gotcha with fail_count >= blockThreshold still
+// denies) cannot run in-process: blockGotchaCall ends with os.Exit(2), which
+// would take the test binary down. It is covered by TestFindBlockableGotcha and
+// was confirmed against real binaries for this branch — the same seeded gotcha
+// exits 2 on the pre-fix binary and 0 here.
+func TestRunCheckBashOriginFileOpBlockUsesTheSameAdmission(t *testing.T) {
+	const content = "Bash error: `make deploy` in /workspaces/yesmem/.worktrees → make: *** [Makefile:12: deploy] Error 1"
+	seed := func(s *storage.Store) {
+		id := insertGotcha(t, s, content, "hook_auto_learned", "bash")
+		for i := 0; i < blockThreshold; i++ {
+			if err := s.IncrementFailCounts([]int64{id}); err != nil {
+				t.Fatalf("escalate fail count: %v", err)
+			}
+		}
+	}
+
+	t.Run("Edit of the echoed file is neither warned nor blocked", func(t *testing.T) {
+		dir := openTempStore(t, seed)
+		out := runCheckWithHook(t, dir, HookInput{
+			ToolName:  "Edit",
+			CWD:       "/workspaces/yesmem",
+			ToolInput: json.RawMessage(`{"file_path":"/workspaces/yesmem/.worktrees/Makefile"}`),
+		})
+		if strings.Contains(out, `"decision":"block"`) {
+			t.Errorf("escalated Bash-origin gotcha blocked an Edit by file name alone, got: %s", out)
+		}
+		if out != "" {
+			t.Errorf("escalated Bash-origin gotcha injected on Edit by file name alone, got: %s", out)
+		}
+	})
+
+	t.Run("the same gotcha is live on the Bash call", func(t *testing.T) {
+		dir := openTempStore(t, seed)
+		out := runCheckWithHook(t, dir, HookInput{
+			ToolName:  "Bash",
+			CWD:       "/workspaces/yesmem",
+			ToolInput: json.RawMessage(`{"command":"make deploy"}`),
+		})
+		if !strings.Contains(out, "make deploy") {
+			t.Errorf("gotcha did not fire on the Bash call — the harness, not the guard, is silent: %s", out)
+		}
+	})
+}
+
 // TestRunCheckCWDKeepsGlobalGotchas verifies that project-scoped filtering
-// still surfaces global gotchas (canonical_project = ''), which are
+// still surfaces global gotchas (canonical_project = ”), which are
 // intentionally project-agnostic.
 func TestRunCheckCWDKeepsGlobalGotchas(t *testing.T) {
 	dir := t.TempDir()

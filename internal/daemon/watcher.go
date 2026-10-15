@@ -64,13 +64,12 @@ func (w *Watcher) run(watcher *fsnotify.Watcher) {
 	// Debounce: track last change time per file.
 	// Indexing triggers after 3s quiet (fast, no LLM).
 	// LLM extraction triggers after 5min quiet (session likely done).
-	pending := map[string]time.Time{}
-	indexed := map[string]time.Time{} // tracks when we last indexed a file
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
 	const indexDebounce = 3 * time.Second
 	const extractDebounce = 5 * time.Minute
+
+	deb := newFileDebouncer(indexDebounce, extractDebounce)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -96,7 +95,7 @@ func (w *Watcher) run(watcher *fsnotify.Watcher) {
 			}
 
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-				pending[event.Name] = time.Now()
+				deb.mark(event.Name, time.Now())
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -106,24 +105,15 @@ func (w *Watcher) run(watcher *fsnotify.Watcher) {
 			log.Printf("watcher error: %v", err)
 
 		case <-ticker.C:
-			now := time.Now()
-			for path, lastChange := range pending {
-				quiet := now.Sub(lastChange)
-
-				// Quick index after 3s (no LLM, makes search work immediately)
-				if quiet > indexDebounce {
-					if lastIdx, ok := indexed[path]; !ok || lastChange.After(lastIdx) {
-						indexed[path] = now
-						w.onChange(path) // this only indexes, extraction is separate
-					}
-				}
-
-				// LLM extraction after 5min quiet (session is likely done)
-				if quiet > extractDebounce {
-					delete(pending, path)
-					if w.onSettled != nil {
-						w.onSettled(path)
-					}
+			toIndex, settled := deb.due(time.Now())
+			// Quick index after 3s (no LLM, makes search work immediately)
+			for _, path := range toIndex {
+				w.onChange(path) // this only indexes, extraction is separate
+			}
+			// LLM extraction after 5min quiet (session is likely done)
+			for _, path := range settled {
+				if w.onSettled != nil {
+					w.onSettled(path)
 				}
 			}
 		}

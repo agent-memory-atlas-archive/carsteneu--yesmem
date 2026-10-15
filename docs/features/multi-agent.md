@@ -113,7 +113,7 @@ Full lifecycle management for sub-agents spawned as PTY subprocesses:
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `spawn_agent` | `project`, `section`, `backend?`, `caller_session?`, `token_budget?`, `work_dir?`, `max_turns?`, `model?` | Spawn a new agent process with PTY bridge |
+| `spawn_agent` | `project`, `section`, `backend?`, `caller_session?`, `token_budget?`, `work_dir?`, `max_turns?`, `model?`, `theme?` | Spawn a new agent process with PTY bridge. `theme` selects the TUI theme for this agent (empty = the theme of the agent type, see `agents.themes`) |
 | `list_agents` | `project?` | List all agents with status, PID, heartbeat |
 | `get_agent` | `to`, `project?` | Detailed agent info (progress, relay count, errors) |
 | `relay_agent` | `to`, `content`, `project?`, `caller_session?` | Inject content into agent's terminal via PTY |

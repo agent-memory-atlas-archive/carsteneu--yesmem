@@ -71,7 +71,7 @@ The core of YesMem's proactive knowledge injection. Fires on every Bash, Edit, a
    - **Bash:** `extractKeywords(command)` — splits command into significant tokens
    - **Edit/Write:** `extractPathKeywords(filePath)` — path components, filename, extension
 2. **Scoring** against all active gotcha learnings:
-   - **Content matching:** keyword overlap with learning text (score ≥ 2 for Bash, or ≥ 1 with long keyword match ≥6 chars; score ≥ 2 for file ops, or ≥ 1 with filename match)
+   - **Content matching:** keyword overlap with learning text (score ≥ 2 for Bash, or ≥ 1 with long keyword match ≥6 chars; score ≥ 2 for file ops, or ≥ 1 with filename match). A gotcha auto-learned from a Bash failure never uses the file-op filename shortcut: on Edit/Write it needs score ≥ 2 **and** overlap outside the target path and the file name — the pending file op does not run the command that failed (issue #151)
    - **V2 Entity/Action matching:** direct comparison against structured `learning_entities` and `learning_actions` junction data — more precise than keyword overlap
    - **Long keyword bonus:** single match on keywords ≥ 6 chars counts (avoids noise from short tokens)
 3. **Project scoping:** matches split into project-specific (max 3) and global (max 2) buckets. If 0 project matches → global gets 3 slots.

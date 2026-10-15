@@ -1056,7 +1056,7 @@ func TestSpawnAgentProcess_OpencodeResume_EmptySession_MarksError(t *testing.T) 
 
 	// resume=true + backend=opencode + empty OpencodeSessionID → defensive block.
 	h.spawnAgentProcess("agent-1", "daemon-uuid-36-chars-xxxxxxxxx", "proj", "task",
-		"", "/nonexistent/agent-1.sock", t.TempDir(), "opencode", "", 0, true)
+		"", "/nonexistent/agent-1.sock", t.TempDir(), "opencode", "", "", 0, 0, "", true)
 
 	agent, err := s.AgentGet("agent-1")
 	if err != nil || agent == nil {

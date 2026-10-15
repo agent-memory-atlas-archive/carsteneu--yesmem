@@ -52,28 +52,28 @@ type Message struct {
 	FilePath    string    `json:"file_path,omitempty"`
 	Timestamp   time.Time `json:"timestamp"`
 	Sequence    int       `json:"sequence"`
-	Model       string    `json:"model,omitempty"`   // model provenance (e.g. claude-sonnet-4-20250514)
+	Model       string    `json:"model,omitempty"` // model provenance (e.g. claude-sonnet-4-20250514)
 }
 
 // Learning represents an extracted piece of knowledge.
 type Learning struct {
-	ID              int64      `json:"id"`
-	SessionID       string     `json:"session_id,omitempty"`
-	Category        string     `json:"category"`
-	Content         string     `json:"content"`
-	Project         string     `json:"project,omitempty"`
-	Confidence      float64    `json:"confidence"`
-	SupersededBy    *int64     `json:"superseded_by,omitempty"`
-	SupersedeReason string     `json:"supersede_reason,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
-	ModelUsed       string     `json:"model_used"`
-	Source          string     `json:"source,omitempty"` // user_stated, claude_suggested, agreed_upon, llm_extracted
-	OriginTool      string     `json:"origin_tool,omitempty"` // user, bash_command_input, file_read, web_external, cap_<name>, llm_extracted_session
-	SourceAgent     string     `json:"source_agent,omitempty"`
-	TargetAgent     string     `json:"target_agent,omitempty"`
-	CanonicalProject string    `json:"canonical_project,omitempty"` // parent project basename for worktree→main promotion
-	ProjectSource    string    `json:"project_source,omitempty"`    // attribution basis: explicit|repo|session|content|ambiguous
+	ID                 int64      `json:"id"`
+	SessionID          string     `json:"session_id,omitempty"`
+	Category           string     `json:"category"`
+	Content            string     `json:"content"`
+	Project            string     `json:"project,omitempty"`
+	Confidence         float64    `json:"confidence"`
+	SupersededBy       *int64     `json:"superseded_by,omitempty"`
+	SupersedeReason    string     `json:"supersede_reason,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
+	ModelUsed          string     `json:"model_used"`
+	Source             string     `json:"source,omitempty"`      // user_stated, claude_suggested, agreed_upon, llm_extracted
+	OriginTool         string     `json:"origin_tool,omitempty"` // user, bash_command_input, file_read, web_external, cap_<name>, llm_extracted_session
+	SourceAgent        string     `json:"source_agent,omitempty"`
+	TargetAgent        string     `json:"target_agent,omitempty"`
+	CanonicalProject   string     `json:"canonical_project,omitempty"` // parent project basename for worktree→main promotion
+	ProjectSource      string     `json:"project_source,omitempty"`    // attribution basis: explicit|repo|session|content|ambiguous
 	HitCount           int        `json:"hit_count"`
 	FailCount          int        `json:"fail_count"`
 	EmotionalIntensity float64    `json:"emotional_intensity,omitempty"`
@@ -269,11 +269,11 @@ type SelfFeedback struct {
 type PersonaTrait struct {
 	ID            int64     `json:"id"`
 	UserID        string    `json:"user_id"`
-	Dimension     string    `json:"dimension"`      // communication, workflow, expertise, context, boundaries, learning_style
+	Dimension     string    `json:"dimension"` // communication, workflow, expertise, context, boundaries, learning_style
 	TraitKey      string    `json:"trait_key"`
 	TraitValue    string    `json:"trait_value"`
 	Confidence    float64   `json:"confidence"`
-	Source        string    `json:"source"`          // auto_extracted, user_override
+	Source        string    `json:"source"` // auto_extracted, user_override
 	EvidenceCount int       `json:"evidence_count"`
 	FirstSeen     time.Time `json:"first_seen"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -292,14 +292,14 @@ type PersonaDirective struct {
 
 // KnowledgeGap represents a topic where no learnings were found.
 type KnowledgeGap struct {
-	ID         int64     `json:"id"`
-	Topic      string    `json:"topic"`
-	Project    string    `json:"project,omitempty"`
-	FirstSeen  time.Time `json:"first_seen"`
-	LastSeen   time.Time `json:"last_seen"`
-	HitCount   int       `json:"hit_count"`
+	ID         int64      `json:"id"`
+	Topic      string     `json:"topic"`
+	Project    string     `json:"project,omitempty"`
+	FirstSeen  time.Time  `json:"first_seen"`
+	LastSeen   time.Time  `json:"last_seen"`
+	HitCount   int        `json:"hit_count"`
 	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
-	ResolvedBy *int64    `json:"resolved_by,omitempty"`
+	ResolvedBy *int64     `json:"resolved_by,omitempty"`
 }
 
 // SearchResult represents a search hit from Bleve.
@@ -317,11 +317,27 @@ type SearchResult struct {
 }
 
 // IndexState tracks whether a JSONL file has been indexed.
+//
+// IndexedOffset/IndexedSessionID/IndexedMsgCount form the append watermark:
+// they describe the byte position directly after the last complete line that
+// was parsed, which session identity that position belongs to, and how many
+// messages the session had at that point. Together they let a grown file be
+// indexed by parsing only its tail.
 type IndexState struct {
 	JSONLPath string    `json:"jsonl_path"`
 	FileSize  int64     `json:"file_size"`
 	FileMtime time.Time `json:"file_mtime"`
 	IndexedAt time.Time `json:"indexed_at"`
+
+	IndexedOffset    int64  `json:"indexed_offset"`
+	IndexedSessionID string `json:"indexed_session_id"`
+	IndexedMsgCount  int    `json:"indexed_msg_count"`
+	// IndexedPrefixHash fingerprints the last 256 bytes immediately before
+	// IndexedOffset. An append never changes them, so a mismatch means the
+	// already-indexed region was rewritten and the offset can no longer be
+	// trusted. It is a window at the offset, not a hash of the whole prefix: a
+	// length-preserving edit further back leaves it unchanged.
+	IndexedPrefixHash string `json:"indexed_prefix_hash"`
 }
 
 // ProjectShortFromPath returns the canonical absolute path for a project directory.

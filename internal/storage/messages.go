@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"sort"
@@ -11,6 +12,11 @@ import (
 
 // InsertMessages inserts a batch of messages in a single transaction.
 // Writes to messages.db and syncs FTS5 index.
+//
+// Every message must carry a sequence that is unique within its session (the
+// (session_id, sequence) index is UNIQUE, so a batch that repeats one is rejected
+// as a whole). Callers either let the parser assign sequences or count them from
+// zero; leaving the field at its zero value would insert colliding rows.
 func (s *Store) InsertMessages(msgs []models.Message) error {
 	db := s.messagesWriteDB()
 	tx, err := db.Begin()
@@ -19,6 +25,42 @@ func (s *Store) InsertMessages(msgs []models.Message) error {
 	}
 	defer tx.Rollback()
 
+	if err := insertMessagesTx(tx, msgs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReplaceMessagesBySession swaps a session's messages for a new set in one
+// transaction: the old rows and their FTS entries go, the new ones come in, or
+// nothing happens at all.
+//
+// Re-indexing a session used to delete and then insert as two separate
+// statements, so a crash in between — or a second writer losing the race for the
+// unique (session_id, sequence) index — left the session with no messages while
+// the index watermark still described the indexed file.
+func (s *Store) ReplaceMessagesBySession(sessionID string, msgs []models.Message) error {
+	db := s.messagesWriteDB()
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := deleteMessagesBySessionTx(tx, sessionID); err != nil {
+		return err
+	}
+	if msgs != nil {
+		if err := insertMessagesTx(tx, msgs); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// insertMessagesTx inserts the batch plus its FTS rows inside the caller's
+// transaction.
+func insertMessagesTx(tx *sql.Tx, msgs []models.Message) error {
 	stmt, err := tx.Prepare(`INSERT INTO messages
 		(session_id, source_agent, role, message_type, content, content_blob, tool_name, file_path, timestamp, sequence, model)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -52,8 +94,21 @@ func (s *Store) InsertMessages(msgs []models.Message) error {
 			}
 		}
 	}
+	return nil
+}
 
-	return tx.Commit()
+// deleteMessagesBySessionTx removes a session's messages and their FTS rows
+// inside the caller's transaction.
+func deleteMessagesBySessionTx(tx *sql.Tx, sessionID string) error {
+	if _, err := tx.Exec(
+		`DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE session_id = ?)`,
+		sessionID); err != nil {
+		return fmt.Errorf("delete fts for %s: %w", sessionID, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("delete messages for %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 // GetMessagesBySession returns all messages for a session, ordered by sequence.
@@ -104,10 +159,33 @@ func (s *Store) GetMessagesBySessionRange(sessionID string, fromSeq, toSeq int) 
 // DeleteMessagesBySession removes all messages for a session (for re-indexing).
 func (s *Store) DeleteMessagesBySession(sessionID string) error {
 	db := s.messagesWriteDB()
-	// Delete FTS5 entries first
-	db.Exec(`DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE session_id = ?)`, sessionID)
-	_, err := db.Exec(`DELETE FROM messages WHERE session_id = ?`, sessionID)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := deleteMessagesBySessionTx(tx, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteMessagesFromSequence removes the tail of a session: every message with
+// sequence >= fromSeq plus its FTS row. Used before an incremental append insert
+// so a previous run that inserted messages but crashed before persisting the new
+// byte offset cannot leave duplicates behind — re-running the append is idempotent.
+// With fromSeq <= 0 it is equivalent to DeleteMessagesBySession.
+func (s *Store) DeleteMessagesFromSequence(sessionID string, fromSeq int) error {
+	db := s.messagesWriteDB()
+	if _, err := db.Exec(`DELETE FROM messages_fts WHERE rowid IN (
+		SELECT id FROM messages WHERE session_id = ? AND sequence >= ?)`, sessionID, fromSeq); err != nil {
+		return fmt.Errorf("delete fts tail for %s from seq %d: %w", sessionID, fromSeq, err)
+	}
+	if _, err := db.Exec(`DELETE FROM messages WHERE session_id = ? AND sequence >= ?`, sessionID, fromSeq); err != nil {
+		return fmt.Errorf("delete message tail for %s from seq %d: %w", sessionID, fromSeq, err)
+	}
+	return nil
 }
 
 // MessageSearchResult holds a single FTS5 search hit.
@@ -477,6 +555,20 @@ func (s *Store) runDeepSearchScan(query string, args []any, limit int) ([]Messag
 		}
 	}
 	return results, rows.Err()
+}
+
+// SessionMessageStats summarises a session's stored messages: how many there are
+// and the lowest and highest sequence they occupy. Together with the append
+// watermark this tells whether the rows are a clean contiguous run (count == 0
+// or min == 0 && max == count-1) or whether duplicates, gaps or missing rows have
+// crept in.
+func (s *Store) SessionMessageStats(sessionID string) (count, minSeq, maxSeq int, err error) {
+	if err := s.messagesReaderDB().QueryRow(
+		`SELECT COUNT(*), COALESCE(MIN(sequence), 0), COALESCE(MAX(sequence), -1)
+		 FROM messages WHERE session_id = ?`, sessionID).Scan(&count, &minSeq, &maxSeq); err != nil {
+		return 0, 0, 0, fmt.Errorf("message stats for %s: %w", sessionID, err)
+	}
+	return count, minSeq, maxSeq, nil
 }
 
 // MessageCount returns total message count in messages.db.

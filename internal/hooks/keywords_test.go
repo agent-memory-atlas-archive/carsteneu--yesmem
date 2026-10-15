@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"path/filepath"
 	"testing"
 )
 
@@ -137,5 +138,78 @@ func TestExtractPathKeywords(t *testing.T) {
 				t.Errorf("extractPathKeywords(%q) = %v, missing %q", tt.path, kw, want)
 			}
 		}
+	}
+}
+
+func TestHasNonFilenameKeywordMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "file name only",
+			path:    "/x/data/ab.txt",
+			content: "Bash error: `cat ab.txt` → No such file",
+			want:    false,
+		},
+		{
+			name:    "file name with stem",
+			path:    "/x/data/notes.txt",
+			content: "Bash error: `cat notes.txt` → No such file",
+			want:    false,
+		},
+		{
+			name:    "echoed absolute path",
+			path:    "/x/data/ab.txt",
+			content: "Bash error: `cat /x/data/ab.txt` → cat: /x/data/ab.txt: No such file",
+			want:    false,
+		},
+		{
+			name:    "echoed directory only",
+			path:    "/x/data/ab.txt",
+			content: "Bash error: `ls -la /x/data` → Permission denied",
+			want:    false,
+		},
+		{
+			name:    "directory segment as a standalone word",
+			path:    "/x/data/ab.txt",
+			content: "Bash error: `cp ab.txt data` → data is read-only",
+			want:    true,
+		},
+		{
+			name:    "unrelated transcript",
+			path:    "/x/data/ab.txt",
+			content: "Bash error: `systemctl restart nginx` → Unit not found",
+			want:    false,
+		},
+		{
+			// MED-1: the file name is the last path segment, whether or not it
+			// carries an extension. "Makefile" must not count as overlap just
+			// because the transcript echoes "[Makefile:12:".
+			name:    "extension-less file name only",
+			path:    "/home/u/yesmem/Makefile",
+			content: "Bash error: `make deploy` in /home/u/yesmem → make: *** [Makefile:12: deploy] Error 1",
+			want:    false,
+		},
+		{
+			// Guard against over-suppression: a non-filename path segment that
+			// the transcript mentions as a standalone word still counts.
+			name:    "extension-less file name plus standalone segment",
+			path:    "/home/u/yesmem/Makefile",
+			content: "Bash error: `make yesmem` → make: *** [Makefile:12: yesmem] Error 1",
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasNonFilenameKeywordMatch(extractPathKeywords(tt.path), tt.content, filepath.Base(tt.path))
+			if got != tt.want {
+				t.Errorf("hasNonFilenameKeywordMatch(%q, %q) = %v, want %v",
+					tt.path, tt.content, got, tt.want)
+			}
+		})
 	}
 }

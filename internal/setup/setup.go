@@ -1516,6 +1516,15 @@ http:
   listen: "127.0.0.1:9377"
   auth_token: ""
 
+# --- Diagnostics (optional) ---
+# Debug endpoints for troubleshooting memory growth. Off by default.
+# pprof binds loopback only (never 0.0.0.0) and exposes allocation sites and
+# goroutine stacks, not session content. YESMEM_PPROF=1 in the environment
+# overrides the pprof flag.
+diagnostics:
+  pprof: false
+  pprof_listen: "127.0.0.1:7071"
+
 # --- Paths ---
 # All paths have sensible defaults under ~/.claude/yesmem/.
 # Only set these if you need a custom location.
@@ -1550,6 +1559,15 @@ agents:
   max_turns: 0
   max_depth: 0
   token_budget: 0
+
+  # TUI theme per agent type (section prefix). The yesmem theme family is
+  # installed to ~/.config/opencode/themes; any opencode theme name works,
+  # an empty value disables the theme for that type.
+  themes:
+    yesloop: yesmem-loop
+    yesresearch: yesmem-research
+    subresearch: yesmem-subresearch
+    orchestrator: yesmem-dark
   `, summarizeModel, model, narrativeModel, qualityModel, autoExtract, llmBlock, langs, apiBlock, terminal, agentsBackend)
 }
 
@@ -2241,7 +2259,19 @@ func installOpencodePlugin(home, binaryPath, primaryModel, smallModel string) er
 		}
 	}
 
-	return mergeOpencodeJSON(home, pluginSource, primaryModel, smallModel)
+	if err := mergeOpencodeJSON(home, pluginSource, primaryModel, smallModel); err != nil {
+		return err
+	}
+	// Window plugin: registers which session a terminal window shows so
+	// spawned agents open on the caller's desktop.
+	if _, err := InstallWindowPlugin(home); err != nil {
+		fmt.Fprintf(os.Stderr, "  opencode window plugin not installed: %v\n", err)
+	}
+	// Agent themes: the type-accented theme family spawned agent TUIs select.
+	if _, err := InstallThemes(home); err != nil {
+		fmt.Fprintf(os.Stderr, "  opencode agent themes not installed: %v\n", err)
+	}
+	return nil
 }
 
 // installOpencodePluginSource copies the bundled opencode plugin source files

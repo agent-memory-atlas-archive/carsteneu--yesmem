@@ -951,39 +951,6 @@ func TestFormatCheckMessagesResult_InvalidJSON(t *testing.T) {
 	}
 }
 
-// --- notifySession (edge cases without xdotool) ---
-
-func TestNotifySession_NoWindow(t *testing.T) {
-	h, _ := mustHandler(t)
-	if h.notifySession("unknown-sess", "text") {
-		t.Error("expected false for unregistered session")
-	}
-}
-
-func TestNotifySession_Ghostty(t *testing.T) {
-	h, _ := mustHandler(t)
-	h.windowMapMu.Lock()
-	h.windowMap["ghost-sess"] = "0xABCD"
-	h.terminalMap["ghost-sess"] = "ghostty"
-	h.windowMapMu.Unlock()
-
-	if h.notifySession("ghost-sess", "text") {
-		t.Error("expected false for ghostty terminal")
-	}
-}
-
-func TestNotifySession_SharedWindow(t *testing.T) {
-	h, _ := mustHandler(t)
-	h.windowMapMu.Lock()
-	h.windowMap["sess-a"] = "0xSHARED"
-	h.windowMap["sess-b"] = "0xSHARED"
-	h.windowMapMu.Unlock()
-
-	if h.notifySession("sess-a", "text") {
-		t.Error("expected false for shared window")
-	}
-}
-
 func TestHandleWhoami_IncludesModelFromProxyState(t *testing.T) {
 	h, s := mustHandler(t)
 	if err := s.SetProxyState("session_model:sid-w-model", "claude-opus-4-7"); err != nil {

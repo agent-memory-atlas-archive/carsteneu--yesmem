@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/carsteneu/yesmem/internal/textutil"
@@ -74,6 +75,18 @@ func (s *Store) createSchema() error {
 		}
 	}
 
+	// The messages sequence index is a UNIQUE one and is created by its own
+	// guard, because upgrading a database that still holds duplicates needs a
+	// purge first (see ensureUniqueMessageSequence). yesmem.db carries a mirror
+	// of the messages table, so it gets the same treatment as messages.db.
+	//
+	// A failure is not fatal: the repair runs again on the next Open, and refusing
+	// to start (or to serve a hook) over a lock timeout would be worse than running
+	// one more session with the older, non-unique index.
+	if err := ensureUniqueMessageSequence(s.db); err != nil {
+		log.Printf("warn: messages sequence index not repaired: %v", err)
+	}
+
 	// FTS5 for learnings — table only, NO triggers (background sync instead)
 	if _, err := s.db.Exec(tableLearningsFTS); err != nil {
 		return err
@@ -141,6 +154,14 @@ func (s *Store) createMessagesSchema() error {
 	// Migrations for messages.db (run idempotently, ignore "duplicate column" errors)
 	for _, mig := range messagesMigrations {
 		db.Exec(mig)
+	}
+
+	// The append path binds session_id and sequence (message stats, tail trim):
+	// without that index they fall back to a scan of the session's entries
+	// through idx_messages_session_type, which grows with the session. It is
+	// UNIQUE, created and repaired by its own guard.
+	if err := ensureUniqueMessageSequence(db); err != nil {
+		log.Printf("warn: messages sequence index not repaired: %v", err)
 	}
 
 	return nil
@@ -523,6 +544,15 @@ var migrations = []string{
 	`ALTER TABLE learnings ADD COLUMN project_source TEXT NOT NULL DEFAULT ''`,
 	// v0.70: Agent permission-kick setting — ''=inherit config default, on/off override
 	`ALTER TABLE agents ADD COLUMN permission_kick TEXT DEFAULT ''`,
+	// v0.71: Append watermark on index_state — byte offset after the last complete
+	// parsed line, the session identity it belongs to, and the message count at that
+	// point. Enables tail-only reindexing of grown session files.
+	`ALTER TABLE index_state ADD COLUMN indexed_offset INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE index_state ADD COLUMN indexed_session_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE index_state ADD COLUMN indexed_msg_count INTEGER NOT NULL DEFAULT 0`,
+	// v0.72: Fingerprint of the bytes before the append watermark, so a rewrite
+	// in place cannot be mistaken for an append.
+	`ALTER TABLE index_state ADD COLUMN indexed_prefix_hash TEXT NOT NULL DEFAULT ''`,
 }
 
 // messagesMigrations runs against messages.db (separate from yesmem.db migrations).
@@ -647,7 +677,11 @@ const tableIndexState = `CREATE TABLE IF NOT EXISTS index_state (
 	jsonl_path  TEXT PRIMARY KEY,
 	file_size   INTEGER NOT NULL,
 	file_mtime  TEXT NOT NULL,
-	indexed_at  TEXT NOT NULL
+	indexed_at  TEXT NOT NULL,
+	indexed_offset    INTEGER NOT NULL DEFAULT 0,
+	indexed_session_id TEXT NOT NULL DEFAULT '',
+	indexed_msg_count  INTEGER NOT NULL DEFAULT 0,
+	indexed_prefix_hash TEXT NOT NULL DEFAULT ''
 )`
 
 const tableOpencodeScanState = `CREATE TABLE IF NOT EXISTS opencode_scan_state (
@@ -728,10 +762,17 @@ const tableSessionTracking = `CREATE TABLE IF NOT EXISTS session_tracking (
 )`
 
 var indices = []string{
+	// Mirror of the messages.db index set: yesmem.db carries a legacy messages
+	// table, and createSchema must not fail on it. The (session_id, sequence)
+	// index is deliberately not part of this list — it is UNIQUE and owned by
+	// ensureUniqueMessageSequence, which can repair a database that predates it.
 	`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type)`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_file ON messages(file_path) WHERE file_path IS NOT NULL`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`,
+	// The append path asks who owns a session by looking the session id up here,
+	// once per reindex of a grown file.
+	`CREATE INDEX IF NOT EXISTS idx_index_state_session ON index_state(indexed_session_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_short)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_project_started ON sessions(project, started_at DESC)`,

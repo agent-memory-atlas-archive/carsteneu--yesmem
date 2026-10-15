@@ -39,6 +39,31 @@ func (m *Manager) AddSession(sessionID string, terms []string) {
 	m.filters[sessionID] = f
 }
 
+// AddTerms merges terms into a session's bloom filter, creating the filter when
+// the session is not tracked yet. Unlike AddSession it never drops the terms
+// registered earlier, which is what an incremental append needs: a grown file
+// only contributes its new lines, so the already-indexed part must survive.
+//
+// A filter it creates itself only covers the terms passed in — callers that need
+// full coverage for a session must seed it with that session's complete term set
+// (AddSession) first. MayContain is only exact for sessions that were seeded.
+func (m *Manager) AddTerms(sessionID string, terms []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	f, ok := m.filters[sessionID]
+	if !ok {
+		f = bloomlib.NewWithEstimates(1000, 0.01)
+		m.filters[sessionID] = f
+	}
+
+	for _, term := range terms {
+		for _, word := range tokenize(term) {
+			f.AddString(word)
+		}
+	}
+}
+
 // MayContain returns session IDs whose bloom filter matches the term.
 // False positives possible (~1%), false negatives never.
 func (m *Manager) MayContain(term string) []string {

@@ -204,6 +204,14 @@ func main() {
 }
 
 func runMCP() {
+	// Capture the client pid as early as possible. If the client dies during
+	// startup, a subreaper adopts this process and os.Getppid() then returns that
+	// subreaper — a pid that never changes again, which would leave the parent
+	// watch dormant and the helper alive forever. This read cannot cover a client
+	// that died before main started; such a helper is treated as deliberately
+	// detached and not watched.
+	originPpid := os.Getppid()
+
 	// Prevent MCP recursion deadlock: when the daemon spawns opencode
 	// (which loads yesmem mcp), the child mcp must not reconnect to the
 	// same daemon that is blocked waiting for opencode to finish.
@@ -219,7 +227,7 @@ func runMCP() {
 	if err != nil {
 		log.Fatalf("mcp server: %v", err)
 	}
-	if err := srv.ServeStdio(); err != nil {
+	if err := srv.ServeStdio(originPpid); err != nil {
 		log.Fatalf("mcp server: %v", err)
 	}
 }
@@ -258,11 +266,24 @@ func runDaemon() {
 		Replace:          replace,
 		HTTPEnabled:      enableHTTP || appCfg.HTTP.Enabled,
 		HTTPListen:       appCfg.HTTP.Listen,
+		PprofEnabled:     appCfg.Diagnostics.PprofEnabled(),
+		PprofListen:      appCfg.Diagnostics.PprofListen,
 		CapsDir:          appCfg.CapsDir,
 		TerminalsSave: func() {
 			if err := terminals.Save(dataDir); err != nil {
 				log.Printf("[terminals] periodic save: %v", err)
 			}
+		},
+		LiveWindows: func() ([]daemon.LiveWindow, error) {
+			ws, err := terminals.LiveWindows()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]daemon.LiveWindow, 0, len(ws))
+			for _, w := range ws {
+				out = append(out, daemon.LiveWindow{XID: w.XID, Desktop: w.Workspace, Pid: w.Pid})
+			}
+			return out, nil
 		},
 	}); err != nil {
 		log.Fatalf("daemon: %v", err)

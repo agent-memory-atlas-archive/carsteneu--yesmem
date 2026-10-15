@@ -57,7 +57,10 @@ func buildShellCmd(cmd string, args []string, title string) string {
 	}
 	titleEsc := ""
 	if title != "" {
-		titleEsc = fmt.Sprintf("echo -ne '\\033]0;%s\\007'; ", title)
+		// The title carries caller-supplied text (the agent section), so it is
+		// quoted like any other argument — an unescaped quote would end the
+		// echo's quoting and run whatever followed.
+		titleEsc = fmt.Sprintf("echo -ne %s; ", shellQuote("\\033]0;"+title+"\\007"))
 	}
 	return ". ~/.bashrc 2>/dev/null; " + titleEsc + "exec " + strings.Join(parts, " ")
 }

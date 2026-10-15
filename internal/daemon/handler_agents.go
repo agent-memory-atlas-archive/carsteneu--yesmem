@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,11 +52,16 @@ func (h *Handler) handleSpawnAgent(params map[string]any) Response {
 		maxTurns = int(mt)
 	}
 	model, _ := params["model"].(string)
+	theme, _ := params["theme"].(string)
 	workDir, _ := params["work_dir"].(string)
 	permissionKick, _ := params["permission_kick"].(string)
 	if permissionKick != "" && permissionKick != "on" && permissionKick != "off" {
 		permissionKick = "" // ungültige Werte erben vom Config-Default
 	}
+	parentPid := callerPidParam(params)
+	// Read before the resolveSessionID fallback below: only an authoritative
+	// session id may select the caller's window.
+	parentWindow := h.callerWindowFromParams(params)
 
 	// Auto-resolve caller session from MCP context if not explicitly set
 	if callerSession == "" {
@@ -152,7 +159,7 @@ func (h *Handler) handleSpawnAgent(params map[string]any) Response {
 	sockPath := filepath.Join(h.dataDir, fmt.Sprintf("%s.sock", id))
 	workDir = h.resolveAgentWorkDir(project, workDir, backend)
 	if !h.disableAgentProcesses {
-		go h.spawnAgentProcess(id, sessionID, project, section, prompt, sockPath, workDir, backend, model, maxTurns, false)
+		go h.spawnAgentProcess(id, sessionID, project, section, prompt, sockPath, workDir, backend, model, theme, maxTurns, parentPid, parentWindow, false)
 	}
 
 	return jsonResponse(map[string]any{
@@ -198,6 +205,8 @@ func (h *Handler) handleOpenAgentTerminal(params map[string]any) Response {
 	if agentSessionID == "" {
 		agentSessionID = generateAgentUUID()
 	}
+	parentPid := callerPidParam(params)
+	parentWindow := h.callerWindowFromParams(params)
 	section := fmt.Sprintf("term-%s", strings.TrimPrefix(id, "agent-"))
 
 	agent := storage.Agent{
@@ -218,7 +227,7 @@ func (h *Handler) handleOpenAgentTerminal(params map[string]any) Response {
 	sockPath := filepath.Join(h.dataDir, fmt.Sprintf("%s.sock", id))
 	wd := h.resolveAgentWorkDir(project, workDir, backend)
 	if !h.disableAgentProcesses {
-		go h.spawnAgentProcess(id, agentSessionID, project, section, "", sockPath, wd, backend, "", 0, sessionID != "")
+		go h.spawnAgentProcess(id, agentSessionID, project, section, "", sockPath, wd, backend, "", "", 0, parentPid, parentWindow, sessionID != "")
 	}
 	return jsonResponse(map[string]any{
 		"status":   "starting",
@@ -460,8 +469,124 @@ func buildAgentExtraEnv(backend, sessionID string) []string {
 	return env
 }
 
+// callerPidParam returns the PID the MCP layer injected for the calling
+// process, or 0 when absent.
+func callerPidParam(params map[string]any) int {
+	if p, ok := params["_caller_pid"].(float64); ok && p > 0 {
+		return int(p)
+	}
+	return 0
+}
+
+// callerWindowFromParams returns the terminal window of the caller, or "".
+// Only authoritative session ids are consulted; the global
+// active_session_opencode fallback of resolveSessionID is skipped because it
+// is last-writer-wins across sessions and would pick another session's
+// window. The per-call _session_id (injected by the MCP layer / opencode
+// plugin) says where the caller really is and wins. caller_session, the reply
+// target, is the fallback for callers without a window of their own, e.g. an
+// orchestrator agent behind the daemon's PTY bridge spawning on behalf of the
+// user's session.
+func (h *Handler) callerWindowFromParams(params map[string]any) string {
+	// One window-manager call at most, and only if a window is registered.
+	var live map[string]LiveWindow
+	known, asked := false, false
+	for _, key := range []string{"_session_id", "caller_session"} {
+		sid, ok := params[key].(string)
+		if !ok || sid == "" {
+			continue
+		}
+		w := h.callerWindow(sid)
+		if w == "" {
+			continue
+		}
+		if !asked {
+			live, known = h.liveSnapshot()
+			asked = true
+		}
+		if known {
+			if _, alive := windowAlive(w, h.windowPidOf(sid), live); !alive {
+				continue // closed, or the id now belongs to another client
+			}
+		}
+		return w
+	}
+	return ""
+}
+
+// x11WindowID matches a well-formed X11 window id ("0x" + 1..16 hex digits).
+var x11WindowID = regexp.MustCompile(`^0[xX][0-9a-fA-F]{1,16}$`)
+
+// callerWindow returns the terminal window registered for a session via
+// register_window (fed by the opencode TUI plugin), or "" when none is known.
+// register_window accepts any string, so only a well-formed X11 id is passed
+// on. agent-tty resolves its desktop at placement time, so a window moved
+// since registration is still placed correctly.
+func (h *Handler) callerWindow(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	h.windowMapMu.Lock()
+	wid := h.windowMap[sessionID]
+	h.windowMapMu.Unlock()
+	if !x11WindowID.MatchString(wid) {
+		return ""
+	}
+	return wid
+}
+
+// shouldPlaceAgentWindow reports whether a freshly spawned agent window should
+// be moved to the caller's desktop. The tmux backend splits into an existing
+// tmux session and opens no window of its own; without a caller PID or a
+// registered caller window there is no desktop to inherit.
+func shouldPlaceAgentWindow(terminal string, parentPid int, parentWindow string) bool {
+	return terminal != "tmux" && (parentPid > 0 || parentWindow != "")
+}
+
+// opencodeSpawnPlan assembles the argv and environment for an opencode agent:
+// the resume flag, the model override, and the TUI theme (see
+// themeSpawnOverride). Kept as one unit so the theme reaches argv and env
+// together — a spawn that silently drops one of the two is exactly the failure
+// this feature cannot afford.
+func (h *Handler) opencodeSpawnPlan(id, sessionID string, resume bool, model, theme, section, bin string, environ []string) (args, env []string) {
+	if resume {
+		// Prefer stored per-agent opencode session ID.
+		sid := sessionID
+		if agent, _ := h.store.AgentGet(id); agent != nil && agent.OpencodeSessionID != "" {
+			sid = agent.OpencodeSessionID
+		}
+		args = []string{"-s", sid}
+	} else {
+		args = []string{}
+	}
+	if resolved := h.resolvedAgentModel(model, "opencode"); resolved != "" {
+		args = append(args, "--model", resolved)
+	}
+	themeFlags, themeEnv := h.themeSpawnOverride("opencode", bin, theme, section, environ)
+	return append(args, themeFlags...), themeEnv
+}
+
+// buildAgentTTYArgs assembles the `yesmem agent-tty` argv run inside the new
+// terminal window, including the placement sources when there are any.
+func buildAgentTTYArgs(sockPath, terminal string, parentPid int, parentWindow string) []string {
+	args := []string{"agent-tty", "--sock", sockPath}
+	if !shouldPlaceAgentWindow(terminal, parentPid, parentWindow) {
+		return args
+	}
+	// agent-tty moves its own window onto the desktop the caller's terminal
+	// sits on instead of leaving it on the focused one.
+	if parentPid > 0 {
+		args = append(args, "--parent-pid", strconv.Itoa(parentPid))
+	}
+	if parentWindow != "" {
+		args = append(args, "--parent-window", parentWindow)
+	}
+	return args
+}
+
 // spawnAgentProcess creates a PTY bridge, opens a terminal, and waits for the agent to finish.
-func (h *Handler) spawnAgentProcess(id, sessionID, project, section, prompt, sockPath, workDir, backend, model string, maxTurns int, resume bool) {
+// theme is the explicit per-spawn theme override (empty = the agent type's default from config).
+func (h *Handler) spawnAgentProcess(id, sessionID, project, section, prompt, sockPath, workDir, backend, model, theme string, maxTurns, parentPid int, parentWindow string, resume bool) {
 	// L4 defensive: handleResumeAgent catches this first, but defend direct
 	// callers too. attemptRestart (heartbeat.go) builds its own exec.Command
 	// and is guarded separately. Without this guard the opencode resume
@@ -481,23 +606,12 @@ func (h *Handler) spawnAgentProcess(id, sessionID, project, section, prompt, soc
 
 	var agentBin string
 	var agentArgs []string
+	var themeEnv []string
 
 	switch backend {
 	case "opencode":
 		agentBin = resolveAgentBinary(backend)
-		if resume {
-			// Prefer stored per-agent opencode session ID.
-			sid := sessionID
-			if agent, _ := h.store.AgentGet(id); agent != nil && agent.OpencodeSessionID != "" {
-				sid = agent.OpencodeSessionID
-			}
-			agentArgs = []string{"-s", sid}
-		} else {
-			agentArgs = []string{}
-		}
-		if resolved := h.resolvedAgentModel(model, "opencode"); resolved != "" {
-			agentArgs = append(agentArgs, "--model", resolved)
-		}
+		agentArgs, themeEnv = h.opencodeSpawnPlan(id, sessionID, resume, model, theme, section, agentBin, os.Environ())
 	case "codex":
 		agentBin = resolveAgentBinary(backend)
 		if resume {
@@ -555,6 +669,7 @@ func (h *Handler) spawnAgentProcess(id, sessionID, project, section, prompt, soc
 	// the global active_session_opencode proxy-state (Last-Writer-Wins across
 	// parallel agents). See resolveClientSessionID in internal/mcp/server.go.
 	extraEnv := buildAgentExtraEnv(backend, sessionID)
+	extraEnv = append(extraEnv, themeEnv...)
 
 	bridge, err := orchestrator.NewAgentBridge(agentBin, agentArgs, sockPath, workDir, extraEnv...)
 	if err != nil {
@@ -579,7 +694,8 @@ func (h *Handler) spawnAgentProcess(id, sessionID, project, section, prompt, soc
 		terminal = "ghostty"
 	}
 	title := fmt.Sprintf("yesmem-%s #%s", section, strings.TrimPrefix(id, "agent-"))
-	bin, spawnArgs := orchestrator.BuildSpawnCommand(terminal, binPath, title, "agent-tty", "--sock", sockPath)
+	agentTTYArgs := buildAgentTTYArgs(sockPath, terminal, parentPid, parentWindow)
+	bin, spawnArgs := orchestrator.BuildSpawnCommand(terminal, binPath, title, agentTTYArgs...)
 	termCmd := exec.Command(bin, spawnArgs...)
 	if err := termCmd.Start(); err != nil {
 		bridge.Close()
@@ -1065,7 +1181,7 @@ func (h *Handler) handleResumeAgent(params map[string]any) Response {
 	if agent.Backend == "claude" && explicitSession != "" {
 		resumeSession = explicitSession
 	}
-	go h.spawnAgentProcess(agent.ID, resumeSession, agent.Project, agent.Section, "", sockPath, workDir, agent.Backend, "", 0, true)
+	go h.spawnAgentProcess(agent.ID, resumeSession, agent.Project, agent.Section, "", sockPath, workDir, agent.Backend, "", "", 0, 0, "", true)
 
 	return jsonResponse(map[string]any{
 		"status":   "resuming",
@@ -1109,7 +1225,7 @@ func (h *Handler) bootstrapOpencodeResume(sessionID, workDir, project string) Re
 	}
 	if !h.disableAgentProcesses {
 		sockPath := filepath.Join(h.dataDir, fmt.Sprintf("%s.sock", id))
-		go h.spawnAgentProcess(id, agent.SessionID, project, section, "", sockPath, workDir, "opencode", "", 0, true)
+		go h.spawnAgentProcess(id, agent.SessionID, project, section, "", sockPath, workDir, "opencode", "", "", 0, 0, "", true)
 	}
 	return jsonResponse(map[string]any{
 		"status":       "resuming",

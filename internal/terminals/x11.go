@@ -1,16 +1,24 @@
 package terminals
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// commandTimeout bounds every X11 helper call, so a hung X server cannot
+// block the daemon (whoami, agent spawn) or a CLI forever.
+const commandTimeout = 5 * time.Second
 
 // commandOut runs an external helper and returns its trimmed stdout.
 // Referenced through a var so tests can stub the X11 layer.
 var commandOut = func(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).Output()
 	return strings.TrimSpace(string(out)), err
 }
 

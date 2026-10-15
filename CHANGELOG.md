@@ -9,15 +9,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Session-rename convention for yesloop/yesresearch agents
+- Subtle per-hue background tint for the agent themes
+- Stronger text contrast for yesmem-light muted family
+- Add yesmem-light (cream day theme from the memkea palette)
+- Brighter green and amber family across all themes
+- Pure white text in yesmem-default
+- Align agent themes with the yesmem-default design language
+- Near-white light-grey text in yesmem-default
+- Light-grey text with minimal warm cast in yesmem-default
+- Greyer thinking, more brilliant headings and highlights
+- Neutralize the yesmem-default background chrome
+- One more brightness step for yesmem-default accents
+- Darken the yesmem-default background ladder
+- Raise accent brilliance, drop the cream cast in yesmem-default
+- Push yesmem-default text to near-max brightness
+- Raise text brightness and contrast in yesmem-default
+- Rebuild yesmem-default from the memkea logo palette (ember ink)
+- Mute and darken yesmem-default (slate palette)
+- Add yesmem-default (deep ice) as the user-facing default theme
+- Give spawned agents the theme of their type
+- Probe whether the opencode binary accepts --theme
+- Add the agent theme family and its installer
+- Bound indexing concurrency behind a worker pool (#152)
+- Index grown sessions from their append watermark (#152)
+- Append watermark and tail-parsing primitives (#152)
+- List live mcp helper processes (#152)
+- Opt-in localhost-only pprof diagnostics endpoint (#152)
+- Add diagnostics.pprof flag with YESMEM_PPROF override (#152)
+- Exit when the parent client dies (#152)
+- Ship v2 TUI window plugin, drop v1 tui.json path
+- Persist session windows and report window + desktop in whoami
+- Register the yesmem opencode TUI plugin in tui.json
+- Register the session's terminal window from the TUI
+- Hand the caller's registered window to spawned agents
+- Place agent windows via the caller's registered window
+- Open spawned agent windows on the caller's desktop
 - Remove the orphaned cap reddit_reminder_today (R4-5)
 
 ### Changed
 
+- Drop a redundant condition from the bench assertion
+- Register the window only when the session changes
+- Drop xdotool push from send_to and broadcast
+- Remove stray empty HEAD file from repo root
 - Reword doc comments gofmt would mangle (R3-4)
 - Prepared project-scope data cleanup (apply + rollback)
 
 ### Fixed
 
+- Update family contract to the shipped design, de-home paths
+- Synthetic repo root in hook tests (pre-sync path scan)
+- Literal hex for selectedListItemText (reference not resolved by the special-cased slot)
+- Define selectedListItemText (port default is dark-mode white)
+- Harden the installer and the theme name bound after security review
+- Address the consequence review
+- Harden theme selection after cold review
+- Verify the copy at both ends and after an append
+- Keep the pool consistent when a pass panics
+- Store every row under the session's own id
+- Repair the messages index in one transaction
+- Treat NaN as over the pprof seconds cap
+- Serialize concurrent passes and contain a failing one
+- Close the same-site pprof vector and drop the pointless body check
+- Persist what the append pass read, not just the new messages
+- Heal empty session identity fields on upsert
+- Make the messages sequence index unique
+- Anchor helper detection on argv[1] and capture the client pid early
+- Fence the pprof endpoint against cross-site starts and cap profile duration
+- Treat extension-less file names as file names in the file-op guard
+- Hash the parsed prefix and check row contiguity (#152)
+- Restore whole-file parse fidelity and guard the watermark (#152)
+- Close append-path holes found in review (#152)
+- Label orphan groups truthfully, harden the cmdline cut (#152)
+- Harden pprof endpoint (GET-only, loopback Host, bounded shutdown) (#152)
+- Flag adopted helpers, bound the cmdline read (#152)
+- Leave an already orphaned helper alone (#152)
+- Close two leaks in the file-op guard for Bash-origin gotchas (#151)
+- Require content overlap for Bash-origin auto-learned gotchas on file ops (#151)
+- Commit the rewired EnsureOpencodeTuiPlugin call sites
+- Quote the agent window title in the spawn shell command
+- Re-review findings for the persisted window map
+- One registration per prompt, send the window owner pid
+- Bound, validate and verify the persisted window map
+- Consequence and security review findings
+- Second cold-review findings (symlinked tui.json, ancestry, fallback)
+- Cold-review findings for caller window placement and tui.json
+- Register only from a real ghostty window, refresh every minute
+- Only pass well-formed X11 ids to agent-tty; clean agent-tty -h
 - Version above the deployed one, honest scope, precise selection
 - Keep the SQL error visible, and close the review's edge cases
 - Use cap_name, target caps.db, and fail loudly on SQL errors
@@ -36,6 +115,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scope active-caps catalog to the requesting project
 - Scope briefing doc index and docs hint to the project
 - Scope narrative per thread, not per proxy
+
+### Performance
+
+- Append the missing tail instead of copying the file again
+- Index messages(session_id, sequence) for the append path (#152)
+
+### Documentation
+
+- Opencode v2 API agent ideas and yesmem integration brainstorm
+- Add reverse-steering (agent wakes its orchestrator) to the profile
+- Multi-loop top-results profile (wave plan for the API capabilities)
+- 2026-10-15 update — drop cross-backend, API channel as foundation
+- Add memkea logo assets (source of the theme palette)
+- Say what the prefix fingerprint does not catch
+- Note that a GB-class scaling run needs -timeout 0 (#152)
+- Correct origin mechanism comments and the file-op rule (#151)
+- Regen with v2.3.18 and context-scope / cap_delete entries
+
+### Testing
+
+- Cover the exclusion check and the panic cleanup
+- Cover the keyed locks directly
+- Pin that the file-op admission also gates the hard block
+- Restore pre-existing filter tests overwritten while adding AddTerms cases (#152)
+- Append-reindex scaling report and benchmarks (#152)
+- Cover the ServeStdio wiring (#152)
+- Cover echoed paths, hidden dirs and the V2 boundary (#151)
+- Pin Bash-origin predicate branches (origin_tool, German prefix)
 
 ## [2.3.18] - 2026-10-01
 
