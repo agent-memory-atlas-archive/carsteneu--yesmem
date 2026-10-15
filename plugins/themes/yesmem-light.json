@@ -12,7 +12,7 @@
     "textMuted": "#4a443a",
     "background": "#f7f5ec",
     "backgroundPanel": "#efece0",
-    "backgroundElement": "#e8e4d6",
+    "backgroundElement": "#e0dac8",
     "backgroundMenu": "#e0dbca",
     "border": "#cfc8b4",
     "borderActive": "#a8996e",
@@ -51,7 +51,7 @@
     "markdownListEnumeration": "#5e421e",
     "markdownImage": "#a34f2a",
     "markdownImageText": "#5e421e",
-    "markdownCodeBlock": "#1e1c18",
+    "markdownCodeBlock": "#8f421f",
     "selectedListItemText": "#1e1c18"
   },
   "theme": {
