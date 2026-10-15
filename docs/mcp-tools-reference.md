@@ -85,7 +85,7 @@ Large results (>30K chars) include `_meta.anthropic/maxResultSizeChars` for trun
 ### Agent Orchestration
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `spawn_agent` | `project`, `section`, `caller_session?`, `token_budget?`, `max_turns?`, `model?`, `work_dir?`, `backend?` | Spawn an autonomous agent for a project section. Use to delegate work to an isolated agent with its own worktree, model, and token budget. Agents run as visible TUI processes. Specify backend (`claude`|`codex`|`opencode`) and optional model override. |
+| `spawn_agent` | `project`, `section`, `caller_session?`, `token_budget?`, `max_turns?`, `model?`, `theme?`, `work_dir?`, `backend?` | Spawn an autonomous agent for a project section. Use to delegate work to an isolated agent with its own worktree, model, and token budget. Agents run as visible TUI processes. Specify backend (`claude`|`codex`|`opencode`) and optional model override. `theme` overrides the TUI theme for this agent (empty = the theme of the agent type; see `agents.themes`). |
 | `relay_agent` | `to`, `content`, `project?`, `caller_session?` | Inject content into a running agent's terminal. Use to send instructions, nudges, or context to an agent without stopping it. Target by agent ID or section name. |
 | `stop_agent` | `to`, `project?` | Stop a running agent. Use to terminate an agent that has completed its work or is misbehaving. Target by agent ID. |
 | `stop_all_agents` | `project` | Stop all running agents in a project. Use for cleanup or when resetting a project's agent state. |

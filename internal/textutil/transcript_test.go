@@ -24,3 +24,27 @@ func TestIsRawBashTranscript(t *testing.T) {
 		}
 	}
 }
+
+func TestFailureOriginTool(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"go hook format", "Bash error: `cat ab.txt` → No such file", "bash"},
+		{"german variant", "Bash-Fehler: `cat ab.txt` → Datei nicht gefunden", "bash"},
+		{"opencode shell tool", "shell error: Unable to execute command: cat ab.txt", "bash"},
+		{"read transcript", "Read error: `ab.txt` → No such file", "read"},
+		{"edit transcript", "edit error: Could not find oldString in ab.txt", "edit"},
+		{"webfetch transcript", "WebFetch-Fehler: `WebFetch www.reddit.com` → blocked", "webfetch"},
+		{"leading whitespace", "\n  Bash error: `ls` → Exit code 2", "bash"},
+		{"mid-sentence mention is not a transcript", "a lesson about Bash error: handling", ""},
+		{"plain lesson", "Bash commands must be single-quoted", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		if got := FailureOriginTool(tc.content); got != tc.want {
+			t.Errorf("%s: FailureOriginTool = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

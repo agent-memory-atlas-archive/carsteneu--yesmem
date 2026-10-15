@@ -120,6 +120,18 @@ func runMigrateCmd() {
 	} else {
 		fmt.Printf("  Plugin: %d files updated\n", n)
 	}
+	// 5d. Opencode window plugin (session → terminal window registration)
+	if n, err := setup.InstallWindowPlugin(home); err != nil {
+		fmt.Fprintf(os.Stderr, "  Window plugin warning: %v\n", err)
+	} else if n > 0 {
+		fmt.Println("  Window plugin: installed to ~/.config/opencode/plugins/yesmem-window/")
+	}
+	// 5e. Opencode agent themes (type accent for spawned agent TUIs)
+	if n, err := setup.InstallThemes(home); err != nil {
+		fmt.Fprintf(os.Stderr, "  Themes warning: %v\n", err)
+	} else if n > 0 {
+		fmt.Printf("  Themes: %d updated in ~/.config/opencode/themes/\n", n)
+	}
 
 	// 6. Hook-guard state: clean up legacy JSON cooldown (now DB-backed)
 	if removed, err := setup.MigrateGuardState(home); err != nil {

@@ -1,6 +1,9 @@
 package indexer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +25,15 @@ type Indexer struct {
 	bloom          *bloom.Manager
 	archiver       *archive.Archiver
 	excludeProject map[string]bool
+
+	// IndexSession is not reentrant: the watcher pool and the startup scan both
+	// call it, and two passes over one file — or over two files carrying the same
+	// session id — interleave their delete and insert into duplicates or into a
+	// session missing rows. Both callers run inside one process, so in-process
+	// locks are enough; the unique (session_id, sequence) index covers the case of
+	// two daemons, where no lock can.
+	pathLocks    keyedLocks
+	sessionLocks keyedLocks
 }
 
 // New creates an indexer with all dependencies.
@@ -38,8 +50,26 @@ func New(store *storage.Store, bloomMgr *bloom.Manager, arch *archive.Archiver, 
 	}
 }
 
-// IndexSession runs the full pipeline for a single session JSONL file.
+// errNotAppendable reports that the incremental fast path does not apply to a
+// file (no usable watermark, identity mismatch, shrinking file). The caller
+// then reindexes fully.
+var errNotAppendable = errors.New("append fast path not applicable")
+
+// IndexSession runs the pipeline for a single session JSONL file.
+//
+// When the file only grew since the last run and still belongs to the same
+// session, only the appended tail is parsed and inserted — a running session no
+// longer costs O(file size) per write. Anything else (shrink, rewrite, missing
+// or stale watermark) takes the full path, and so does a failed append: a
+// growing file indexed correctly beats one indexed cheaply.
 func (idx *Indexer) IndexSession(jsonlPath string) error {
+	// One file, one pass. The pool deduplicates only the paths submitted through
+	// it, and the startup scan reaches the same file through IndexAll. The key is
+	// the cleaned path so that two spellings of one file ("./x" and "x") do not
+	// silently end up in two different critical sections.
+	unlock := idx.pathLocks.lock(filepath.Clean(jsonlPath))
+	defer unlock()
+
 	// 1. Check if reindex needed
 	info, err := os.Stat(jsonlPath)
 	if err != nil {
@@ -49,11 +79,322 @@ func (idx *Indexer) IndexSession(jsonlPath string) error {
 		return nil // already up to date
 	}
 
+	// 2. Incremental fast path — appends only.
+	if state := idx.appendWatermark(jsonlPath, info); state != nil {
+		err := idx.indexAppendedTail(jsonlPath, info, state)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errNotAppendable) {
+			log.Printf("warn: incremental index %q: %v — falling back to full reindex", jsonlPath, err)
+		}
+	}
+
+	return idx.indexFullSession(jsonlPath, info)
+}
+
+// appendWatermark returns the stored watermark when the file qualifies for an
+// append-only pass, or nil when the file needs a full parse. The check is purely
+// local (no parsing) so a non-qualifying file costs one row read.
+func (idx *Indexer) appendWatermark(jsonlPath string, info os.FileInfo) *models.IndexState {
+	state, err := idx.store.GetIndexState(jsonlPath)
+	if err != nil || state == nil {
+		return nil // never indexed, or no watermark yet
+	}
+	if state.IndexedOffset <= 0 || state.IndexedSessionID == "" || state.IndexedMsgCount < 0 {
+		return nil
+	}
+	// Only strict growth is an append. Equal size means an in-place rewrite and
+	// a smaller size means truncation; both need a full pass.
+	if info.Size() <= state.FileSize || state.IndexedOffset > info.Size() {
+		return nil
+	}
+	// Every watermark is the position after a complete line, so the byte before
+	// it must be a newline. If it is not, the file was rewritten in place to a
+	// larger size and seeking there would land inside a line.
+	if !offsetSitsOnLineBoundary(jsonlPath, state.IndexedOffset) {
+		return nil
+	}
+	// Size and the boundary byte alone cannot tell an append from an in-place
+	// rewrite of the same length. The bytes before the watermark can: an append
+	// leaves them untouched.
+	prefix, err := prefixFingerprint(jsonlPath, state.IndexedOffset)
+	if err != nil || state.IndexedPrefixHash == "" || prefix != state.IndexedPrefixHash {
+		return nil
+	}
+	return state
+}
+
+// fingerprintBytes is how many bytes preceding the watermark are hashed to
+// check that the already indexed region was not rewritten in place. A few
+// hundred bytes catch the realistic cases — a rewrite that shifts the line
+// boundaries, a replaced tail — at a negligible read cost.
+//
+// It is a window at the watermark, not a hash of the whole prefix. A
+// length-preserving edit further back (a secret redacted in hindsight, say)
+// stays invisible: the offsets still line up, so the append is accepted and the
+// changed bytes remain as they were indexed until a full pass happens for some
+// other reason. Verifying a whole-prefix hash would mean re-reading the prefix on
+// every append — the cost this fast path exists to avoid — so the narrow window
+// is the deliberate trade: an append can never misalign, but the stored prefix
+// is not guaranteed to be current.
+const fingerprintBytes = 256
+
+// prefixFingerprint hashes the bytes immediately preceding an append watermark.
+// The value stored at index time is taken from the parse itself
+// (TailResult.PrefixHash); this function re-reads the same window from disk to
+// verify it before an append is allowed. Both cover the last up to
+// prefixWindowBytes bytes before the offset.
+func prefixFingerprint(path string, offset int64) (string, error) {
+	if offset <= 0 {
+		return "", nil
+	}
+	n := int64(fingerprintBytes)
+	if offset < n {
+		n = offset
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, offset-n); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// offsetSitsOnLineBoundary reports whether the byte preceding offset is a
+// newline, i.e. whether offset is the start of a line.
+func offsetSitsOnLineBoundary(path string, offset int64) bool {
+	if offset <= 0 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], offset-1); err != nil {
+		return false
+	}
+	return b[0] == '\n'
+}
+
+// indexAppendedTail parses and stores only the bytes after the watermark,
+// leaving everything already indexed untouched (no session-wide delete, so the
+// FTS index grows incrementally as well).
+func (idx *Indexer) indexAppendedTail(jsonlPath string, info os.FileInfo, state *models.IndexState) error {
+	// The whole append runs under the session's lock. Its trim removes everything
+	// past the watermark, so a full pass for another file of the same session must
+	// not be interleaved with it — and the checks below (identity, ownership,
+	// contiguity) only mean anything while the session's rows cannot change
+	// underneath them. The tail parse is cheap, so holding the lock across it costs
+	// nothing.
+	unlock := idx.sessionLocks.lock(state.IndexedSessionID)
+	defer unlock()
+
+	existing, err := idx.store.GetSession(state.IndexedSessionID)
+	if err != nil {
+		return fmt.Errorf("%w: session %s: %v", errNotAppendable, state.IndexedSessionID, err)
+	}
+
+	// Mirrors the full path: an excluded project is not indexed at all, even when
+	// the file already carries a watermark from before it was excluded.
+	if idx.excludeProject[strings.ToLower(existing.Project)] || idx.excludeProject[existing.ProjectShort] {
+		return nil
+	}
+
+	// The path may have been reused for another session (rotation, import
+	// rewrite). Verify the head against the watermark before trusting offsets.
+	identity, err := parser.FileSessionIdentity(jsonlPath)
+	if err != nil {
+		return err
+	}
+	if identity == "" || models.NormalizeSessionID(existing.SourceAgent, identity) != state.IndexedSessionID {
+		return fmt.Errorf("%w: head identity %q does not match watermark %q",
+			errNotAppendable, identity, state.IndexedSessionID)
+	}
+
+	// Another file carrying the same session id would lose messages to this
+	// append (the trim below removes everything past this file's watermark), so
+	// only the owning file may append.
+	elsewhere, err := idx.store.SessionIndexedByOtherPath(existing.ID, jsonlPath)
+	if err != nil {
+		return err
+	}
+	if elsewhere {
+		return fmt.Errorf("%w: session %q is also indexed from another file",
+			errNotAppendable, existing.ID)
+	}
+
+	res, err := parser.ParseAutoTail(jsonlPath, state.IndexedOffset, state.IndexedMsgCount)
+	if err != nil {
+		return err
+	}
+	if res.NewOffset <= state.IndexedOffset {
+		// Only an unterminated trailing line so far and nothing to store — but the
+		// pass has looked at the file, and that has to be recorded. Leaving the
+		// stored size behind would keep NeedsReindex true, so every later scan of
+		// every session with an unfinished last line re-reads the file for nothing.
+		state.FileSize = info.Size()
+		state.FileMtime = info.ModTime()
+		state.IndexedAt = time.Now()
+		if err := idx.store.UpsertIndexState(state); err != nil {
+			return fmt.Errorf("update index state: %w", err)
+		}
+		return nil
+	}
+
+	// Mirrors the full path: daemon-internal extraction sessions are not indexed,
+	// which also matters for one that only starts looking like one mid-file. Like
+	// the full path this leaves the watermark untouched, so such a session stops
+	// advancing and its later messages stay out of the index.
+	if isExtractionPipelineSession(res.Messages) {
+		return nil
+	}
+
+	// The watermark is only trustworthy while the store agrees with it: the rows
+	// must be contiguous from sequence 0 and at least cover the watermark. A
+	// mismatch means another writer, a binary that predates the watermark, an
+	// interrupted pass or leftover duplicates — states in which appending could
+	// leave a gap or a duplicate. The full path rebuilds the session instead.
+	// More rows than the watermark covers are fine: that is a trailing line the
+	// whole-file parse accepted but deliberately did not count, and the trim
+	// below re-reads exactly that range from the file.
+	count, minSeq, maxSeq, err := idx.store.SessionMessageStats(existing.ID)
+	if err != nil {
+		return err
+	}
+	contiguous := count == 0 || (minSeq == 0 && maxSeq == count-1)
+	if !contiguous || count < state.IndexedMsgCount {
+		return fmt.Errorf("%w: session %q holds %d messages (sequences %d..%d), watermark records %d",
+			errNotAppendable, existing.ID, count, minSeq, maxSeq, state.IndexedMsgCount)
+	}
+
+	// Re-key the tail to the stored session: the tail parser cannot know a
+	// subagent id (line.sessionId carries the parent) nor a Codex session id
+	// (that header lives in the first line). The watermark identity wins.
+	for i := range res.Messages {
+		res.Messages[i].SessionID = existing.ID
+		res.Messages[i].SourceAgent = existing.SourceAgent
+	}
+
+	// Metadata the first index could not see. Claude Code writes header lines
+	// (file-history-snapshot, hooks, attachments) ahead of the first turn, so a
+	// session indexed early carries an empty first_message, project and branch —
+	// and the append is the only writer that ever reads the turn filling them.
+	// UpsertSession heals instead of replacing, so a field that another pass
+	// already set stays untouched.
+	if existing.FirstMessage == "" && res.Meta.FirstUserMessage != "" {
+		existing.FirstMessage = res.Meta.FirstUserMessage
+		// A subagent's agent type is guessed from that first message, so a stored
+		// guess was made from an empty string and has to be redone now.
+		if existing.ParentSessionID != "" {
+			existing.AgentType = guessAgentType(existing.FirstMessage)
+		}
+	}
+	if existing.Project == "" && res.Meta.Project != "" {
+		existing.Project = res.Meta.Project
+		// The tail can be the first part of the file that names the project, and
+		// the exclusion list is config: stop here if it turns out to be an excluded
+		// one, the same way the full path does (it reads the project from its
+		// parse). Like there, the watermark is left untouched, so such a session
+		// stops advancing.
+		short := models.ProjectShortFromPath(existing.Project)
+		if idx.excludeProject[strings.ToLower(existing.Project)] || idx.excludeProject[short] {
+			return nil
+		}
+	}
+	if existing.GitBranch == "" && res.Meta.GitBranch != "" {
+		existing.GitBranch = res.Meta.GitBranch
+	}
+	// The tail's first timestamp is not the session's start — the header lines
+	// that carry it were indexed before this append — so it only fills a gap.
+	if existing.StartedAt.IsZero() && !res.Meta.StartedAt.IsZero() {
+		existing.StartedAt = res.Meta.StartedAt
+	}
+
+	existing.MessageCount = state.IndexedMsgCount + len(res.Messages)
+	existing.JSONLSize = info.Size()
+	existing.IndexedAt = time.Now()
+	if !res.Meta.EndedAt.IsZero() && res.Meta.EndedAt.After(existing.EndedAt) {
+		existing.EndedAt = res.Meta.EndedAt
+	}
+	if err := idx.store.UpsertSession(existing); err != nil {
+		return fmt.Errorf("store session: %w", err)
+	}
+
+	// Trim anything a previous half-finished append left beyond the watermark.
+	// Reads like belt and braces next to the count check above and is exactly
+	// that: the check rules out the states where it matters, this keeps the
+	// insert idempotent if such a state is ever reached anyway.
+	//
+	// Trim and insert are two statements, not one transaction. That is safe in the
+	// direction that matters: the watermark is written last, so a crash between
+	// them leaves rows that still match the watermark, and the next pass re-reads
+	// the same range from the file — the full path (which is atomic) only runs when
+	// the append refuses.
+	if err := idx.store.DeleteMessagesFromSequence(existing.ID, state.IndexedMsgCount); err != nil {
+		return err
+	}
+	if len(res.Messages) > 0 {
+		if err := idx.store.InsertMessages(res.Messages); err != nil {
+			return fmt.Errorf("store messages: %w", err)
+		}
+	}
+
+	idx.storePulses(existing.ID, existing.ProjectShort, res.Messages)
+
+	// AddTerms, not AddSession: the pre-append terms must survive.
+	idx.bloom.AddTerms(existing.ID, extractTerms(res.Messages))
+
+	assocs := buildAssociations(existing.ID, existing.ProjectShort, res.Messages)
+	if len(assocs) > 0 {
+		if err := idx.store.InsertAssociationBatch(assocs); err != nil {
+			log.Printf("warn: associations for %s: %v", existing.ID, err)
+		}
+	}
+
+	idx.updateCoverage(existing.ProjectShort, res.Messages)
+
+	if idx.archiver != nil {
+		if err := idx.archiver.ArchiveFile(jsonlPath, projectDirName(jsonlPath)); err != nil {
+			log.Printf("warn: archive %s: %v", jsonlPath, err)
+		}
+	}
+
+	if err := idx.store.UpsertIndexState(&models.IndexState{
+		JSONLPath:         jsonlPath,
+		FileSize:          info.Size(),
+		FileMtime:         info.ModTime(),
+		IndexedAt:         time.Now(),
+		IndexedOffset:     res.NewOffset,
+		IndexedSessionID:  existing.ID,
+		IndexedMsgCount:   existing.MessageCount,
+		IndexedPrefixHash: res.PrefixHash,
+	}); err != nil {
+		return fmt.Errorf("update index state: %w", err)
+	}
+
+	return nil
+}
+
+// indexFullSession re-parses the whole file and replaces everything stored for
+// the session.
+func (idx *Indexer) indexFullSession(jsonlPath string, info os.FileInfo) error {
 	// 2. Parse JSONL
-	messages, meta, err := parser.ParseAuto(jsonlPath)
+	res, err := parser.ParseAutoTail(jsonlPath, 0, 0)
 	if err != nil {
 		return fmt.Errorf("parse %s: %w", jsonlPath, err)
 	}
+	messages, meta := res.Messages, res.Meta
 	if meta.SessionID == "" {
 		return nil // empty or unparseable session
 	}
@@ -100,51 +441,33 @@ func (idx *Indexer) IndexSession(jsonlPath string) error {
 		sess.AgentType = guessAgentType(meta.FirstUserMessage)
 	}
 
+	// Serialize per session id, not per path: two files can carry the same id (a
+	// resumed session keeps the parent id behind a snapshot header, a restored copy
+	// duplicates it), and both would otherwise replace the same session's rows at
+	// the same time. Taken after the parse — that is the expensive part — and in
+	// the same order as the append path (path lock, then session lock), so the two
+	// cannot deadlock.
+	unlockSession := idx.sessionLocks.lock(sess.ID)
+	defer unlockSession()
+
 	// 4. Store session + messages in SQLite
 	if err := idx.store.UpsertSession(sess); err != nil {
 		return fmt.Errorf("store session: %w", err)
 	}
-	idx.store.DeleteMessagesBySession(sess.ID) // clean re-index
-	if len(messages) > 0 {
-		// Fix session ID on messages for subagents
-		if meta.AgentID != "" {
-			for i := range messages {
-				messages[i].SessionID = sess.ID
-				messages[i].SourceAgent = meta.SourceAgent
-			}
-		}
-		if err := idx.store.InsertMessages(messages); err != nil {
-			return fmt.Errorf("store messages: %w", err)
-		}
+	// Every row carries the session's own id. The store keys its deletion on that
+	// id, so a file whose turn lines name a different id — the first line with an
+	// id wins for the session (parser.go) — would insert rows under the other id,
+	// collide with them on the next pass and never advance its watermark again.
+	// The append path re-keys its tail the same way.
+	for i := range messages {
+		messages[i].SessionID = sess.ID
+	}
+	if err := idx.store.ReplaceMessagesBySession(sess.ID, messages); err != nil {
+		return fmt.Errorf("store messages: %w", err)
 	}
 
 	// 4b. Store pulse learnings from away_summary events
-	for _, msg := range messages {
-		if msg.MessageType != "pulse" {
-			continue
-		}
-		exists, err := idx.store.HasPulseForSession(sess.ID)
-		if err != nil {
-			log.Printf("warn: pulse dedup check for %s: %v", sess.ID, err)
-			continue
-		}
-		if exists {
-			continue
-		}
-		_, err = idx.store.InsertLearning(&models.Learning{
-			SessionID:  sess.ID,
-			Category:   "pulse",
-			Content:    msg.Content,
-			Project:    projectShort,
-			Confidence: 1.0,
-			Source:     "system_captured",
-			ModelUsed:  "cc_recap",
-			CreatedAt:  msg.Timestamp,
-		})
-		if err != nil {
-			log.Printf("warn: pulse learning for %s: %v", sess.ID, err)
-		}
-	}
+	idx.storePulses(sess.ID, projectShort, messages)
 
 	// 5. FTS5 indexing happens automatically via InsertMessages() — no separate step needed
 
@@ -171,17 +494,58 @@ func (idx *Indexer) IndexSession(jsonlPath string) error {
 		}
 	}
 
-	// 10. Update index state
+	// 10. Update index state — the watermark records where parsing stopped so the
+	// next run can append instead of re-reading the file. res.NewOffset (not the
+	// file size) is the anchor: a trailing line that was still being written is
+	// re-read from its own start rather than from halfway through it, and the
+	// message count is the one belonging to that offset, not the total. The
+	// fingerprint comes from the parse, so a rewrite during this pass cannot make
+	// it describe a file state that was never indexed.
 	if err := idx.store.UpsertIndexState(&models.IndexState{
-		JSONLPath: jsonlPath,
-		FileSize:  info.Size(),
-		FileMtime: info.ModTime(),
-		IndexedAt: time.Now(),
+		JSONLPath:         jsonlPath,
+		FileSize:          info.Size(),
+		FileMtime:         info.ModTime(),
+		IndexedAt:         time.Now(),
+		IndexedOffset:     res.NewOffset,
+		IndexedSessionID:  sess.ID,
+		IndexedMsgCount:   res.CompleteCount,
+		IndexedPrefixHash: res.PrefixHash,
 	}); err != nil {
 		return fmt.Errorf("update index state: %w", err)
 	}
 
 	return nil
+}
+
+// storePulses persists away_summary recaps as pulse learnings. At most one pulse
+// per session is kept, so re-running over the same messages is harmless.
+func (idx *Indexer) storePulses(sessionID, projectShort string, msgs []models.Message) {
+	for _, msg := range msgs {
+		if msg.MessageType != "pulse" {
+			continue
+		}
+		exists, err := idx.store.HasPulseForSession(sessionID)
+		if err != nil {
+			log.Printf("warn: pulse dedup check for %s: %v", sessionID, err)
+			continue
+		}
+		if exists {
+			continue
+		}
+		_, err = idx.store.InsertLearning(&models.Learning{
+			SessionID:  sessionID,
+			Category:   "pulse",
+			Content:    msg.Content,
+			Project:    projectShort,
+			Confidence: 1.0,
+			Source:     "system_captured",
+			ModelUsed:  "cc_recap",
+			CreatedAt:  msg.Timestamp,
+		})
+		if err != nil {
+			log.Printf("warn: pulse learning for %s: %v", sessionID, err)
+		}
+	}
 }
 
 // ProgressFunc is called during IndexAll to report progress.

@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -77,93 +76,98 @@ type progressData struct {
 	Content string `json:"content"`
 }
 
+// claudeSink accumulates messages and metadata while consuming Claude Code
+// session JSONL lines. The whole-file parser and the incremental tail parser
+// share it, so both produce identical messages for the same lines.
+type claudeSink struct {
+	messages []models.Message
+	meta     *SessionMeta
+	seq      int
+}
+
+// newClaudeSink returns a sink whose sequence counter starts at baseSeq.
+func newClaudeSink(baseSeq int) *claudeSink {
+	return &claudeSink{meta: &SessionMeta{}, seq: baseSeq}
+}
+
+// count reports how many messages the sink has produced so far.
+func (s *claudeSink) count() int { return len(s.messages) }
+
+// consume processes one raw JSONL line.
+func (s *claudeSink) consume(raw []byte) {
+	var line rawLine
+	if err := json.Unmarshal(raw, &line); err != nil {
+		return
+	}
+
+	// Extract metadata
+	if s.meta.SessionID == "" && line.SessionID != "" {
+		s.meta.SessionID = line.SessionID
+	}
+	if s.meta.Project == "" && line.CWD != "" {
+		s.meta.Project = line.CWD
+	}
+	if s.meta.GitBranch == "" && line.GitBranch != "" {
+		s.meta.GitBranch = line.GitBranch
+	}
+	if s.meta.AgentID == "" && line.AgentID != "" {
+		s.meta.AgentID = line.AgentID
+	}
+
+	ts := parseTimestamp(line.Timestamp)
+	if s.meta.StartedAt.IsZero() && !ts.IsZero() {
+		s.meta.StartedAt = ts
+	}
+	if !ts.IsZero() {
+		s.meta.EndedAt = ts
+	}
+
+	switch line.Type {
+	case "user":
+		msgs := parseUserMessage(line, s.meta, s.seq, ts)
+		s.messages = append(s.messages, msgs...)
+		s.seq += len(msgs)
+
+	case "assistant":
+		msgs := parseAssistantMessage(line, s.seq, ts)
+		s.messages = append(s.messages, msgs...)
+		s.seq += len(msgs)
+
+	case "progress":
+		if msg, ok := parseProgressMessage(line, s.seq, ts); ok {
+			s.messages = append(s.messages, msg)
+			s.seq++
+		}
+
+	case "system":
+		if line.Subtype == "away_summary" && len(line.ContentStr) > 0 {
+			var content string
+			if err := json.Unmarshal(line.ContentStr, &content); err != nil {
+				return
+			}
+			if content == "" {
+				return
+			}
+			s.messages = append(s.messages, models.Message{
+				SessionID:   s.meta.SessionID,
+				Role:        "system",
+				MessageType: "pulse",
+				Content:     cleanAwaySummary(content),
+				Timestamp:   ts,
+				Sequence:    s.seq,
+			})
+			s.seq++
+		}
+	}
+}
+
 // ParseSessionFile reads a Claude Code session JSONL file and extracts messages and metadata.
 func ParseSessionFile(path string) ([]models.Message, *SessionMeta, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+	sink := newClaudeSink(0)
+	if _, err := scanSession(path, 0, true, sink); err != nil {
+		return sink.messages, sink.meta, err
 	}
-	defer f.Close()
-
-	var messages []models.Message
-	meta := &SessionMeta{}
-	seq := 0
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
-
-	for scanner.Scan() {
-		var line rawLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			continue
-		}
-
-		// Extract metadata
-		if meta.SessionID == "" && line.SessionID != "" {
-			meta.SessionID = line.SessionID
-		}
-		if meta.Project == "" && line.CWD != "" {
-			meta.Project = line.CWD
-		}
-		if meta.GitBranch == "" && line.GitBranch != "" {
-			meta.GitBranch = line.GitBranch
-		}
-		if meta.AgentID == "" && line.AgentID != "" {
-			meta.AgentID = line.AgentID
-		}
-
-		ts := parseTimestamp(line.Timestamp)
-		if meta.StartedAt.IsZero() && !ts.IsZero() {
-			meta.StartedAt = ts
-		}
-		if !ts.IsZero() {
-			meta.EndedAt = ts
-		}
-
-		switch line.Type {
-		case "user":
-			msgs := parseUserMessage(line, meta, seq, ts)
-			messages = append(messages, msgs...)
-			seq += len(msgs)
-
-		case "assistant":
-			msgs := parseAssistantMessage(line, seq, ts)
-			messages = append(messages, msgs...)
-			seq += len(msgs)
-
-		case "progress":
-			if msg, ok := parseProgressMessage(line, seq, ts); ok {
-				messages = append(messages, msg)
-				seq++
-			}
-
-		case "system":
-			if line.Subtype == "away_summary" && len(line.ContentStr) > 0 {
-				var content string
-				if err := json.Unmarshal(line.ContentStr, &content); err != nil {
-					continue
-				}
-				if content == "" {
-					continue
-				}
-				messages = append(messages, models.Message{
-					SessionID:   meta.SessionID,
-					Role:        "system",
-					MessageType: "pulse",
-					Content:     cleanAwaySummary(content),
-					Timestamp:   ts,
-					Sequence:    seq,
-				})
-				seq++
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return messages, meta, fmt.Errorf("scan %s: %w", path, err)
-	}
-
-	return messages, meta, nil
+	return sink.messages, sink.meta, nil
 }
 
 // ParseAuto detects the session source from path/content and dispatches to the

@@ -400,6 +400,12 @@ func removeOpencodePlugin(home string) error {
 	pluginSourceDir := filepath.Join(home, ".local", "share", "yesmem", "plugins", "opencode-yesmem")
 	os.RemoveAll(pluginSourceDir)
 
+	if err := RemoveThemes(home); err != nil {
+		// Like the two RemoveAll calls above: a leftover theme file must not
+		// stop the settings cleanup below.
+		fmt.Printf("⚠ removing themes: %v\n", err)
+	}
+
 	return removeOpencodeSettings(home)
 }
 

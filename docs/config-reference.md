@@ -260,6 +260,52 @@ max_per_category:
 
 ---
 
+## diagnostics — Diagnostics Endpoints
+
+Off by default. The daemon reads config once at startup, so a change needs a daemon restart.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pprof` | bool | `false` | Start the Go pprof endpoint. `YESMEM_PPROF` overrides it (`1`/`true`/`yes`/`on` forces on, `0`/`false`/`no`/`off` forces off). |
+| `pprof_listen` | string | `127.0.0.1:7071` | Listen address. Must be loopback — a non-loopback host (`0.0.0.0`, `::`, a LAN address) is rejected and the endpoint does not start. |
+
+The endpoint serves Go runtime profiles only — allocation sites, goroutine stacks and CPU samples, never session transcripts. It is **unauthenticated**: any process on this machine can read a profile (`/debug/pprof/cmdline` returns the daemon's argv), and on a machine with other logged-in users they can read it too.
+
+Reading is not the only capability. `/debug/pprof/profile` and `/debug/pprof/trace` keep the daemon busy for as long as the request asks, so an unsupervised local user can start a CPU profile or an execution trace and let it run. Leave `pprof` off unless you are diagnosing something — it is a debugging aid, not a service, and `pprof_listen` must stay loopback for that reason.
+
+Requests are fenced in three ways:
+
+- every request must carry a loopback `Host` header (`localhost`, `127.0.0.1` or `::1`) — non-loopback hosts are rejected, which also blocks DNS rebinding;
+- requests a browser marks as coming from another origin (`Origin`, `Sec-Fetch-Site: cross-site` or `same-site`) are rejected (403), so a page cannot start a profile through an `<img>` tag or a `fetch`. A request carrying none of those labels is admitted: any process on this machine, and a fetch a browser does not attribute to a page (for example from an extension, which sends `Sec-Fetch-Site: none`). The endpoint trusts this machine — the labels only separate a page from an operator;
+- methods other than GET and HEAD are rejected (405).
+
+The duration of a profile request is capped at 120 seconds — `profile` and `trace`, and any named profile that takes a `seconds` parameter to look at a window (for example `heap?seconds=300` for the allocation rate). A longer value is silently reduced, with no response header to show it.
+
+**`block` and `mutex` stay empty.** The daemon never enables the block or mutex profiler (`runtime.SetBlockProfileRate`, `runtime.SetMutexProfileFraction`), so those two profiles exist but report no samples.
+
+```yaml
+diagnostics:
+  pprof: true
+  pprof_listen: "127.0.0.1:7071"
+```
+
+Read a heap profile:
+
+```bash
+go tool pprof http://127.0.0.1:7071/debug/pprof/heap
+```
+
+**`inuse_space` vs `alloc_space`** — the distinction that separates retention from churn:
+
+| Metric | High value means |
+|--------|------------------|
+| `inuse_space` | Live heap still referenced — retention or a leak. |
+| `alloc_space` | Total allocated since start — churn/spikes. With a low `inuse_space` the memory was already released by the GC. |
+
+Pass `?gc=1` to sample from live data — it triggers a real garbage collection (stop-the-world) inside the daemon, so use it when you need a clean `inuse_space` reading. Switch between `-inuse_space` and `-alloc_space` inside `go tool pprof`.
+
+---
+
 ## update — Auto-Update
 
 | Key | Type | Default | Description |
@@ -280,6 +326,64 @@ max_per_category:
 | `max_turns` | int | `0` | Max relay turns per agent. `0` = 30 default. |
 | `max_depth` | int | `0` | Max spawn depth (agent → sub-agent). `0` = 3 default. |
 | `token_budget` | int | `0` | Max tokens per agent (input+output). `0` = 500000 default. Overridable per spawn. |
+| `themes` | map | `{}` | Agent type → opencode TUI theme for spawned agents (e.g. `yesloop: yesmem-loop`). Empty value disables the type's theme. See [agents.themes](#agentsthemes--agent-tui-themes). |
+
+### agents.themes — Agent TUI Themes
+
+Every spawned opencode agent gets a theme that names its type, so parallel agent
+windows are distinguishable at a glance. The type is the section prefix:
+`yesloop-agent-themes` → `yesloop`, `yesresearch-fusion` → `yesresearch`,
+`subresearch-materials` → `subresearch`, `orchestrator` → `orchestrator`.
+
+| Type | Theme | Accent |
+|------|-------|--------|
+| `yesloop` | `yesmem-loop` | Amber |
+| `yesresearch` | `yesmem-research` | Teal |
+| `subresearch` | `yesmem-subresearch` | Magenta (with its own status/menu tone) |
+| `orchestrator` | `yesmem-dark` | Violet |
+
+`subresearch` is a mapping for `subresearch-*` sections. The yesresearch skill
+names its area agents `yesresearch-<topic>-<cluster>`, so they take the research
+accent; name a section `subresearch-…` (or pass `theme`) to get magenta.
+
+All four share one dark base (background, body text, borders), so the accent is
+what carries the type. They are dark-only by construction; with `theme.mode: light`
+in `cli.json`, opencode keeps its light surfaces for a few elements (its own
+built-in dark themes behave the same way). The theme files ship with yesmem and
+are installed to
+`~/.config/opencode/themes/` by `yesmem update`, the setup wizard, and
+`make deploy`; opencode discovers every `*.json` in that directory (and in any
+`.opencode/themes/` between the working directory and `$HOME`). `yesmem uninstall`
+removes the files it installed and leaves themes you added yourself alone. A
+`yesmem-*` theme that is not installed is reported in the daemon log — opencode
+itself falls back to its default theme for an unknown name without saying so.
+
+Resolution order per spawn: the `theme` parameter of `spawn_agent` →
+`agents.themes[<section prefix>]` → no theme (opencode's own default).
+
+The daemon applies the resolved theme differently depending on the deployed
+opencode binary: it passes `--theme <name>` when `opencode --help` documents that
+flag (checked once per binary generation, keyed by mtime+size), otherwise it sets
+`OPENCODE_CLI_CONFIG_CONTENT` for the spawned process. A theme name that could be
+parsed as a flag is refused, since it would abort the start of the TUI. If that
+variable is already set in the daemon's environment, the daemon leaves it alone —
+an explicit operator setting wins over the agent theme. The one exception is
+yesmem's own value (`{"theme":{"name":…}}` and nothing else): a daemon started
+from inside an agent window inherits it, and reading that as an operator decision
+would disable theming for good.
+
+```yaml
+agents:
+  themes:
+    yesloop: yesmem-loop
+    yesresearch: yesmem-research
+    subresearch: yesmem-subresearch
+    orchestrator: yesmem-dark
+    # Any opencode theme name works, including the built-in ones:
+    # yesresearch: tokyonight
+    # Disable theming for one type:
+    # yesloop: ""
+```
 
 ---
 

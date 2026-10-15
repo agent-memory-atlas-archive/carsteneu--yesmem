@@ -88,12 +88,20 @@ type Config struct {
 	Replace          bool   // Kill existing daemon before starting
 	HTTPEnabled      bool   // --http flag or config: start HTTP API server
 	HTTPListen       string // from config, default "127.0.0.1:9377"
+	PprofEnabled     bool   // config diagnostics.pprof or YESMEM_PPROF: start the localhost pprof endpoint
+	PprofListen      string // from config, default "127.0.0.1:7071"
 	CapsDir          string // CAP.md file directory — defaults to DataDir/../caps
 
 	// TerminalsSave, if set, runs 1 minute after daemon start and then every
 	// 15 minutes to keep terminals.json resume-ready. Wired in main (main.go)
 	// because internal/terminals imports this package back.
 	TerminalsSave func()
+
+	// LiveWindows lists every mapped window (id, desktop, owner pid) with one
+	// window-manager call; err means "can't tell". Used by whoami, agent
+	// placement and to prune windows.json. Wired in main for the same reason
+	// as TerminalsSave.
+	LiveWindows func() ([]LiveWindow, error)
 }
 
 // Run starts the daemon: socket-first for instant MCP availability, then index async.
@@ -174,6 +182,10 @@ func Run(cfg Config) error {
 	handler := NewHandler(store, bloomMgr)
 	handler.dataDir = cfg.DataDir
 	handler.RebuildFromPIDFiles()
+	handler.liveWindows = cfg.LiveWindows
+	handler.RebuildWindowMap()
+	// Liveness check calls the window manager: never on the startup path.
+	go handler.PruneDeadWindows()
 	if ac != nil {
 		handler.agentTerminal = ac.Agents.Terminal
 		if ac.Agents.MaxRuntime != "" {
@@ -194,6 +206,7 @@ func Run(cfg Config) error {
 			handler.agentDefaultBackend = ac.Agents.DefaultBackend
 		}
 		handler.agentPermissionKick = ac.Agents.PermissionKick
+		handler.agentThemes = mergeAgentThemes(ac.Agents.Themes)
 		if d, err := time.ParseDuration(ac.Agents.PermissionKickDelay); err == nil && d > 0 {
 			handler.agentPermissionKickDelay = d
 		}
@@ -369,6 +382,13 @@ func Run(cfg Config) error {
 		}
 	}
 
+	// ━━━ pprof diagnostics (optional, loopback only) ━━━
+	if srv, err := startPprofIfEnabled(cfg.PprofEnabled, cfg.PprofListen); err != nil {
+		log.Printf("warn: pprof diagnostics not started: %v", err)
+	} else if srv != nil {
+		defer shutdownServer(srv)
+	}
+
 	// Proxy runs as separate systemd unit (yesmem-proxy.service), not embedded here.
 
 	// Context for graceful shutdown of background workers
@@ -446,6 +466,14 @@ func Run(cfg Config) error {
 		}
 	}
 
+	// One pool for every session root: indexing happens off the watcher's
+	// dispatch loop with a bounded worker count, so a large session no longer
+	// blocks the small ones behind it and two large ones never expand at once.
+	indexPool := indexer.NewIndexPool(idx.IndexSession, indexer.DefaultIndexWorkers,
+		indexer.LargeSessionBytes, func(path string) {
+			handler.InvalidateProjectCache()
+		})
+
 	startWatcher := func(root string) (*Watcher, error) {
 		if root == "" {
 			return nil, nil
@@ -460,10 +488,7 @@ func Run(cfg Config) error {
 		w := NewWatcher(root,
 			func(path string) {
 				log.Printf("Change detected: %s", filepath.Base(path))
-				if err := idx.IndexSession(path); err != nil {
-					log.Printf("warn: index %s: %v", path, err)
-				}
-				handler.InvalidateProjectCache()
+				indexPool.Submit(path)
 			},
 			func(path string) {
 				log.Printf("Session settled (5min quiet): %s — queued for batch extraction", filepath.Base(path))

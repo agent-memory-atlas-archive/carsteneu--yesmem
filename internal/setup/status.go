@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/carsteneu/yesmem/internal/storage"
 )
@@ -154,6 +155,14 @@ func Status(dataDir string) error {
 	printSize("  Bleve index", filepath.Join(dataDir, "bleve-index"))
 	printSize("  Vectors", filepath.Join(dataDir, "vectors"))
 	printSize("  Archive", filepath.Join(dataDir, "archive"))
+
+	// Live MCP helpers — one per connected client session. Orphans and stale
+	// binaries point at clients that died without closing stdin.
+	fmt.Println("\nMCP helpers:")
+	helpers, scanErr := scanMCPHelpers(procRootPath, time.Now())
+	for _, line := range formatMCPHelperSection(helpers, scanErr) {
+		fmt.Println(line)
+	}
 
 	return nil
 }

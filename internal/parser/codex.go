@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -58,90 +57,96 @@ type codexContentItem struct {
 	Text string `json:"text"`
 }
 
+// codexSink accumulates messages and metadata while consuming Codex JSONL
+// lines. Shared by the whole-file parser and the incremental tail parser so the
+// two cannot diverge in how a line is interpreted.
+type codexSink struct {
+	messages []models.Message
+	meta     *SessionMeta
+	seq      int
+}
+
+// newCodexSink returns a sink whose sequence counter starts at baseSeq.
+func newCodexSink(baseSeq int) *codexSink {
+	return &codexSink{meta: &SessionMeta{SourceAgent: "codex"}, seq: baseSeq}
+}
+
+// count reports how many messages the sink has produced so far.
+func (s *codexSink) count() int { return len(s.messages) }
+
+// consume processes one raw Codex JSONL line.
+func (s *codexSink) consume(raw []byte) {
+	var line codexLine
+	if err := json.Unmarshal(raw, &line); err != nil {
+		return
+	}
+
+	ts := parseTimestamp(line.Timestamp)
+	if s.meta.StartedAt.IsZero() && !ts.IsZero() {
+		s.meta.StartedAt = ts
+	}
+	if !ts.IsZero() {
+		s.meta.EndedAt = ts
+	}
+
+	switch line.Type {
+	case "session_meta":
+		var payload codexSessionMetaPayload
+		if json.Unmarshal(line.Payload, &payload) != nil {
+			return
+		}
+		if payload.ID != "" && s.meta.SessionID == "" {
+			s.meta.SessionID = normalizeCodexSessionID(payload.ID)
+		}
+		if payload.CWD != "" && s.meta.Project == "" {
+			s.meta.Project = payload.CWD
+		}
+		if s.meta.StartedAt.IsZero() {
+			if parsed := parseTimestamp(payload.Timestamp); !parsed.IsZero() {
+				s.meta.StartedAt = parsed
+			}
+		}
+	case "response_item":
+		added := parseCodexResponseItem(line.Payload, s.meta, ts, s.seq)
+		s.messages = append(s.messages, added...)
+		s.seq += len(added)
+	case "function_call":
+		if msg, ok := parseCodexFunctionCall(line.Payload, s.meta.SessionID, ts, s.seq); ok {
+			s.messages = append(s.messages, msg)
+			s.seq++
+		}
+	case "function_call_output":
+		if msg, ok := parseCodexFunctionCallOutput(line.Payload, s.meta.SessionID, ts, s.seq); ok {
+			s.messages = append(s.messages, msg)
+			s.seq++
+		}
+	case "reasoning":
+		if msg, ok := parseCodexReasoning(line.Payload, s.meta.SessionID, ts, s.seq); ok {
+			s.messages = append(s.messages, msg)
+			s.seq++
+		}
+	case "event_msg":
+		if msg, ok := parseCodexEventMsg(line.Payload, s.meta.SessionID, ts, s.seq); ok {
+			s.messages = append(s.messages, msg)
+			s.seq++
+		}
+	}
+}
+
 // ParseCodexSession parses Codex JSONL event streams from ~/.codex/sessions.
 // It normalizes user/assistant messages, function calls, outputs, and reasoning
 // into yesmem's generic session/message model.
 func ParseCodexSession(path string) ([]models.Message, *SessionMeta, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-
-	meta := &SessionMeta{SourceAgent: "codex"}
-	var messages []models.Message
-	seq := 0
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
-
-	for scanner.Scan() {
-		var line codexLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			continue
-		}
-
-		ts := parseTimestamp(line.Timestamp)
-		if meta.StartedAt.IsZero() && !ts.IsZero() {
-			meta.StartedAt = ts
-		}
-		if !ts.IsZero() {
-			meta.EndedAt = ts
-		}
-
-		switch line.Type {
-		case "session_meta":
-			var payload codexSessionMetaPayload
-			if json.Unmarshal(line.Payload, &payload) != nil {
-				continue
-			}
-			if payload.ID != "" && meta.SessionID == "" {
-				meta.SessionID = normalizeCodexSessionID(payload.ID)
-			}
-			if payload.CWD != "" && meta.Project == "" {
-				meta.Project = payload.CWD
-			}
-			if meta.StartedAt.IsZero() {
-				if parsed := parseTimestamp(payload.Timestamp); !parsed.IsZero() {
-					meta.StartedAt = parsed
-				}
-			}
-		case "response_item":
-			added := parseCodexResponseItem(line.Payload, meta, ts, seq)
-			messages = append(messages, added...)
-			seq += len(added)
-		case "function_call":
-			if msg, ok := parseCodexFunctionCall(line.Payload, meta.SessionID, ts, seq); ok {
-				messages = append(messages, msg)
-				seq++
-			}
-		case "function_call_output":
-			if msg, ok := parseCodexFunctionCallOutput(line.Payload, meta.SessionID, ts, seq); ok {
-				messages = append(messages, msg)
-				seq++
-			}
-		case "reasoning":
-			if msg, ok := parseCodexReasoning(line.Payload, meta.SessionID, ts, seq); ok {
-				messages = append(messages, msg)
-				seq++
-			}
-		case "event_msg":
-			if msg, ok := parseCodexEventMsg(line.Payload, meta.SessionID, ts, seq); ok {
-				messages = append(messages, msg)
-				seq++
-			}
-		}
+	sink := newCodexSink(0)
+	if _, err := scanSession(path, 0, true, sink); err != nil {
+		return sink.messages, sink.meta, err
 	}
 
-	if err := scanner.Err(); err != nil {
-		return messages, meta, fmt.Errorf("scan %s: %w", path, err)
+	if sink.meta.Project == "" {
+		sink.meta.Project = projectFromCodexPath(path)
 	}
 
-	if meta.Project == "" {
-		meta.Project = projectFromCodexPath(path)
-	}
-
-	return messages, meta, nil
+	return sink.messages, sink.meta, nil
 }
 
 func parseCodexResponseItem(raw json.RawMessage, meta *SessionMeta, ts time.Time, seq int) []models.Message {

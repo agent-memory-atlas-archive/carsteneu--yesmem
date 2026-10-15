@@ -95,6 +95,63 @@ func hasFileKeywordMatch(keywords []string, content string) bool {
 	return false
 }
 
+// hasNonFilenameKeywordMatch reports whether content mentions one of the
+// keywords outside of an echoed path and outside the file name itself. For a
+// file op every keyword comes from the target path, so this asks whether the
+// gotcha says anything about that path beyond repeating it.
+//
+// The file name is the last path segment as the caller sees it (filename), not
+// whatever happens to contain a ".": Makefile, Dockerfile and README are file
+// names too, and counting them as ordinary path words let a Bash transcript that
+// merely echoes the name pass as overlap (MED-1). extractPathKeywords emits a
+// dotted name together with its extension-less stem ("notes.txt" → "notes.txt",
+// "notes"), so the stem is excluded as well.
+//
+// A directory segment that the transcript mentions as a standalone word is kept:
+// that is a statement about the location rather than an echo of the path. That
+// also holds for a dotted segment: a transcript that says "module y@v1.2.3 not
+// found" is talking about the version directory, so a gotcha carrying it can
+// select a file op under that path. The previous derivation excluded every
+// dotted keyword, which suppressed that overlap as a side effect.
+//
+// Corner case, accepted: when an extension-less file name is also one of the
+// path's directory segments (…/mcp/mcp), excluding the name removes the only
+// keyword that could have matched, so the gotcha cannot fire at all. That errs
+// towards silence, which is the safe direction for this guard.
+func hasNonFilenameKeywordMatch(keywords []string, content, filename string) bool {
+	// keywords are lowercased by extractPathKeywords, so compare in lower case.
+	filenameParts := make(map[string]bool)
+	if filename != "" {
+		filename = strings.ToLower(filename)
+		filenameParts[filename] = true
+		if i := strings.LastIndex(filename, "."); i > 0 {
+			if stem := filename[:i]; len(stem) >= 3 {
+				filenameParts[stem] = true
+			}
+		}
+	}
+
+	var prose strings.Builder
+	for _, tok := range strings.Fields(content) {
+		if strings.ContainsAny(tok, `/\`) {
+			continue
+		}
+		prose.WriteString(tok)
+		prose.WriteByte(' ')
+	}
+	lower := strings.ToLower(prose.String())
+
+	for _, kw := range keywords {
+		if filenameParts[kw] {
+			continue
+		}
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // pathNoise contains generic path segments to skip during file path keyword extraction.
 var pathNoise = map[string]bool{
 	"home": true, "root": true, "usr": true, "var": true,

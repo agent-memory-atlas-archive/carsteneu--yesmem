@@ -294,8 +294,8 @@ func TestGenerateRecovery_ReturnsBlock(t *testing.T) {
 		FirstMessage: "Fix the login bug", MessageCount: 3,
 	})
 	store.InsertMessages([]models.Message{
-		{SessionID: "recover-me", Role: "user", MessageType: "text", Content: "Fix the login bug in auth.go"},
-		{SessionID: "recover-me", Role: "assistant", MessageType: "text", Content: "Looking at auth.go now"},
+		{SessionID: "recover-me", Role: "user", MessageType: "text", Content: "Fix the login bug in auth.go", Sequence: 0},
+		{SessionID: "recover-me", Role: "assistant", MessageType: "text", Content: "Looking at auth.go now", Sequence: 1},
 	})
 
 	gen := New(store, 3)

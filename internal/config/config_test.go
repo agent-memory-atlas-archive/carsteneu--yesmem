@@ -1038,3 +1038,75 @@ func TestCoerceValue(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsPprofDefaultsOff(t *testing.T) {
+	t.Setenv("YESMEM_PPROF", "")
+	cfg := Default()
+	if cfg.Diagnostics.Pprof {
+		t.Error("diagnostics.pprof should default to false")
+	}
+	if cfg.Diagnostics.PprofListen != "127.0.0.1:7071" {
+		t.Errorf("diagnostics.pprof_listen: got %q, want 127.0.0.1:7071", cfg.Diagnostics.PprofListen)
+	}
+	if cfg.Diagnostics.PprofEnabled() {
+		t.Error("PprofEnabled() should be false by default")
+	}
+}
+
+func TestPprofEnabledFromConfig(t *testing.T) {
+	t.Setenv("YESMEM_PPROF", "")
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("diagnostics:\n  pprof: true\n  pprof_listen: \"127.0.0.1:7072\"\n"), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Diagnostics.PprofEnabled() {
+		t.Error("diagnostics.pprof: true should enable pprof")
+	}
+	if cfg.Diagnostics.PprofListen != "127.0.0.1:7072" {
+		t.Errorf("pprof_listen: got %q, want 127.0.0.1:7072", cfg.Diagnostics.PprofListen)
+	}
+}
+
+func TestDiagnosticsAbsentKeepsDefaults(t *testing.T) {
+	t.Setenv("YESMEM_PPROF", "")
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("extraction:\n  model: opus\n"), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// Parse proof: a sibling key from the same file must have taken effect,
+	// otherwise a silent parse error would make this test pass vacuously.
+	if cfg.Extraction.Model != "opus" {
+		t.Fatalf("config file was not parsed: extraction.model = %q, want opus", cfg.Extraction.Model)
+	}
+	if cfg.Diagnostics.Pprof {
+		t.Error("absent diagnostics block should leave pprof off")
+	}
+	if cfg.Diagnostics.PprofListen != "127.0.0.1:7071" {
+		t.Errorf("absent diagnostics block should keep default pprof_listen, got %q", cfg.Diagnostics.PprofListen)
+	}
+}
+
+func TestPprofEnabledEnvOverride(t *testing.T) {
+	// Env forces ON even when the config is off.
+	t.Setenv("YESMEM_PPROF", "1")
+	off := Default()
+	if !off.Diagnostics.PprofEnabled() {
+		t.Error("YESMEM_PPROF=1 should enable pprof even when config is false")
+	}
+
+	// Env forces OFF even when the config is on.
+	t.Setenv("YESMEM_PPROF", "false")
+	on := Default()
+	on.Diagnostics.Pprof = true
+	if on.Diagnostics.PprofEnabled() {
+		t.Error("YESMEM_PPROF=false should disable pprof even when config is true")
+	}
+}
+

@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // resolveSessionID extracts session ID from params, falls back to pidMap lookup, then activeSessionID.
@@ -159,8 +157,6 @@ func (h *Handler) handleSendTo(params map[string]any) Response {
 	if err != nil {
 		return errorResponse(err.Error())
 	}
-
-	go h.notifySession(target, "Du hast eine Nachricht erhalten.")
 
 	shortTarget := target
 	if len(shortTarget) > 8 {
@@ -427,14 +423,26 @@ func (h *Handler) handleListRegistrations(params map[string]any) Response {
 
 	h.windowMapMu.Lock()
 	windows := make(map[string]string, len(h.windowMap))
+	pids := make(map[string]int, len(h.windowMap))
 	for sid, xid := range h.windowMap {
 		windows[sid] = xid
+		pids[sid] = h.windowPid[sid]
 	}
 	terminals := make(map[string]string, len(h.terminalMap))
 	for sid, t := range h.terminalMap {
 		terminals[sid] = t
 	}
 	h.windowMapMu.Unlock()
+
+	// Never hand save-terminals a window that is closed or whose id now
+	// belongs to another client (one window-manager call, outside the lock).
+	if live, known := h.liveSnapshot(); known {
+		for sid, xid := range windows {
+			if _, ok := windowAlive(xid, pids[sid], live); !ok {
+				delete(windows, sid)
+			}
+		}
+	}
 
 	return jsonResponse(map[string]any{
 		"sessions":  sessions,
@@ -443,7 +451,27 @@ func (h *Handler) handleListRegistrations(params map[string]any) Response {
 	})
 }
 
-// handleRegisterWindow stores the X11 window ID and terminal type for xdotool push.
+// maxRegisterLen bounds session_id and terminal in register_window; real
+// values are well below (opencode:ses_… ≈ 40 chars).
+const maxRegisterLen = 256
+
+// sameX11Window reports whether two well-formed X11 ids name the same window
+// ("0x06800004" and "0x6800004" do).
+func sameX11Window(a, b string) bool {
+	x, errA := strconv.ParseUint(a[2:], 16, 64)
+	y, errB := strconv.ParseUint(b[2:], 16, 64)
+	return errA == nil && errB == nil && x == y
+}
+
+// handleRegisterWindow stores the X11 terminal window a session is shown in
+// (fed by the opencode TUI plugin) so consumers can find that window, e.g. to
+// open a spawned agent on the caller's desktop. Read-only use: the daemon never
+// drives a registered window (no input injection). Input is validated on write
+// (any same-uid socket client can call this), and a window shows exactly one
+// session: registering a window removes every other session claiming it, so
+// save-terminals sees a deterministic session per window. window_pid (the
+// window's owner pid, optional) lets later readers detect a window id the X
+// server handed to another client. No window-manager call happens here.
 func (h *Handler) handleRegisterWindow(params map[string]any) Response {
 	sessionID, _ := params["session_id"].(string)
 	windowID, _ := params["window_id"].(string)
@@ -451,63 +479,34 @@ func (h *Handler) handleRegisterWindow(params map[string]any) Response {
 	if sessionID == "" || windowID == "" {
 		return errorResponse("session_id and window_id required")
 	}
+	if !x11WindowID.MatchString(windowID) {
+		return errorResponse("window_id must be an X11 id like 0x04c00004")
+	}
+	if len(sessionID) > maxRegisterLen || len(terminal) > maxRegisterLen {
+		return errorResponse("session_id or terminal too long")
+	}
+	pid := 0
+	if raw, present := params["window_pid"]; present {
+		f, ok := raw.(float64)
+		if !ok || f <= 0 || f > maxPid || f != float64(int(f)) {
+			return errorResponse("window_pid must be a positive process id")
+		}
+		pid = int(f)
+	}
 	h.windowMapMu.Lock()
-	h.windowMap[sessionID] = windowID
-	if terminal != "" {
-		h.terminalMap[sessionID] = terminal
-	}
-	h.windowMapMu.Unlock()
-	return jsonResponse(map[string]any{"status": "ok"})
-}
-
-// notifySession injects a prompt into a running Claude session via xdotool.
-// Returns true if push was successful, false if polling fallback is needed.
-// Skips xdotool for: Ghostty (unreliable), shared windows (tabs), missing xdotool.
-func (h *Handler) notifySession(sessionID, text string) bool {
-	h.windowMapMu.Lock()
-	wid, ok := h.windowMap[sessionID]
-	if !ok || wid == "" {
-		h.windowMapMu.Unlock()
-		return false
-	}
-	// Skip Ghostty — xdotool type is unreliable in Ghostty terminals
-	if h.terminalMap[sessionID] == "ghostty" {
-		h.windowMapMu.Unlock()
-		return false
-	}
-	// Check if window is shared by multiple sessions (tabs) → unsafe for xdotool
-	shareCount := 0
-	for _, w := range h.windowMap {
-		if w == wid {
-			shareCount++
+	for sid, wid := range h.windowMap {
+		if sid != sessionID && x11WindowID.MatchString(wid) && sameX11Window(wid, windowID) {
+			h.deleteWindowLocked(sid)
 		}
 	}
+	if _, known := h.windowMap[sessionID]; !known && len(h.windowMap) >= maxWindowEntries {
+		h.evictOldestLocked()
+	}
+	h.windowNextSeq++
+	h.setWindowLocked(sessionID, windowRecord{Window: windowID, Terminal: terminal, Pid: pid, Seq: h.windowNextSeq})
 	h.windowMapMu.Unlock()
-	if shareCount > 1 {
-		return false
-	}
-
-	// Check if xdotool is available
-	xdotool, err := exec.LookPath("xdotool")
-	if err != nil {
-		return false
-	}
-
-	// windowactivate --sync, then type, then Enter
-	activate := exec.Command(xdotool, "windowactivate", "--sync", wid)
-	if err := activate.Run(); err != nil {
-		return false
-	}
-	time.Sleep(300 * time.Millisecond)
-
-	typeCmd := exec.Command(xdotool, "type", "--clearmodifiers", "--delay", "50", text)
-	if err := typeCmd.Run(); err != nil {
-		return false
-	}
-	time.Sleep(200 * time.Millisecond)
-
-	exec.Command(xdotool, "key", "Return").Run()
-	return true
+	h.saveWindowMap()
+	return jsonResponse(map[string]any{"status": "ok"})
 }
 
 func (h *Handler) handleBroadcast(params map[string]any) Response {
@@ -525,21 +524,8 @@ func (h *Handler) handleBroadcast(params map[string]any) Response {
 		return errorResponse(err.Error())
 	}
 
-	// Notify all registered sessions except sender
-	go func() {
-		h.pidMapMu.Lock()
-		sessions := make(map[string]int, len(h.pidMap))
-		for sid, pid := range h.pidMap {
-			sessions[sid] = pid
-		}
-		h.pidMapMu.Unlock()
-		for sid := range sessions {
-			if sid != sender {
-				h.notifySession(sid, "You received a broadcast message. Check broadcasts.")
-			}
-		}
-	}()
-
+	// Recipients pick the broadcast up via check_broadcasts; the daemon never
+	// types into their windows.
 	return jsonResponse(map[string]any{"message_id": msgID, "status": "broadcast_sent"})
 }
 
@@ -633,7 +619,31 @@ func (h *Handler) handleWhoami(params map[string]any) Response {
 		if model, err := h.store.GetProxyState("session_model:" + sessionID); err == nil && model != "" {
 			result["model"] = model
 		}
+		// The terminal window this session is shown in (registered by the
+		// opencode TUI plugin) and the desktop that window sits on right now.
+		// Only for an explicitly named session: the active-session fallback of
+		// resolveSessionID is last-writer-wins and would report another
+		// session's window.
+		if explicitSessionParam(params) == sessionID {
+			if window, desktop, ok := h.windowInfo(sessionID); window != "" {
+				result["window"] = window
+				if ok {
+					result["desktop"] = desktop
+				}
+			}
+		}
 	}
 
 	return jsonResponse(result)
+}
+
+// explicitSessionParam returns the session id the caller named itself
+// (session_id or the per-call _session_id), or "".
+func explicitSessionParam(params map[string]any) string {
+	for _, key := range []string{"session_id", "_session_id"} {
+		if s, ok := params[key].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }

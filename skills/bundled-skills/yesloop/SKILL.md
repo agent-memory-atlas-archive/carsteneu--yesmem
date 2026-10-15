@@ -19,11 +19,11 @@ When invoked from an interactive session, **do NOT execute the pipeline yourself
    - Multiple agents can run in parallel without conflicts
    - Easy cleanup: delete worktree + branch if abandoned
 2. Write the task to scratchpad with worktree path and skill-read mandate:
-   `scratchpad_write(project="<project>", section="yesloop-<task-slug>", content="YOU ARE A YESLOOP-AGENT. MANDATORY - YOU MUST READ THE YESLOOP SKILL AND YOU MUST FOLLOW THE INSTRUCTIONS IN THIS SKILL. Load the yesloop skill: use your platform's skill tool, or read ~/.claude/skills/yesloop/SKILL.md, or <repo-root>/skills/bundled-skills/yesloop/SKILL.md. Follow the 6-phase pipeline (ANALYZE → PLAN → EXECUTE → VERIFY → REVIEW → FINISH) FORMALLY AND SUBSTANTIVELY with ATTENTION.\n\nWorktree: <path>\nTask: <description>\n\nReport to scratchpad.")`
+   `scratchpad_write(project="<project>", section="yesloop-<task-slug>", content="YOU ARE A YESLOOP-AGENT. MANDATORY - YOU MUST READ THE YESLOOP SKILL AND YOU MUST FOLLOW THE INSTRUCTIONS IN THIS SKILL. Load the yesloop skill: use your platform's skill tool, or read ~/.claude/skills/yesloop/SKILL.md, or <repo-root>/skills/bundled-skills/yesloop/SKILL.md. Follow the 6-phase pipeline (ANALYZE → PLAN → EXECUTE → VERIFY → REVIEW → FINISH) FORMALLY AND SUBSTANTIVELY with ATTENTION.\n\nWorktree: <path>\nTask: <description>\nSession title: <one-line title from the requirement, max ~60 chars>\n\nReport to scratchpad.")`
    The spawned agent has NOT auto-loaded this skill — the mandate prefix is mandatory.
 3. **Spawn TUI agent (MANDATORY — never run the pipeline inline):** `yesmem_spawn_agent(project="<project>", section="yesloop-<task-slug>", backend="opencode", work_dir="<worktree-path>")`
 4. Wait 15s for opencode TUI to load + PTY injection to deliver the startup prompt
-5. **Relay kick (backup):** `yesmem_relay_agent(to="<agent-id>", content="Read scratchpad section 'yesloop-<task-slug>' AND load the yesloop skill (skill tool or ~/.claude/skills/yesloop/SKILL.md). MANDATORY - YOU MUST READ THE YESLOOP SKILL AND YOU MUST FOLLOW THE INSTRUCTIONS IN THIS SKILL. Begin the 6-phase pipeline FORMALLY AND SUBSTANTIVELY with ATTENTION.\n")` — backup if PTY is slow
+5. **Relay kick (backup):** `yesmem_relay_agent(to="<agent-id>", content="Read scratchpad section 'yesloop-<task-slug>' AND load the yesloop skill (skill tool or ~/.claude/skills/yesloop/SKILL.md). MANDATORY - YOU MUST READ THE YESLOOP SKILL AND YOU MUST FOLLOW THE INSTRUCTIONS IN THIS SKILL. Your agent id: <agent-id>. At Phase 1 start, rename your session to '[<agent-id>] <Session title from briefing>'. Begin the 6-phase pipeline FORMALLY AND SUBSTANTIVELY with ATTENTION.\n")` — backup if PTY is slow
 6. Confirm: "Agent spawned in worktree — visible in terminal."
 
 **Only run inline if:** the user EXPLICITLY says `--inline`. There is NO trivial-task exception — "< 2 min" is not a license to skip the worktree. If you'd commit it, it runs in the worktree. Create the worktree BEFORE the first edit.
@@ -172,6 +172,7 @@ These patterns cause the guard to reject the DONE claim:
 | No deploy evidence in Phase 6 | No `Deploy executed:` or `Deploy required:` | Must document deployment outcome |
 | Missing status line | Phase block exists but no `**Status:**` | Every phase needs a status |
 | Missing session id note | Phase 1 has no `**Session id:**` field and no "session id missing" note | `whoami()` must be called at Phase 1 start; backend session id (or retry-failure note) must appear in Phase 1 block |
+| Missing session title | Phase 1 has no `**Session title set:**` field and no rename-failure note | `session_rename` at Phase 1 start with `[<agent-id>] <Session title>` (see SESSION TITLE rule) |
 
 ### Findings-Table
 
@@ -193,6 +194,8 @@ Each phase writes ONE structured block to scratchpad. Block format is mandatory 
 All `scratchpad_write` and `scratchpad_read` calls MUST use the `project` value returned by `whoami()`. Call `whoami()` as the FIRST action at Phase 1 start and use its `project` field verbatim for every scratchpad call afterwards. Do NOT guess, do NOT use the worktree basename, do NOT hardcode a short name. The orchestrator and the idle/done-verify state machines read from `agent.Project` (set by `yesmem_spawn_agent`); using a different string means your writes and reads land in a different scope and the orchestrator never sees your progress.
 
 `whoami()` also returns the backend session id (`opencode_session_id` for opencode, `codex_session_id` for codex). This id is required for `resume_agent` after crashes. The daemon polls it asynchronously after spawn, so the first `whoami()` call may return it empty. Retry up to 3 times with 5 seconds sleep between calls. If still empty after 3 retries, note "session id missing — resume may fail" in Phase 1 scratchpad and proceed. Do not block beyond 15 seconds.
+
+**SESSION TITLE (MANDATORY at Phase 1 start, opencode backend):** Rename your own session so agent windows and session lists are identifiable: `session_rename(title="[<agent-id>] <Session title>")` — omit `sessionID` (renames the current session). `<agent-id>` comes from the relay kick (e.g. agent-20261015-05); `<Session title>` from the briefing field, or derive a short title from the Task line if absent. Record `**Session title set:** <final title>` in the Phase 1 block. Non-opencode backends or rename failure: non-blocking — note it and continue.
 
 **SCRATCHPAD DISCIPLINE (MANDATORY — prevents briefing clobber):**
 
@@ -477,6 +480,7 @@ update_agent_status(phase="Phase 6/6 FINISH")
 **Status:** COMPLETE
 **Goal understood:** Add config.yaml read/write to set_config/get_config
 **Session id:** ses_abc123 (from whoami())
+**Session title set:** [agent-20261015-05] config read/write
 **Codebase explored:** internal/daemon/handler_state.go, internal/config/config.go
 **Constraints identified:** no breaking MCP API, proxy_state overrides must still work
 **Risks:** concurrent writes, type coercion

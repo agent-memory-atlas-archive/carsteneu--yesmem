@@ -79,14 +79,22 @@ func (s *Server) getProxy() (*ProxyClient, error) {
 	return s.proxy, nil
 }
 
-// ServeStdio starts the MCP server on stdin/stdout.
-func (s *Server) ServeStdio() error {
+// serveStdio is indirected so tests can run ServeStdio without a real stdio
+// server on the other end.
+var serveStdio = mcpserver.ServeStdio
+
+// ServeStdio starts the MCP server on stdin/stdout. The stdio mode is the only
+// way this server runs, so the parent watch belongs here. originPpid is the
+// client's pid as captured by the caller before anything that can block — see
+// startParentWatch for why it may not be read at this point.
+func (s *Server) ServeStdio(originPpid int) error {
 	defer func() {
 		if s.proxy != nil {
 			s.proxy.Close()
 		}
 	}()
-	return mcpserver.ServeStdio(s.srv)
+	startParentWatch(originPpid)
+	return serveStdio(s.srv)
 }
 
 func buildProxyParams(arguments map[string]any, withThreadID bool) map[string]any {
@@ -955,7 +963,7 @@ func (s *Server) registerTools() {
 
 	s.srv.AddTool(
 		mcplib.NewTool("whoami",
-			mcplib.WithDescription("Get your own session ID and agent metadata. Use at startup to discover your identity for send_to callbacks and to confirm your agent context (section, project, backend session ID)."),
+			mcplib.WithDescription("Get your own session ID and agent metadata. Use at startup to discover your identity for send_to callbacks and to confirm your agent context (section, project, backend session ID). Also returns the terminal window your session is shown in (window) and the desktop it currently sits on (desktop), when known."),
 			mcplib.WithString("project", mcplib.Description(projectFilterDesc)),
 		), s.proxyCallWithThreadID("whoami", nil))
 
@@ -1329,6 +1337,7 @@ func (s *Server) registerTools() {
 			mcplib.WithNumber("token_budget", mcplib.Description("Token budget (0=default)")),
 			mcplib.WithNumber("max_turns", mcplib.Description("Max turns (0=unlimited)")),
 			mcplib.WithString("model", mcplib.Description("Model override")),
+			mcplib.WithString("theme", mcplib.Description("TUI theme for this agent (empty = the theme of the agent type, e.g. yesmem-loop for a yesloop section)")),
 			mcplib.WithString("work_dir", mcplib.Description("Working directory")),
 			mcplib.WithString("backend", mcplib.Description("claude|codex|opencode")),
 			mcplib.WithString("permission_kick", mcplib.Description("Permission-kick setting for the agent: on|off (empty = inherit config default)")),

@@ -45,6 +45,7 @@ type Handler struct {
 	agentPermissionKick         bool               // kick agents stuck in permission dialogs via double-Enter — set by daemon from config
 	agentPermissionKickDelay    time.Duration      // stream-idle before first kick — set by daemon from config
 	agentPermissionKickInterval time.Duration      // re-kick interval after first kick — set by daemon from config
+	agentThemes                 map[string]string  // agent type → TUI theme — set by daemon from config (agents.themes)
 	disableAgentProcesses       bool               // test guard; production default remains false
 	defaultSandboxProfile       SandboxProfile     // default sandbox for scheduled jobs — set by daemon from config
 	httpRPCAddr                 string             // HTTP API listen address for bun MCP polyfill (e.g. 127.0.0.1:9377)
@@ -120,10 +121,22 @@ type Handler struct {
 	// OpenCode session scanner for extraction pipeline
 	opencodeScanner *indexer.OpencodeScanner
 
-	// Window tracking for xdotool push (session_id → X11 window ID string)
+	// Window tracking (session_id → X11 window ID string), fed by register_window
+	// from the opencode TUI plugin; read-only, used for agent window placement
+	// and whoami. Persisted in dataDir/windows.json (window_persist.go).
 	windowMapMu sync.Mutex
 	windowMap   map[string]string
 	terminalMap map[string]string // session_id → terminal type (ghostty, gnome-terminal, etc.)
+	// windowSaveMu serialises writes of windows.json.
+	windowSaveMu sync.Mutex
+	// windowPid / windowSeq: owner pid of the registered window (0 = unknown)
+	// and registration order, both guarded by windowMapMu; lazily created.
+	windowPid     map[string]int
+	windowSeq     map[string]int64
+	windowNextSeq int64
+	// liveWindows lists the mapped windows (err: can't tell). Injected via
+	// Config.LiveWindows because internal/terminals imports this package.
+	liveWindows func() ([]LiveWindow, error)
 
 	// Project name resolution cache: input key → resolved full path or
 	// ambiguous-marker error. Keys are composite: bare "project" for global

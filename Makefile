@@ -35,6 +35,13 @@ deploy: build
 	fi
 	mkdir -p $(HOME)/.local/share/yesmem/plugins/opencode-yesmem
 	cp plugins/opencode-yesmem/*.ts plugins/opencode-yesmem/RULES.md plugins/opencode-yesmem/package.json $(HOME)/.local/share/yesmem/plugins/opencode-yesmem/
+	mkdir -p $(HOME)/.config/opencode/plugins/yesmem-window
+	cp plugins/yesmem-window/tui.tsx $(HOME)/.config/opencode/plugins/yesmem-window/
+	mkdir -p $(HOME)/.config/opencode/themes
+	@for f in plugins/themes/*.json; do \
+		dst=$(HOME)/.config/opencode/themes/$$(basename $$f); \
+		install -m 644 $$f $$dst.tmp && mv -f $$dst.tmp $$dst || exit 1; \
+	done
 	$(MAKE) restart-services
 	$(MAKE) reap-stale-mcp
 	@echo "deployed $(VERSION) → $(INSTALL)"

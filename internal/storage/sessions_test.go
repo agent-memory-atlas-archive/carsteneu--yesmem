@@ -19,6 +19,72 @@ func insertSessionForResolve(t *testing.T, s *Store, id, project, projectShort s
 	}
 }
 
+// UpsertSession must not freeze a session's metadata at the state of its first
+// index. When the first pass runs before the file carries its first user
+// prompt (a hook or attachment line, a Codex session_meta header), the
+// incremental append is the only later writer that ever sees the prompt, so the
+// empty stored fields have to be healed there. The guard matters as much as the
+// heal: a value that is already set must never be overwritten by a later pass
+// that happens to know less about it.
+func TestUpsertSessionHealsEmptyMetadataOnly(t *testing.T) {
+	s := openTestStore(t)
+
+	started := time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
+	// First pass: the file had no user turn yet.
+	if err := s.UpsertSession(&models.Session{
+		ID: "sess-heal", Project: "/proj/heal", JSONLPath: "/proj/heal/s.jsonl",
+		StartedAt: started, IndexedAt: started,
+	}); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	// Later pass: the prompt and the project path are known now.
+	later := started.Add(2 * time.Minute)
+	if err := s.UpsertSession(&models.Session{
+		ID: "sess-heal", Project: "/proj/heal", JSONLPath: "/proj/heal/s.jsonl",
+		FirstMessage: "the first prompt", StartedAt: later, IndexedAt: later,
+	}); err != nil {
+		t.Fatalf("healing upsert: %v", err)
+	}
+
+	got, err := s.GetSession("sess-heal")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got.FirstMessage != "the first prompt" {
+		t.Errorf("first_message: got %q, want %q", got.FirstMessage, "the first prompt")
+	}
+	if !got.StartedAt.Equal(started) {
+		t.Errorf("started_at: got %s, want unchanged %s (a later writer knows less, not more)",
+			got.StartedAt, started)
+	}
+	if got.Project != "/proj/heal" || got.ProjectShort != "/proj/heal" {
+		t.Errorf("project: got %q/%q, want /proj/heal", got.Project, got.ProjectShort)
+	}
+
+	// A third pass claiming different metadata must not win: the stored value is
+	// authoritative once it is non-empty.
+	if err := s.UpsertSession(&models.Session{
+		ID: "sess-heal", Project: "/proj/other", JSONLPath: "/proj/heal/s.jsonl",
+		FirstMessage: "a different prompt", StartedAt: later.Add(time.Hour), IndexedAt: later,
+	}); err != nil {
+		t.Fatalf("third upsert: %v", err)
+	}
+	got, err = s.GetSession("sess-heal")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got.FirstMessage != "the first prompt" {
+		t.Errorf("first_message after conflicting pass: got %q, want %q", got.FirstMessage, "the first prompt")
+	}
+	if got.Project != "/proj/heal" {
+		t.Errorf("project after conflicting pass: got %q, want /proj/heal", got.Project)
+	}
+	if !got.StartedAt.Equal(started) {
+		t.Errorf("started_at after conflicting pass: got %s, want %s", got.StartedAt, started)
+	}
+}
+
 func TestResolveProjectShort_AbsolutePathIdentity(t *testing.T) {
 	s := mustOpen(t)
 	in := "/var/www/html/ccm19/main/cookie-consent-management"

@@ -18,6 +18,7 @@ import (
 	"github.com/carsteneu/yesmem/internal/hints"
 	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
+	"github.com/carsteneu/yesmem/internal/textutil"
 )
 
 // HookInput represents the JSON Claude Code sends on stdin for hook events.
@@ -90,6 +91,7 @@ func RunCheck(dataDir string) {
 	// Parse tool input to get inputStr (for save_count) and keywords (for matching)
 	var keywords []string
 	var inputStr string
+	var fileBase string
 	isFileOp := false
 	switch hook.ToolName {
 	case "send_to", "start_dialog", "end_dialog":
@@ -129,6 +131,7 @@ func RunCheck(dataDir string) {
 		}
 		inputStr = file.FilePath
 		keywords = extractPathKeywords(file.FilePath)
+		fileBase = filepath.Base(file.FilePath)
 		isFileOp = true
 	case "WebFetch":
 		var wf WebFetchInput
@@ -239,7 +242,15 @@ func RunCheck(dataDir string) {
 		effScore := float64(score) * decay
 		matched := false
 		if isFileOp {
-			matched = effScore >= 2.0 || (effScore >= 1.0 && hasFileKeywordMatch(keywords, g.Content))
+			if isBashOriginAutoLearned(&g) {
+				// A Bash failure transcript only mentions a file incidentally — the
+				// pending Write/Edit is not running the failed command, so the file
+				// name alone must not select it (issue #151). Require overlap that
+				// does not come from the file name itself.
+				matched = effScore >= 2.0 && hasNonFilenameKeywordMatch(keywords, g.Content, fileBase)
+			} else {
+				matched = effScore >= 2.0 || (effScore >= 1.0 && hasFileKeywordMatch(keywords, g.Content))
+			}
 		} else {
 			matched = effScore >= 2.0 || (effScore >= 1.0 && hasLongKeywordMatch(keywords, g.Content))
 		}
@@ -464,6 +475,23 @@ func isProtectedFile(filePath string) bool {
 // Warning threshold is score >= 2; blocking requires stronger evidence to avoid
 // cross-matching unrelated commands that share generic keywords.
 const blockMinScore = 4
+
+// isBashOriginAutoLearned reports whether g is a gotcha auto-learned from a Bash
+// failure. Hook-learned rows do not record their origin reliably: the Go
+// producer (learnFromAnyFailure) leaves OriginTool empty, and the daemon
+// defaults a missing origin to "user" (handler_learnings.go). The origin is
+// therefore taken from OriginTool when it carries a recognised label and
+// otherwise from the transcript prefix the producers write.
+func isBashOriginAutoLearned(g *models.Learning) bool {
+	if g.Source != "hook_auto_learned" {
+		return false
+	}
+	switch strings.ToLower(g.OriginTool) {
+	case "bash", "bash_command_input":
+		return true
+	}
+	return textutil.FailureOriginTool(g.Content) == "bash"
+}
 
 // isRelevantForTool checks whether a gotcha's actions make it relevant for the current tool.
 // Gotchas with destructive/bash-only actions (rm, mv, git push, make, deploy) only fire on Bash/Write/Edit.

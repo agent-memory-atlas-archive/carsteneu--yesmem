@@ -21,6 +21,13 @@ func (s *Store) UpsertSession(sess *models.Session) error {
 		sess.ProjectShort = models.ProjectShortFromPath(sess.Project)
 	}
 
+	// On conflict the identity fields (project, started_at, first_message,
+	// git_branch) are healed, never replaced: they are written when they are
+	// still empty, because a later pass may be the first one to know them — the
+	// incremental append is the only writer that sees a session whose first
+	// index ran before its first user prompt existed. A value that is already
+	// set stays, so no partial pass can blank out what an earlier, better
+	// informed one stored.
 	_, err := s.db.Exec(`
 		INSERT INTO sessions (id, project, project_short, git_branch, first_message,
 			message_count, started_at, ended_at, jsonl_path, jsonl_size, indexed_at,
@@ -34,6 +41,20 @@ func (s *Store) UpsertSession(sess *models.Session) error {
 			parent_session_id = excluded.parent_session_id,
 			agent_type = excluded.agent_type,
 			source_agent = excluded.source_agent,
+			first_message = CASE WHEN sessions.first_message IS NULL OR sessions.first_message = ''
+				THEN excluded.first_message ELSE sessions.first_message END,
+			started_at = CASE WHEN sessions.started_at IS NULL OR sessions.started_at = ''
+				THEN excluded.started_at ELSE sessions.started_at END,
+			project = CASE WHEN sessions.project IS NULL OR sessions.project = ''
+				THEN excluded.project ELSE sessions.project END,
+			-- The short name describes the project that won above, so it is only
+			-- adopted while it is empty and while it belongs to the same path.
+			project_short = CASE
+				WHEN (sessions.project_short IS NULL OR sessions.project_short = '')
+					AND (sessions.project IS NULL OR sessions.project = '' OR sessions.project = excluded.project)
+				THEN excluded.project_short ELSE sessions.project_short END,
+			git_branch = CASE WHEN sessions.git_branch IS NULL OR sessions.git_branch = ''
+				THEN excluded.git_branch ELSE sessions.git_branch END,
 			extracted_at = CASE
 				WHEN sessions.extracted_at IS NOT NULL AND sessions.message_count <= 5 AND excluded.message_count > 5
 				THEN NULL ELSE sessions.extracted_at END`,

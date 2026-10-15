@@ -455,7 +455,7 @@ update_agent_status(phase="Phase 2/6 DECOMPOSE")
 - **UPDATE MODE:** Group delta-tasks (from Phase 1 delta-scan) into batches à 5-8 per Bereichs-Agent. Same cluster-files typically go to the same Bereichs-Agent to preserve context. A Bereichs-Agent may receive mixed actions: "file X: add visuals", "file Y: refresh sources", "file Z: run persona review".
 - Create one scratchpad section per cluster: `yesresearch-<topic-slug>-<cluster-slug>`.
 - For each cluster section, write:
-  - **Both modes:** cluster name, file list (or delta-task list in UPDATE MODE), source hints, language, min-sources-per-file, special constraints, **mode flag (FRESH or UPDATE)**, resolved model
+  - **Both modes:** cluster name, file list (or delta-task list in UPDATE MODE), source hints, language, min-sources-per-file, special constraints, **mode flag (FRESH or UPDATE)**, resolved model, **session title (one line, cluster topic — agents rename their session to `[<agent-id>] <session title>` at Phase 1 start)**
   - **UPDATE MODE additional:** per-file action, existing frontmatter state, existing content path
 - Decide `max_runtime` per agent (default `2h`, longer for source-heavy clusters; UPDATE typically shorter since not all files need work).
 
@@ -472,7 +472,7 @@ update_agent_status(phase="Phase 3/6 DISPATCH")
 - Per batch: `yesmem_spawn_agent` × N. Backend: `<resolved-backend>` (from scratchpad briefing). work_dir: shared worktree.
 - **Model:** use resolved model from Phase 2 (scratchpad briefing carries it).
 - Wait 15s after each spawn for TUI load.
-- **Relay kick** within 30s: `yesmem_relay_agent(to="<agent-id>", content="Read scratchpad section <section> AND load the yesresearch skill (skill tool or ~/.claude/skills/yesresearch/SKILL.md). MANDATORY - YOU MUST READ THE YESRESEARCH SKILL AND YOU MUST FOLLOW THE INSTRUCTIONS IN THIS SKILL. Mode: FRESH|UPDATE. Begin Phase 1 CONTEXT.")` — backup if PTY is slow
+- **Relay kick** within 30s: `yesmem_relay_agent(to="<agent-id>", content="Read scratchpad section <section> AND load the yesresearch skill (skill tool or ~/.claude/skills/yesresearch/SKILL.md). MANDATORY - YOU MUST READ THE YESRESEARCH SKILL AND YOU MUST FOLLOW THE INSTRUCTIONS IN THIS SKILL. Your agent id: <agent-id>. At Phase 1 start, rename your session to '[<agent-id>] <session title from briefing>'. Mode: FRESH|UPDATE. Begin Phase 1 CONTEXT.")` — backup if PTY is slow
 - Log agent IDs in orchestrator scratchpad.
 
 ### Phase 4/6: MONITOR
@@ -566,6 +566,8 @@ When you are spawned as a yesresearch Bereichs-Agent, you receive via scratchpad
 - Min sources per file, language, constraints
 - Reference to master plan (or full plan inline)
 
+**SESSION TITLE (MANDATORY at Phase 1 start, opencode backend):** `session_rename(title="[<agent-id>] <session title>")` — omit `sessionID` (renames the current session). `<agent-id>` comes from the relay kick; the session title from your briefing (or derive it from the cluster name). Record `**Session title set:** <final title>` in the Phase 1 block. Rename failure or non-opencode backend: non-blocking — note it and continue.
+
 ### Phase 1/6: CONTEXT
 ```
 update_agent_status(phase="Phase 1/6 CONTEXT")
@@ -573,6 +575,7 @@ update_agent_status(phase="Phase 1/6 CONTEXT")
 ### Phase 1: CONTEXT
 **Status:** COMPLETE
 **Session id:** <opencode_session_id from whoami()>
+**Session title set:** [<agent-id from relay kick>] <session title>
 **Mode:** FRESH | UPDATE
 **Cluster:** <name>
 **Files in scope:** <list with one-line description each>

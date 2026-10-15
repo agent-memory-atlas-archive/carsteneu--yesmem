@@ -28,6 +28,7 @@ type Config struct {
 	Signals               SignalsConfig             `yaml:"signals"`
 	ClaudeMd              ClaudeMdConfig            `yaml:"claudemd"`
 	HTTP                  HTTPConfig                `yaml:"http"`
+	Diagnostics           DiagnosticsConfig         `yaml:"diagnostics"`
 	Update                UpdateConfig              `yaml:"update"`
 	Agents                AgentsConfig              `yaml:"agents"`
 	ForkedAgents          ForkedAgentsConfig        `yaml:"forked_agents"`
@@ -58,6 +59,11 @@ type AgentsConfig struct {
 	PermissionKick bool   `yaml:"permission_kick"`  // Kick agents stuck in permission dialogs via double-Enter. Default true.
 	PermissionKickDelay    string `yaml:"permission_kick_delay"`    // Stream-inactivity before first kick (Go duration). Empty = 3m default.
 	PermissionKickInterval string `yaml:"permission_kick_interval"` // Re-kick interval (Go duration). Empty = 5m default.
+
+	// Themes maps an agent type (the section prefix, e.g. "yesloop") to the
+	// opencode TUI theme for its spawned agents. An empty value disables the
+	// type's theme; unset keys keep the built-in default.
+	Themes map[string]string `yaml:"themes"`
 }
 
 // SecretsSanitizationConfig konfiguriert die SecretRedactor-Pipeline.
@@ -305,6 +311,31 @@ type HTTPConfig struct {
 	AuthToken string `yaml:"auth_token"` // bearer token, auto-generated if empty
 }
 
+// DiagnosticsConfig controls optional diagnostic endpoints on the daemon.
+// Everything here is off by default.
+type DiagnosticsConfig struct {
+	Pprof       bool   `yaml:"pprof"`        // start the localhost pprof endpoint (default: false)
+	PprofListen string `yaml:"pprof_listen"` // loopback listen address (default: DefaultPprofListen)
+}
+
+// DefaultPprofListen is the loopback address used when diagnostics.pprof_listen
+// is empty. Shared with the daemon so the default lives in one place.
+const DefaultPprofListen = "127.0.0.1:7071"
+
+// PprofEnabled reports whether the pprof endpoint should start. The YESMEM_PPROF
+// environment variable overrides the config value (1/true/yes/on forces it on,
+// 0/false/no/off forces it off) so diagnostics can be toggled on hosts without
+// access to config.yaml.
+func (d DiagnosticsConfig) PprofEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("YESMEM_PPROF"))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return d.Pprof
+}
+
 // ExtractionConfig controls LLM-based knowledge extraction.
 type ExtractionConfig struct {
 	Model          string `yaml:"model"`                 // Pass 2 extraction model (default: sonnet)
@@ -508,6 +539,10 @@ func Default() *Config {
 		HTTP: HTTPConfig{
 			Enabled: false,
 			Listen:  "127.0.0.1:9377",
+		},
+		Diagnostics: DiagnosticsConfig{
+			Pprof:       false,
+			PprofListen: DefaultPprofListen,
 		},
 		Update: UpdateConfig{
 			AutoUpdate:    true,
