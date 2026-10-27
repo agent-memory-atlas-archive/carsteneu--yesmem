@@ -173,8 +173,23 @@ func TestSandboxFlagsV09_UnchangedByTheTwoXSupport(t *testing.T) {
 
 // fetchPinnedAiJail unpacks the pinned release into a temp dir. Never into
 // ~/.local/bin: the host's installed binary is the host's business.
+// requireBubblewrap skips when ai-jail cannot run at all: it refuses to start any
+// profile without bubblewrap ("bwrap not found in trusted locations"), and a CI
+// runner image does not carry it. Skipping here keeps that from surfacing as a
+// broken sandbox further down.
+func requireBubblewrap(t *testing.T) {
+	t.Helper()
+	if os.Getenv("BWRAP_BIN") != "" {
+		return
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bubblewrap is not installed; ai-jail cannot run a profile without it")
+	}
+}
+
 func fetchPinnedAiJail(t *testing.T) string {
 	t.Helper()
+	requireBubblewrap(t)
 	if testing.Short() {
 		t.Skip("needs the network to fetch the pinned ai-jail release")
 	}

@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Give the sandbox tests a bubblewrap and skip the docs they cannot read
 - Install the skills the nudge fixtures name
 - Make the public test suite pass on a runner without ai-jail and with a slower clock
 - Call the session rename by its registered tool id

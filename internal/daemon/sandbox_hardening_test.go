@@ -187,6 +187,7 @@ func TestRunWithProfile_FallbackPathReportsNonZeroExit(t *testing.T) {
 // of the repository.
 func realAiJailSandbox(t *testing.T, cfg SandboxConfig) *Sandbox {
 	t.Helper()
+	requireBubblewrap(t)
 	t.Chdir(t.TempDir())
 	s := NewSandbox(cfg)
 	if !s.Available() {

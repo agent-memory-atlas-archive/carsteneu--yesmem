@@ -33,6 +33,13 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      # ai-jail refuses to start a profile without bubblewrap, and the runner image
+      # does not carry it; the sandbox tests exercise real profiles, so the package
+      # has to be there.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Build
         env:
           CGO_ENABLED: "0"
