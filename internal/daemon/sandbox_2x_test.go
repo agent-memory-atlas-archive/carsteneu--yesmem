@@ -209,6 +209,17 @@ func requireAiJailPlatform(t *testing.T) {
 	}
 }
 
+// requireLinuxSandbox skips an assertion about the sandbox as the daemon host
+// runs it. The profiles are a Linux contract (systemd unit, ai-jail under
+// bubblewrap); the same binary on darwin enforces different rules, so these
+// assertions would pin the wrong behaviour there.
+func requireLinuxSandbox(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("the sandbox contract is asserted for its Linux host, not %s", runtime.GOOS)
+	}
+}
+
 func fetchPinnedAiJail(t *testing.T) string {
 	t.Helper()
 	requireBubblewrap(t)

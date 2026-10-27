@@ -619,7 +619,7 @@ func TestLos34fRealRunMasksTheProjectLocalConfig(t *testing.T) {
 // created opencode.jsonc on the host — and opencode reads that name first, which
 // made the mask a no-op for the channel it was added for.
 func TestLos34fRealRunCannotWriteTheOpencodeConfigSiblings(t *testing.T) {
-	requireAiJailPlatform(t)
+	requireLinuxSandbox(t)
 	home := isolateHome(t)
 	configDir := filepath.Join(home, ".config", "opencode")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
