@@ -161,9 +161,11 @@ func swapAiJailDigests(t *testing.T, digests map[string]string) func() {
 // returned func to undo both.
 func withFakeAiJailRelease(t *testing.T, archive []byte, digest string) (restoreAPI func(), restoreAssets func()) {
 	t.Helper()
-	assetName, err := aiJailAssetName("linux", "amd64")
+	// The platform of this run, not a fixed one: the fake release has to name the
+	// asset the downloader asks for, or the fixture tests nothing on macOS.
+	assetName, err := aiJailAssetName(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
-		t.Fatalf("asset name: %v", err)
+		t.Skipf("ai-jail has no asset for this platform: %v", err)
 	}
 
 	assets := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
