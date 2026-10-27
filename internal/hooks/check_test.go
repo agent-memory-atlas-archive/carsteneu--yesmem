@@ -1854,6 +1854,14 @@ func TestProjectFromCWD_WorktreeUsesItsCheckoutKey(t *testing.T) {
 	// A linked worktree outside a ".worktrees" path component — the shape a
 	// plain `git worktree add ../yesmem-fix` produces.
 	main, wt := linkedWorktree(t, t.TempDir(), "yesmem", "yesmem-fix")
+	// projectFromCWD answers with the resolved path, and macOS reaches its temp
+	// root through /tmp -> /private/tmp.
+	if resolved, err := filepath.EvalSymlinks(main); err == nil {
+		main = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(wt); err == nil {
+		wt = resolved
+	}
 
 	tests := []struct {
 		cwd  string

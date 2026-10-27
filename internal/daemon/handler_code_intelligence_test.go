@@ -307,7 +307,7 @@ func TestHandleSearchCode_RealGrep(t *testing.T) {
 	if h.codeGraphs == nil {
 		h.codeGraphs = make(map[string]*codeGraphEntry)
 	}
-	h.codeGraphs[dir] = &codeGraphEntry{graph: graph}
+	h.codeGraphs[realPathOrSelf(dir)] = &codeGraphEntry{graph: graph}
 	h.codeGraphMu.Unlock()
 
 	// Search for "request" — should grep actual files
@@ -433,7 +433,7 @@ func TestGetCodeGraph_RebuildsAfterHeadMove(t *testing.T) {
 	}
 
 	h.codeGraphMu.RLock()
-	entry := h.codeGraphs[dir]
+	entry := h.codeGraphs[realPathOrSelf(dir)]
 	h.codeGraphMu.RUnlock()
 	if entry == nil || entry.head != "movedhead123" {
 		t.Fatalf("cache entry must record the new HEAD, got %+v", entry)

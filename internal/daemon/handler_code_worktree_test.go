@@ -28,14 +28,19 @@ func TestResolveProjectDir_UsesCWDWhenProvided(t *testing.T) {
 func TestResolveProjectDir_PrefersProjectDirOverCWD(t *testing.T) {
 	h, _ := mustHandler(t)
 
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	explicit := filepath.Join(base, "explicit-path")
 	params := map[string]any{
-		"_cwd":        "/tmp/cwd-path",
-		"project_dir": "/tmp/explicit-path",
+		"_cwd":        filepath.Join(base, "cwd-path"),
+		"project_dir": explicit,
 	}
 
 	got := h.resolveProjectDir("yesmem", params)
-	if got != "/tmp/explicit-path" {
-		t.Errorf("expected /tmp/explicit-path, got %q", got)
+	if got != explicit {
+		t.Errorf("expected %s, got %q", explicit, got)
 	}
 }
 

@@ -198,8 +198,14 @@ func requireBubblewrap(t *testing.T) {
 // release has no build for. The daemon host is Linux; darwin is not a target.
 func requireAiJailPlatform(t *testing.T) {
 	t.Helper()
-	if _, err := aiJailAssetName(runtime.GOOS, runtime.GOARCH); err != nil {
+	asset, err := aiJailAssetName(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
 		t.Skipf("ai-jail has no build for this platform: %v", err)
+	}
+	// The release names a darwin asset but pins no checksum for it, and the
+	// installer refuses an unverified build.
+	if _, ok := aiJailAssetDigests[asset]; !ok {
+		t.Skipf("ai-jail v%s ships no pinned build for %s", aiJailPinnedVersion, asset)
 	}
 }
 

@@ -77,7 +77,13 @@ func realPathOrSelf(p string) string {
 	if resolved, err := filepath.EvalSymlinks(p); err == nil {
 		return resolved
 	}
-	return p
+	// A path that does not exist yet (a sibling file the mask covers, a database
+	// that was never created) is resolved through its nearest existing ancestor.
+	dir := filepath.Dir(p)
+	if dir == p {
+		return p
+	}
+	return filepath.Join(realPathOrSelf(dir), filepath.Base(p))
 }
 
 func los34fMasked(sb *Sandbox, path string) bool {

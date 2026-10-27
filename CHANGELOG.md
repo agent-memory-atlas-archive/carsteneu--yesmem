@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resolve paths the OS canonicalises, skip the ai-jail builds it lacks
 - Skip the sandbox and process paths macOS cannot run
 - Restore macOS parity for the suite the campaign left Linux-only
 - Make the suite run on macOS again
