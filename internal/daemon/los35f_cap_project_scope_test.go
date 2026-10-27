@@ -37,6 +37,7 @@ func TestLos35fExecuteCapIgnoresAForeignProjectRow(t *testing.T) {
 // runs its body.
 func TestLos35fExecuteCapStillReachesItsOwnProjectRow(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	los35eInsertCapRow(t, h, "los35f_own_row", "/tmp/los35f-proj-a", "echo own", "", "project")
 
@@ -73,6 +74,7 @@ func TestLos35fUnnamedCallerReachesNoBoundRow(t *testing.T) {
 // a project.
 func TestLos35fGlobalCapStaysReachable(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	los35eInsertCapRow(t, h, "los35f_global", "", "echo global-body", "", "user")
 
@@ -90,6 +92,7 @@ func TestLos35fGlobalCapStaysReachable(t *testing.T) {
 // could never shadow a global cap it replaced.
 func TestLos35fOwnRowWinsOverAGlobalRow(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	los35eInsertCapRow(t, h, "los35f_shadowed", "", "echo global-body", "", "user")
 	los35eInsertCapRow(t, h, "los35f_shadowed", "/tmp/los35f-proj-a", "echo project-body", "", "project")
@@ -113,6 +116,7 @@ func TestLos35fOwnRowWinsOverAGlobalRow(t *testing.T) {
 // session row is not readable.
 func TestLos35fCwdNamesTheCallersProject(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	los35eInsertCapRow(t, h, "los35f_cwd_row", "/tmp/los35f-proj-c", "echo cwd-body", "", "project")
 
@@ -136,6 +140,7 @@ func TestLos35fCwdNamesTheCallersProject(t *testing.T) {
 // project that owns the row.
 func TestLos35fTrustedSessionNamesTheCallersProject(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, store := mustHandler(t)
 	los35eInsertCapRow(t, h, "los35f_session_row", "/tmp/los35f-proj-s", "echo session-body", "", "project")
 	if err := store.UpsertSession(&models.Session{ID: "los35f-session", Project: "/tmp/los35f-proj-s"}); err != nil {
@@ -182,6 +187,7 @@ func TestLos35fSameBasenameInAnotherRepositoryIsForeign(t *testing.T) {
 // from inside the worktree.
 func TestLos35fWorktreeOfTheSameRepositoryReachesTheRow(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	root := filepath.Join(t.TempDir(), "yesmem")
 	los35eInsertCapRow(t, h, "los35f_worktree_row", root, "echo worktree-body", "", "project")
@@ -226,6 +232,7 @@ func TestLos35fBareNameCallerReachesNoPathBoundRow(t *testing.T) {
 // project name, which is what the importer itself writes.
 func TestLos35fBareNameCallerReachesANameBoundRow(t *testing.T) {
 	isolateHome(t)
+	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	los35eInsertCapRow(t, h, "los35f_name_bound", "los35f-imported", "echo name-body", "", "project")
 
@@ -241,5 +248,16 @@ func TestLos35fBareNameCallerReachesANameBoundRow(t *testing.T) {
 	}
 	if !strings.Contains(string(resp.Result), "name-body") {
 		t.Fatalf("the name-bound cap did not run, result = %s", resp.Result)
+	}
+}
+
+// los35fRequireAijail skips a test that executes a cap body: execute_cap fails
+// closed without ai-jail (handler_cap_exec.go pins FallbackUnsandboxed false), so
+// on a runner without it the lookup question cannot be answered at all. The
+// refusal paths above do not need this, they never reach the sandbox.
+func los35fRequireAijail(t *testing.T) {
+	t.Helper()
+	if _, err := sandboxLookPath("ai-jail"); err != nil {
+		t.Skip("ai-jail is not installed and execute_cap fails closed without it")
 	}
 }

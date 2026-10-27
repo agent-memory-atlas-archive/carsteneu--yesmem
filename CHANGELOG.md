@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make the public test suite pass on a runner without ai-jail and with a slower clock
 - Call the session rename by its registered tool id
 - Let the citation qualifier ignore case (YM-469 security review)
 - Keep the shell BLOCK gate honest (YM-469 review)
@@ -1174,6 +1175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Regenerate CHANGELOG from the campaign commits
 - Record the 16.10.2026 feature audit that the YM campaign was derived from
 - An explicit false switches off an inherited prompt flag
 - Tighten three claims the re-review measured

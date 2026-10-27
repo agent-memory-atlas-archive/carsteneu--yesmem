@@ -644,6 +644,11 @@ func TestIsTrustedExecutable(t *testing.T) {
 	if err := os.WriteFile(worldWritable, []byte("#!/bin/sh\n"), 0777); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile masks the mode with the umask: on a 022 runner this lands as 0755
+	// and the world-writable case would test nothing.
+	if err := os.Chmod(worldWritable, 0o777); err != nil {
+		t.Fatal(err)
+	}
 	notExec := filepath.Join(dir, "plain")
 	if err := os.WriteFile(notExec, []byte("x"), 0644); err != nil {
 		t.Fatal(err)

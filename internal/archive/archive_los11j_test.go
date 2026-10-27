@@ -20,7 +20,7 @@ import (
 // string is hashed, the raw path (5aq5fp) and not the encoded name (tcdjh7).
 func TestProjectDirNameCapsTheEncodedName_Los11j(t *testing.T) {
 	probedName := strings.Repeat("a", 100) + "_" + strings.Repeat("b", 100)
-	probedPath := "/home/tester/memory/yesmem/.worktrees/yesloop-los-11j/.yesmem/tmp/probe100/" + probedName
+	probedPath := "/home/chief/memory/yesmem/.worktrees/yesloop-los-11j/.yesmem/tmp/probe100/" + probedName
 
 	cases := []struct{ name, path, want string }{
 		{
@@ -28,23 +28,23 @@ func TestProjectDirNameCapsTheEncodedName_Los11j(t *testing.T) {
 			// Live-confirmed with an isolated CLAUDE_CONFIG_DIR at a cwd of exactly
 			// 200 encoded characters: the folder Claude created carried no hash.
 			name: "encoded name of 200 characters stays untouched",
-			path: "/home/tester/" + strings.Repeat("c", 188),
-			want: "-home-tester-" + strings.Repeat("c", 188),
+			path: "/home/chief/" + strings.Repeat("c", 188),
+			want: "-home-chief-" + strings.Repeat("c", 188),
 		},
 		{
 			// One over the limit: the first 200 characters survive, the rest is
 			// replaced by "-<base36 hash of the path>". Live-confirmed at a cwd of
 			// exactly 201 encoded characters: the folder was 207 characters long.
 			name: "encoded name of 201 characters is cut and hashed",
-			path: "/home/tester/" + strings.Repeat("c", 189),
-			want: "-home-tester-" + strings.Repeat("c", 188) + "-gsrro8",
+			path: "/home/chief/" + strings.Repeat("c", 189),
+			want: "-home-chief-" + strings.Repeat("c", 188) + "-gsrro8",
 		},
 		{
 			// The live-probed path: 275 characters. The cut keeps the 74 characters
 			// in front of the run, 100 a's, the dash the "_" becomes, and 25 b's.
 			name: "long path keeps its prefix and a hash of the raw path",
 			path: probedPath,
-			want: "-home-tester-memory-yesmem--worktrees-yesloop-los-11j--yesmem-tmp-probe100-" +
+			want: "-home-chief-memory-yesmem--worktrees-yesloop-los-11j--yesmem-tmp-probe100-" +
 				strings.Repeat("a", 100) + "-" + strings.Repeat("b", 25) + "-5aq5fp",
 		},
 	}
@@ -61,7 +61,7 @@ func TestProjectDirNameCapsTheEncodedName_Los11j(t *testing.T) {
 // hash is what separates them. Without it both would truncate to the same 200
 // characters and one project's archive would land in the other's folder.
 func TestProjectDirNameSeparatesLongPathsSharingAPrefix_Los11j(t *testing.T) {
-	prefix := "/home/tester/" + strings.Repeat("d", 250)
+	prefix := "/home/chief/" + strings.Repeat("d", 250)
 	a := ProjectDirName(prefix + "-alpha")
 	b := ProjectDirName(prefix + "-beta")
 
@@ -119,10 +119,10 @@ func TestArchiveFileAcceptsAClaudeEncodedProjectName_Los11j(t *testing.T) {
 	if err := os.WriteFile(src, []byte(`{"type":"user"}`+"\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	if err := a.ArchiveFile(src, "-home-tester-memory-yesmem"); err != nil {
+	if err := a.ArchiveFile(src, "-home-chief-memory-yesmem"); err != nil {
 		t.Fatalf("ArchiveFile rejected an encoded project name: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "archive", "-home-tester-memory-yesmem", "session.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(root, "archive", "-home-chief-memory-yesmem", "session.jsonl")); err != nil {
 		t.Fatalf("archived copy missing: %v", err)
 	}
 }

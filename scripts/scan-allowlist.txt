@@ -1,0 +1,22 @@
+# Files that intentionally contain a literal the public-mirror security scan
+# blocks: test fixtures with realistic key shapes or local paths, and the guard
+# test that carries the pattern list itself.
+#
+# Read by scripts/sync-public.sh (pre-sync scan) and by
+# public_mirror_hygiene_test.go (guard at test time). Keep the list short.
+# Paths are repo-relative. One path per line, '#' starts a comment.
+internal/sanitize/secrets_test.go
+internal/daemon/handler_summarize_client_wrap_test.go
+internal/daemon/handler_scheduler_test.go
+internal/daemon/handler_redactor_test.go
+internal/daemon/handler_agents_test.go
+internal/extraction/sanitizing_client_test.go
+internal/terminals/terminals_test.go
+internal/proxy/testdata/golden/claude/001_security_monitor_pre.json
+internal/proxy/testdata/golden/claude/001_security_monitor_final.json
+internal/proxy/testdata/golden/codex/001_synthetic_codex_openai_parity_pre.json
+internal/proxy/testdata/golden/codex/001_synthetic_codex_openai_parity_final.json
+internal/proxy/testdata/golden/opencode/001_synthetic_opencode_openai_parity_pre.json
+internal/proxy/testdata/golden/opencode/001_synthetic_opencode_openai_parity_final.json
+public_mirror_hygiene_test.go
+internal/archive/archive_los11j_test.go

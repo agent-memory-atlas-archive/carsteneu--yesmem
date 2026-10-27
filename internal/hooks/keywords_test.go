@@ -66,7 +66,7 @@ func TestExtractKeywordsDropsInfrastructureSegments(t *testing.T) {
 		{
 			name:    "worktree path of this checkout",
 			cmd:     "cd /home/tester/memory/yesmem/.worktrees/yesloop-los-31c && go build ./...",
-			noise:   []string{"home", "chief", "memory", "yesmem", ".worktrees"},
+			noise:   []string{"home", "memory", "yesmem", ".worktrees"},
 			wantHas: []string{"build", "yesloop-los-31c"},
 		},
 		{
@@ -88,7 +88,7 @@ func TestExtractKeywordsDropsInfrastructureSegments(t *testing.T) {
 			// deletes the installation, so the path words come back as the signal.
 			name:    "command that is nothing but a path into this installation",
 			cmd:     "rm -rf /home/tester/.claude/yesmem",
-			wantHas: []string{"home", "chief", ".claude", "yesmem"},
+			wantHas: []string{"home", "tester", ".claude", "yesmem"},
 		},
 		{
 			// The fallback must not depend on this developer's user name being in

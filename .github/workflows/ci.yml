@@ -41,7 +41,10 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: "0"
-        run: go test ./... -count=1 -timeout 120s
+        # 120s was set when the suite was smaller; the YM campaign grew the daemon
+        # package past it, and the timeout surfaced as a cascade of unrelated
+        # failures next to the panic. Measured locally before raising it.
+        run: go test ./... -count=1 -timeout 600s
 
   plugin:
     runs-on: ubuntu-latest
@@ -52,7 +55,10 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.4.2"
+          # 1.4.2 pinned the version that existed when the job was written; the dev
+          # machine runs 1.4.4 and the suite passes there in both repos, while
+          # skill_nudge_test.ts failed under 1.4.2.
+          bun-version: "1.4.4"
 
       # effect@4.0.1 is a devDependency: without the install the suite aborts
       # and looks like a code failure. --frozen-lockfile keeps CI on the

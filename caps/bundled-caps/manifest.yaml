@@ -44,7 +44,7 @@ caps:
     derived_from_hash: 97d7895a9ed132d4855b0289cc79b680aa6017fa52840bb348be7fc78663e666
     revision: 0
   - name: proxy_health
-    derived_from_hash: 13ef6ec43c3141f646003005c3105ac8a3f492466d9af8c47499ff19f80b9414
+    derived_from_hash: 3805d8cbecef2160cbfd0d808735649fdd1f089e5c0f0e824a7cacf8e236d1c1
     revision: 0
   - name: reddit
     derived_from_hash: 7edf92551c10b6b0e90d0a79ee11d2f7664048bdca5c1c17f834f6bcbba908ae
