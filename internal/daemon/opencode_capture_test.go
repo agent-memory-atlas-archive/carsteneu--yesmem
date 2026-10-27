@@ -83,6 +83,12 @@ func isolateHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// os.UserConfigDir and os.UserCacheDir prefer XDG_* over HOME, and a CI runner
+	// exports XDG_CONFIG_HOME: without these a test that writes into its temp home
+	// would still read the runner's real config and find nothing there.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	return home
 }
 
