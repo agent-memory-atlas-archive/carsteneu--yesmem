@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Let the ym297 fixture die between two polls
 - Pin the fake ai-jail release to the running platform
 - Resolve paths the OS canonicalises, skip the ai-jail builds it lacks
 - Skip the sandbox and process paths macOS cannot run

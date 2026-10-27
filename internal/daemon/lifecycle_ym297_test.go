@@ -208,7 +208,10 @@ func TestYm297ReplaceContract(t *testing.T) {
 	requireProcTable(t)
 	oldExe, oldGrace := selfBinaryPath, daemonProcGraceWait
 	t.Cleanup(func() { selfBinaryPath, daemonProcGraceWait = oldExe, oldGrace })
-	daemonProcGraceWait = func(time.Duration) {}
+	// A real wait, not a no-op: the fixture has to be able to die between two
+	// polls. With a no-op the loop burns its iteration bound in microseconds,
+	// before the signalled process is reapable, and reports a survivor.
+	daemonProcGraceWait = time.Sleep
 
 	t.Run("verified stop lets the replacement start", func(t *testing.T) {
 		fixtureBin, fixture := ym297SpawnAliveDaemonArgv(t)
