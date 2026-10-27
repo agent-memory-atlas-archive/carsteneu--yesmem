@@ -55,10 +55,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          # 1.4.2 pinned the version that existed when the job was written; the dev
-          # machine runs 1.4.4 and the suite passes there in both repos, while
-          # skill_nudge_test.ts failed under 1.4.2.
-          bun-version: "1.4.4"
+          bun-version: "1.4.2"
 
       # effect@4.0.1 is a devDependency: without the install the suite aborts
       # and looks like a code failure. --frozen-lockfile keeps CI on the

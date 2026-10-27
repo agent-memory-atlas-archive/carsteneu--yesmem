@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Install the skills the nudge fixtures name
 - Make the public test suite pass on a runner without ai-jail and with a slower clock
 - Call the session rename by its registered tool id
 - Let the citation qualifier ignore case (YM-469 security review)

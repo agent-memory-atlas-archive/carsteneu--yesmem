@@ -16,6 +16,25 @@ import { join } from "node:path"
 // tagged error index.ts relies on.
 import "./opencode-yesmem-fixture"
 
+// The nudge drops a "ghost skill": a name that is not installed under a skills
+// root never reaches the message (skill_whitelist.isSkillInstalled). Without this
+// the suite only passed on a machine that happens to have the skills installed,
+// and failed on a bare runner. The two skills the fixtures name are installed into
+// a temp root for the length of this file.
+const savedSkillRoots = process.env.YESMEM_SKILL_ROOTS
+beforeAll(() => {
+  const roots = mkdtempSync(join(tmpdir(), "yesmem-v2-skill-roots-"))
+  for (const skill of ["brainstorming", "yesmem-config"]) {
+    mkdirSync(join(roots, skill), { recursive: true })
+    writeFileSync(join(roots, skill, "SKILL.md"), `# ${skill}\n`)
+  }
+  process.env.YESMEM_SKILL_ROOTS = roots
+})
+afterAll(() => {
+  if (savedSkillRoots === undefined) delete process.env.YESMEM_SKILL_ROOTS
+  else process.env.YESMEM_SKILL_ROOTS = savedSkillRoots
+})
+
 const { cacheKeyLabel, catalogCandidates, skillNudge } = await import("./skill_nudge")
 type ContextEvent = import("./skill_nudge").ContextEvent
 
