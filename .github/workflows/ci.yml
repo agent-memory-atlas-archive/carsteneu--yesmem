@@ -40,6 +40,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, and
+      # bwrap then fails with "loopback: Failed RTM_NEWADDR". Best effort: when the
+      # runner refuses the sysctl, the sandbox tests skip with that reason.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Build
         env:
           CGO_ENABLED: "0"

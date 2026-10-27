@@ -174,16 +174,23 @@ func TestSandboxFlagsV09_UnchangedByTheTwoXSupport(t *testing.T) {
 // fetchPinnedAiJail unpacks the pinned release into a temp dir. Never into
 // ~/.local/bin: the host's installed binary is the host's business.
 // requireBubblewrap skips when ai-jail cannot run at all: it refuses to start any
-// profile without bubblewrap ("bwrap not found in trusted locations"), and a CI
-// runner image does not carry it. Skipping here keeps that from surfacing as a
-// broken sandbox further down.
+// profile without bubblewrap, and a runner image does not carry it. A runner can
+// also carry bubblewrap and still be unable to create the namespaces it needs
+// (Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor), which
+// surfaces as "bwrap: loopback: Failed RTM_NEWADDR". Both cases are skipped here
+// instead of reported as a broken sandbox further down.
 func requireBubblewrap(t *testing.T) {
 	t.Helper()
-	if os.Getenv("BWRAP_BIN") != "" {
-		return
+	bin := os.Getenv("BWRAP_BIN")
+	if bin == "" {
+		found, err := exec.LookPath("bwrap")
+		if err != nil {
+			t.Skip("bubblewrap is not installed; ai-jail cannot run a profile without it")
+		}
+		bin = found
 	}
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bubblewrap is not installed; ai-jail cannot run a profile without it")
+	if out, err := exec.Command(bin, "--unshare-net", "--ro-bind", "/", "/", "true").CombinedOutput(); err != nil {
+		t.Skipf("bubblewrap cannot create a sandbox here: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 }
 
