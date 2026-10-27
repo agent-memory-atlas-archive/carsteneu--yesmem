@@ -1398,6 +1398,7 @@ func TestHandleStopAgent_LiveAgentWithBystanderPIDNotSignalled(t *testing.T) {
 // The positive control for the gate: a *verified* agent process is still
 // signalled. The child is a real sleep, declared to be a claude process.
 func TestHandleStopAgent_SignalsVerifiedAgentProcess(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	bystander, exited := startBystander(t)
 	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
@@ -1721,6 +1722,7 @@ func TestHandleStopAllAgents_MixedStatuses(t *testing.T) {
 }
 
 func TestHandleStopAllAgents_SequentialPause(t *testing.T) {
+	requireProcTable(t)
 	// Drei Agenten mit echten Prozessen: Der Stop-Run muss nacheinander
 	// stopen (Pause zwischen den Exits), damit das Terminal jeden
 	// Surface-Teardown einzeln verarbeitet statt als Massen-Teardown
@@ -1890,6 +1892,7 @@ func TestHandleResumeAgent_PausedIsResumable(t *testing.T) {
 // exited, its exit tail cleared the successor's pid, socket path and status and
 // unlinked its sockets (YM-70). relay_agent is the way to reach a paused agent.
 func TestHandleResumeAgent_PausedWithLiveProcessIsRefused(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	pinProcessTable(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
@@ -3523,6 +3526,7 @@ func TestHandleStopAgent_PendingRowLeftByADeadDaemonIsClosable(t *testing.T) {
 // the row, so the stop's write is refused and the process the bind installed has to
 // be ended — through the same identity gate as every other signal.
 func TestFinalizeStop_SignalsTheProcessThatDisplacedTheSnapshot(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	pinProcessTable(t)
 	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")

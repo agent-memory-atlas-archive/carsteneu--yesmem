@@ -60,6 +60,7 @@ func los59bForeignPeer(t *testing.T) {
 
 // A session threshold is one session's state.
 func TestLos59bSetProxyStateRefusesAForeignPeerForASessionThreshold(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	los59bForeignPeer(t)
 
@@ -120,6 +121,7 @@ func TestLos59bSetProxyStateKeepsTheModelSlotAndTheProxyWritable(t *testing.T) {
 // The read side answers the same question as the write side: whoever knows a key
 // read another session's state.
 func TestLos59bGetProxyStateRefusesAForeignPeerForSessionState(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	for key, value := range map[string]string{
 		"frozen:ses_victim":                           `{"messages":[]}`,
@@ -182,6 +184,7 @@ func TestLos59bGetProxyStateKeepsInternalReadsWorking(t *testing.T) {
 // move the attack one call over. The store matches "everything starting with the
 // given string", so a shortened prefix wipes the family just as well.
 func TestLos59bDeleteProxyStatePrefixRefusesAForeignPeerForTheThresholdFamily(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	if err := s.SetProxyState("session_override:token_threshold:ses_victim", "123456"); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -212,6 +215,7 @@ func TestLos59bDeleteProxyStatePrefixRefusesAForeignPeerForTheThresholdFamily(t 
 // names. The caller's own session is resolved from what the kernel reports, so an
 // agent that names somebody else's session is refused.
 func TestLos59bSetConfigRefusesAnOverrideForAForeignSession(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	los59bWithProcess(t, 4242, "/home/u/.local/bin/yesmem\x00mcp", "YESMEM_SESSION_ID=opencode:ses_own")
 
@@ -235,6 +239,7 @@ func TestLos59bSetConfigRefusesAnOverrideForAForeignSession(t *testing.T) {
 // production layout of an opencode v2 session: the MCP child of the shared service
 // carries no session in its environment and has no agent row, so nothing binds it.
 func TestLos59bSetConfigRefusesAForgedSelfReport(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	los59bWithProcess(t, 4242, "/home/u/.local/bin/yesmem\x00mcp")
 
@@ -298,6 +303,7 @@ func TestLos59bSetConfigKeepsInternalSessionWritesWorking(t *testing.T) {
 // is the same budget. get_config is the sibling the write guard would otherwise
 // leave open (cold review finding).
 func TestLos59bGetConfigRefusesAForeignSessionsOverride(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	if err := s.SetProxyState("session_override:token_threshold:ses_victim", "123456"); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -341,6 +347,7 @@ func TestLos59bGetConfigKeepsTheCallersOwnReadWorking(t *testing.T) {
 // A caller that cannot be identified at all is refused rather than served the
 // global value under a session scope.
 func TestLos59bGetConfigRefusesAnUnidentifiableCaller(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	if err := s.SetProxyState("session_override:token_threshold:ses_own", "123456"); err != nil {
 		t.Fatalf("seed: %v", err)

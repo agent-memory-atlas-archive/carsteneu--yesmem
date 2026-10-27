@@ -12,6 +12,7 @@ import (
 // client asserts, and it is overwritten on every request — a client that sends
 // the key itself cannot keep its own value.
 func TestSocketServer_AttachesThePeerPID(t *testing.T) {
+	requireProcTable(t)
 	dir := t.TempDir()
 	seen := make(chan any, 1)
 	srv, err := NewSocketServer(dir, func(req Request) Response {

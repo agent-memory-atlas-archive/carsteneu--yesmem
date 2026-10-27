@@ -21,6 +21,7 @@ func los58dWithPeer(t *testing.T, argv string) {
 }
 
 func TestLos58dSetProxyStateRefusesAForeignPeerForAThreadKey(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	los58dWithPeer(t, "/usr/bin/python3\x00-c\x00import os")
 
@@ -98,6 +99,7 @@ func TestLos58dSetProxyStateAllowsTheGlobalConfigSlotFromAClient(t *testing.T) {
 // belongs to (briefing, learnings attribution), so a foreign client that writes
 // it changes another session's attribution.
 func TestLos58dSetProxyStateRefusesAForeignPeerForTheSourceAgent(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	los58dWithPeer(t, "/usr/bin/python3\x00-c\x00import os")
 
@@ -116,6 +118,7 @@ func TestLos58dSetProxyStateRefusesAForeignPeerForTheSourceAgent(t *testing.T) {
 // removes the same state for every thread at once, and the proxy's own cache
 // reset is the only legitimate caller.
 func TestLos58dDeleteProxyStatePrefixRefusesAForeignPeerForAThreadFamily(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	if err := s.SetProxyState("frozen:ses_victim", `{"messages":[]}`); err != nil {
 		t.Fatalf("seed proxy state: %v", err)

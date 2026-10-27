@@ -98,6 +98,9 @@ func los09cStubRelease(t *testing.T, binaryURL, checksumURL string) {
 // it was released before the migration step: migrate runs the new binary, which
 // a concurrent update may already have replaced again.
 func TestLos09cRunUpdateHoldsLockAcrossMigration(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("the migration runs the Linux service binary")
+	}
 	t.Setenv("HOME", t.TempDir())
 	dir, dest, marker := los09cSeededDest(t)
 	binaryURL, checksumURL := los09cAssetServer(t, createTarGz(t, "yesmem", los09cMigrateScript(dir, marker, 0)))

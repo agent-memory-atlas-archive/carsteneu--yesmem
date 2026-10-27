@@ -70,9 +70,20 @@ func los34fEnvValue(env []string, key string) (string, bool) {
 }
 
 // los34fMasked reports whether path is masked on the built sandbox.
+// realPathOrSelf resolves symlinks and falls back to p for a path that does not
+// exist. Mask entries are built from what the OS reports, and macOS reaches its
+// temp root through /tmp -> /private/tmp, so a plain string compare misses.
+func realPathOrSelf(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
+}
+
 func los34fMasked(sb *Sandbox, path string) bool {
+	path = realPathOrSelf(path)
 	for _, mask := range sb.cfg.MaskedPaths {
-		if mask == path {
+		if realPathOrSelf(mask) == path {
 			return true
 		}
 	}
@@ -81,7 +92,9 @@ func los34fMasked(sb *Sandbox, path string) bool {
 
 // los34fCoveredByMask reports whether path, or a directory above it, is masked.
 func los34fCoveredByMask(sb *Sandbox, path string) bool {
+	path = realPathOrSelf(path)
 	for _, mask := range sb.cfg.MaskedPaths {
+		mask = realPathOrSelf(mask)
 		if mask == path || pathInside(mask, path) {
 			return true
 		}
@@ -600,6 +613,7 @@ func TestLos34fRealRunMasksTheProjectLocalConfig(t *testing.T) {
 // created opencode.jsonc on the host — and opencode reads that name first, which
 // made the mask a no-op for the channel it was added for.
 func TestLos34fRealRunCannotWriteTheOpencodeConfigSiblings(t *testing.T) {
+	requireAiJailPlatform(t)
 	home := isolateHome(t)
 	configDir := filepath.Join(home, ".config", "opencode")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {

@@ -194,6 +194,15 @@ func requireBubblewrap(t *testing.T) {
 	}
 }
 
+// requireAiJailPlatform skips a real ai-jail run on a platform the pinned
+// release has no build for. The daemon host is Linux; darwin is not a target.
+func requireAiJailPlatform(t *testing.T) {
+	t.Helper()
+	if _, err := aiJailAssetName(runtime.GOOS, runtime.GOARCH); err != nil {
+		t.Skipf("ai-jail has no build for this platform: %v", err)
+	}
+}
+
 func fetchPinnedAiJail(t *testing.T) string {
 	t.Helper()
 	requireBubblewrap(t)

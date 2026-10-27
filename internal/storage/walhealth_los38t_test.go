@@ -218,6 +218,10 @@ func TestLos38tGuardPoolsGroupByFile(t *testing.T) {
 // symlink: readlink reports the resolved path, so the guard has to compare
 // resolved paths or the whole heal path stays dead.
 func TestLos38tGuardWorksThroughSymlinkedDataDir(t *testing.T) {
+	// The sidecar scan reads /proc/<pid>/fd, which darwin does not expose.
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("the sidecar scan needs /proc/<pid>/fd")
+	}
 	root := t.TempDir()
 	real := filepath.Join(root, "real")
 	if err := os.Mkdir(real, 0o700); err != nil {
@@ -424,6 +428,10 @@ func TestLos38tGuardRefusesReadOnlyStore(t *testing.T) {
 // TestLos38tDeletedSidecarFDsReportsUnlinkedFiles covers the alarm half: the scan
 // must name a sidecar this process still holds after it was unlinked.
 func TestLos38tDeletedSidecarFDsReportsUnlinkedFiles(t *testing.T) {
+	// The sidecar scan reads /proc/<pid>/fd, which darwin does not expose.
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("the sidecar scan needs /proc/<pid>/fd")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "yesmem.db")
 	wal := path + "-wal"

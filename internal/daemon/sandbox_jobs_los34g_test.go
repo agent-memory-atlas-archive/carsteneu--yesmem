@@ -389,6 +389,7 @@ func TestLos34gAutoCorrectSkipsARefusedVerificationRun(t *testing.T) {
 // trusts. The data directory is masked as a whole, so nothing a run writes there
 // reaches the host.
 func TestLos34gRealRunCannotCreateTheSessionDatabase(t *testing.T) {
+	requireAiJailPlatform(t)
 	home := isolateHome(t)
 	dataDir := filepath.Join(home, ".local", "share", "opencode")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {

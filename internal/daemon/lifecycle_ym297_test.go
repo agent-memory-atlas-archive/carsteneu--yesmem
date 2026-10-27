@@ -205,6 +205,7 @@ func TestYm297StopReportsSurvivor(t *testing.T) {
 // the PID file names a live process that is not ours (leaving its socket and PID
 // file untouched).
 func TestYm297ReplaceContract(t *testing.T) {
+	requireProcTable(t)
 	oldExe, oldGrace := selfBinaryPath, daemonProcGraceWait
 	t.Cleanup(func() { selfBinaryPath, daemonProcGraceWait = oldExe, oldGrace })
 	daemonProcGraceWait = func(time.Duration) {}

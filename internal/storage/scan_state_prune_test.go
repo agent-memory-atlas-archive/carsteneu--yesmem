@@ -98,7 +98,12 @@ func TestPruneOrphanedScanState_KeepsRepoKeyForSubdirSession(t *testing.T) {
 	}
 	t.Cleanup(func() { s.Close() })
 
-	repo := t.TempDir()
+	// ScanCacheKey answers with the resolved repository root, and macOS reaches
+	// its temp root through /tmp -> /private/tmp.
+	repo, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve repo: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0755); err != nil {
 		t.Fatal(err)
 	}

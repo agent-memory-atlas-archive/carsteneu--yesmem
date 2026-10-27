@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -69,6 +70,9 @@ func TestLos56fCopyBinaryReplacesAtomically(t *testing.T) {
 // binary up. Without the restart the rename succeeds and the old inode keeps
 // running next to a new file on disk.
 func TestLos56fSetupSwitchesRunningServicesToTheNewBinary(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("the service switch is a systemd path")
+	}
 	prev := systemctlRun
 	t.Cleanup(func() { systemctlRun = prev })
 	var got [][]string

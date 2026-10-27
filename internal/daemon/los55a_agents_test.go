@@ -34,6 +34,7 @@ func startSigtermIgnoringAgent(t *testing.T) (<-chan struct{}, int) {
 // escalated — the daemon's own stop escalates to SIGKILL (lifecycle.go), the
 // agent stop did not.
 func TestHandleStopAgent_EscalatesToSigkillLos55a(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	exited, pid := startSigtermIgnoringAgent(t)
 	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")

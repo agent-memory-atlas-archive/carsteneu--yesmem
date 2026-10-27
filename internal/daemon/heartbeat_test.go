@@ -362,6 +362,7 @@ func TestCrashRecovery_SkipsNonRunning(t *testing.T) {
 }
 
 func TestSupervisionPipelineE2E(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	now := time.Now().Format("2006-01-02 15:04:05")
 	// The children are live agents with real processes: crash recovery treats a
@@ -436,6 +437,7 @@ func TestSupervisionPipelineE2E(t *testing.T) {
 // row alone while its own process is alive: a long tool call blocks the
 // heartbeat while the agent keeps working (#73191).
 func TestCrashRecovery_StaleHeartbeatWithLiveProcess_LeftAlone(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	pinProcessTable(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
@@ -970,6 +972,7 @@ func stubProcStartTime(t *testing.T, start time.Time) {
 // process as gone: stop_agent finalizes the row "stopped" without signalling,
 // leaving an unreachable process behind, and C2/C3/C4 stop watching it.
 func TestBindAgentProcess_MarkerMovesWithThePid(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
 	// Force the process table on: this test pins the marker invariant, which is
@@ -1058,6 +1061,7 @@ func pinProcessTable(t *testing.T) {
 // agent, so recovery may proceed — and here it proceeds fully, because a zombie
 // is a decided death.
 func TestCrashRecovery_ZombiePIDDoesNotHideTheCrash(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	pinProcessTable(t)
 	pid := startZombie(t)
@@ -1102,6 +1106,7 @@ func startZombie(t *testing.T) int {
 // merely fails to identify as this agent — is covered by
 // TestCrashRecovery_AmbiguousPIDDoesNotRespawn and must not reach this path.
 func TestCrashRecovery_ZombieGetsTheFullRecovery(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	pinProcessTable(t)
 	seedCrashCandidate(t, s, "crash-zombie-retry", startZombie(t), "claude")
@@ -1212,6 +1217,7 @@ func TestAgentBinaryName_MirrorsSpawnSwitch(t *testing.T) {
 }
 
 func TestIsAgentProcess_UnknownBackendMeansClaude(t *testing.T) {
+	requireProcTable(t)
 	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
 	a := storage.Agent{ID: "a-1", Backend: "Claude", PID: os.Getpid(), CreatedAt: time.Now().Format(time.RFC3339)}
 	if !isAgentProcess(a) {
@@ -1255,6 +1261,7 @@ func TestAgentProcessGone_WithoutProcessTableAbstains(t *testing.T) {
 // agentProcessGone is not the negation of isAgentProcess: it answers the
 // question the row-closing consumers actually ask.
 func TestAgentProcessGone_ReadsBothDirections(t *testing.T) {
+	requireProcTable(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
 	live := storage.Agent{ID: "a-1", Backend: "opencode", PID: os.Getpid(), CreatedAt: time.Now().Format(time.RFC3339)}
 	if agentProcessGone(live) {
@@ -1367,6 +1374,7 @@ func readProcFile(pid int, name string) []byte {
 }
 
 func TestProcStartTime_OwnPID(t *testing.T) {
+	requireProcTable(t)
 	start, ok := procStartTime(os.Getpid())
 	if !ok {
 		t.Fatal("procStartTime(self) not ok, want a parsed start time")
@@ -1392,6 +1400,7 @@ func TestProcStartTime_DeadPID(t *testing.T) {
 // start time. Only the cmdline is stubbed, so the start-time conjunct still
 // reads real /proc.
 func TestIsAgentProcess_OwnPIDWithMatchingCmdline(t *testing.T) {
+	requireProcTable(t)
 	stubProcCmdline(t, "/home/tester/.opencode/bin/opencode\x00--theme\x00yesmem-loop")
 	a := storage.Agent{ID: "a-1", Backend: "opencode", PID: os.Getpid(), CreatedAt: time.Now().Format(time.RFC3339)}
 	if !isAgentProcess(a) {
@@ -1432,6 +1441,7 @@ func TestIsAgentProcess_RejectsProcessNewerThanRow(t *testing.T) {
 // last_restart_at is the newer spawn marker and wins over created_at, so a
 // restarted agent is not rejected by its own old creation timestamp.
 func TestIsAgentProcess_LastRestartAtIsTheReference(t *testing.T) {
+	requireProcTable(t)
 	stubProcCmdline(t, "/home/tester/.opencode/bin/opencode\x00--theme\x00yesmem-loop")
 	a := storage.Agent{
 		ID: "a-1", Backend: "opencode", PID: os.Getpid(),
@@ -1462,6 +1472,7 @@ func TestIsAgentProcess_ZeroPID(t *testing.T) {
 // An agent row with no backend column reads back as "claude" (AgentCreate
 // default); the empty string must resolve the same way here.
 func TestIsAgentProcess_EmptyBackendMeansClaude(t *testing.T) {
+	requireProcTable(t)
 	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
 	a := storage.Agent{ID: "a-1", PID: os.Getpid(), CreatedAt: time.Now().Format(time.RFC3339)}
 	if !isAgentProcess(a) {
@@ -1472,6 +1483,7 @@ func TestIsAgentProcess_EmptyBackendMeansClaude(t *testing.T) {
 // An unparseable creation stamp leaves the start-time conjunct unverifiable; the
 // cmdline conjunct still has to hold, otherwise the row would be unkillable.
 func TestIsAgentProcess_UnparseableCreatedAtFallsBackToCmdline(t *testing.T) {
+	requireProcTable(t)
 	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
 	matching := storage.Agent{ID: "a-1", Backend: "claude", PID: os.Getpid(), CreatedAt: "not a timestamp"}
 	if !isAgentProcess(matching) {
@@ -1506,6 +1518,7 @@ func startNamedProcess(t *testing.T, name string) *exec.Cmd {
 }
 
 func TestIsAgentProcess_RealProcessWithBackendNameInCmdline(t *testing.T) {
+	requireProcTable(t)
 	cmd := startNamedProcess(t, "claude")
 	a := storage.Agent{
 		ID: "a-1", Backend: "claude", PID: cmd.Process.Pid,
@@ -1523,6 +1536,7 @@ func TestIsAgentProcess_RealProcessWithBackendNameInCmdline(t *testing.T) {
 }
 
 func TestIsAgentProcess_RealProcessWithWrongBackend(t *testing.T) {
+	requireProcTable(t)
 	cmd := startNamedProcess(t, "claude")
 	a := storage.Agent{
 		ID: "a-1", Backend: "opencode", PID: cmd.Process.Pid,
@@ -1593,6 +1607,7 @@ func TestCheckYesloopDoneGuard_SkipsDeadPausedAgent(t *testing.T) {
 // A reused PID must not revive the row either: the process is alive but belongs
 // to someone else, which is the case the DONE-guard cannot see with signal 0.
 func TestCheckYesloopDoneGuard_SkipsPausedAgentBehindBystanderPID(t *testing.T) {
+	requireProcTable(t)
 	resetDoneGuardState()
 	t.Cleanup(resetDoneGuardState)
 	h, s := mustHandler(t)
@@ -1738,6 +1753,7 @@ func TestReapGoneAgents_KeepsLivePausedAgent(t *testing.T) {
 // was recycled onto an unrelated process (C1 + C4). A *resumed* agent is never
 // this shape: bindAgentProcess moves the marker with the pid.
 func TestReapGoneAgents_ReapsPausedAgentWhosePIDWasRecycled(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
 	stubProcStartTime(t, time.Now().Add(-time.Minute))
@@ -1756,6 +1772,7 @@ func TestReapGoneAgents_ReapsPausedAgentWhosePIDWasRecycled(t *testing.T) {
 // A bystander on a recycled PID must not keep the row alive: signal 0 says
 // "alive", the cmdline says "not claude" (C1 + C4).
 func TestReapGoneAgents_ReapsPausedAgentBehindBystanderPID(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	bystander := exec.Command("sleep", "30")
 	if err := bystander.Start(); err != nil {
@@ -2011,6 +2028,7 @@ func TestCrashRecovery_ClosesAbandonedCrashedRow(t *testing.T) {
 // already produced a replacement: the notice would send the orchestrator looking
 // for a problem that is not there.
 func TestCrashRecovery_AbandonedRowWithLiveReplacementDoesNotClaimAnEmptySection(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	pinProcessTable(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
@@ -2331,6 +2349,7 @@ func TestAttemptRestart_AppliesTheStrategyPersistedAtSpawn(t *testing.T) {
 // An orphan stop closed the child's row and left its process working with no
 // relay, no limit and no owner: the same defect YM-66 names, one level down.
 func TestDetectOrphanedAgents_EndsTheOrphanProcess(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	child, exited := startBystander(t)
 	pinProcessTable(t)
@@ -2369,6 +2388,7 @@ func TestDetectOrphanedAgents_EndsTheOrphanProcess(t *testing.T) {
 // and left their processes running, so a stopped orchestrator left live children
 // that nothing relayed to and no limit watched.
 func TestHandleStopAgent_CascadeEndsChildProcesses(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	child, exited := startBystander(t)
 	pinProcessTable(t)
@@ -2453,6 +2473,7 @@ func TestCrashRecovery_AbandonedRowWithFinishedSuccessorDoesNotAskForARestart(t 
 // end anyway — a row that says stopped while the agent keeps working is the
 // invisible agent YM-66 is about, and no guard looks at closed rows.
 func TestHandleStopAgent_EndsTheProcessEvenWhenTheInjectWriteSucceeds(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	child, exited := startBystander(t)
 	pinProcessTable(t)

@@ -48,6 +48,7 @@ func TestResolveAiJailAssetURL_AsksForThePinnedTag(t *testing.T) {
 }
 
 func TestDownloadAiJail_InstallsThePinnedArchive(t *testing.T) {
+	requireAiJailPlatform(t)
 	archive := buildTarGz(t, []tarEntry{{name: "ai-jail", mode: 0o755, body: []byte("#!/bin/sh\necho pinned\n")}}).Bytes()
 	home := t.TempDir()
 	t.Setenv("HOME", home)

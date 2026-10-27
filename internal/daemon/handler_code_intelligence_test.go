@@ -450,7 +450,7 @@ func TestGetCodeGraph_FallsBackToStaleGraphOnScanFailure(t *testing.T) {
 	known := newTestCodeGraph()
 
 	h.codeGraphMu.Lock()
-	h.codeGraphs = map[string]*codeGraphEntry{dir: {graph: known, head: "old-head"}}
+	h.codeGraphs = map[string]*codeGraphEntry{realPathOrSelf(dir): {graph: known, head: "old-head"}}
 	h.codeGraphMu.Unlock()
 
 	if got := h.getCodeGraph(dir); got != known {
@@ -505,7 +505,7 @@ func TestGetCodeGraph_ServesFreshEntry(t *testing.T) {
 	cached := newTestCodeGraph()
 
 	h.codeGraphMu.Lock()
-	h.codeGraphs = map[string]*codeGraphEntry{dir: {
+	h.codeGraphs = map[string]*codeGraphEntry{realPathOrSelf(dir): {
 		graph:    cached,
 		head:     codescan.ReadGitHead(dir),
 		cbmMtime: codescan.CBMIndexMtime(dir).Unix(),

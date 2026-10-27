@@ -400,6 +400,7 @@ func TestRunUsesTheWorkDirOnBothAiJailMajors(t *testing.T) {
 //   - a headless run, which starts in its job work dir, keeps it readable and the
 //     write is refused — that is what lets a sandboxed `claude -p` start at all.
 func TestRunWithProfile_ClaudeGlobalConfigHidesTheWriteForReal(t *testing.T) {
+	requireAiJailPlatform(t)
 	realHome, err := os.UserHomeDir()
 	if err != nil {
 		t.Skipf("no home directory: %v", err)

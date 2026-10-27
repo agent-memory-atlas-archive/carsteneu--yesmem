@@ -1887,12 +1887,18 @@ func TestProjectFromCWD_DotWorktreesLayout(t *testing.T) {
 	os.WriteFile(filepath.Join(wt, ".git"),
 		[]byte("gitdir: "+filepath.Join(gitDir, "worktrees", "loop-02")+"\n"), 0644)
 
+	// projectFromCWD answers with the resolved path, and macOS reaches its temp
+	// root through /tmp -> /private/tmp.
+	resolved, err := filepath.EvalSymlinks(wt)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
 	tests := []struct {
 		cwd  string
 		want string
 	}{
-		{wt, wt},
-		{filepath.Join(wt, "internal", "proxy"), wt},
+		{resolved, resolved},
+		{filepath.Join(resolved, "internal", "proxy"), resolved},
 	}
 	for _, tt := range tests {
 		if got := projectFromCWD(tt.cwd); got != tt.want {

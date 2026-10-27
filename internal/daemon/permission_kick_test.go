@@ -359,6 +359,7 @@ func TestPermissionKick_PendingAgentGetsKicked(t *testing.T) {
 // "lebt" (der Bystander läuft), die cmdline sagt "nicht opencode" — genau die
 // Unterscheidung, die isPIDAlive allein nicht treffen kann (C2, C1).
 func TestPermissionKick_BystanderProcessNotKicked(t *testing.T) {
+	requireProcTable(t)
 	h, s := newPermKickHandler(t, true)
 	sockPath := los24dAgentSock(t, h, "agent-pk-bystander")
 	rec := startFakeInjectSocket(t, sockPath+".inject")

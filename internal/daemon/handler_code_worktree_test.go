@@ -1,19 +1,27 @@
 package daemon
 
 import (
+	"path/filepath"
 	"testing"
 )
 
 func TestResolveProjectDir_UsesCWDWhenProvided(t *testing.T) {
 	h, _ := mustHandler(t)
 
+	// A resolved base keeps the expectation platform-neutral: resolveProjectDir
+	// answers with the path as the OS reports it, and macOS resolves /tmp.
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	cwd := filepath.Join(base, "worktree-path")
 	params := map[string]any{
-		"_cwd": "/tmp/worktree-path",
+		"_cwd": cwd,
 	}
 
 	got := h.resolveProjectDir("yesmem", params)
-	if got != "/tmp/worktree-path" {
-		t.Errorf("expected /tmp/worktree-path, got %q", got)
+	if got != cwd {
+		t.Errorf("expected %s, got %q", cwd, got)
 	}
 }
 

@@ -1149,6 +1149,7 @@ func TestCheckChannel_ProxyPeerReadsTheNamedSession(t *testing.T) {
 // enough, because that value is one the caller chooses (review finding on
 // YM-204).
 func TestCheckChannel_ForeignInboxStaysClosed(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	if _, err := s.SendChannelMessage("opencode:ses_VICTIM", "someone", "for the victim", "command"); err != nil {
 		t.Fatal(err)
@@ -1260,6 +1261,7 @@ func TestCheckChannel_InProcessCallerKeepsTheNamedSession(t *testing.T) {
 // there: otherwise a foreign caller can silently swallow another session's
 // messages.
 func TestMarkChannelRead_ForeignInboxStaysClosed(t *testing.T) {
+	requireProcTable(t)
 	h, s := mustHandler(t)
 	if _, err := s.SendChannelMessage("opencode:ses_VICTIM", "someone", "for the victim", "command"); err != nil {
 		t.Fatal(err)

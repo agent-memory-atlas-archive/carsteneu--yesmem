@@ -21,6 +21,7 @@ import (
 // window instead of leaving it to timing. No daemon, socket or data dir of the
 // host is touched.
 func TestLos56gStopAcceptsAnExitDuringTheIdentityCheck(t *testing.T) {
+	requireProcTable(t)
 	oldSignal, oldGone, oldWait, oldNow, oldExe := daemonProcSignal, daemonProcGone, daemonProcGraceWait, daemonProcNow, selfBinaryPath
 	t.Cleanup(func() {
 		daemonProcSignal, daemonProcGone, daemonProcGraceWait, daemonProcNow, selfBinaryPath = oldSignal, oldGone, oldWait, oldNow, oldExe

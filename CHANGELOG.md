@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Skip the sandbox and process paths macOS cannot run
 - Restore macOS parity for the suite the campaign left Linux-only
 - Make the suite run on macOS again
 - Probe that bubblewrap can actually build a sandbox
