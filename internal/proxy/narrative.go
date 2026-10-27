@@ -20,12 +20,12 @@ type Narrative struct {
 	mu sync.RWMutex
 
 	requestCount   int
-	goal           string           // extracted from first user message
-	phases         []phase          // chronological phases
-	decisions      []string         // key decisions (from isDecision messages)
-	pivotMoments   []string         // from yesmem pivot_moment learnings (Phase-A)
-	archivedTopics []ArchivedTopic  // stubbed topic summaries
-	lastQuestion   string           // last user message ending with ?
+	goal           string          // extracted from first user message
+	phases         []phase         // chronological phases
+	decisions      []string        // key decisions (from isDecision messages)
+	pivotMoments   []string        // from yesmem pivot_moment learnings (Phase-A)
+	archivedTopics []ArchivedTopic // stubbed topic summaries
+	lastQuestion   string          // last user message ending with ?
 }
 
 type phase struct {

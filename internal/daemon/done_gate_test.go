@@ -710,3 +710,27 @@ func TestSummarizeErrors_IncludesDetail(t *testing.T) {
 		t.Errorf("summarizeErrors must keep the Phase:Field prefix, got: %s", got)
 	}
 }
+
+// TestDoneGuardRelayNamesFieldsNotRegexPatterns (YM-150): the DONE-guard relay
+// must name the missing field, not the regex that checks it. A relay carrying
+// "(?m)^\*\*(Tests run|Build|Verification):\*\*" is un-actionable for the agent
+// that is supposed to fix its scratchpad block.
+func TestDoneGuardRelayNamesFieldsNotRegexPatterns(t *testing.T) {
+	r := ValidatePhaseBlocks(allPhasesPhase4Invalid)
+	if r.Compliant {
+		t.Fatal("fixture must be non-compliant")
+	}
+	for _, fe := range r.FieldErrors {
+		if strings.Contains(fe.Field, "(?m)") || strings.Contains(fe.Field, `\*`) {
+			t.Errorf("phase %d: FieldError.Field carries regex source %q, want a human field name", fe.Phase, fe.Field)
+		}
+	}
+
+	got := summarizeErrors(r)
+	if strings.Contains(got, "(?m)") || strings.Contains(got, `\*`) {
+		t.Errorf("relay names a regex pattern instead of field names: %s", got)
+	}
+	if !strings.Contains(got, "Tests run") {
+		t.Errorf("relay must name the expected Phase 4 field, got: %s", got)
+	}
+}

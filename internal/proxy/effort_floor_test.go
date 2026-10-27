@@ -4,7 +4,7 @@ import "testing"
 
 func TestEnforceEffortFloor_NoOutputConfig(t *testing.T) {
 	req := map[string]any{
-		"model":   "claude-opus-4-6",
+		"model":    "claude-opus-4-6",
 		"messages": []any{},
 	}
 	got := EnforceEffortFloor(req, "high")

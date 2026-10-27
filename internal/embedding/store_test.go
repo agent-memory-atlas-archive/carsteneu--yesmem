@@ -366,9 +366,43 @@ func testDB(t *testing.T) *sql.DB {
 		embedding_vector BLOB,
 		embedding_status TEXT,
 		superseded_by INTEGER,
+		quarantined_at TEXT,
 		created_at TEXT NOT NULL DEFAULT ''
 	)`)
 	return db
+}
+
+// TestVectorStoreSearchExcludesQuarantined (YM-44): both scan paths filtered
+// superseded_by but not quarantined_at, so quarantined learnings stayed reachable
+// through semantic search.
+func TestVectorStoreSearchExcludesQuarantined(t *testing.T) {
+	db := testDB(t)
+	store, err := NewVectorStore(db, 384)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	ctx := context.Background()
+
+	db.Exec(`INSERT INTO learnings(id, content, category) VALUES (1, 'active doc', 'test')`)
+	db.Exec(`INSERT INTO learnings(id, content, category, quarantined_at) VALUES (2, 'quarantined doc', 'test', '2026-01-01T00:00:00Z')`)
+	store.Add(ctx, VectorDoc{ID: "1", Embedding: makeVec(384, 0.1)})
+	store.Add(ctx, VectorDoc{ID: "2", Embedding: makeVec(384, 0.1)})
+
+	full, err := store.Search(ctx, makeVec(384, 0.1), 5)
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(full) != 1 || full[0].ID != "1" {
+		t.Errorf("brute-force scan returned %v, want only the active doc", full)
+	}
+
+	allowed, err := store.SearchAllowed(ctx, makeVec(384, 0.1), 5, map[string]bool{"1": true, "2": true})
+	if err != nil {
+		t.Fatalf("allowed search failed: %v", err)
+	}
+	if len(allowed) != 1 || allowed[0].ID != "1" {
+		t.Errorf("allowed scan returned %v, want only the active doc", allowed)
+	}
 }
 
 func TestVectorStoreSearchAllowedLargeSet(t *testing.T) {

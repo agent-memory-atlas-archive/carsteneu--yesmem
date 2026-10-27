@@ -14,9 +14,11 @@ func TestParseSandboxProfile(t *testing.T) {
 		{"none", ProfileNone, true},
 		{"standard", ProfileStandard, true},
 		{"strict", ProfileStrict, true},
-		{"", ProfileNone, true},
-		{"danger-full-access", ProfileNone, false},
-		{"STANDARD", ProfileNone, false},
+		// YM-230: an empty value is not a decision. It used to parse to none,
+		// which made every cap without a sandbox line run unsandboxed.
+		{"", ProfileStandard, false},
+		{"danger-full-access", ProfileStandard, false},
+		{"STANDARD", ProfileStandard, false},
 	}
 	for _, tt := range tests {
 		got, err := ParseSandboxProfile(tt.input)
@@ -28,6 +30,11 @@ func TestParseSandboxProfile(t *testing.T) {
 		}
 		if tt.ok && got != tt.want {
 			t.Errorf("ParseSandboxProfile(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+		// The error path must land on the sandboxed side: a caller that drops the
+		// error would otherwise run unsandboxed (YM-230).
+		if !tt.ok && got != ProfileStandard {
+			t.Errorf("ParseSandboxProfile(%q) = %v on the error path, want standard", tt.input, got)
 		}
 	}
 }
@@ -46,40 +53,15 @@ func TestSandboxRunWithProfile_None(t *testing.T) {
 	}
 }
 
-func TestSandboxBuildSandboxedCommand(t *testing.T) {
-	s := &Sandbox{
-		binaryPath: "/usr/local/bin/ai-jail",
-		cfg:        SandboxConfig{AllowedPorts: []int{80, 443}},
-	}
-	cmd := s.BuildSandboxedCommand("claude -p", ProfileStandard)
-	if cmd == "" {
-		t.Fatal("expected non-empty command")
-	}
-	if !strings.Contains(cmd, "ai-jail") {
-		t.Errorf("command should contain ai-jail, got %q", cmd)
-	}
-	if !strings.Contains(cmd, "claude -p") {
-		t.Errorf("command should contain original command, got %q", cmd)
-	}
-}
-
-func TestSandboxBuildSandboxedCommand_None(t *testing.T) {
-	s := &Sandbox{
-		binaryPath: "/usr/local/bin/ai-jail",
-		cfg:        SandboxConfig{AllowedPorts: []int{80, 443}},
-	}
-	cmd := s.BuildSandboxedCommand("echo hi", ProfileNone)
-	if cmd != "echo hi" {
-		t.Errorf("ProfileNone should return original command, got %q", cmd)
-	}
-}
-
 func TestSandboxWrapExecArgs(t *testing.T) {
 	s := &Sandbox{
 		binaryPath: "/usr/local/bin/ai-jail",
 		cfg:        SandboxConfig{AllowedPorts: []int{80, 443}},
 	}
-	bin, args := s.WrapExecArgs("claude", []string{"-p", "--output-format", "json"}, ProfileStandard)
+	bin, args, err := s.WrapExecArgs("claude", []string{"-p", "--output-format", "json"}, ProfileStandard)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
 	if bin != "/usr/local/bin/ai-jail" {
 		t.Errorf("binary = %q, want ai-jail path", bin)
 	}
@@ -103,7 +85,10 @@ func TestSandboxWrapExecArgs_None(t *testing.T) {
 		binaryPath: "/usr/local/bin/ai-jail",
 		cfg:        SandboxConfig{AllowedPorts: []int{80, 443}},
 	}
-	bin, args := s.WrapExecArgs("claude", []string{"-p", "--verbose"}, ProfileNone)
+	bin, args, err := s.WrapExecArgs("claude", []string{"-p", "--verbose"}, ProfileNone)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
 	if bin != "claude" {
 		t.Errorf("binary = %q, want claude (no wrapping)", bin)
 	}

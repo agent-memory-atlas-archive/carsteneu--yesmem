@@ -1,6 +1,8 @@
 package archive
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,11 +10,60 @@ import (
 	"testing"
 )
 
+// ProjectDirName has to reproduce the encoding Claude Code uses for
+// ~/.claude/projects, otherwise a project's exported sessions land beside, not
+// inside, the folder holding its JSONL copies.
+func TestProjectDirNameMatchesClaudeProjectEncoding(t *testing.T) {
+	cases := []struct{ path, want string }{
+		{"/home/tester/memory/yesmem", "-home-tester-memory-yesmem"},
+		{"/home/tester/memory/.claude", "-home-tester-memory--claude"},
+		{"/home/tester/memory/yesmem/", "-home-tester-memory-yesmem"},
+		// Claude Code drops the "+" as well (live: the worktree directory below
+		// exists as -home-tester-memory-yesmem--claude-worktrees-feat-capability-memory).
+		{"/home/tester/memory/yesmem/.claude/worktrees/feat+capability-memory", "-home-tester-memory-yesmem--claude-worktrees-feat-capability-memory"},
+		{"/home/user/a+b", "-home-user-a-b"},
+		// Claude's rule is "every character outside [A-Za-z0-9] becomes a dash"
+		// (extracted from the shipped CLI and probed with an isolated
+		// CLAUDE_CONFIG_DIR: dir_with_underscore, "a b@c+d" all lose the character).
+		{"/home/tester/projects/dora_bank11", "-home-tester-projects-dora-bank11"},
+		{"/tmp/a b@c", "-tmp-a-b-c"},
+		{"", "unknown"},
+		{"/", "unknown"},
+		{"  ", "unknown"},
+	}
+	for _, tc := range cases {
+		if got := ProjectDirName(tc.path); got != tc.want {
+			t.Errorf("ProjectDirName(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// That "+" and "_" collide with "-" is Claude Code's behavior and therefore
+// wanted here: two projects whose names differ only in such a character share
+// one folder. The archive has no reverse mapping, so the fold must not surprise
+// anyone later as a bug.
+func TestProjectDirNameAdoptsClaudesCollisions(t *testing.T) {
+	for _, tc := range [][2]string{
+		{"/home/user/a-b", "/home/user/a+b"},
+		{"/home/user/a-b", "/home/user/a_b"},
+		{"/home/user/a-b", "/home/user/a b"},
+	} {
+		got := ProjectDirName(tc[0])
+		// Pinned absolutely as well: a constant encoder would satisfy the
+		// equality check alone.
+		if got != "-home-user-a-b" {
+			t.Fatalf("ProjectDirName(%q) = %q, want -home-user-a-b", tc[0], got)
+		}
+		if ProjectDirName(tc[1]) != got {
+			t.Errorf("%q and %q were told apart (%q vs %q), Claude Code folds both",
+				tc[0], tc[1], got, ProjectDirName(tc[1]))
+		}
+	}
+}
+
 func TestArchiveFile(t *testing.T) {
-	// Create temp dirs
 	srcDir := t.TempDir()
 	archiveDir := t.TempDir()
-
 	// Create a fake JSONL
 	srcFile := filepath.Join(srcDir, "test-session.jsonl")
 	content := []byte(`{"type":"user","message":"hello"}` + "\n")
@@ -291,5 +342,117 @@ func TestArchiveFileSurvivesConcurrentAppends(t *testing.T) {
 			t.Fatalf("round %d: archived copy is %d bytes (source %d): an append was appended twice",
 				round, len(got), len(grown))
 		}
+	}
+}
+
+// A session document is replaced, not extended, and it holds the conversation
+// itself: the copy must stay owner-only and must not leave temp files behind.
+func TestWriteSessionDocReplacesPrivately(t *testing.T) {
+	archiveDir := t.TempDir()
+	a := New(archiveDir)
+
+	write := func(body string) func(io.Writer) error {
+		return func(w io.Writer) error {
+			_, err := io.WriteString(w, body)
+			return err
+		}
+	}
+	if err := a.WriteSessionDoc("proj", "session.json", write(`{"v":1}`)); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := a.WriteSessionDoc("proj", "session.json", write(`{"v":2}`)); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	path := filepath.Join(archiveDir, "proj", "session.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data) != `{"v":2}` {
+		t.Errorf("archived document = %q, want the replacement", string(data))
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("archived document mode = %o, want 600 (it contains the conversation)", perm)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(archiveDir, "proj"))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("project folder holds %v, want only the document", names)
+	}
+}
+
+// The name is formed in another package; the archiver refuses anything that
+// would leave the project folder.
+func TestWriteSessionDocRejectsEscapingNames(t *testing.T) {
+	archiveDir := t.TempDir()
+	a := New(archiveDir)
+
+	for _, name := range []string{"", ".", "..", "../escape.json", "sub/escape.json", "/abs.json"} {
+		err := a.WriteSessionDoc("proj", name, func(w io.Writer) error { return nil })
+		if err == nil {
+			t.Errorf("name %q was accepted, want an error", name)
+		}
+	}
+	for _, project := range []string{"", ".", "..", "../escaped-project", "a/b"} {
+		err := a.WriteSessionDoc(project, "s.json", func(w io.Writer) error { return nil })
+		if err == nil {
+			t.Errorf("project %q was accepted, want an error", project)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, "escape.json")); err == nil {
+		t.Error("a write escaped the project folder")
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, "..", "escaped-project", "s.json")); err == nil {
+		t.Error("a write escaped the archive base directory")
+	}
+}
+
+// A failing writer must not replace the previous document with a truncated one.
+func TestWriteSessionDocKeepsPreviousCopyOnWriteError(t *testing.T) {
+	archiveDir := t.TempDir()
+	a := New(archiveDir)
+
+	if err := a.WriteSessionDoc("proj", "s.json", func(w io.Writer) error {
+		_, err := io.WriteString(w, `{"v":1}`)
+		return err
+	}); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	boom := errors.New("boom")
+	err := a.WriteSessionDoc("proj", "s.json", func(w io.Writer) error {
+		io.WriteString(w, `{"v":2`)
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("second write: got %v, want the writer's error", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(archiveDir, "proj", "s.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data) != `{"v":1}` {
+		t.Errorf("archived document = %q, want the previous complete copy", string(data))
+	}
+	entries, err := os.ReadDir(filepath.Join(archiveDir, "proj"))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("project folder holds %d entries, want only the document", len(entries))
 	}
 }

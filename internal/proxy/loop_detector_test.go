@@ -223,15 +223,15 @@ func TestDetectLoop_EditTestErrorCycle_VaryingContent(t *testing.T) {
 	// detectEditTestErrorCycle SHOULD fire (same file, same build error pattern).
 	msgs := buildMessages(
 		userMsg("fix"),
-		assistantWithToolUse("Edit", "broken.go"),   // edit 1
+		assistantWithToolUse("Edit", "broken.go"), // edit 1
 		toolResult(false, "edited v1"),
 		assistantWithToolUse("Bash", "go test ./..."), // test → fail
 		toolResult(true, "FAIL: TestBroken line 10"),
-		assistantWithToolUse("Write", "broken.go"),   // edit 2 (Write, not Edit — different hash)
+		assistantWithToolUse("Write", "broken.go"), // edit 2 (Write, not Edit — different hash)
 		toolResult(false, "wrote v2"),
 		assistantWithToolUse("Bash", "go test ./..."), // test → fail
 		toolResult(true, "FAIL: TestBroken line 15"),
-		assistantWithToolUse("Edit", "broken.go"),    // edit 3
+		assistantWithToolUse("Edit", "broken.go"), // edit 3
 		toolResult(false, "edited v3"),
 		assistantWithToolUse("Bash", "go test ./..."), // test → fail
 		toolResult(true, "FAIL: TestBroken line 20"),

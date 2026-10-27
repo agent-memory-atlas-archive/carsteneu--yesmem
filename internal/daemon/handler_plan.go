@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -36,27 +37,66 @@ func LoadPlansFromDB(store *storage.Store) {
 	if err != nil {
 		return
 	}
-	planStore.Lock()
+
+	// Build before taking the lock: the docs hint needs a store query per plan.
+	// Memoized per project — every plan of the same project yields the same hint,
+	// and a restart can restore hundreds of them.
+	hints := make(map[string]string)
+	restored := make(map[string]*Plan, len(rows))
 	for _, r := range rows {
-		planStore.plans[r.ThreadID] = &Plan{
-			Content:   r.Content,
-			Status:    r.Status,
-			Scope:     r.Scope,
-			Project:   r.Project,
-			ThreadID:  r.ThreadID,
+		hint, ok := hints[r.Project]
+		if !ok {
+			hint = buildDocsHint(store, r.Project)
+			hints[r.Project] = hint
+		}
+		restored[r.ThreadID] = &Plan{
+			Content:  r.Content,
+			Status:   r.Status,
+			Scope:    r.Scope,
+			Project:  r.Project,
+			ThreadID: r.ThreadID,
+			// DocsHint is derived from the project's doc sources and never
+			// persisted, so a reloaded plan has to rebuild it or its
+			// checkpoints lose the docs reminder until the next set_plan.
+			DocsHint:  hint,
 			CreatedAt: r.CreatedAt,
 			UpdatedAt: r.UpdatedAt,
 		}
 	}
+
+	planStore.Lock()
+	for threadID, p := range restored {
+		planStore.plans[threadID] = p
+	}
 	planStore.Unlock()
 }
 
-// persistPlan writes the in-memory plan to DB.
-func (h *Handler) persistPlan(p *Plan) {
+// planPersistMu serializes [snapshot, write] pairs of one plan.
+//
+// Without it two parallel update_plan calls can invert: caller A reads the plan,
+// caller B reads the newer one, B writes, A writes — and the DB keeps the older
+// content while memory holds the newer one. Under this mutex every writer reads
+// the state as it is when it gets its turn, so the last write is the current
+// state.
+var planPersistMu sync.Mutex
+
+// persistPlan writes the plan of threadID to the DB. The snapshot is taken
+// under planStore's read lock: reading the *Plan after Unlock raced against a
+// concurrent update_plan that was mutating the same struct.
+func (h *Handler) persistPlan(threadID string) {
 	if h.store == nil {
 		return
 	}
-	h.store.UpsertPlan(&storage.PlanRow{
+	planPersistMu.Lock()
+	defer planPersistMu.Unlock()
+
+	planStore.RLock()
+	p, ok := planStore.plans[threadID]
+	if !ok || p == nil {
+		planStore.RUnlock()
+		return
+	}
+	row := storage.PlanRow{
 		ThreadID:  p.ThreadID,
 		Content:   p.Content,
 		Status:    p.Status,
@@ -64,7 +104,10 @@ func (h *Handler) persistPlan(p *Plan) {
 		Project:   p.Project,
 		CreatedAt: p.CreatedAt,
 		UpdatedAt: p.UpdatedAt,
-	})
+	}
+	planStore.RUnlock()
+
+	h.store.UpsertPlan(&row)
 }
 
 func (h *Handler) handleSetPlan(params map[string]any) Response {
@@ -77,7 +120,12 @@ func (h *Handler) handleSetPlan(params map[string]any) Response {
 		scope = "session"
 	}
 	threadID, _ := params["thread_id"].(string)
-	project, _ := params["project"].(string)
+	// Store the resolved project, not the raw param: the MCP schema for
+	// set_plan carries only plan/scope, so the param is empty on the normal
+	// path while the docs hint is built from the cwd fallback. A plan restored
+	// after a daemon restart rebuilds its hint from this value and would
+	// otherwise fall back to globals-only.
+	project := docsHintProject(params)
 
 	now := time.Now()
 	p := &Plan{
@@ -95,14 +143,14 @@ func (h *Handler) handleSetPlan(params map[string]any) Response {
 	// plan/scope), so fall back to the caller's working directory — otherwise
 	// the hint would degrade to globals-only and drop the session's own docs.
 	if h.store != nil {
-		p.DocsHint = buildDocsHint(h.store, docsHintProject(params))
+		p.DocsHint = buildDocsHint(h.store, project)
 	}
 
 	planStore.Lock()
 	planStore.plans[threadID] = p
 	planStore.Unlock()
 
-	h.persistPlan(p)
+	h.persistPlan(threadID)
 
 	return jsonResponse(map[string]any{
 		"message": fmt.Sprintf("Plan set (%s scope, %d chars)", scope, len(plan)),
@@ -114,6 +162,26 @@ func (h *Handler) handleSetPlan(params map[string]any) Response {
 func (h *Handler) handleUpdatePlan(params map[string]any) Response {
 	threadID, _ := params["thread_id"].(string)
 
+	// A plan written before set_plan persisted the resolved project carries an
+	// empty one. Resolve it here as well, and outside planStore's lock: the
+	// lookup walks the filesystem for a .git root and buildDocsHint runs a store
+	// query, while GetActivePlan sits on the request path.
+	needsBackfill := false
+	planStore.RLock()
+	if existing, ok := planStore.plans[threadID]; ok && existing != nil && existing.Project == "" {
+		needsBackfill = true
+	}
+	planStore.RUnlock()
+
+	backfillProject := ""
+	backfillHint := ""
+	if needsBackfill {
+		backfillProject = docsHintProject(params)
+		if backfillProject != "" && h.store != nil {
+			backfillHint = buildDocsHint(h.store, backfillProject)
+		}
+	}
+
 	planStore.Lock()
 	p, ok := planStore.plans[threadID]
 	if !ok || p == nil {
@@ -123,6 +191,14 @@ func (h *Handler) handleUpdatePlan(params map[string]any) Response {
 	if p.Status == "completed" {
 		planStore.Unlock()
 		return errorResponse("plan already completed — use set_plan() for a new plan")
+	}
+
+	if backfillProject != "" && p.Project == "" {
+		p.Project = backfillProject
+		if h.store != nil {
+			p.DocsHint = backfillHint
+		}
+		log.Printf("[plan] backfilled project %q on thread %q", backfillProject, threadID)
 	}
 
 	// Apply updates
@@ -156,7 +232,7 @@ func (h *Handler) handleUpdatePlan(params map[string]any) Response {
 	content := p.Content
 	planStore.Unlock()
 
-	h.persistPlan(p)
+	h.persistPlan(threadID)
 
 	return jsonResponse(map[string]any{
 		"message": "Plan updated",
@@ -168,10 +244,12 @@ func (h *Handler) handleUpdatePlan(params map[string]any) Response {
 func (h *Handler) handleGetPlan(params map[string]any) Response {
 	threadID, _ := params["thread_id"].(string)
 
+	// Read every field under the lock: another goroutine mutates this plan in
+	// place under the write lock (update_plan), so a field read after RUnlock
+	// raced against that write.
 	planStore.RLock()
+	defer planStore.RUnlock()
 	p, ok := planStore.plans[threadID]
-	planStore.RUnlock()
-
 	if !ok || p == nil {
 		return jsonResponse(map[string]any{"exists": false, "plan": "", "status": ""})
 	}
@@ -199,7 +277,7 @@ func (h *Handler) handleCompletePlan(params map[string]any) Response {
 	content := p.Content
 	planStore.Unlock()
 
-	h.persistPlan(p)
+	h.persistPlan(threadID)
 
 	return jsonResponse(map[string]any{
 		"message": "Plan completed — checkpoints stopped",

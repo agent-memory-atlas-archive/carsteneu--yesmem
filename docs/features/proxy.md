@@ -20,25 +20,26 @@ When estimated tokens exceed the threshold, the proxy runs:
 
 ```
 StripReminders → stripSkillHints → CompressContext → CalcCollapseCutoff → CollapseOldMessages
-→ ReplaceSystemBlock (Narrative) → StripOldNarratives → reexpandStubs
-→ UpgradeCacheTTL → EnforceCacheBreakpointLimit
+→ StripOldNarratives → reexpandStubsFor → NormalizeCacheTTL → EnforceCacheBreakpointLimit
 ```
+
+There is no `ReplaceSystemBlock` step for the narrative any more: the narrative is baked into the cached briefing turn pair (`composeBriefingText`), because rewriting a system block on every request burned the system-prefix cache. `UpgradeCacheTTL` is only reachable through `NormalizeCacheTTL`, which is the single TTL pass at the end of the pipeline.
 
 The proxy also rewrites the system prompt early in the pipeline (see §12e):
 ```
 StripCLAUDEMDDisclaimer → StripOutputEfficiency → StripToneBrevity
-→ InjectAntDirectives → InjectCLAUDEMDAuthority → InjectPersonaTone
+→ InjectAntDirectives → InjectCLAUDEMDAuthority → … → InjectPersonaTone
 ```
 
-**InjectAntDirectives** inserts behavioral directives into an `[ant]` block in the system prompt. Currently carries the `code-tools-first` directive: instructs Claude to use MCP code tools (`get_file_index`, `search_code_index`, `get_file_symbols`, `get_code_snippet`, `get_code_context`) for code navigation before spawning agents or using raw grep/find. The directive is injected as plain text inside the system block — not as a tool hint or user message.
+**InjectAntDirectives** writes the `[yesmem-directives]` system block (verification before completion, faithful reporting, collaborator mode). It has nothing to do with code-tool preference: that is a separate injector, `InjectCodeToolsFirst`, which writes `[yesmem-code-tools-first]` and asks Claude to use the project's code-navigation tools before raw grep/find. Both are plain text inside a system block, not tool hints and not user messages.
 
 ### Context Compression (CompressContext)
 
 Before stubbing or collapse, a compression pass removes low-value content:
 - Only targets messages outside the `keepRecent` window (default 10)
-- **Thinking blocks** ≥ 500 tokens → replaced with `[context compressed: thinking block]`
-- **Tool results** → summarized to first sentences + `deep_search('...')` hint
-- Zero information loss — deep-search hints preserve retrieval paths
+- **Thinking blocks** are dropped entirely at any age outside `keepRecent`, with no size threshold. They are never rewritten: the API validates each thinking block's signature against its text, so any rewrite makes the request invalid (`thinking.signature: Field required`)
+- **Tool results** over 500 tokens → summarized stub with a `deep_search('<keywords>')` hint, which is the form `reexpandStubsFor` can resolve. Only when the tool_use is gone and no keywords exist does it fall back to `get_session('<thread>', mode=paginated, offset=N, limit=1)`
+- Archived content stays reachable through those two hints, not a separate archive
 
 ### Differentiated Stubs (Not Dumb Summarization)
 
@@ -72,9 +73,9 @@ When Collapse does not trigger (cutoff ≤ 0), stubs age through 4 stages:
 
 Stage boundaries are **adaptive** based on token pressure (`totalTokens / threshold`). Decisions and pivot moments never decay.
 
-### Eager Tool-Result Stubbing
+### Eager Tool-Result Stubbing (Default: Off)
 
-Tool results are stubified aggressively on every request — not only when the sawtooth threshold is reached. This keeps token counts low proactively rather than waiting for a full stub cycle to trigger.
+`eager_stub_enabled` stubifies closed-turn tool results on every request, not only when the sawtooth threshold is reached. It is **off by default**: the field comment in `config.go` records why (`eager_stub_enabled` — upstream 400s and cache-miss cascades).
 
 Combined with **selective cache breakpoint shifting**: for text-only assistant turns (no tool calls), the proxy shifts the cache breakpoint position forward to keep the most recently cached content warm. Tool-use turns keep the standard breakpoint position. This preserves cache hit rate when eager stubbing compresses content that would otherwise anchor the breakpoint.
 
@@ -95,14 +96,14 @@ When token estimates exceed the threshold:
    - **Offen** — unfinished work items
    - **Timeline** (fallback) — mechanical event timeline with deduplication when no extraction data exists yet
    - Up to 20 relevant learnings (categories: decision, pattern, gotcha, pivot_moment, unfinished, explicit_teaching)
-5. Compacted blocks persisted to DB for later retrieval
+5. Compacted blocks are **not** written to `compacted_blocks` by the collapse path. The collapsed region lives in the frozen prefix, persisted per thread as `frozen:<threadID>` in `proxy_state`; `get_compacted_stubs` serves it from there by parsing the `[Archiv: Messages X-Y …]` marker. The `compacted_blocks` table survives as a read-only legacy path: `get_compacted_stubs` and `expand_context` fall back to it for rows an older proxy wrote. Nothing writes it any more, and the `store_compacted_block` write RPC is gone.
 
 ### Reexpand (Context Recovery)
 
 After collapse, the proxy can selectively re-expand stubs relevant to the current query:
 - Triggered when user query ≥ 10 chars and stubs with `deep_search('...')` hints exist
 - Selects top 3 stubs by keyword overlap
-- Budget: max 10% of TokenThreshold, max 2000 runes per expansion
+- Budget: max 25% of TokenThreshold, max 2000 runes per expansion
 - Runs **after Collapse** — targeted "undo" for the most relevant context
 
 ### Narrative Block
@@ -129,8 +130,8 @@ Exploits Anthropic's prompt caching for cost reduction:
 
 The proxy auto-detects whether the account uses 5-minute ephemeral or 1-hour prompt caching:
 - **Detection method:** Analyzes `cache_read_input_tokens` ratio from API responses. A gap test (no requests for >5 min) followed by a high cache-read ratio indicates 1-hour TTL.
-- **`cache_keepalive_mode`:** Config option (`auto`, `ephemeral`, `1h`). Default `auto` uses detection. `ephemeral_1h` is the detected state when 1-hour caching is confirmed. Note: Go code default is `"5m"` (config.go:444); the setup template writes `"auto"` (setup.go:838).
-- **Impact on keepalive:** Dynamic interval adjusts based on detected TTL — 4.5min pings for ephemeral (effectiveInterval = 300*0.9 = 270s), 54min for 1h. Default `cache_keepalive_pings_5m: 6` (optimized from 12 — diminishing returns above 6 pings per cycle). Note: Go code default is `5` (config.go:445); the setup template writes `6`.
+- **`cache_keepalive_mode`:** Config option (`auto`, `5m`, `1h`). Default is `"5m"` in the Go code (`config.go`) **and** in the setup template — not `auto`.
+- **Impact on keepalive:** Dynamic interval adjusts based on detected TTL — 4.5min pings for ephemeral (effectiveInterval = 300*0.9 = 270s), 54min for 1h. `cache_keepalive_pings_5m` defaults to `5` in both the Go code and the setup template.
 
 ### Per-Thread Keepalive
 
@@ -146,7 +147,7 @@ Aggressive cleanup of redundant `<system-reminder>` blocks from older messages:
 - Skill-check, yesmem-context, task-reminder, local-cmd → stripped immediately
 - File-change diffs: < 3 requests = full, 3–10 = summary, > 10 = minimal
 - SessionStart blocks → always protected
-- Most recent messages untouched
+- Only the **last user message** stays untouched; every older message is processed (age in turns measured from this thread's own tail)
 
 ### Subagent Detection
 
@@ -167,7 +168,7 @@ Claude Code has a hardcoded 180k token budget and warns at ~160k. Since the prox
 
 ### Lossless Archive
 
-Original messages are archived in the `compacted_blocks` table — nothing is lost. Claude can retrieve archived content via `deep_search()` or `get_compacted_stubs()`.
+Nothing is lost, but the archive is not the `compacted_blocks` table: the collapsed region is kept in the frozen prefix (per-thread `frozen:<threadID>` in `proxy_state`), and `get_compacted_stubs()` plus `deep_search()` are the retrieval paths. `compacted_blocks` is a legacy table: `get_compacted_stubs` and `expand_context` still read it, and no RPC writes it any more.
 
 ### Auto-Start
 
@@ -183,10 +184,12 @@ proxy:
   token_threshold: 250000
   token_minimum_threshold: 100000
   token_thresholds:                   # per-model overrides (substring match)
-    opus: 500000                      # 1M context models get higher threshold (code defaults: opus=180k, sonnet=180k, haiku=130k — config.go:452-455)
+    opus: 500000                      # 1M context models get higher threshold
     sonnet: 250000
     haiku: 150000
     gpt-5.2: 250000
+  # Code defaults (config.go): opus 180000, sonnet 180000, haiku 130000,
+  # gpt-5 180000, codex 180000, deepseek 600000, glm-5.2 500000
   keep_recent: 10
   sawtooth_enabled: true
   cache_ttl: "ephemeral"              # default: 5min TTL (cheaper than 1h; auto-detected overrides this)
@@ -195,7 +198,7 @@ proxy:
   effort_floor: ""                     # minimum effort value for API requests (string field; proxy raises effort if request is below floor)
 ```
 
-Runtime override per model via MCP: `set_config(key="token_threshold", value="opus=500000")`.
+Runtime override per model via MCP: `set_config(key="token_threshold", value="opus=500000")`. The proxy reads those overrides from **`runtime.db`** under `config_override:token_threshold[:<model>|:<threadID>]`, so they take effect immediately without a restart.
 
 ### OpenAI Parity Pipeline (Codex & OpenCode Support)
 
@@ -217,7 +220,8 @@ Codex/Opencode → POST /v1/responses → yesmem proxy
 - Incoming Responses API `input[]` blocks → Anthropic `messages[]` (user/assistant/tool roles)
 - Outgoing Anthropic streaming SSE events → Responses API `output[]` blocks
 - `cache_control` breakpoints are translated through both directions — preserving DeepSeek prompt cache across the round-trip
-- ThreadID detection: uses stable `session_id` from request metadata, not content hash. Falls back to SHA256 of user_id when metadata is absent. Falls back to `DeriveThreadID(req)` (a content hash of session ID + working directory + first user text) when no stable `session_id` is available in request metadata.
+- ThreadID detection: uses the stable `session_id` from request metadata when present. Without it, the ID is `DeriveThreadID(req)`, a content hash of session ID + working directory + first user text — a cache key, not an identity. There is no SHA256-over-`user_id` fallback
+- Thread prefix: always `opencode:` for this path; only a detected Codex client gets `codex:`
 
 **Injection pipeline** (`internal/proxy/openai_parity.go`):
 
@@ -227,7 +231,7 @@ The parity pipeline runs the same injection sequence as the main proxy pipeline,
 - `InjectCodingDiscipline` / `InjectBeweislast` / `InjectScopeDiscipline`
 - `InjectClarifyFirst` / `InjectCodeToolsFirst` / `InjectWikiFirst`
 - `InjectTimestamps` → wall-clock timestamps and message sequence numbers (same as §12c)
-- Claude-specific injectors (`InjectClaudeToolPrefs`, `InjectDelegationContract`) are **excluded** from the parity path via profile gating
+- Claude-specific injectors (`InjectClaudeToolPrefs`, `InjectDelegationContract`) are never invoked on this path. They are not filtered out by a profile check while running — the parity pipeline simply does not call them
 - `injectOpencodeCapabilitiesCatalog` → registers active caps as available tools (§25)
 
 **Cache management for DeepSeek:**
@@ -256,10 +260,12 @@ The parity pipeline runs the same injection sequence as the main proxy pipeline,
 | `openai` | OpenAI Responses API | OpenAI API key |
 | `openai_compatible` | Any OpenAI-compatible endpoint | API key + base URL |
 
-API key lookup is provider-aware via `cfg.ResolvedAPIKey()`:
-- **Anthropic:** `ANTHROPIC_API_KEY` env → `config.yaml api.api_key` → Claude Code's `~/.claude.json`
-- **OpenAI:** `OPENAI_API_KEY` env → `config.yaml api.openai_api_key`
+API key lookup is provider-aware via `cfg.ResolvedAPIKey()`. **Config beats env**, and the proxy itself does not read `~/.claude.json` (only the setup wizard and the hook-side key resolver in `internal/hooks/guard.go` do):
+- **Anthropic:** `config.yaml api.api_key` → `ANTHROPIC_API_KEY` env
+- **OpenAI:** `config.yaml api.openai_api_key` → `OPENAI_API_KEY` env
 - **OpenAI-compatible:** Same as OpenAI + `OPENAI_BASE_URL` env → `config.yaml api.openai_base_url`
+
+The config-first order is deliberate: an explicit key in `config.yaml` (for example a DeepSeek key paired with `api.deepseek.com`) must not be silently overridden by an `OPENAI_API_KEY` from the shell profile.
 
 Model tier names (`haiku`, `sonnet`, `opus`) are mapped automatically per provider:
 | Tier | Anthropic | OpenAI |
@@ -367,7 +373,7 @@ Per-million-token pricing for budget tracking — configurable via `config.yaml`
 pricing:
   haiku:      { input: 1.0, output: 5.0 }
   sonnet:     { input: 3.0, output: 15.0 }
-  opus:       { input: 15.0, output: 75.0 }
+  opus:       { input: 5.0, output: 25.0 }
   gpt-5-mini: { input: 0.25, output: 2.0 }
   gpt-5.2:    { input: 1.75, output: 14.0 }
   gpt-5.4:    { input: 2.5, output: 15.0 }
@@ -407,7 +413,7 @@ The proxy reads three config sources from the opencode installation at startup a
 **What it does:**
 1. Discovers active OpenAI-compatible providers (npm check: `@ai-sdk/openai-compatible`, `@ai-sdk/openai`, `@ai-sdk/mistral`)
 2. Resolves credentials via three-tier lookup: opencode.json per-provider `env` vars → models.json env hints → auth.json
-3. Verifies discovered credentials against provider endpoints
+3. Checks that credentials are **present** (`hasProviderCredentials`: opencode.json env vars, auth.json entries, models.json env hints). It does not probe the provider endpoint — a key that is present but invalid is still routed
 4. Builds `autoProviderTargets` map for `resolveOpenAITarget()` request routing
 5. Patches `opencode.json` with `baseURL: http://localhost:9099/v1` for discovered providers (idempotent — skips if already set)
 6. First-party defaults for providers without API endpoints in models.json (openai, anthropic, google, groq, mistral)
@@ -447,4 +453,4 @@ Runtime loop detection runs inside the proxy, no LLM call needed:
   - Level 1: "Step back, same approach failed N times"
   - Level 2: "WARNING: Loop continues — ask user for guidance"
   - Level 3+: "ALERT: persistent loop — stop and ask user"
-- **Injection:** `[yesmem-loop-warning]` system-reminder block in next user message
+- **Injection:** `[loop-warning]` label inside the timestamp meta prefix of the next user message, followed by `[YesMem Loop Detection] <description>`

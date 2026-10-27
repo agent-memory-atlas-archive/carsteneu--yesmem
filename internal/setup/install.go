@@ -1,13 +1,16 @@
 package setup
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"time"
+
+	"github.com/carsteneu/yesmem/internal/update"
 )
 
 const DefaultExtractionModel = "sonnet"
@@ -56,21 +59,13 @@ func ensurePermanentLocation(home, binaryPath string) string {
 	os.MkdirAll(filepath.Dir(dest), 0755)
 	var copyErr error
 	withSpinner("Installing to "+dest, func() (string, error) {
+		// No busy-binary workaround here any more: copyBinary installs by rename
+		// and never opens the running inode for writing, so ETXTBSY cannot occur.
+		// The old branch stopped both services and killed every yesmem process on
+		// the host to get past it (YM-313).
 		if err := copyBinary(absPath, dest); err != nil {
-			if strings.Contains(err.Error(), "text file busy") {
-				exec.Command("systemctl", "--user", "stop", "yesmem-proxy").Run()
-				exec.Command("systemctl", "--user", "stop", "yesmem").Run()
-				selfPid := fmt.Sprintf("%d", os.Getpid())
-				exec.Command("bash", "-c", fmt.Sprintf("pgrep -x yesmem | grep -v %s | xargs -r kill", selfPid)).Run()
-				time.Sleep(1 * time.Second)
-				if err := copyBinary(absPath, dest); err != nil {
-					copyErr = err
-					return "", fmt.Errorf("%v — keeping at %s", err, absPath)
-				}
-			} else {
-				copyErr = err
-				return "", fmt.Errorf("%v — keeping at %s", err, absPath)
-			}
+			copyErr = err
+			return "", fmt.Errorf("%v — keeping at %s", err, absPath)
 		}
 		return "", nil
 	})
@@ -78,8 +73,29 @@ func ensurePermanentLocation(home, binaryPath string) string {
 		ensureInPath(home, filepath.Dir(absPath))
 		return absPath
 	}
+	// A running daemon and proxy keep the inode they mapped. The in-place copy this
+	// replaces failed with ETXTBSY, the setup then stopped both services to get past
+	// it, and step 11's `systemctl --user start` brought the new binary up. A rename
+	// succeeds silently, so the switch has to be asked for here, or setup would
+	// leave the old binary executing next to a new file on disk.
+	restartInstalledServices()
 	ensureInPath(home, filepath.Dir(dest))
 	return dest
+}
+
+// restartInstalledServices lets an already-running installation pick up the
+// binary copyBinary just installed. try-restart restarts a running unit and does
+// nothing for an inactive one, which step 11 starts the normal way; a host
+// without systemd is left alone (macOS uses launchd, started in step 11).
+func restartInstalledServices() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), systemdReloadTimeout)
+	defer cancel()
+	if err := systemctlRun(ctx, "--user", "try-restart", "yesmem.service", "yesmem-proxy.service"); err != nil {
+		log.Printf("setup: restarting the installed services: %v (a running daemon keeps the previous binary until its next restart)", err)
+	}
 }
 
 func isPermanentLocation(home, path string) bool {
@@ -114,23 +130,54 @@ func isPermanentLocation(home, path string) bool {
 	return true // Anywhere else, assume the user knows what they're doing
 }
 
+// copyBinary installs src as dst. It takes the same update lock as `yesmem
+// update` and `make install`, and it replaces the file by rename instead of
+// writing through the target: a running yesmem has the installed inode mapped,
+// so an in-place copy fails with ETXTBSY mid-write (or leaves a truncated
+// binary behind), and a parallel update would replace a path this copy is still
+// writing. There is no busy-file workaround any more, because a rename never
+// touches the running inode.
 func copyBinary(src, dst string) error {
+	unlock, err := update.LockBinaryUpdate(dst)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	// The temp name has to sit in the target directory: rename across filesystems
+	// would copy again. os.CreateTemp reserves the name, so a leftover from an
+	// aborted run cannot block the install (the .bak.tmp lesson of YM-301).
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".yesmem-copy-*")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
 
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
 		return err
 	}
-	return out.Sync()
+	// cp keeps an existing target's mode; the installed binary must be 0755
+	// whatever the umask and whatever the file was before.
+	if err := tmp.Chmod(0755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, dst)
 }
 
 func ensureInPath(home, dir string) {

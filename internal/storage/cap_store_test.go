@@ -242,6 +242,59 @@ func TestCapStoreCellSizeLimit(t *testing.T) {
 	}
 }
 
+// fillCapTable pushes a table to the row quota with few statements; one upsert
+// per row would dominate the runtime of every quota test.
+func fillCapTable(t *testing.T, s *Store, fullName string, n int) {
+	t.Helper()
+	const chunk = 500
+	for written := 0; written < n; written += chunk {
+		count := chunk
+		if n-written < count {
+			count = n - written
+		}
+		vals := strings.TrimSuffix(strings.Repeat("('x'),", count), ",")
+		if _, err := s.capStoreDB.Exec(fmt.Sprintf("INSERT INTO %s (name) VALUES %s", fullName, vals)); err != nil {
+			t.Fatalf("fill %s: %v", fullName, err)
+		}
+	}
+}
+
+// The quota exempted any upsert that carried an `id`. An id the table does not
+// know is an INSERT, not an update — so inventing one swallowed the limit.
+func TestCapsUpsert_RowQuotaNotBypassedByInventedID(t *testing.T) {
+	s := mustOpenCapStore(t)
+	if err := s.CapsCreateTable("test", "items", []ColumnDef{{Name: "name", Type: "TEXT"}}); err != nil {
+		t.Fatal(err)
+	}
+	fullName := "cap_test__items"
+	fillCapTable(t, s, fullName, CapsMaxRowsPerTable)
+
+	if _, err := s.CapsUpsert("test", "items", map[string]any{"id": 999999, "name": "smuggled"}); err == nil {
+		t.Error("an id the table does not know must not bypass the row quota")
+	}
+
+	var existing int64
+	if err := s.capStoreDB.QueryRow(fmt.Sprintf("SELECT id FROM %s ORDER BY id LIMIT 1", fullName)).Scan(&existing); err != nil {
+		t.Fatalf("read existing id: %v", err)
+	}
+	if _, err := s.CapsUpsert("test", "items", map[string]any{"id": existing, "name": "updated"}); err != nil {
+		t.Errorf("updating an existing row must stay possible at the quota: %v", err)
+	}
+}
+
+// The cell limit only looked at string values, so a BLOB went in unbounded.
+func TestCapStoreCellSizeLimit_NonStringValue(t *testing.T) {
+	s := mustOpenCapStore(t)
+	if err := s.CapsCreateTable("test", "blobs", []ColumnDef{{Name: "data", Type: "BLOB"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	big := make([]byte, CapsMaxCellBytes+1)
+	if _, err := s.CapsUpsert("test", "blobs", map[string]any{"data": big}); err == nil {
+		t.Error("a []byte cell must be held to the same size limit as a string")
+	}
+}
+
 func TestCapStoreNonExistentTable(t *testing.T) {
 	s := mustOpenCapStore(t)
 
@@ -807,4 +860,38 @@ func TestCapsClaimAndRead_RequiresSet(t *testing.T) {
 	s.CapsCreateTable("test", "items", []ColumnDef{{Name: "processed", Type: "INTEGER"}})
 	_, err := s.CapsClaimAndRead("test", "items", "processed = 0", "id ASC", nil, nil, []string{"id"})
 	if err == nil { t.Error("claim without set columns should fail") }
+}
+
+// YM-213/OPS-45: CapsUpsert held every cell to CapsMaxCellBytes, but
+// CapsClaimAndRead attached its set values to the UPDATE unchecked — the same
+// boundary, one path over.
+func TestCapsClaimAndRead_CellSizeLimit(t *testing.T) {
+	s := mustOpenCapStore(t)
+	if err := s.CapsCreateTable("test", "queue", []ColumnDef{
+		{Name: "state", Type: "TEXT"},
+		{Name: "payload", Type: "TEXT"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CapsUpsert("test", "queue", map[string]any{"state": "new", "payload": "small"}); err != nil {
+		t.Fatal(err)
+	}
+
+	big := strings.Repeat("x", CapsMaxCellBytes+1)
+	_, err := s.CapsClaimAndRead("test", "queue", "state = ?", "id ASC", []any{"new"},
+		map[string]any{"state": "claimed", "payload": big}, []string{"*"})
+	if err == nil {
+		t.Error("claim_and_read must hold its set values to the cell size limit")
+	}
+
+	rows, qerr := s.CapsQuery("test", "queue", "id = 1", nil, 1)
+	if qerr != nil {
+		t.Fatalf("query: %v", qerr)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want the seeded row, got %d rows", len(rows))
+	}
+	if rows[0]["state"] != "new" {
+		t.Errorf("state = %v, want new — the oversized claim must not have landed", rows[0]["state"])
+	}
 }

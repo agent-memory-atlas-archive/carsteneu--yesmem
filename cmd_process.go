@@ -10,10 +10,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/config"
+	"github.com/carsteneu/yesmem/internal/daemon"
 	"github.com/carsteneu/yesmem/internal/proxy"
 )
 
@@ -30,67 +30,7 @@ func runProxy() {
 	resetCache := fs.Bool("reset-cache", false, "clear persisted frozen stubs and decay state")
 	fs.Parse(os.Args[2:])
 
-	pcfg := proxy.Config{
-		ListenAddr:            cfg.Proxy.Listen,
-		TargetURL:             cfg.Proxy.Target,
-		TokenThreshold:        cfg.Proxy.TokenThreshold,
-		TokenMinimumThreshold: cfg.Proxy.TokenMinimumThreshold,
-		TokenThresholds:       cfg.Proxy.TokenThresholds,
-		KeepRecent:            cfg.Proxy.KeepRecent,
-		DataDir:               dataDir,
-		OpenAITargetURL:       cfg.Proxy.OpenAITarget,
-		AutoConfigureProviders: cfg.Proxy.AutoConfigureProviders,
-		ProviderTargets:       cfg.Proxy.ProviderTargets,
-		// Signal reflection
-		SignalsEnabled:     cfg.Signals.Enabled,
-		SignalsMode:        cfg.Signals.Mode,
-		SignalsEveryNTurns: cfg.Signals.EveryNTurns,
-		SignalsModel:       cfg.SignalsModelID(),
-		APIKey:             cfg.API.APIKey,
-		SawtoothEnabled:      cfg.Proxy.SawtoothEnabled,
-		CacheTTL:             cfg.Proxy.CacheTTL,
-		UsageDeflationFactor: cfg.Proxy.UsageDeflationFactor,
-		PromptUngate:         cfg.Proxy.PromptUngate,
-		PromptRewrite:        cfg.Proxy.PromptRewrite,
-		PromptEnhance:        cfg.Proxy.PromptEnhance,
-		PromptToolPrefs:        cfg.Proxy.PromptToolPrefs,
-		PromptOutputDiscipline: cfg.Proxy.PromptOutputDiscipline,
-		PromptCodingDiscipline: cfg.Proxy.PromptCodingDiscipline,
-		PromptBeweislast:         cfg.Proxy.PromptBeweislast,
-		PromptFable:              cfg.Proxy.PromptFable,
-		PromptScopeDiscipline:    cfg.Proxy.PromptScopeDiscipline,
-		PromptDelegationContract: cfg.Proxy.PromptDelegationContract,
-		PromptClarifyFirst:       cfg.Proxy.PromptClarifyFirst,
-		PromptCodeToolsFirst:     cfg.Proxy.PromptCodeToolsFirst,
-		PromptWikiFirst:          cfg.Proxy.PromptWikiFirst,
-		PromptPatternSuggest:     cfg.Proxy.PromptPatternSuggest,
-		EffortFloor:          cfg.Proxy.EffortFloor,
-		SkillEvalInject:      cfg.Proxy.SkillEvalInject,
-		CacheKeepaliveEnabled:     cfg.Proxy.CacheKeepaliveEnabled,
-		CacheKeepaliveMode:        cfg.Proxy.CacheKeepaliveMode,
-		CacheKeepalivePings5m:     cfg.Proxy.CacheKeepalivePings5m,
-		CacheKeepalivePings1h:     cfg.Proxy.CacheKeepalivePings1h,
-		CacheKeepaliveMinMessages: cfg.Proxy.CacheKeepaliveMinMessages,
-		EagerStubEnabled:          cfg.Proxy.EagerStubEnabled,
-		// Forked agents
-		ForkedAgentsEnabled:            cfg.ForkedAgents.Enabled,
-		ForkedAgentsModel:              cfg.ForkedAgentsModelID(),
-		ForkedAgentsTokenGrowthTrigger: cfg.ForkedAgents.TokenGrowthTrigger,
-		ForkedAgentsMaxFailures:        3,
-		ForkedAgentsMaxForksPerSession: cfg.ForkedAgents.MaxForksPerSession,
-		ForkedAgentsDebug:              cfg.ForkedAgents.Debug,
-		QualityModelID:                 cfg.QualityModelID(),
-		// Per-model feature gates
-		ModelFeatures:  cfg.Proxy.ModelFeatures,
-		FeatureDefaults: cfg.Proxy.FeatureDefaults,
-		CustomSystemPrompt: proxy.CustomSystemPromptConfig{
-			EnabledOpenCode:   cfg.Proxy.CustomSystemPrompt.EnabledOpenCode,
-			EnabledClaudeCode: cfg.Proxy.CustomSystemPrompt.EnabledClaudeCode,
-			EnabledCodex:      cfg.Proxy.CustomSystemPrompt.EnabledCodex,
-			TemplatePath:      cfg.Proxy.CustomSystemPrompt.TemplatePath,
-			ModelTemplates:    cfg.Proxy.CustomSystemPrompt.ModelTemplates,
-		},
-	}
+	pcfg := buildProxyConfig(cfg, dataDir)
 
 	// CLI overrides
 	if *port > 0 {
@@ -143,17 +83,21 @@ func runStop() {
 		target = os.Args[2] // "daemon", "proxy", or "all"
 	}
 
-	self := os.Getpid()
+	dataDir := yesmemDataDir()
 	stopped := 0
 
+	stop := func(role string) {
+		n, _ := stopProcesses(role, dataDir)
+		stopped += n
+	}
 	switch target {
 	case "daemon":
-		stopped = stopProcesses("yesmem daemon", self)
+		stop("daemon")
 	case "proxy":
-		stopped = stopProcesses("yesmem proxy", self)
+		stop("proxy")
 	default: // "all"
-		stopped += stopProcesses("yesmem daemon", self)
-		stopped += stopProcesses("yesmem proxy", self)
+		stop("daemon")
+		stop("proxy")
 	}
 
 	if stopped == 0 {
@@ -163,64 +107,85 @@ func runStop() {
 	}
 }
 
-func stopProcesses(pattern string, selfPID int) int {
-	cmd := exec.Command("pgrep", "-f", pattern)
-	out, err := cmd.Output()
+// stopProcesses stops this installation's instances of role and reports how many it
+// ended, plus whether a service manager ended the process instead of a signal.
+// Naming the role is all it decides: which processes carry it is daemon.StopRole's
+// question, and that one verifies the argv structure and the data dir (or, where the
+// process table cannot be read, the launchd agent or the data dir's PID file)
+// instead of trusting a name match.
+func stopProcesses(role, dataDir string) (stopped int, byService bool) {
+	pids, stoppedByService, err := daemon.StopRole(role, dataDir)
 	if err != nil {
-		return 0
+		fmt.Fprintf(os.Stderr, "  %s: %v\n", role, err)
 	}
+	for _, pid := range pids {
+		fmt.Fprintf(os.Stderr, "  signalled PID %d (%s)\n", pid, role)
+	}
+	if stoppedByService {
+		fmt.Fprintf(os.Stderr, "  stopped the %s service\n", role)
+		return 1, true
+	}
+	return len(pids), false
+}
 
-	count := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		pid := 0
-		fmt.Sscanf(line, "%d", &pid)
-		if pid == 0 || pid == selfPID {
-			continue
-		}
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			continue
-		}
-		// Try SIGTERM first
-		if err := proc.Signal(syscall.SIGTERM); err == nil {
-			fmt.Fprintf(os.Stderr, "  stopped PID %d (%s)\n", pid, pattern)
-			count++
-		}
-		// Wait briefly, then SIGKILL zombies
-		time.Sleep(500 * time.Millisecond)
-		if err := proc.Signal(syscall.Signal(0)); err == nil {
-			// Still alive → force kill
-			proc.Signal(syscall.SIGKILL)
-			fmt.Fprintf(os.Stderr, "  force-killed PID %d (%s)\n", pid, pattern)
-		}
+// daemonStillAnswers reports whether something accepts a connection on the daemon
+// socket.
+func daemonStillAnswers(sockPath string) bool {
+	conn, err := net.DialTimeout("unix", sockPath, time.Second)
+	if err != nil {
+		return false
 	}
-	return count
+	conn.Close()
+	return true
 }
 
 func runRestart() {
-	dataDir := os.Getenv("YESMEM_DATA_DIR")
-	if dataDir == "" {
-		dataDir = filepath.Join(os.Getenv("HOME"), ".claude", "yesmem")
-	}
+	dataDir := yesmemDataDir()
 
 	fmt.Fprintf(os.Stderr, "Stopping all yesmem processes...\n")
-	self := os.Getpid()
-	stopProcesses("yesmem daemon", self)
-	stopProcesses("yesmem proxy", self)
+	stopProcesses("daemon", dataDir)
 
 	// Wait for processes to die
 	time.Sleep(1 * time.Second)
 
-	// Clean up stale socket and PID file
 	sockPath := filepath.Join(dataDir, "daemon.sock")
 	pidPath := filepath.Join(dataDir, "daemon.pid")
+	if daemonStillAnswers(sockPath) {
+		// On a platform where the instance could not be verified (no /proc) the
+		// stop above did nothing. Starting a second daemon on the same database
+		// would be worse than not restarting: say so and leave the state alone,
+		// including the proxy this restart has not touched yet.
+		fmt.Fprintf(os.Stderr, "A daemon still answers on %s and could not be verified as this installation's. Not starting a second instance.\n", sockPath)
+		os.Exit(1)
+	}
+	_, proxyStoppedByService := stopProcesses("proxy", dataDir)
+
+	// Clean up stale socket and PID file
 	os.Remove(sockPath)
 	os.Remove(pidPath)
 
 	fmt.Fprintf(os.Stderr, "Starting daemon...\n")
+	// Where a service manager owns the process, it has to start it again: a daemon
+	// spawned here would live outside its supervision, and a kept-alive agent would
+	// fight it. The proxy comes back the same way, but only if this restart took it
+	// out of the domain: starting an agent the user had unloaded would be a change
+	// nobody asked for. Without a manager the flow below is the only path, as before.
+	if startedByService, err := daemon.StartRole("daemon"); err != nil {
+		log.Fatalf("restart: %v", err)
+	} else if startedByService {
+		if proxyStoppedByService {
+			if _, proxyErr := daemon.StartRole("proxy"); proxyErr != nil {
+				fmt.Fprintf(os.Stderr, "  proxy: %v\n", proxyErr)
+			}
+		}
+		if waitForDaemonSocket(sockPath) {
+			fmt.Fprintf(os.Stderr, "Daemon ready (started by the service manager).\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "Daemon started by the service manager but socket not yet ready. Check logs.\n")
+		}
+		return
+	}
+
 	exe, _ := os.Executable()
 	cmd := exec.Command(exe, "daemon")
 	cmd.Stdout = os.Stdout
@@ -240,6 +205,18 @@ func runRestart() {
 		}
 	}
 	fmt.Fprintf(os.Stderr, "Daemon started (PID %d) but socket not yet ready. Check logs.\n", cmd.Process.Pid)
+}
+
+// waitForDaemonSocket polls for the daemon socket. Used where the pid of the new
+// daemon is not ours to report (a service manager started it).
+func waitForDaemonSocket(sockPath string) bool {
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if _, err := os.Stat(sockPath); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureProxyRunning starts the proxy if ANTHROPIC_BASE_URL points to
@@ -285,4 +262,71 @@ func ensureProxyRunning() {
 	}
 	cmd.Process.Release()
 	time.Sleep(200 * time.Millisecond)
+}
+
+// buildProxyConfig maps the loaded configuration onto the proxy's runtime
+// config. It is separate from runProxy so a test can assert the mapping without
+// starting the proxy: the profile layers once went missing exactly here and no
+// test noticed.
+func buildProxyConfig(cfg *config.Config, dataDir string) proxy.Config {
+	return proxy.Config{
+		ListenAddr:             cfg.Proxy.Listen,
+		TargetURL:              cfg.Proxy.Target,
+		TokenThreshold:         cfg.Proxy.TokenThreshold,
+		TokenMinimumThreshold:  cfg.Proxy.TokenMinimumThreshold,
+		TokenThresholds:        cfg.Proxy.TokenThresholds,
+		KeepRecent:             cfg.Proxy.KeepRecent,
+		DataDir:                dataDir,
+		OpenAITargetURL:        cfg.Proxy.OpenAITarget,
+		AutoConfigureProviders: cfg.Proxy.AutoConfigureProviders,
+		ProviderTargets:        cfg.Proxy.ProviderTargets,
+		// Inline reflection (config signals.enabled)
+		InlineReflectionEnabled:   cfg.Signals.Enabled,
+		APIKey:                    cfg.API.APIKey,
+		SawtoothEnabled:           cfg.Proxy.SawtoothEnabled,
+		CacheTTL:                  cfg.Proxy.CacheTTL,
+		UsageDeflationFactor:      cfg.Proxy.UsageDeflationFactor,
+		PromptUngate:              cfg.Proxy.PromptUngate,
+		PromptRewrite:             cfg.Proxy.PromptRewrite,
+		PromptEnhance:             cfg.Proxy.PromptEnhance,
+		PromptToolPrefs:           cfg.Proxy.PromptToolPrefs,
+		PromptOutputDiscipline:    cfg.Proxy.PromptOutputDiscipline,
+		PromptCodingDiscipline:    cfg.Proxy.PromptCodingDiscipline,
+		PromptBeweislast:          cfg.Proxy.PromptBeweislast,
+		PromptFable:               cfg.Proxy.PromptFable,
+		PromptScopeDiscipline:     cfg.Proxy.PromptScopeDiscipline,
+		PromptDelegationContract:  cfg.Proxy.PromptDelegationContract,
+		PromptClarifyFirst:        cfg.Proxy.PromptClarifyFirst,
+		PromptCodeToolsFirst:      cfg.Proxy.PromptCodeToolsFirst,
+		PromptWikiFirst:           cfg.Proxy.PromptWikiFirst,
+		PromptPatternSuggest:      cfg.Proxy.PromptPatternSuggest,
+		EffortFloor:               cfg.Proxy.EffortFloor,
+		SkillEvalInject:           cfg.Proxy.SkillEvalInject,
+		CacheKeepaliveEnabled:     cfg.Proxy.CacheKeepaliveEnabled,
+		CacheKeepaliveMode:        cfg.Proxy.CacheKeepaliveMode,
+		CacheKeepalivePings5m:     cfg.Proxy.CacheKeepalivePings5m,
+		CacheKeepalivePings1h:     cfg.Proxy.CacheKeepalivePings1h,
+		CacheKeepaliveMinMessages: cfg.Proxy.CacheKeepaliveMinMessages,
+		EagerStubEnabled:          cfg.Proxy.EagerStubEnabled,
+		// Forked agents
+		ForkedAgentsEnabled:            cfg.ForkedAgents.Enabled,
+		ForkedAgentsModel:              cfg.ForkedAgentsModelID(),
+		ForkedAgentsTokenGrowthTrigger: cfg.ForkedAgents.TokenGrowthTrigger,
+		ForkedAgentsMaxFailures:        3,
+		ForkedAgentsMaxForksPerSession: cfg.ForkedAgents.MaxForksPerSession,
+		ForkedAgentsDebug:              cfg.ForkedAgents.Debug,
+		QualityModelID:                 cfg.QualityModelID(),
+		// Per-model feature gates
+		ModelFeatures:   cfg.Proxy.ModelFeatures,
+		FeatureDefaults: cfg.Proxy.FeatureDefaults,
+		// Profile-aware prompt layers (shared_prompt + per-client profiles).
+		Prompt: &cfg.Proxy,
+		CustomSystemPrompt: proxy.CustomSystemPromptConfig{
+			EnabledOpenCode:   cfg.Proxy.CustomSystemPrompt.EnabledOpenCode,
+			EnabledClaudeCode: cfg.Proxy.CustomSystemPrompt.EnabledClaudeCode,
+			EnabledCodex:      cfg.Proxy.CustomSystemPrompt.EnabledCodex,
+			TemplatePath:      cfg.Proxy.CustomSystemPrompt.TemplatePath,
+			ModelTemplates:    cfg.Proxy.CustomSystemPrompt.ModelTemplates,
+		},
+	}
 }

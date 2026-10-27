@@ -281,6 +281,51 @@ func TestPurgeOldQueryLogs(t *testing.T) {
 	}
 }
 
+// match/save/fail have no column in learning_cluster_scores and feed nothing:
+// counting them as injections dilutes the affinity ratio (use/inject, noise/inject)
+// that handler_hybrid computes from these rows.
+func TestClusterScores_NonInjectionSignalsDoNotCountAsInject(t *testing.T) {
+	s := mustOpen(t)
+
+	clusterID, _ := s.SaveQueryCluster(QueryCluster{
+		Project:        "yesmem",
+		CentroidVector: []float32{1, 0, 0},
+		Label:          "test",
+		QueryCount:     1,
+	})
+
+	if err := s.IncrementClusterScore(202, clusterID, "inject"); err != nil {
+		t.Fatalf("increment inject: %v", err)
+	}
+	for _, field := range []string{"match", "save", "fail"} {
+		if err := s.IncrementClusterScore(202, clusterID, field); err != nil {
+			t.Fatalf("increment %s: %v", field, err)
+		}
+	}
+
+	scores, err := s.GetClusterScoresForLearnings([]string{"202"})
+	if err != nil {
+		t.Fatalf("get scores: %v", err)
+	}
+	if len(scores["202"]) != 1 {
+		t.Fatalf("expected 1 score entry, got %d", len(scores["202"]))
+	}
+	if got := scores["202"][0].InjectCount; got != 1 {
+		t.Errorf("inject_count = %d, want 1 — match/save/fail are not injections", got)
+	}
+}
+
+func TestClusterScores_UnknownFieldIsAnError(t *testing.T) {
+	s := mustOpen(t)
+
+	clusterID, _ := s.SaveQueryCluster(QueryCluster{
+		Project: "yesmem", CentroidVector: []float32{1, 0, 0}, QueryCount: 1,
+	})
+	if err := s.IncrementClusterScore(203, clusterID, "usee"); err == nil {
+		t.Error("expected an error for an unknown cluster score field")
+	}
+}
+
 func TestGetRecentClusterForLearnings(t *testing.T) {
 	s := mustOpen(t)
 
@@ -305,6 +350,38 @@ func TestGetRecentClusterForLearnings(t *testing.T) {
 	empty := s.GetRecentClusterForLearnings(nil)
 	if len(empty) != 0 {
 		t.Errorf("expected empty map, got %v", empty)
+	}
+}
+
+// injected_learning_ids is a comma-joined list — a substring match resolves
+// learning 12 to the cluster of learning 1012.
+func TestGetRecentClusterForLearnings_ExactIDMatch(t *testing.T) {
+	s := mustOpen(t)
+
+	// An older query that only injected learning 1012 …
+	s.InsertQueryLog("yesmem", "foreign id", []float32{1, 0, 0}, []string{"1012"})
+	foreignCluster, _ := s.SaveQueryCluster(QueryCluster{
+		Project: "yesmem", CentroidVector: []float32{1, 0, 0}, QueryCount: 1,
+	})
+	unclustered, _ := s.GetUnclusteredQueries(100)
+	s.AssignQueryToCluster(unclustered[0].ID, foreignCluster)
+	s.DB().Exec("UPDATE query_log SET created_at = datetime('now', '-1 hour') WHERE cluster_id = ?", foreignCluster)
+
+	// … must never answer for learning 12.
+	if cid, ok := s.GetRecentClusterForLearnings([]int64{12})[12]; ok {
+		t.Errorf("learning 12 resolved to cluster %d, the cluster of the foreign id 1012", cid)
+	}
+
+	// A query that really injected 12 answers for it.
+	s.InsertQueryLog("yesmem", "own id", []float32{1, 0, 0}, []string{"12"})
+	ownCluster, _ := s.SaveQueryCluster(QueryCluster{
+		Project: "yesmem", CentroidVector: []float32{1, 0, 0}, QueryCount: 1,
+	})
+	unclustered, _ = s.GetUnclusteredQueries(100)
+	s.AssignQueryToCluster(unclustered[0].ID, ownCluster)
+
+	if got := s.GetRecentClusterForLearnings([]int64{12})[12]; got != ownCluster {
+		t.Errorf("learning 12 → cluster %d, want %d", got, ownCluster)
 	}
 }
 

@@ -384,8 +384,7 @@ func TestParseAnthropicResponse_Error(t *testing.T) {
 }
 
 func TestNewExtractAndEvaluateConfig_OpenAIFormat(t *testing.T) {
-	// APIFormat is no longer set in config — it's auto-detected at runtime.
-	// Verify config structure is correct regardless.
+	// The wire format is derived at request time, not in the constructor.
 	cfg := NewExtractAndEvaluateConfig("deepseek-v4-flash")
 	if cfg.Name != "extract_and_evaluate" {
 		t.Errorf("expected name 'extract_and_evaluate', got %q", cfg.Name)
@@ -432,7 +431,7 @@ func TestBuildForkRequest_PreservesBytePrefix_OpenAI(t *testing.T) {
 
 	cfg := ForkConfig{
 		Name:      "test_fork",
-		Model:     "",   // inherit from original body
+		Model:     "", // inherit from original body
 		MaxTokens: 3072,
 		Prompt: func(ctx ForkContext) string {
 			return "[FORK_PROMPT]"
@@ -467,8 +466,8 @@ func TestBuildForkRequest_PreservesBytePrefix_OpenAI(t *testing.T) {
 		for i := 0; i < minLen; i++ {
 			if origStr[i] != resStr[i] {
 				t.Errorf("byte-identical prefix broken at offset %d (%d bytes in)", i, len(origStr[:i]))
-				t.Logf("original prefix ends with: %q", origStr[max(0,i-30):i+30])
-				t.Logf("fork prefix ends with:      %q", resStr[max(0,i-30):i+30])
+				t.Logf("original prefix ends with: %q", origStr[max(0, i-30):i+30])
+				t.Logf("fork prefix ends with:      %q", resStr[max(0, i-30):i+30])
 				break
 			}
 		}

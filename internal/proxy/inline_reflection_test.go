@@ -181,6 +181,130 @@ func TestScanAssistantSignals_StopsAtUserMessage(t *testing.T) {
 	}
 }
 
+// A real request always ends with the user message of the current turn. The
+// signals must therefore come from the assistant response before it.
+func TestScanAssistantSignals_RealisticTranscriptEndsWithUserMessage(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "user", "content": "first question"},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Older answer with [ID:999]."},
+			},
+		},
+		map[string]any{"role": "user", "content": "second question"},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": "I leaned on [ID:123] here."},
+				map[string]any{"type": "text", "text": "Here is the answer.\n<!-- [IDs: 456] -->"},
+			},
+		},
+		map[string]any{"role": "user", "content": "third question"},
+	}
+
+	got := scanAssistantSignals(messages)
+	if !got.Scanned {
+		t.Error("Scanned = false, want true — an assistant response was available")
+	}
+	wantIDs := map[int64]bool{123: true, 456: true}
+	if len(got.UsedIDs) != 2 {
+		t.Fatalf("UsedIDs = %v, want the two IDs of the previous assistant answer", got.UsedIDs)
+	}
+	for _, id := range got.UsedIDs {
+		if !wantIDs[id] {
+			t.Errorf("unexpected ID %d", id)
+		}
+	}
+}
+
+// Tool loop: the previous turn's final text sits behind a tool_result message.
+func TestScanAssistantSignals_ToolLoopTranscript(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "user", "content": "run the build"},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "tool_use", "id": "t1", "name": "Bash", "input": map[string]any{}},
+			},
+		},
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+			},
+		},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Build is green.\n<!-- [IDs: 321] -->"},
+			},
+		},
+		map[string]any{"role": "user", "content": "next thing"},
+	}
+
+	got := scanAssistantSignals(messages)
+	if len(got.UsedIDs) != 1 || got.UsedIDs[0] != 321 {
+		t.Errorf("UsedIDs = %v, want [321] from the final answer of the previous turn", got.UsedIDs)
+	}
+}
+
+// Without a previous assistant response there is nothing to scan — the caller
+// must not treat every injected learning as noise in that case.
+func TestScanAssistantSignals_NoAssistantResponseNotScanned(t *testing.T) {
+	got := scanAssistantSignals([]any{
+		map[string]any{"role": "user", "content": "kickoff"},
+	})
+	if got.Scanned {
+		t.Error("Scanned = true without any assistant message")
+	}
+	if len(got.UsedIDs) != 0 {
+		t.Errorf("UsedIDs = %v, want none", got.UsedIDs)
+	}
+}
+
+// reflectionFixture is a request transcript as the proxy sees it: the user
+// message of the current turn comes last, the signals sit in the assistant
+// answer before it.
+func reflectionFixture() []any {
+	return []any{
+		map[string]any{"role": "user", "content": "how do we count a use?"},
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Per [ID:77].\n<!-- [gap: cluster columns] -->\n<!-- [contradiction: 1 vs 2: stale doc] -->"},
+			},
+		},
+		map[string]any{"role": "user", "content": "and now?"},
+	}
+}
+
+// signals.enabled off must switch the inline reflection off entirely.
+func TestScanInlineSignals_GateOff(t *testing.T) {
+	s := &Server{cfg: Config{InlineReflectionEnabled: false}}
+	got := s.scanInlineSignals(reflectionFixture())
+	if got.Scanned || len(got.UsedIDs) != 0 || len(got.GapTopics) != 0 || len(got.Contradictions) != 0 {
+		t.Errorf("gated off: signals = %+v, want none and Scanned=false", got)
+	}
+}
+
+func TestScanInlineSignals_GateOn(t *testing.T) {
+	s := &Server{cfg: Config{InlineReflectionEnabled: true}}
+	got := s.scanInlineSignals(reflectionFixture())
+	if !got.Scanned {
+		t.Error("gated on: Scanned = false")
+	}
+	if len(got.UsedIDs) != 1 || got.UsedIDs[0] != 77 {
+		t.Errorf("gated on: UsedIDs = %v, want [77]", got.UsedIDs)
+	}
+	if len(got.GapTopics) != 1 {
+		t.Errorf("gated on: GapTopics = %v, want 1 entry", got.GapTopics)
+	}
+	if len(got.Contradictions) != 1 {
+		t.Errorf("gated on: Contradictions = %v, want 1 entry", got.Contradictions)
+	}
+}
+
 func TestScanAssistantSignals_PlainStringContent(t *testing.T) {
 	// content is a plain string, not a []any block list.
 	messages := []any{

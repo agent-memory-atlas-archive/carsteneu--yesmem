@@ -49,7 +49,11 @@ func isBypassed(header http.Header) bool {
 // to prevent flapping around the threshold.
 // Activate at TokenThreshold, deactivate at TokenMinimumThreshold.
 func (s *Server) shouldStub(totalTokens int, model string) bool {
-	threshold := s.effectiveTokenThreshold(model)
+	// Deliberately the process-wide threshold: the hysteresis latch below is a
+	// single process-wide flag, so a per-thread threshold would let one session
+	// toggle stubbing for another. Session overrides reach the sawtooth path and
+	// the stub cycle, not this legacy gate.
+	threshold := s.effectiveTokenThreshold("", model)
 	lowWatermark := s.cfg.TokenMinimumThreshold
 	if lowWatermark == 0 {
 		lowWatermark = threshold * 4 / 5 // fallback: 80%
@@ -96,4 +100,3 @@ func (s *Server) markRequest(fp string) {
 	defer s.retryMu.Unlock()
 	s.lastFingerprint = fp
 }
-

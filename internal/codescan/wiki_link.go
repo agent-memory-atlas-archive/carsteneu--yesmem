@@ -5,17 +5,35 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/carsteneu/yesmem/internal/wikidir"
 )
 
+// renderWikiLink builds the code-map header for a project. project is the
+// project identifier as the caller knows it — a repository path (normal case)
+// or a short name; both resolve to the same wiki directory as the writer uses.
 func renderWikiLink(project string) string {
-	wikiPath := fmt.Sprintf("~/.claude/yesmem/wiki/%s/", project)
+	// DisplayRoot is home-relative; resolve it against HOME instead of
+	// hardcoding the wiki location a second time.
+	rel := strings.TrimPrefix(wikidir.DisplayRoot, "~/")
+	name := wikidir.ShortName(project)
+	hasName := name != ""
+	if !hasName {
+		name = "project"
+	}
 	timestamp := "not yet rendered — will appear after first wiki-tick"
 	if home, err := os.UserHomeDir(); err == nil {
-		healthPath := filepath.Join(home, ".claude", "yesmem", "wiki", project, "health.md")
-		if info, err := os.Stat(healthPath); err == nil {
+		root := filepath.Join(home, rel)
+		if hasName {
+			// Marker-aware: a basename shared with another live project renders
+			// into a suffixed directory (see wikidir).
+			name = filepath.Base(wikidir.Dir(root, project))
+		}
+		if info, err := os.Stat(filepath.Join(root, name, "health.md")); err == nil {
 			timestamp = fmt.Sprintf("last build: %s", info.ModTime().Format("15:04"))
 		}
 	}
+	wikiPath := "~/" + filepath.Join(rel, name) + "/"
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("\n**Full code map:** `%s` (%s)\n\n", wikiPath, timestamp))
 	b.WriteString("> BEFORE editing any file, check its wiki page for per-file\n")

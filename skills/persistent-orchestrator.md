@@ -110,14 +110,16 @@ Before deciding if an agent is stuck, check telemetry via `list_agents()`:
 | Field | Meaning | Action if concerning |
 |---|---|---|
 | `turns_used` | How many turns consumed | If near max_turns → resume with fresh session |
-| `input_tokens + output_tokens` | Token burn | If >80% of budget → warn orchestrator |
+| `output_tokens` | Token burn (the budget's unit) | If >80% of budget → warn orchestrator |
 | `last_activity_at` | Last API call | If >5 min ago + status=running → might be stuck |
 | `phase` | Self-reported state | Use for progress visibility only |
 
 **Decision rule:**
 - `last_activity_at` > 5 min AND `turns_used` unchanged → agent is stuck, consider resume
 - `turns_used` near `max_turns` → proactively resume before it hits the limit
-- `input_tokens + output_tokens` > 80% of `token_budget` → flag, consider stopping and resuming
+- `output_tokens` > 80% of `token_budget` → flag, consider stopping and resuming
+  (`token_budget` is measured in output tokens; `input_tokens` is cumulative and
+  includes cache reads, so it is not a work or cost signal)
 
 ---
 

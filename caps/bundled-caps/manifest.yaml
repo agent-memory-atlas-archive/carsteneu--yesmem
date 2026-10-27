@@ -1,0 +1,57 @@
+# Provenance of the bundled caps. internal/setup decides from this file whether a
+# bundled body may replace the installed one; the frontmatter version stays in the
+# CAP.md but no longer gates anything (YM-450).
+#
+# derived_from_hash is the body this bundle was derived from, that is the CAP.md an
+# installation holds. The digest is textutil.BodyDigest: it ignores line endings and
+# trailing newlines and compares everything else, because inside a cap body the case
+# and the indentation are the program. A body that was only checked out with CRLF, or
+# whose trailing newlines differ, therefore compares equal to the body it descends
+# from.
+#
+# An entry that carries the hash of its own body makes no claim: it only says that
+# an installation holding exactly these bytes already has the bundle. Editing a body
+# normally needs no edit here, because the entry already names the body the new one
+# descends from, and that is the body an installation took last. It changes only
+# after a reported conflict was reconciled; the conflict line names the hash to
+# record.
+#
+# revision counts the installs that reached an installation. The live count is kept
+# in <caps_dir>/manifest.yaml; the value here records what this file is.
+caps:
+  - name: adapter_e2e_test
+    derived_from_hash: 7daf23113f7bd4b00f9e28abdadd46b9dd678b71a971e4a5e72667ff05b6a12f
+    revision: 0
+  - name: cap_collect
+    derived_from_hash: a9fde357c76a00fb62ec884bed9a1da6738549a842a749b6c4e09b8e2b375bb7
+    revision: 0
+  - name: cap_delete
+    derived_from_hash: b55b44369afbbd9e33b26a04f818dcb8013543bf372bc30a83aa4bc6b6bc7be5
+    revision: 0
+  - name: cap_save_analysis
+    derived_from_hash: 55f0f47fd423cc92c15961cec01242c14730295fb523b8ebe4044f30d5ff47ab
+    revision: 0
+  - name: cap_search
+    derived_from_hash: 85d9e035eb772aa29fbdab4755b33aeb0e93ae090abec5223d799c55b71a2d33
+    revision: 0
+  - name: changelog_check
+    derived_from_hash: aa8834629a6f3bcd686704ea3ca17456dab439061dcc8dce8ea0fa6524857966
+    revision: 0
+  - name: chrome_headless
+    derived_from_hash: 9bc44ed660cd17fa977bad5589c26566b212833320f1f7b8d3e7b2ebb82ce088
+    revision: 0
+  - name: deploy
+    derived_from_hash: 97d7895a9ed132d4855b0289cc79b680aa6017fa52840bb348be7fc78663e666
+    revision: 0
+  - name: proxy_health
+    derived_from_hash: 13ef6ec43c3141f646003005c3105ac8a3f492466d9af8c47499ff19f80b9414
+    revision: 0
+  - name: reddit
+    derived_from_hash: 7edf92551c10b6b0e90d0a79ee11d2f7664048bdca5c1c17f834f6bcbba908ae
+    revision: 0
+  - name: rocketchat
+    derived_from_hash: 7f600b9aa1ebe09c496dd33e2fd1dbd2ec8854238d236b6efc61ba08c89ae1d8
+    revision: 0
+  - name: telegram
+    derived_from_hash: 989bf5ceb7af6ba3a260be4929f68671d03afbfd440882d28cb3d968308bc072
+    revision: 0

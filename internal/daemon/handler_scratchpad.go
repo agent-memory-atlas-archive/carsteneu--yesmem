@@ -1,10 +1,36 @@
 package daemon
 
 import (
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// scratchpadAssetsDir returns the assets directory of a scratchpad project.
+// project is a caller value and may be an absolute repository path, so the guard
+// proves containment below <dataDir>/projects instead of rejecting separators:
+// ".." segments used to resolve outside it, and the delete path removes the
+// result recursively (OPS-68). The proof is lexical by design: it stops caller
+// strings, not a symlink planted inside the projects root, which would need the
+// daemon's own write access.
+func (h *Handler) scratchpadAssetsDir(project string) (string, error) {
+	if h.dataDir == "" {
+		return "", fmt.Errorf("scratchpad project %q: data dir is empty", project)
+	}
+	root := filepath.Join(h.dataDir, "projects")
+	dir := filepath.Join(root, project, "assets")
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return "", fmt.Errorf("scratchpad project %q: %v", project, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("scratchpad project %q escapes the projects directory", project)
+	}
+	return dir, nil
+}
 
 // handleScratchpadWrite upserts a scratchpad section for a project.
 func (h *Handler) handleScratchpadWrite(params map[string]any) Response {
@@ -32,11 +58,13 @@ func (h *Handler) handleScratchpadWrite(params map[string]any) Response {
 		})
 	}
 
-	// Ensure assets directory exists for this project
-	assetsDir := filepath.Join(h.dataDir, "projects", project, "assets")
-	if err := os.MkdirAll(assetsDir, 0755); err != nil {
-		// Non-fatal — log but don't fail the write
-		_ = err
+	// Ensure assets directory exists for this project. A project the guard
+	// refuses still stores its section, so the refusal is logged rather than
+	// failing the write; nothing is created outside the projects root.
+	if assetsDir, err := h.scratchpadAssetsDir(project); err != nil {
+		log.Printf("[scratchpad] assets dir for %q refused: %v", project, err)
+	} else if err := os.MkdirAll(assetsDir, 0755); err != nil {
+		log.Printf("[scratchpad] assets dir for %q: %v", project, err)
 	}
 
 	return jsonResponse(map[string]any{
@@ -92,10 +120,10 @@ func (h *Handler) handleScratchpadAppend(params map[string]any) Response {
 	}
 
 	return jsonResponse(map[string]any{
-		"status":     "ok",
-		"project":    project,
-		"section":    section,
-		"appended":   true,
+		"status":   "ok",
+		"project":  project,
+		"section":  section,
+		"appended": true,
 	})
 }
 
@@ -192,6 +220,17 @@ func (h *Handler) handleScratchpadDelete(params map[string]any) Response {
 	}
 	section, _ := params["section"].(string)
 
+	// Validated before the rows are touched: an escaping project belongs to no
+	// section and must not delete anything.
+	var assetsDir string
+	if section == "" {
+		var err error
+		assetsDir, err = h.scratchpadAssetsDir(project)
+		if err != nil {
+			return errorResponse(err.Error())
+		}
+	}
+
 	count, err := h.store.ScratchpadDelete(project, section)
 	if err != nil {
 		return errorResponse(err.Error())
@@ -199,7 +238,6 @@ func (h *Handler) handleScratchpadDelete(params map[string]any) Response {
 
 	// Remove assets directory when deleting the whole project scratchpad
 	if section == "" {
-		assetsDir := filepath.Join(h.dataDir, "projects", project, "assets")
 		_ = os.RemoveAll(assetsDir)
 	}
 

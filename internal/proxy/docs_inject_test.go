@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestDocsHintInject_FirstRequest(t *testing.T) {
 	// First request should set baseline, not inject
@@ -50,5 +53,34 @@ func TestDocsHintInject_IndependentOfPlan(t *testing.T) {
 	docsCp.mu.Unlock()
 	if !exists {
 		t.Error("docs hint should track tokens independently")
+	}
+}
+
+// YM-99: the docs-hint mark stored the absolute token count, so after a
+// collapse the delta turned negative and the hint paused until the context
+// climbed back over the pre-collapse high-water mark.
+func TestDocsHintInject_ResetsAfterContextShrink(t *testing.T) {
+	s := fakeDaemon(t, func(method string, params map[string]any) string {
+		if method != "get_docs_hint" {
+			return ""
+		}
+		b, _ := json.Marshal(map[string]any{"docs_hint": "[Docs available] reference docs indexed"})
+		return string(b)
+	})
+	const threadID = "thread-shrink"
+	t.Cleanup(func() {
+		docsCp.mu.Lock()
+		delete(docsCp.lastTokenCount, threadID)
+		docsCp.mu.Unlock()
+	})
+
+	if got := s.docsHintInject(threadID, 100000, "/tmp/proj"); got != "" {
+		t.Fatalf("first call should only set the baseline, got %q", got)
+	}
+	if got := s.docsHintInject(threadID, 5000, "/tmp/proj"); got != "" {
+		t.Fatalf("the collapsed context must not fire a hint, got %q", got)
+	}
+	if got := s.docsHintInject(threadID, 15000, "/tmp/proj"); got == "" {
+		t.Fatal("docs hint stayed silent after the context shrank — counter still pinned to the pre-collapse mark")
 	}
 }

@@ -96,11 +96,11 @@ func TestInjectTimestamps_PositionBased(t *testing.T) {
 	ts.Store("t1", 3, &TimestampMeta{Timestamp: "Di 2026-04-14 20:15:42", Delta: "4s"})
 
 	msgs := []any{
-		map[string]any{"role": "user", "content": "first question"},                  // msg:1
-		map[string]any{"role": "assistant", "content": "answer"},                     // msg:2 (skip)
-		map[string]any{"role": "user", "content": "second question"},                 // msg:3 — has stored ts
-		map[string]any{"role": "assistant", "content": "answer 2"},                   // msg:4 (skip)
-		map[string]any{"role": "user", "content": "third question"},                  // msg:5 — current
+		map[string]any{"role": "user", "content": "first question"},  // msg:1
+		map[string]any{"role": "assistant", "content": "answer"},     // msg:2 (skip)
+		map[string]any{"role": "user", "content": "second question"}, // msg:3 — has stored ts
+		map[string]any{"role": "assistant", "content": "answer 2"},   // msg:4 (skip)
+		map[string]any{"role": "user", "content": "third question"},  // msg:5 — current
 	}
 
 	n := InjectTimestamps(ts, "t1", msgs, 4, 0, 0) // endIdx=4: exclude current, offset=0, stubs=0
@@ -220,11 +220,23 @@ func TestBuildMeta_WithAllInjects(t *testing.T) {
 	}
 }
 
+func TestBuildMeta_WithChannel(t *testing.T) {
+	meta := &TimestampMeta{
+		Timestamp: "Di 2026-05-12 12:00:00",
+		Channel:   "SESSION_ID: ses_x\n📨 Von orchestrator [command]:\nhi",
+	}
+	got := BuildMeta(42, meta)
+	want := "[Di 2026-05-12 12:00:00] [msg:42]\n[channel] SESSION_ID: ses_x\n📨 Von orchestrator [command]:\nhi"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestBuildMeta_WithLoopWarning(t *testing.T) {
 	meta := &TimestampMeta{
-		Timestamp:    "Di 2026-05-12 12:00:00",
-		Delta:        "5s",
-		LoopWarning:  "[YesMem Loop Detection] level 1: you are repeating the same Edit→Bash cycle.",
+		Timestamp:   "Di 2026-05-12 12:00:00",
+		Delta:       "5s",
+		LoopWarning: "[YesMem Loop Detection] level 1: you are repeating the same Edit→Bash cycle.",
 	}
 	got := BuildMeta(7, meta)
 	want := "[Di 2026-05-12 12:00:00] [msg:7] [+5s]\n[loop-warning] [YesMem Loop Detection] level 1: you are repeating the same Edit→Bash cycle."
@@ -399,11 +411,11 @@ func TestInjectTimestamps_WithExtendedMeta(t *testing.T) {
 	})
 
 	msgs := []any{
-		map[string]any{"role": "user", "content": "first"},                     // msg:1
-		map[string]any{"role": "assistant", "content": "answer"},               // msg:2
-		map[string]any{"role": "user", "content": "second"},                    // msg:3 — has stored extended meta
-		map[string]any{"role": "assistant", "content": "answer 2"},             // msg:4
-		map[string]any{"role": "user", "content": "third"},                     // msg:5 — current
+		map[string]any{"role": "user", "content": "first"},         // msg:1
+		map[string]any{"role": "assistant", "content": "answer"},   // msg:2
+		map[string]any{"role": "user", "content": "second"},        // msg:3 — has stored extended meta
+		map[string]any{"role": "assistant", "content": "answer 2"}, // msg:4
+		map[string]any{"role": "user", "content": "third"},         // msg:5 — current
 	}
 
 	n := InjectTimestamps(ts, "t1", msgs, 4, 0, 0)
@@ -421,8 +433,8 @@ func TestInjectTimestamps_WithExtendedMeta(t *testing.T) {
 func TestInjectTimestamps_ReAnnotatesExtendedMeta(t *testing.T) {
 	ts := NewTimestampStore()
 	ts.Store("t1", 1, &TimestampMeta{
-		Timestamp:     "Di 2026-05-12 12:00:00",
-		SkillEval:     "Skills!",
+		Timestamp: "Di 2026-05-12 12:00:00",
+		SkillEval: "Skills!",
 	})
 
 	msgs := []any{
@@ -508,9 +520,9 @@ func TestInjectTimestamps_WithOffset(t *testing.T) {
 	ts.Store("t1", 501, &TimestampMeta{Timestamp: "Di 2026-04-14 20:15:42", Delta: "4s"})
 
 	msgs := []any{
-		map[string]any{"role": "user", "content": "fresh question 1"},   // msg:501
-		map[string]any{"role": "assistant", "content": "answer"},        // msg:502 (skip)
-		map[string]any{"role": "user", "content": "fresh question 2"},   // msg:503
+		map[string]any{"role": "user", "content": "fresh question 1"}, // msg:501
+		map[string]any{"role": "assistant", "content": "answer"},      // msg:502 (skip)
+		map[string]any{"role": "user", "content": "fresh question 2"}, // msg:503
 	}
 
 	n := InjectTimestamps(ts, "t1", msgs, 2, 500, 0) // offset=500, endIdx=2, stubs=0

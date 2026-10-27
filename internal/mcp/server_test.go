@@ -191,6 +191,122 @@ func TestFormatRememberSurfacesDedupMessage(t *testing.T) {
 	}
 }
 
+// TestFormatRememberRendersBlockedSupersede (YM-278): a refused supersede must
+// not render as a replacement. The caller has to see that the old learning is
+// still active, otherwise it keeps trusting stale knowledge.
+func TestFormatRememberRendersBlockedSupersede(t *testing.T) {
+	raw := []byte(`{
+		"id": 79501,
+		"category": "gotcha",
+		"project": "yesmem",
+		"content": "sandbox.go hat kein BuildSandboxedCommand",
+		"supersedes_id": 65218,
+		"supersede_outcome": "blocked",
+		"supersede_trust": 3.2
+	}`)
+
+	got := formatRemember(raw)
+
+	if strings.Contains(got, "Supersedes: #65218\n") {
+		t.Fatalf("formatRemember() rendered a refused supersede as done, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Supersedes:  #65218 BLOCKED") {
+		t.Fatalf("formatRemember() must mark the refused supersede as BLOCKED, got:\n%s", got)
+	}
+	for _, want := range []string{"stays active", "force_supersede", "supersede_reason"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatRemember() missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+// TestFormatRememberRendersReplacedSupersede pins the positive case, so the
+// blocked rendering cannot be achieved by dropping the line altogether.
+func TestFormatRememberRendersReplacedSupersede(t *testing.T) {
+	raw := []byte(`{
+		"id": 79502,
+		"category": "gotcha",
+		"content": "Sandbox bietet Run",
+		"supersedes_id": 65100,
+		"supersede_outcome": "replaced"
+	}`)
+
+	got := formatRemember(raw)
+
+	for _, want := range []string{"Supersedes:", "#65100", "replaced"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatRemember() missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+// TestFormatRememberRendersNotFoundSupersede: a target that does not exist must
+// not look like a replacement in an otherwise successful save box.
+func TestFormatRememberRendersNotFoundSupersede(t *testing.T) {
+	raw := []byte(`{
+		"id": 79505,
+		"category": "gotcha",
+		"content": "Sandbox bietet Run",
+		"supersedes_id": 424242,
+		"supersede_outcome": "not_found",
+		"supersede_error": "sql: no rows in result set"
+	}`)
+
+	got := formatRemember(raw)
+
+	for _, want := range []string{"#424242 not found", "nothing was replaced", "no rows"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatRemember() missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+// TestFormatRememberRendersFailedSupersede: a write that did not happen must not
+// look like a trust refusal, and the store's reason must survive the formatter.
+func TestFormatRememberRendersFailedSupersede(t *testing.T) {
+	raw := []byte(`{
+		"id": 79504,
+		"category": "gotcha",
+		"content": "Sandbox bietet Run",
+		"supersedes_id": 65218,
+		"supersede_outcome": "failed",
+		"supersede_trust": 0.4,
+		"supersede_error": "#65218 was not linked to #79504 (already superseded?)"
+	}`)
+
+	got := formatRemember(raw)
+
+	for _, want := range []string{"#65218 FAILED", "nothing was replaced", "already superseded"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatRemember() missing %q in output:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "BLOCKED") {
+		t.Fatalf("formatRemember() must not present a failed write as a trust refusal, got:\n%s", got)
+	}
+}
+
+// TestFormatRememberLegacySupersedeLineIsUnchanged: a daemon that predates the
+// outcome field sends only supersedes_id. The line keeps its old shape (no
+// invented verdict) so CLI and daemon can be updated independently.
+func TestFormatRememberLegacySupersedeLineIsUnchanged(t *testing.T) {
+	raw := []byte(`{
+		"id": 79503,
+		"category": "gotcha",
+		"content": "alte Form",
+		"supersedes_id": 99
+	}`)
+
+	got := formatRemember(raw)
+
+	if !strings.Contains(got, "Supersedes: #99") {
+		t.Fatalf("formatRemember() must keep the legacy line, got:\n%s", got)
+	}
+	if strings.Contains(got, "BLOCKED") {
+		t.Fatalf("formatRemember() must not invent a verdict without the outcome field, got:\n%s", got)
+	}
+}
+
 func TestFormatPersonaGroupsByDimension(t *testing.T) {
 	input := json.RawMessage(`{
 		"traits": [
@@ -221,6 +337,47 @@ func TestFormatPersonaDirectiveOnly(t *testing.T) {
 	result := formatPersona(input)
 	if !strings.Contains(result, "Directive: Only directive") {
 		t.Errorf("missing directive in output: %s", result)
+	}
+}
+
+// An _session_id taken from the MCP child's own environment must be marked as
+// such: under opencode v2 that environment belongs to the shared service
+// process, so the id names the last created session, not the caller. Without
+// the marker the daemon cannot tell an injected per-call id from a leaked one.
+func TestBuildProxyParamsMarksEnvDerivedSession(t *testing.T) {
+	for _, key := range []string{
+		"YESMEM_SESSION_ID",
+		"CODEX_THREAD_ID",
+		"CLAUDE_SESSION_ID",
+		"CLAUDE_CODE_SESSION_ID",
+		"OPENCODE",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("YESMEM_SOURCE_AGENT", "opencode")
+	t.Setenv("YESMEM_SESSION_ID", "ses_last_created")
+
+	params := buildProxyParams(map[string]any{"query": "needle"}, false)
+	if got := params["_session_id"]; got != "opencode:ses_last_created" {
+		t.Fatalf("_session_id = %v, want opencode:ses_last_created", got)
+	}
+	if got := params["_session_id_source"]; got != sessionIDSourceEnv {
+		t.Fatalf("_session_id_source = %v, want %q", got, sessionIDSourceEnv)
+	}
+}
+
+// A per-call id the caller supplied — the plugin's tool.execute.before
+// injection — is authoritative and must not carry the env marker.
+func TestBuildProxyParamsCallerSessionIsNotMarkedEnv(t *testing.T) {
+	t.Setenv("YESMEM_SOURCE_AGENT", "opencode")
+	t.Setenv("YESMEM_SESSION_ID", "ses_last_created")
+
+	params := buildProxyParams(map[string]any{"_session_id": "opencode:ses_caller", "_source_agent": "opencode"}, false)
+	if got := params["_session_id"]; got != "opencode:ses_caller" {
+		t.Fatalf("_session_id = %v, want the caller-supplied id", got)
+	}
+	if got, exists := params["_session_id_source"]; exists {
+		t.Fatalf("_session_id_source = %v, want unset for a caller-supplied id", got)
 	}
 }
 

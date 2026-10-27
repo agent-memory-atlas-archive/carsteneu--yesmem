@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // LoopType identifies which loop pattern was detected.
@@ -36,11 +37,46 @@ type ToolCallEntry struct {
 	ErrorMsg string
 }
 
+// loopToolClass groups the tool names of the clients the proxy serves. Claude
+// Code sends PascalCase names (Edit, Write, Bash, Read, Grep, Glob); opencode
+// sends lowercase ones and names its shell tool "shell" instead of "bash".
+// Detection reads the class, never the raw name, so a loop is visible in every
+// dialect.
+type loopToolClass int
+
+const (
+	loopToolOther loopToolClass = iota
+	loopToolFileEdit
+	loopToolShell
+	loopToolReadOnly
+)
+
+func classifyLoopTool(name string) loopToolClass {
+	switch strings.ToLower(name) {
+	case "edit", "write":
+		return loopToolFileEdit
+	case "bash", "shell":
+		return loopToolShell
+	case "read", "grep", "glob":
+		return loopToolReadOnly
+	}
+	return loopToolOther
+}
+
+func loopToolCommand(input map[string]any) string {
+	cmd, _ := input["command"].(string)
+	return cmd
+}
+
 const (
 	loopWindowSize          = 12
 	minIdenticalRepetitions = 2
 	minEditTestCycles       = 3
 	minRepeatedErrors       = 3
+	// loopWarningResetAfter is how many consecutive signal-free checks clear the
+	// warning count. One is not enough: a loop whose pattern sits on the window
+	// boundary flickers (signal, no signal, signal) and would never escalate.
+	loopWarningResetAfter = 2
 )
 
 // DetectLoop checks the message history for real-time loop patterns.
@@ -95,26 +131,30 @@ func extractRecentToolCalls(messages []any, maxN int) []ToolCallEntry {
 				ArgHash: hashToolCall(name, input),
 			}
 
-			switch name {
-			case "Edit", "Write":
-				entry.FilePath, _ = input["file_path"].(string)
-			case "Bash":
-				cmd, _ := input["command"].(string)
+			switch classifyLoopTool(name) {
+			case loopToolFileEdit:
+				entry.FilePath = toolFilePath(input)
+			case loopToolShell:
+				cmd := loopToolCommand(input)
 				if len(cmd) > 120 {
 					cmd = cmd[:120]
 				}
 				entry.Command = cmd
 			}
 
-			// Look ahead for the matching tool_result
+			// Look ahead for the matching tool_result. A message carries the
+			// results of every tool call of the previous assistant turn, so the
+			// result has to be matched by tool_use_id: reading the message would
+			// attribute the failure of one parallel call to all of them.
+			callID, _ := b["id"].(string)
 			for j := i + 1; j < len(messages) && j <= i+2; j++ {
 				next, ok := messages[j].(map[string]any)
 				if !ok {
 					continue
 				}
-				if hasErrorInToolResult(next) {
+				if text, found := errorTextForToolUse(next, callID); found {
 					entry.IsError = true
-					entry.ErrorMsg = extractErrorText(next, 100)
+					entry.ErrorMsg = text
 					break
 				}
 				if isToolResultMsg(next) {
@@ -138,18 +178,24 @@ func hashToolCall(name string, input map[string]any) uint64 {
 	h.Write([]byte(name))
 	h.Write([]byte{0})
 
-	switch name {
-	case "Edit", "Write", "Read":
-		fp, _ := input["file_path"].(string)
-		h.Write([]byte(fp))
-	case "Bash":
-		cmd, _ := input["command"].(string)
-		cmd = strings.TrimSpace(cmd)
+	switch strings.ToLower(name) {
+	case "edit", "write", "read":
+		// The file is the identity of the step, not the payload: a loop that
+		// edits the same file with changing strings is still the same step.
+		h.Write([]byte(toolFilePath(input)))
+	case "bash", "shell":
+		cmd := strings.TrimSpace(loopToolCommand(input))
 		if len(cmd) > 200 {
 			cmd = cmd[:200]
 		}
 		h.Write([]byte(cmd))
-	case "Grep", "Glob":
+		// opencode's shell carries a workdir; the same command in another
+		// directory is another step, not a repetition of this one.
+		if wd, _ := input["workdir"].(string); wd != "" {
+			h.Write([]byte{0})
+			h.Write([]byte(wd))
+		}
+	case "grep", "glob":
 		pattern, _ := input["pattern"].(string)
 		h.Write([]byte(pattern))
 	default:
@@ -168,6 +214,54 @@ func hashToolCall(name string, input map[string]any) uint64 {
 	}
 
 	return h.Sum64()
+}
+
+// errorTextForToolUse returns the failure text of the tool_result block that
+// answers toolUseID, bounded to 100 chars.
+//
+// A message that carries exactly ONE result needs no id: there is nothing to
+// confuse, so the failure belongs to this call. Several results in one message
+// are the output of parallel calls, and there the tool_use_id decides — reading
+// the message instead attributed one failed call to its siblings.
+func errorTextForToolUse(msg map[string]any, toolUseID string) (string, bool) {
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return "", false
+	}
+	var results []map[string]any
+	for _, block := range content {
+		b, ok := block.(map[string]any)
+		if !ok || b["type"] != "tool_result" {
+			continue
+		}
+		results = append(results, b)
+	}
+	if len(results) == 1 {
+		if !toolResultIsError(results[0]) {
+			return "", false
+		}
+		return boundedResultText(results[0]), true
+	}
+	for _, b := range results {
+		if !toolResultIsError(b) {
+			continue
+		}
+		if toolUseID != "" {
+			if id, _ := b["tool_use_id"].(string); id != toolUseID {
+				continue
+			}
+		}
+		return boundedResultText(b), true
+	}
+	return "", false
+}
+
+func boundedResultText(block map[string]any) string {
+	text, _ := block["content"].(string)
+	if len(text) > 100 {
+		text = text[:100]
+	}
+	return text
 }
 
 // extractErrorText returns up to maxLen chars from the error content of a tool_result message.
@@ -192,18 +286,35 @@ func extractErrorText(msg map[string]any, maxLen int) string {
 	return ""
 }
 
-// shortLoopPath returns the last 2 path segments of a file path.
+// maxLoopPathRunes bounds the file path shown in a loop warning.
+const maxLoopPathRunes = 120
+
+// shortLoopPath returns the last 2 path segments of a file path. The path comes
+// from a tool input and is rendered into an injected reminder line, so control
+// characters are flattened and the result is bounded: a newline inside it would
+// forge a line of its own next to the metadata blocks.
 func shortLoopPath(fp string) string {
+	fp = strings.Map(func(r rune) rune {
+		if isControlRune(r) {
+			return ' '
+		}
+		return r
+	}, fp)
+
 	parts := strings.Split(fp, "/")
-	if len(parts) <= 2 {
-		return fp
+	short := fp
+	if len(parts) > 2 {
+		short = strings.Join(parts[len(parts)-2:], "/")
 	}
-	return strings.Join(parts[len(parts)-2:], "/")
+	if runes := []rune(short); len(runes) > maxLoopPathRunes {
+		return string(runes[:maxLoopPathRunes]) + "…"
+	}
+	return short
 }
 
 // isBuildTool reports whether a tool call is a build/test command.
 func isBuildTool(c ToolCallEntry) bool {
-	return c.Tool == "Bash" && isBuildCommand(c.Command)
+	return classifyLoopTool(c.Tool) == loopToolShell && isBuildCommand(c.Command)
 }
 
 // --- Detection signals ---
@@ -272,7 +383,7 @@ func detectEditTestErrorCycle(calls []ToolCallEntry) *LoopSignal {
 	sawEdit := false
 
 	for _, c := range calls {
-		if (c.Tool == "Edit" || c.Tool == "Write") && c.FilePath != "" {
+		if classifyLoopTool(c.Tool) == loopToolFileEdit && c.FilePath != "" {
 			if currentFile == "" || c.FilePath == currentFile {
 				currentFile = c.FilePath
 				sawEdit = true
@@ -291,7 +402,7 @@ func detectEditTestErrorCycle(calls []ToolCallEntry) *LoopSignal {
 				currentFile = ""
 			}
 			sawEdit = false
-		} else if c.Tool != "Read" && c.Tool != "Grep" && c.Tool != "Glob" {
+		} else if classifyLoopTool(c.Tool) != loopToolReadOnly {
 			// Unrelated tool (not a read-only inspection) breaks pattern
 			cycles = 0
 			currentFile = ""
@@ -362,11 +473,28 @@ const loopCooldownRequests = 3
 
 // LoopState tracks per-thread warning state.
 type LoopState struct {
+	// mu serializes the state transitions for this thread only. The loopMu on
+	// the server protects the map, not the counter: detection scans the message
+	// history, and holding a server-wide lock across that scan would serialize
+	// every thread behind the longest one.
+	mu           sync.Mutex
 	WarningCount int
 	cooldownLeft int
+	// emptyRuns counts consecutive signal-free checks; it gates the reset so a
+	// flickering signal does not restart the escalation ladder.
+	emptyRuns int
 }
 
 func (s *LoopState) InCooldown() bool { return s.cooldownLeft > 0 }
+
+// escalated reports whether dropping this state would lose a pending warning.
+// The fields are written under mu by the detector, so a prune on another
+// goroutine reads them under the same lock.
+func (s *LoopState) escalated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.WarningCount > 0 || s.cooldownLeft > 0
+}
 
 func (s *LoopState) Tick() {
 	if s.cooldownLeft > 0 {
@@ -382,14 +510,23 @@ func (s *LoopState) RecordWarning() {
 // CheckLoopAndFormat runs detection and returns a formatted warning if a loop is found.
 // Returns ("", 0) if no loop or in cooldown. Mutates state.
 func CheckLoopAndFormat(messages []any, state *LoopState) (warning string, level int) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
 	state.Tick()
 	if state.InCooldown() {
 		return "", 0
 	}
 	signal := DetectLoop(messages)
 	if signal == nil {
+		state.emptyRuns++
+		if state.emptyRuns >= loopWarningResetAfter {
+			// The loop is over: the next one is a new loop and starts at level 1.
+			state.WarningCount = 0
+		}
 		return "", 0
 	}
+	state.emptyRuns = 0
 	state.RecordWarning()
 	level = state.WarningCount
 	warning = FormatLoopWarning(signal, level)

@@ -100,6 +100,7 @@ func runGapReview() {
 	if err != nil {
 		log.Fatalf("LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 
 	// Build batch prompt with context enrichment
 	var lines []string

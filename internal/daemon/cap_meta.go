@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/carsteneu/yesmem/internal/capfile"
 )
 
 // ScriptMeta holds one callable script within a cap.
@@ -15,26 +17,41 @@ type ScriptMeta struct {
 	Body    string `json:"body"`
 	Schema  string `json:"schema,omitempty"`  // JSON schema (tool kind only)
 	Sandbox string `json:"sandbox,omitempty"` // "" | "none" | "standard" | "strict"
-	Timeout int64  `json:"timeout,omitempty"` // seconds; 0 = auto (default/llm heuristic)
+	// AllowedHosts is the egress allowlist for the standard sandbox profile under
+	// ai-jail 2.x. Empty means no egress at all.
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+	Timeout      int64    `json:"timeout,omitempty"` // seconds; 0 = auto (default/llm heuristic)
 }
 
 // CapMeta holds structured metadata for a cap learning.
 // Serialized as JSON in the Learning's Context field.
 type CapMeta struct {
-	Name        string            `json:"cap_name"`
-	Description string            `json:"cap_description,omitempty"`
-	Scripts     []ScriptMeta      `json:"cap_scripts"`
-	Schema      string            `json:"cap_schema,omitempty"`       // legacy single-tool schema
-	HandlerREPL string            `json:"cap_handler_repl,omitempty"` // legacy REPL handler
-	HandlerBash string            `json:"cap_handler_bash,omitempty"` // legacy bash handler
-	Tags        []string          `json:"cap_tags,omitempty"`
-	Requires    []string          `json:"cap_requires,omitempty"`
-	Version     int               `json:"cap_version"`
-	Tested      bool              `json:"cap_tested"`
-	TestDate    string            `json:"cap_test_date,omitempty"`
-	AutoActive  bool              `json:"cap_auto_active,omitempty"`
-	Actions     map[string]string `json:"cap_actions,omitempty"`
-	Scope       string            `json:"cap_scope,omitempty"` // "user" | "project"
+	Name        string       `json:"cap_name"`
+	Description string       `json:"cap_description,omitempty"`
+	Scripts     []ScriptMeta `json:"cap_scripts"`
+	Schema      string       `json:"cap_schema,omitempty"`       // legacy single-tool schema
+	HandlerREPL string       `json:"cap_handler_repl,omitempty"` // legacy REPL handler
+	HandlerBash string       `json:"cap_handler_bash,omitempty"` // legacy bash handler
+	Tags        []string     `json:"cap_tags,omitempty"`
+	Requires    []string     `json:"cap_requires,omitempty"`
+	Version     int          `json:"cap_version"`
+	// ImportedVersion is the version of the CAP.md source this row was last
+	// imported from. Version counts local revisions (every save, the
+	// auto-correct pass included, raises it), so it cannot answer "is this file
+	// newer than what I already have from disk". Comparing a bundled file
+	// against Version made every auto-correction shadow the bundle forever.
+	ImportedVersion int `json:"cap_imported_version,omitempty"`
+	// ImportedDigest identifies the script set that import brought. A later
+	// comparison needs it to tell "the row is still what the file said" from
+	// "someone changed the row after that import": the version counter cannot
+	// answer that, because it also moves on a repair and on a bundle revision that
+	// is lower than the local count.
+	ImportedDigest string            `json:"cap_imported_digest,omitempty"`
+	Tested         bool              `json:"cap_tested"`
+	TestDate       string            `json:"cap_test_date,omitempty"`
+	AutoActive     bool              `json:"cap_auto_active,omitempty"`
+	Actions        map[string]string `json:"cap_actions,omitempty"`
+	Scope          string            `json:"cap_scope,omitempty"` // "user" | "project"
 }
 
 // ParseCapMeta parses JSON from a Learning's Context field into CapMeta.
@@ -67,6 +84,11 @@ func ParseCapMeta(s string) (CapMeta, error) {
 		case "", "none", "standard", "strict":
 		default:
 			return CapMeta{}, fmt.Errorf("script %q: sandbox must be none, standard, or strict, got %q", sc.Name, sc.Sandbox)
+		}
+		for _, host := range sc.AllowedHosts {
+			if err := capfile.ValidateHost(host); err != nil {
+				return CapMeta{}, fmt.Errorf("script %q: %w", sc.Name, err)
+			}
 		}
 		if sc.Body == "" {
 			return CapMeta{}, fmt.Errorf("script %q: body is required", sc.Name)

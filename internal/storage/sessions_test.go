@@ -266,13 +266,14 @@ func TestResolveProjectShortStrict_AmbiguousNoCwdMatch(t *testing.T) {
 
 func TestResolveProjectShortStrict_ZeroCandidates(t *testing.T) {
 	s := mustOpen(t)
-	// No sessions in DB → 0 candidates
+	// No sessions in DB → 0 candidates, and no cwd to compare against: the name is
+	// handed back. Callers that would persist it mark it unresolved (YM-300).
 	got, err := s.ResolveProjectShortStrict("nonexistent", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got != "nonexistent" {
-		t.Errorf("got %q, want passthrough 'nonexistent'", got)
+		t.Errorf("got %q, want 'nonexistent'", got)
 	}
 }
 
@@ -434,6 +435,52 @@ func TestResolveProjectShortStrict_CwdResolvesAmbiguity(t *testing.T) {
 	}
 	if got != "/var/www/client-a/cms" {
 		t.Errorf("got %q, want /var/www/client-a/cms", got)
+	}
+}
+
+// reviewed_at / first_seen / last_seen are written by SQLite CURRENT_TIMESTAMP
+// ("2006-01-02 15:04:05", UTC, no offset). parseTime has to accept that layout as
+// well, otherwise every such column reads back as the zero time.
+func TestParseTimeAcceptsSQLiteTimestamp(t *testing.T) {
+	const raw = "2026-10-16 22:17:52"
+	got := parseTime(raw)
+	want := time.Date(2026, 10, 16, 22, 17, 52, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("parseTime(%q) = %v, want %v", raw, got, want)
+	}
+	if got.Location() != time.UTC {
+		t.Errorf("CURRENT_TIMESTAMP is UTC, got location %v", got.Location())
+	}
+}
+
+func TestParseTimeStillAcceptsRFC3339(t *testing.T) {
+	got := parseTime("2026-10-16T22:17:52+02:00")
+	want := time.Date(2026, 10, 16, 20, 17, 52, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("parseTime(RFC3339) = %v, want %v", got, want)
+	}
+	if !parseTime("").IsZero() {
+		t.Error("empty input must stay the zero time")
+	}
+}
+
+// YM-294: doc_chunks.updated_at is stamped with milliseconds on a re-embedding
+// (SetDocChunkEmbedding). time.Parse accepts a fractional second even when the
+// layout does not name one, so this pins that guarantee rather than fixing a
+// parser gap: a layout that required the fraction's absence would silently read
+// back a zero UpdatedAt for every re-embedded chunk.
+func TestParseTimeAcceptsFractionalSecondsLos07c(t *testing.T) {
+	got := parseTime("2026-10-16 22:17:52.412")
+	if got.IsZero() {
+		t.Fatal("parseTime dropped a fractional-second timestamp to the zero time")
+	}
+	want := time.Date(2026, 10, 16, 22, 17, 52, 412_000_000, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("parseTime(fractional) = %v, want %v", got, want)
+	}
+	// The plain form must keep parsing through the same layout.
+	if !parseTime("2026-10-16 22:17:52").Equal(time.Date(2026, 10, 16, 22, 17, 52, 0, time.UTC)) {
+		t.Error("parseTime no longer accepts the plain CURRENT_TIMESTAMP form")
 	}
 }
 

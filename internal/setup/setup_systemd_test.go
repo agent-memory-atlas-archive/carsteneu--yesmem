@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildSystemdUnits_NoNetworkOnline(t *testing.T) {
-	daemon := buildDaemonUnit("/usr/local/bin/yesmem", ":0", "/home/u/.Xauthority", "unix:path=/run/user/1000/bus")
+	daemon := buildDaemonUnit("/usr/local/bin/yesmem", ":0", "/home/u/.Xauthority", "unix:path=/run/user/1000/bus", "http://localhost:9099")
 	proxy := buildProxyUnit("/usr/local/bin/yesmem")
 
 	for name, unit := range map[string]string{"daemon": daemon, "proxy": proxy} {

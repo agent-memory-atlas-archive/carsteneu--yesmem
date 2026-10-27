@@ -52,6 +52,9 @@ var dimensionMap = map[string]string{
 	"visual_thinker":        "learning_style",
 }
 
+// dimensionList is the readable form of validDimensions for error messages.
+const dimensionList = "communication, workflow, expertise, context, boundaries, learning_style"
+
 // prefixDimensionMap maps trait key prefixes to dimensions.
 var prefixDimensionMap = map[string]string{
 	"expertise.": "expertise",
@@ -89,6 +92,13 @@ func (h *Handler) handleSetPersona(params map[string]any) Response {
 
 	if dimension == "" {
 		dimension = autoDetectDimension(traitKey)
+		if !validDimensions[dimension] {
+			return errorResponse(fmt.Sprintf(
+				"cannot auto-detect a dimension for trait_key %q — pass one of: %s",
+				traitKey, dimensionList))
+		}
+	} else if !validDimensions[dimension] {
+		return errorResponse(fmt.Sprintf("invalid dimension %q — allowed: %s", dimension, dimensionList))
 	}
 
 	err := h.store.UpsertPersonaTrait(&models.PersonaTrait{

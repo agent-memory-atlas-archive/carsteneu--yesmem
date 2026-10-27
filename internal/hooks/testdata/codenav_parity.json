@@ -1,0 +1,105 @@
+{
+  "cwd": "/proj",
+  "note": "Shared navigation fixtures for the Claude Code hook (internal/hooks) and the opencode plugin (plugins/opencode-yesmem-v2). Both must resolve the same targets for the same shell line, otherwise a command blocks on one side and slips through on the other (YM-409). Files are absolute and carry no trailing separator.",
+  "cases": [
+    {
+      "command": "grep -n \"func Run\" internal/proxy/proxy.go",
+      "expected": [{ "tool": "grep", "file": "/proj/internal/proxy/proxy.go" }]
+    },
+    {
+      "command": "grep -n \"func\" proxy.go | head -5",
+      "expected": [{ "tool": "grep", "file": "/proj/proxy.go" }]
+    },
+    {
+      "command": "git status; cat internal/x.go",
+      "expected": [{ "tool": "cat", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cd internal && grep -n Run hooks/check.go",
+      "expected": [{ "tool": "grep", "file": "/proj/internal/hooks/check.go" }]
+    },
+    {
+      "command": "pushd sub && cat a.go && popd && cat b.go",
+      "expected": [
+        { "tool": "cat", "file": "/proj/sub/a.go" },
+        { "tool": "cat", "file": "/proj/b.go" }
+      ]
+    },
+    {
+      "command": "find internal/ -name \"*.go\"",
+      "expected": [{ "tool": "find", "file": "/proj/internal" }]
+    },
+    {
+      "command": "find internal -name \"*.go\"",
+      "expected": [{ "tool": "find", "file": "/proj/internal" }]
+    },
+    {
+      "command": "grep -rn needle internal",
+      "expected": [{ "tool": "grep", "file": "/proj/internal" }]
+    },
+    {
+      "command": "grep -rn needle .",
+      "expected": [{ "tool": "grep", "file": "/proj" }]
+    },
+    {
+      "command": "grep -rn needle .github/workflows",
+      "expected": [{ "tool": "grep", "file": "/proj/.github/workflows" }]
+    },
+    {
+      "command": "grep -n \"a|b\" internal/x.go",
+      "expected": [{ "tool": "grep", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cat internal/x.go > out.json",
+      "expected": [{ "tool": "cat", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cat internal/x.go 2>/dev/null",
+      "expected": [{ "tool": "cat", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "echo don't; cat internal/x.go",
+      "expected": [{ "tool": "cat", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cat /proj/internal/x.go",
+      "expected": [{ "tool": "cat", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cat tui.tsx",
+      "expected": [{ "tool": "cat", "file": "/proj/tui.tsx" }]
+    },
+    {
+      "command": "grep -rn \"internal/x.go\" .",
+      "expected": [{ "tool": "grep", "file": "/proj" }]
+    },
+    {
+      "command": "grep -rn 'x*' internal/x.go",
+      "expected": [{ "tool": "grep", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "awk '{print $1}' internal/x.go",
+      "expected": [{ "tool": "awk", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cat internal/x.go &",
+      "expected": [{ "tool": "cat", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "head -c 100 internal/x.go >/dev/null",
+      "expected": [{ "tool": "head", "file": "/proj/internal/x.go" }]
+    },
+    {
+      "command": "cat $HOME/x.go",
+      "expected": []
+    },
+    {
+      "command": "go test ./internal/proxy/",
+      "expected": []
+    },
+    {
+      "command": "cat server.log",
+      "expected": []
+    }
+  ]
+}

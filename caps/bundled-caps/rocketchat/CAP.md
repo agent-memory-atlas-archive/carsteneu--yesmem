@@ -1,37 +1,33 @@
 ---
 name: rocketchat
 description: "Bidirectional Rocket.Chat messaging via REST API — send messages, poll channel history, reply via headless agent. Commands use /yesmem prefix."
-version: 11
+version: 16
 tags: [rocketchat, bot, messaging, chat]
+requires: [store]
 scope: user
-tested: false
 auto_active: true
 ---
 
 ## Purpose
 
-Bidirectional Rocket.Chat messaging via REST API (self-hosted, e.g. https://chat.papoo-service.de) — mirror of the telegram cap: send messages, poll a private channel (`chief`) for inbound messages, reply via headless agent with session handling.
-
-Transport decisions (documented per task contract):
-- REST polling only (login → cached auth token → `groups.history` with `oldest` cursor). No WebSocket/DDP daemon — cap-first, no new service infrastructure.
-- Auth: `POST /api/v1/login` with user/password from config; `authToken`/`userId` cached in config (`rc_auth_token`, `rc_user_id`), refreshed on HTTP 401. Personal access tokens are a possible later optimization — token caching is sufficient.
-- Secrets (password, auth token) are never passed as curl argv: headers go via `-H @file` (0600, deleted after use), bodies via stdin (`-d @-`). See gotchas #83571/#83632.
-- Commands are prefixed `/yesmem …` (`/yesmem use`, `/yesmem sessions`, `/yesmem status`, `/yesmem model`, `/yesmem models`) so they cannot collide with Rocket.Chat's own slash commands (user decision 2026-08-18). The RC client intercepts unknown slash commands locally — typing `\yesmem status` (backslash escape) sends the command as plain text; the reply handler normalizes `\yesmem` → `/yesmem`.
-- The bot's own messages are filtered in poll (`u.username == rc_user`, case-insensitive) to prevent reply loops.
-- Backlog: poll fetches count=50 per run; a >50-message burst between polls defers the excess to subsequent runs (documented design limit, mirrors the telegram cap).
-- First poll run seeds the cursor to the newest message timestamp without processing backlog.
-- Poll only stores; reply is a separate handler (claim_and_read) — same separation as telegram.
-- rc_api runs inside `$(…)` subshells, so HTTP code and body are both printed to stdout; callers split them via RC_RESP/RC_HTTP_CODE helper functions (plain assignment, no subshell).
+Bidirectional Rocket.Chat messaging via REST API — send messages, poll channel history, reply via headless agent. Commands use /yesmem prefix.
 
 ## Scripts
 
 ### rocketchat_send
 kind: tool
 schema: {"type":"object","properties":{"text":{"type":"string","description":"Message text"},"rid":{"type":"string","description":"Optional room id override"},"reply_to":{"type":"string","description":"Optional thread parent message id (tmid)"}},"required":["text"]}
+sandbox: standard
+allowed_hosts: chat.papoo-service.de
 
 ```bash
+: "${YESMEM_JOB_DIR:=/tmp}"
+mkdir -p "$YESMEM_JOB_DIR" 2>/dev/null || YESMEM_JOB_DIR=/tmp
 umask 077
-exec 2>>/tmp/rcsend.log
+# keep the log bounded: the job dir survives the run. Truncating after
+# the redirect below would leave a sparse file, so it happens before it.
+if [ -f "$YESMEM_JOB_DIR/rcsend.log" ] && [ "$(wc -c <"$YESMEM_JOB_DIR/rcsend.log")" -gt 1048576 ]; then : >"$YESMEM_JOB_DIR/rcsend.log"; fi
+exec 2>>"$YESMEM_JOB_DIR/rcsend.log"
 
 # Decode Go json.Marshal HTML escapes from injected args (\u003c etc. arrive as literal text)
 # and literal \n sequences (daemon arg injection cannot carry real newlines — they break the script).
@@ -46,7 +42,7 @@ AUTH_TOKEN=$(store '{"capability":"rocketchat","action":"query","table":"config"
 AUTH_UID=$(store '{"capability":"rocketchat","action":"query","table":"config","where":"key=?","args":["rc_user_id"],"limit":1}' | yesmem json -r '.rows[0].value // empty')
 
 if [ -z "$URL" ] || [ -z "$RC_USER" ] || [ -z "$RC_PASS" ] || [ -z "$RID" ]; then
-  printf '[%s] send: missing config\n' "$(date -Is)" >> /tmp/rcsend.log
+  printf '[%s] send: missing config\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcsend.log"
   echo '{"error":"missing config (rc_url/rc_user/rc_pass/rc_rid)"}'
   exit 0
 fi
@@ -58,7 +54,7 @@ rc_login() {
   tok=$(echo "$resp" | yesmem json -r '.data.authToken // empty')
   uid=$(echo "$resp" | yesmem json -r '.data.userId // empty')
   if [ -z "$tok" ] || [ -z "$uid" ]; then
-    printf '[%s] send: login failed\n' "$(date -Is)" >> /tmp/rcsend.log
+    printf '[%s] send: login failed\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcsend.log"
     return 1
   fi
   AUTH_TOKEN="$tok"
@@ -112,16 +108,27 @@ if [ "$RC_HTTP_CODE" = "401" ]; then
 fi
 
 echo "$RC_RESP"
-printf '[%s] send: http=%s ok=%s\n' "$(date -Is)" "${RC_HTTP_CODE:-?}" "$(echo "$RC_RESP" | yesmem json -r '.success // "?"')" >> /tmp/rcsend.log
+printf '[%s] send: http=%s ok=%s\n' "$(date -Is)" "${RC_HTTP_CODE:-?}" "$(echo "$RC_RESP" | yesmem json -r '.success // "?"')" >> "$YESMEM_JOB_DIR/rcsend.log"
 ```
 
 ### rocketchat_poll
 kind: handler
+sandbox: standard
+allowed_hosts: chat.papoo-service.de
 
 ```bash
+: "${YESMEM_JOB_DIR:=/tmp}"
+mkdir -p "$YESMEM_JOB_DIR" 2>/dev/null || YESMEM_JOB_DIR=/tmp
 umask 077
-exec 2>>/tmp/rcpoll.log
-printf '[%s] poll start\n' "$(date -Is)" >> /tmp/rcpoll.log
+# keep the log bounded: the job dir survives the run. Truncating after
+# the redirect below would leave a sparse file, so it happens before it.
+if [ -f "$YESMEM_JOB_DIR/rcpoll.log" ] && [ "$(wc -c <"$YESMEM_JOB_DIR/rcpoll.log")" -gt 1048576 ]; then : >"$YESMEM_JOB_DIR/rcpoll.log"; fi
+exec 2>>"$YESMEM_JOB_DIR/rcpoll.log"
+# Nothing here reads stdin, and a run can inherit an fd that never reaches EOF.
+# Pinning it keeps a future read (in this script or in the adapter) from
+# blocking the job until its timeout (YM-439).
+exec 0</dev/null
+printf '[%s] poll start\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"
 
 URL=$(store '{"capability":"rocketchat","action":"query","table":"config","where":"key=?","args":["rc_url"],"limit":1}' | yesmem json -r '.rows[0].value // empty')
 RC_USER=$(store '{"capability":"rocketchat","action":"query","table":"config","where":"key=?","args":["rc_user"],"limit":1}' | yesmem json -r '.rows[0].value // empty')
@@ -131,7 +138,7 @@ AUTH_TOKEN=$(store '{"capability":"rocketchat","action":"query","table":"config"
 AUTH_UID=$(store '{"capability":"rocketchat","action":"query","table":"config","where":"key=?","args":["rc_user_id"],"limit":1}' | yesmem json -r '.rows[0].value // empty')
 
 if [ -z "$URL" ] || [ -z "$RC_USER" ] || [ -z "$RC_PASS" ] || [ -z "$RID" ]; then
-  printf '[%s] poll: no config\n' "$(date -Is)" >> /tmp/rcpoll.log
+  printf '[%s] poll: no config\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"
   exit 0
 fi
 
@@ -142,7 +149,7 @@ rc_login() {
   tok=$(echo "$resp" | yesmem json -r '.data.authToken // empty')
   uid=$(echo "$resp" | yesmem json -r '.data.userId // empty')
   if [ -z "$tok" ] || [ -z "$uid" ]; then
-    printf '[%s] poll: login failed\n' "$(date -Is)" >> /tmp/rcpoll.log
+    printf '[%s] poll: login failed\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"
     return 1
   fi
   AUTH_TOKEN="$tok"
@@ -192,9 +199,9 @@ if [ -z "$CURSOR" ]; then
   NEWEST=$(echo "$RC_RESP" | yesmem json -r '.messages[0].ts // empty')
   if [ -n "$NEWEST" ]; then
     store "$(yesmem json -n --arg key "rc_latest" --arg value "$NEWEST" '{capability:"rocketchat","action":"upsert","table":"config","data":{key:$key,value:$value}}')" > /dev/null
-    printf '[%s] poll: first run, cursor seeded to %s\n' "$(date -Is)" "$NEWEST" >> /tmp/rcpoll.log
+    printf '[%s] poll: first run, cursor seeded to %s\n' "$(date -Is)" "$NEWEST" >> "$YESMEM_JOB_DIR/rcpoll.log"
   else
-    printf '[%s] poll: first run, no messages\n' "$(date -Is)" >> /tmp/rcpoll.log
+    printf '[%s] poll: first run, no messages\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"
   fi
   exit 0
 fi
@@ -206,47 +213,54 @@ if [ "$RC_HTTP_CODE" = "401" ]; then
 fi
 
 if [ "$RC_HTTP_CODE" != "200" ]; then
-  printf '[%s] poll: http=%s\n' "$(date -Is)" "${RC_HTTP_CODE:-?}" >> /tmp/rcpoll.log
+  printf '[%s] poll: http=%s\n' "$(date -Is)" "${RC_HTTP_CODE:-?}" >> "$YESMEM_JOB_DIR/rcpoll.log"
   exit 0
 fi
 
 CLEAN=$(echo "$RC_RESP" | yesmem json -r --arg me "$RC_USER" '[.messages[]? | select(((.u.username // "") | ascii_downcase) != ($me | ascii_downcase)) | select(.t == null) | select((.msg // "") != "")] | sort_by(.ts)')
 COUNT=$(echo "$CLEAN" | yesmem json 'length')
 if [ -z "$COUNT" ] || [ "$COUNT" = "0" ] || [ "$COUNT" = "null" ]; then
-  printf '[%s] poll: no messages\n' "$(date -Is)" >> /tmp/rcpoll.log
+  printf '[%s] poll: no messages\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"
   exit 0
 fi
 
-printf '[%s] poll: %s messages\n' "$(date -Is)" "$COUNT" >> /tmp/rcpoll.log
+printf '[%s] poll: %s messages\n' "$(date -Is)" "$COUNT" >> "$YESMEM_JOB_DIR/rcpoll.log"
 MAX_TS="$CURSOR"
 N=0
 for i in $(seq 0 $((COUNT - 1))); do
   N=$((N + 1))
-  if [ $N -gt 50 ]; then printf '[%s] poll: LIMIT 50 reached, deferring remaining\n' "$(date -Is)" >> /tmp/rcpoll.log; break; fi
+  if [ $N -gt 50 ]; then printf '[%s] poll: LIMIT 50 reached, deferring remaining\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"; break; fi
   MSG=$(echo "$CLEAN" | yesmem json ".[$i]")
   PAYLOAD=$(echo "$MSG" | yesmem json '{capability:"rocketchat","action":"upsert",table:"updates",data:{rc_message_id:._id,rid:.rid,sender:(.u.username // "unknown"),text:(.msg // ""),direction:"in",ts:(.ts // "")}}')
-  echo "$PAYLOAD" | while IFS= read -r p; do store "$p" > /dev/null || printf '[%s] poll: store FAILED for this message\n' "$(date -Is)" >> /tmp/rcpoll.log; done
+  echo "$PAYLOAD" | while IFS= read -r p; do store "$p" > /dev/null || printf '[%s] poll: store FAILED for this message\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcpoll.log"; done
   TS=$(echo "$MSG" | yesmem json -r '.ts // empty')
   if [ -n "$TS" ] && [[ "$TS" > "$MAX_TS" ]]; then MAX_TS="$TS"; fi
-  printf '[%s] poll: stored %s from %s\n' "$(date -Is)" "$(echo "$MSG" | yesmem json -r '._id')" "$(echo "$MSG" | yesmem json -r '(.u.username // "?")')" >> /tmp/rcpoll.log
+  printf '[%s] poll: stored %s from %s\n' "$(date -Is)" "$(echo "$MSG" | yesmem json -r '._id')" "$(echo "$MSG" | yesmem json -r '(.u.username // "?")')" >> "$YESMEM_JOB_DIR/rcpoll.log"
 done
 
 store "$(yesmem json -n --arg key "rc_latest" --arg value "$MAX_TS" '{capability:"rocketchat","action":"upsert","table":"config","data":{key:$key,value:$value}}')" > /dev/null
-printf '[%s] poll: done, cursor=%s\n' "$(date -Is)" "$MAX_TS" >> /tmp/rcpoll.log
+printf '[%s] poll: done, cursor=%s\n' "$(date -Is)" "$MAX_TS" >> "$YESMEM_JOB_DIR/rcpoll.log"
 ```
 
 ### rocketchat_reply
 kind: handler
+sandbox: standard
+allowed_hosts: chat.papoo-service.de
 
 ```bash
+: "${YESMEM_JOB_DIR:=/tmp}"
+mkdir -p "$YESMEM_JOB_DIR" 2>/dev/null || YESMEM_JOB_DIR=/tmp
 umask 077
-exec 2>>/tmp/rcreply.log
-printf '[%s] reply: check\n' "$(date -Is)" >> /tmp/rcreply.log
+# keep the log bounded: the job dir survives the run. Truncating after
+# the redirect below would leave a sparse file, so it happens before it.
+if [ -f "$YESMEM_JOB_DIR/rcreply.log" ] && [ "$(wc -c <"$YESMEM_JOB_DIR/rcreply.log")" -gt 1048576 ]; then : >"$YESMEM_JOB_DIR/rcreply.log"; fi
+exec 2>>"$YESMEM_JOB_DIR/rcreply.log"
+printf '[%s] reply: check\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
 
 CLAIM=$(store '{"capability":"rocketchat","action":"claim_and_read","table":"updates","where":"processed=0","order":"id ASC","set":{"processed":1},"returning":["id","rid","sender","text"]}')
 CLAIMED=$(echo "$CLAIM" | yesmem json -r '.claimed')
 if [ "$CLAIMED" != "true" ]; then
-  printf '[%s] reply: no pending\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: no pending\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 fi
 
@@ -255,7 +269,7 @@ TEXT=$(echo "$CLAIM" | yesmem json -r '.row.text')
 # RC client intercepts unknown slash commands; \ escapes them ("\yesmem ..." arrives as text). Normalize:
 TEXT=$(printf '%s' "$TEXT" | sed 's|^\\[Yy][Ee][Ss][Mm][Ee][Mm]|/yesmem|')
 SENDER=$(echo "$CLAIM" | yesmem json -r '.row.sender')
-printf '[%s] reply: replying row=%s sender=%s text=%s\n' "$(date -Is)" "$ROW_ID" "$SENDER" "${TEXT:0:80}" >> /tmp/rcreply.log
+printf '[%s] reply: replying row=%s sender=%s text=%s\n' "$(date -Is)" "$ROW_ID" "$SENDER" "${TEXT:0:80}" >> "$YESMEM_JOB_DIR/rcreply.log"
 
 URL=$(store '{"capability":"rocketchat","action":"query","table":"config","where":"key=?","args":["rc_url"],"limit":1}' | yesmem json -r '.rows[0].value // empty')
 RC_USER=$(store '{"capability":"rocketchat","action":"query","table":"config","where":"key=?","args":["rc_user"],"limit":1}' | yesmem json -r '.rows[0].value // empty')
@@ -271,7 +285,7 @@ rc_login() {
   tok=$(echo "$resp" | yesmem json -r '.data.authToken // empty')
   uid=$(echo "$resp" | yesmem json -r '.data.userId // empty')
   if [ -z "$tok" ] || [ -z "$uid" ]; then
-    printf '[%s] reply: login failed\n' "$(date -Is)" >> /tmp/rcreply.log
+    printf '[%s] reply: login failed\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
     return 1
   fi
   AUTH_TOKEN="$tok"
@@ -321,7 +335,7 @@ rc_send() {
       rc_post "/api/v1/chat.sendMessage" "$MSG_JSON"
     fi
     if [ "$RC_HTTP_CODE" != "200" ]; then
-      printf '[%s] reply: send FAILED http=%s body=%s\n' "$(date -Is)" "${RC_HTTP_CODE:-?}" "$RC_RESP" >> /tmp/rcreply.log
+      printf '[%s] reply: send FAILED http=%s body=%s\n' "$(date -Is)" "${RC_HTTP_CODE:-?}" "$RC_RESP" >> "$YESMEM_JOB_DIR/rcreply.log"
       ERR_PAYLOAD=$(yesmem json -n </dev/null --arg rid "${ROW_ID:-0}" --arg sender "${SENDER:-}" --arg stage "send" --arg msg "$chunk" --arg code "${RC_HTTP_CODE:-0}" --arg body "$RC_RESP" --arg model "$MODEL" --arg ts "$(date -Is)" '{capability:"rocketchat","action":"upsert","table":"reply_errors","data":{row_id:$rid,sender:$sender,stage:$stage,message_text:$msg,http_code:$code,error_body:$body,model:$model,created_at:$ts}}')
       echo "$ERR_PAYLOAD" | while IFS= read -r p; do store "$p" > /dev/null 2>&1; done
       return 1
@@ -354,7 +368,7 @@ flush()
 for c in chunks:
     sys.stdout.write(c); sys.stdout.write("\0")
 ')
-  printf '[%s] reply: sent %s chunk(s) ok\n' "$(date -Is)" "$SENT" >> /tmp/rcreply.log
+  printf '[%s] reply: sent %s chunk(s) ok\n' "$(date -Is)" "$SENT" >> "$YESMEM_JOB_DIR/rcreply.log"
 }
 
 # --- Command detection (case-insensitive, /yesmem prefix to avoid RC built-in collisions) ---
@@ -385,7 +399,7 @@ elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+sessions?$ ]]; then
     MSG=$(echo "$ROWS" | yesmem json -r '"Sessions (" + (.rows | length | tostring) + "):\n" + ([.rows[] | "  " + .name + (if .is_default == 1 then " (*)" else "" end) + " [" + (.session_id // "fresh") + "]"] | join("\n"))')
   fi
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem sessions -> %s\n' "$(date -Is)" "${COUNT:-0}" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem sessions -> %s\n' "$(date -Is)" "${COUNT:-0}" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+status$ ]]; then
   STATUS_ROW=$(store '{"capability":"rocketchat","action":"query","table":"sessions","where":"is_default=1","limit":1}')
@@ -406,12 +420,12 @@ elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+status$ ]]; then
     fi
   fi
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem status -> %s\n' "$(date -Is)" "${STATUS_NAME:-none}" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem status -> %s\n' "$(date -Is)" "${STATUS_NAME:-none}" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+use([[:space:]]|$) ]]; then
   MSG=$'Usage: /yesmem use <name> | /yesmem use <name> <session_id>\nName: A-Z a-z 0-9 _ - (max 32).'
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem use invalid syntax\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem use invalid syntax\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+model$ ]]; then
   ACTIVE_ROW=$(store '{"capability":"rocketchat","action":"query","table":"sessions","where":"is_default=1","limit":1}')
@@ -426,7 +440,7 @@ elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+model$ ]]; then
     MSG="Aktive Session: ${ACTIVE_NAME}"$'\n'"Model: ${GLOBAL_MODEL} (globaler Default)"$'\n'"Session-spezifisch setzen via: /yesmem model <name>"
   fi
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem model -> %s\n' "$(date -Is)" "${ACTIVE_NAME:-none}" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem model -> %s\n' "$(date -Is)" "${ACTIVE_NAME:-none}" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+model[[:space:]]+([A-Za-z0-9_./-]{1,64})$ ]]; then
   MODEL_ARG="${BASH_REMATCH[1]}"
@@ -435,7 +449,7 @@ elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+model[[:space:]]+([A-Za-z0-9_./-]{1,64})$
   if [ -z "$ACTIVE_NAME" ]; then
     MSG="Keine aktive Session. /yesmem use <name> zuerst."
     rc_send "$MSG"
-    printf '[%s] reply: /yesmem model failed: no active session\n' "$(date -Is)" >> /tmp/rcreply.log
+    printf '[%s] reply: /yesmem model failed: no active session\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
     exit 0
   fi
   if [[ "$MODEL_ARG" =~ ^(default|clear|reset)$ ]]; then
@@ -449,33 +463,40 @@ elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+model[[:space:]]+([A-Za-z0-9_./-]{1,64})$
     MSG="Session ${ACTIVE_NAME}: model gesetzt auf ${MODEL_ARG}"
   fi
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem model -> %s=%s\n' "$(date -Is)" "$ACTIVE_NAME" "$MODEL_ARG" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem model -> %s=%s\n' "$(date -Is)" "$ACTIVE_NAME" "$MODEL_ARG" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+model([[:space:]]|$) ]]; then
   MSG=$'Usage: /yesmem model | /yesmem model <name> | /yesmem model default\nName: A-Z a-z 0-9 _ . / - (max 64).'
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem model invalid syntax\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem model invalid syntax\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem[[:space:]]+models$ ]]; then
-  OC_CONFIG="${HOME}/.config/opencode/opencode.json"
-  if [ ! -f "$OC_CONFIG" ]; then
-    MSG="opencode.json nicht gefunden: $OC_CONFIG"
+  # A sandboxed run gets the list from the daemon: ~/.config/opencode/opencode.json
+  # is masked there (plugin paths and mcpServers in it become code at the next
+  # opencode start). The file read stays as the fallback for a manual run.
+  if [ -n "${YESMEM_OPENCODE_MODELS:-}" ]; then
+    MSG="$YESMEM_OPENCODE_MODELS"
   else
-    MSG=$(yesmem json -r < "$OC_CONFIG" '
-      [.provider // {} | to_entries[] | .key as $p |
-        (.value.models // {}) | keys[]? | "\($p)/\(.)"
-      ] as $explicit |
-      [.provider // {} | to_entries[] | select((.value.models // {}) == {}) | "\(.key)/* (default)"] as $default
-      | ($explicit + $default) | sort | unique | .[]
-    ' 2>&1)
+    OC_CONFIG="${HOME}/.config/opencode/opencode.json"
+    if [ ! -f "$OC_CONFIG" ]; then
+      MSG="opencode.json nicht gefunden: $OC_CONFIG"
+    else
+      MSG=$(yesmem json -r < "$OC_CONFIG" '
+        [.provider // {} | to_entries[] | .key as $p |
+          (.value.models // {}) | keys[]? | "\($p)/\(.)"
+        ] as $explicit |
+        [.provider // {} | to_entries[] | select((.value.models // {}) == {}) | "\(.key)/* (default)"] as $default
+        | ($explicit + $default) | sort | unique | .[]
+      ' 2>&1)
+    fi
   fi
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem models\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem models\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 elif [[ "$TEXT" =~ ^/yesmem([[:space:]]|$) ]]; then
   MSG=$'Commands: /yesmem use <name> [<session_id>] | /yesmem sessions | /yesmem status | /yesmem model [<name>|default] | /yesmem models'
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem help\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem help\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 fi
 shopt -u nocasematch
@@ -490,7 +511,7 @@ if [ -n "$NAME" ] && [ -n "$UPSERT_PAYLOAD" ]; then
   MSG="Aktive Session: ${NAME}"
   if [ -n "$EXPLICIT_SESSION" ]; then MSG="${MSG}"$'\n'"Session: ${EXPLICIT_SESSION}"; fi
   rc_send "$MSG"
-  printf '[%s] reply: /yesmem use -> %s\n' "$(date -Is)" "$NAME" >> /tmp/rcreply.log
+  printf '[%s] reply: /yesmem use -> %s\n' "$(date -Is)" "$NAME" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 fi
 
@@ -501,7 +522,7 @@ fi
 SESS_PROBE=$(store '{"capability":"rocketchat","action":"query","table":"sessions","limit":1}' 2>&1)
 if echo "$SESS_PROBE" | grep -q "does not exist"; then
   store '{"capability":"rocketchat","action":"create_table","table":"sessions","columns":[{"name":"name","type":"TEXT","unique":true},{"name":"session_id","type":"TEXT"},{"name":"is_default","type":"INTEGER"},{"name":"model","type":"TEXT"},{"name":"last_used_at","type":"TEXT"}]}' > /dev/null 2>&1
-  printf '[%s] reply: auto-created sessions table\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: auto-created sessions table\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
 fi
 
 # reply_errors: persist send/llm failures in the DB (survives /tmp cleanup,
@@ -511,7 +532,7 @@ ERR_PROBE=$(store '{"capability":"rocketchat","action":"query","table":"reply_er
 if echo "$ERR_PROBE" | grep -q "does not exist"; then
   store '{"capability":"rocketchat","action":"create_table","table":"reply_errors","columns":[{"name":"row_id","type":"INTEGER"},{"name":"sender","type":"TEXT"},{"name":"stage","type":"TEXT"},{"name":"message_text","type":"TEXT"},{"name":"http_code","type":"INTEGER"},{"name":"error_body","type":"TEXT"},{"name":"model","type":"TEXT"}]}' > /dev/null 2>&1
   # create_table auto-injects id/created_at/updated_at — do NOT list them in columns (duplicate column error).
-  printf '[%s] reply: auto-created reply_errors table\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: auto-created reply_errors table\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
 fi
 
 SESSION_ID=$(store '{"capability":"rocketchat","action":"query","table":"sessions","where":"is_default=1","limit":1}' | yesmem json -r '.rows[0].session_id // empty')
@@ -527,14 +548,14 @@ SYSPROMPT=$(store '{"capability":"rocketchat","action":"query","table":"config",
 RESULT=$(llm "$MODEL" "$SYSPROMPT" "Nachricht von $SENDER: $TEXT" "$SESSION_ID")
 LLM_EXIT=$?
 if [ "$LLM_EXIT" -ne 0 ]; then
-  printf '[%s] reply: llm failed exit=%s\n' "$(date -Is)" "$LLM_EXIT" >> /tmp/rcreply.log
+  printf '[%s] reply: llm failed exit=%s\n' "$(date -Is)" "$LLM_EXIT" >> "$YESMEM_JOB_DIR/rcreply.log"
   ERR_PAYLOAD=$(yesmem json -n </dev/null --arg rid "${ROW_ID:-0}" --arg sender "${SENDER:-}" --arg stage "llm" --arg code "$LLM_EXIT" --arg body "$RESULT" --arg model "$MODEL" --arg ts "$(date -Is)" '{capability:"rocketchat","action":"upsert","table":"reply_errors","data":{row_id:$rid,sender:$sender,stage:$stage,http_code:$code,error_body:$body,model:$model,created_at:$ts}}')
   echo "$ERR_PAYLOAD" | while IFS= read -r p; do store "$p" > /dev/null 2>&1; done
   exit 0
 fi
 
 if ! echo "$RESULT" | yesmem json -e '.' > /dev/null 2>&1; then
-  printf '[%s] reply: invalid llm JSON\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: invalid llm JSON\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   ERR_PAYLOAD=$(yesmem json -n </dev/null --arg rid "${ROW_ID:-0}" --arg sender "${SENDER:-}" --arg stage "invalid_json" --arg code -1 --arg body "$RESULT" --arg model "$MODEL" --arg ts "$(date -Is)" '{capability:"rocketchat","action":"upsert","table":"reply_errors","data":{row_id:$rid,sender:$sender,stage:$stage,http_code:$code,error_body:$body,model:$model,created_at:$ts}}')
   echo "$ERR_PAYLOAD" | while IFS= read -r p; do store "$p" > /dev/null 2>&1; done
   exit 0
@@ -543,7 +564,7 @@ fi
 REPLY=$(echo "$RESULT" | yesmem json -r '.result // empty')
 REPLY=$(echo "$REPLY" | sed '/^\[[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\] \[msg:[0-9]\+\]/d')
 if [ -z "$REPLY" ]; then
-  printf '[%s] reply: empty reply from llm\n' "$(date -Is)" >> /tmp/rcreply.log
+  printf '[%s] reply: empty reply from llm\n' "$(date -Is)" >> "$YESMEM_JOB_DIR/rcreply.log"
   exit 0
 fi
 
@@ -558,7 +579,7 @@ if [ -n "$NEW_SESSION" ]; then
 fi
 
 rc_send "$REPLY"
-printf '[%s] reply: sent row=%s > %s\n' "$(date -Is)" "$ROW_ID" "${REPLY:0:60}" >> /tmp/rcreply.log
+printf '[%s] reply: sent row=%s > %s\n' "$(date -Is)" "$ROW_ID" "${REPLY:0:60}" >> "$YESMEM_JOB_DIR/rcreply.log"
 ```
 
 ## Database
@@ -568,6 +589,30 @@ CREATE TABLE cap_rocketchat__config (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT UNIQUE,
   value TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE cap_rocketchat__reply_errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  row_id INTEGER,
+  sender TEXT,
+  stage TEXT,
+  message_text TEXT,
+  http_code INTEGER,
+  error_body TEXT,
+  model TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE cap_rocketchat__sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT UNIQUE,
+  session_id TEXT,
+  is_default INTEGER,
+  model TEXT,
+  last_used_at TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -583,16 +628,5 @@ CREATE TABLE cap_rocketchat__updates (
   ts TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE cap_rocketchat__sessions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT UNIQUE,
-  session_id TEXT,
-  is_default INTEGER,
-  last_used_at TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  model TEXT
 );
 ```

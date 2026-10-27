@@ -238,29 +238,173 @@ func TestRemoveOpencodeCompaction(t *testing.T) {
 	}
 }
 
-func TestRemoveOpencodePluginEntry_YesMemPluginRemoved(t *testing.T) {
-	cfg := map[string]any{
-		"plugin": []any{"/home/testuser/.local/share/yesmem/plugins/opencode-yesmem/index.ts", "/other/plugin.ts"},
+// Uninstall must drop exactly the entry a v1 install wrote. Matching any
+// "…/index.ts" with "yesmem" somewhere in the path takes a user's own plugin
+// down with it (YM-296).
+func TestRemoveOpencodeSettings_DropsOnlyOwnPluginEntry(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	own := filepath.Join(v1InstallDir(home), "index.ts")
+	foreign := "/home/other/projects/yesmem-tools/plugins/index.ts"
+	other := "/home/other/.config/opencode/plugins/other.ts"
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+own+`", "`+foreign+`", "`+other+`"]}`)
+
+	if err := removeOpencodeSettings(home); err != nil {
+		t.Fatalf("removeOpencodeSettings: %v", err)
 	}
 
-	removeOpencodePluginEntryWithHome(cfg, "/home/testuser")
-
-	plugins, ok := cfg["plugin"].([]any)
-	if !ok || len(plugins) != 1 || plugins[0] != "/other/plugin.ts" {
-		t.Errorf("yesmem plugin not removed: %v", cfg["plugin"])
+	got := readPluginEntries(t, home)
+	want := []string{foreign, other}
+	if len(got) != len(want) {
+		t.Fatalf("plugin entries = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("plugin[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
-func TestRemoveOpencodePluginEntry_OnlyYesMem(t *testing.T) {
-	cfg := map[string]any{
-		"plugin": []any{"/home/testuser/.local/share/yesmem/plugins/opencode-yesmem/index.ts"},
+func TestRemoveOpencodeSettings_DeletesEmptyPluginKey(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	own := filepath.Join(v1InstallDir(home), "index.ts")
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+own+`"]}`)
+
+	if err := removeOpencodeSettings(home); err != nil {
+		t.Fatalf("removeOpencodeSettings: %v", err)
 	}
 
-	removeOpencodePluginEntryWithHome(cfg, "/home/testuser")
-
-	if cfg["plugin"] != nil {
-		t.Error("plugin key should be removed when empty")
+	if cfg := readOpencodeConfig(t, home); cfg["plugin"] != nil {
+		t.Errorf("plugin key should be removed when empty, got %v", cfg["plugin"])
 	}
+}
+
+// A config entry only proves a yesmem install when it points at the file a v1
+// install wrote: a foreign plugin path with "yesmem" in it reported a working
+// installation that does not exist (YM-296).
+func TestReadOpencodeConfigState_ForeignYesmemPathIsNotConfigured(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	writeOpencodeJSONC(t, home, `{"plugin": ["/home/other/projects/yesmem-tools/plugins/index.ts"]}`)
+
+	if state := readOpencodeConfigState(home); state.PluginConfigured {
+		t.Error("foreign plugin path reported as a yesmem install")
+	}
+}
+
+// The narrowing must not cost status the detection of a real v1 leftover.
+func TestReadOpencodeConfigState_OwnV1EntryCountsAsConfigured(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	own := filepath.Join(v1InstallDir(home), "index.ts")
+	if err := os.MkdirAll(filepath.Dir(own), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(own, []byte("// plugin"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+own+`"]}`)
+
+	if state := readOpencodeConfigState(home); !state.PluginConfigured {
+		t.Error("own v1 plugin entry not reported as configured")
+	}
+}
+
+// A v1 dev setup wrote the plugin path as <bin>/../plugins/opencode-yesmem/
+// index.ts, and that shape is ours only while it sits next to the running
+// binary (isDevTreeEntry). A bare path in the home is not: before YM-371 it was
+// swept together with another project's registration in the same home. The
+// entry stays and status does not report a yesmem install.
+func TestLos18iRemoveOpencodeSettingsKeepsAForeignDevTreeEntry(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	foreignEntry := filepath.Join(home, "projects", "otherapp", "bin", "..", "plugins", "opencode-yesmem", "index.ts")
+	if err := os.MkdirAll(filepath.Dir(foreignEntry), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(foreignEntry, []byte("// plugin"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	userPlugin := filepath.Join(home, ".config", "opencode", "plugins", "other.ts")
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+foreignEntry+`", "`+userPlugin+`"]}`)
+
+	// The file exists, so a tail-shaped predicate would report the install as
+	// configured. Ownership has to decide: status must not claim it either.
+	if state := readOpencodeConfigState(home); state.PluginConfigured {
+		t.Error("a foreign dev-tree entry was reported as our install")
+	}
+
+	if err := removeOpencodeSettings(home); err != nil {
+		t.Fatalf("removeOpencodeSettings: %v", err)
+	}
+
+	got := readPluginEntries(t, home)
+	if len(got) != 2 || got[0] != foreignEntry || got[1] != userPlugin {
+		t.Errorf("plugin entries = %v, want the foreign entry kept", got)
+	}
+}
+
+// The v2 install directory is the shape that uninstall has to remove from a
+// home it owns.
+func TestRemoveOpencodeSettings_DropsV2InstallDirEntry(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	v2Entry := filepath.Join(opencodePluginV2Dir(home), "index.ts")
+	userPlugin := filepath.Join(home, ".config", "opencode", "plugins", "other.ts")
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+v2Entry+`", "`+userPlugin+`"]}`)
+
+	if err := removeOpencodeSettings(home); err != nil {
+		t.Fatalf("removeOpencodeSettings: %v", err)
+	}
+
+	got := readPluginEntries(t, home)
+	if len(got) != 1 || got[0] != userPlugin {
+		t.Errorf("plugin entries = %v, want only the user's own plugin", got)
+	}
+}
+
+// Status counts an entry only while it points at a plugin of ours and the file
+// it names exists. The dev shape is not claimed without the binary anchor, so
+// this covers the persistent install and the v2 directory instead.
+func TestReadOpencodeConfigState_CountsOwnPluginEntries(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	v2Entry := filepath.Join(opencodePluginV2Dir(home), "index.ts")
+	if err := os.MkdirAll(filepath.Dir(v2Entry), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(v2Entry, []byte("// plugin"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+v2Entry+`"]}`)
+
+	if state := readOpencodeConfigState(home); !state.PluginConfigured {
+		t.Error("own v2 plugin entry not reported as configured")
+	}
+}
+
+func readOpencodeConfig(t *testing.T, home string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(opencodeConfigPath(home))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config after removal is not JSON: %v", err)
+	}
+	return cfg
+}
+
+func readPluginEntries(t *testing.T, home string) []string {
+	t.Helper()
+	raw, ok := readOpencodeConfig(t, home)["plugin"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		s, ok := p.(string)
+		if !ok {
+			t.Fatalf("plugin entry is not a string: %v", p)
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func TestDefaultOpencodeSettings_MergePreservesExisting(t *testing.T) {
@@ -548,29 +692,6 @@ func TestOpencodeSettingsRemove_NoFile(t *testing.T) {
 
 	if err := removeOpencodeSettings(home); err != nil {
 		t.Fatalf("removeOpencodeSettings should not error on missing file: %v", err)
-	}
-}
-
-func removeOpencodePluginEntryWithHome(cfg map[string]any, home string) {
-	plugins, ok := cfg["plugin"].([]any)
-	if !ok || len(plugins) == 0 {
-		return
-	}
-	yesmemPlugin := filepath.Join(home, ".local", "share", "yesmem", "plugins", "opencode-yesmem", "index.ts")
-
-	var filtered []any
-	for _, p := range plugins {
-		if s, ok := p.(string); ok {
-			if s == yesmemPlugin || (filepath.Base(s) == "index.ts" && searchString(s, "yesmem")) {
-				continue
-			}
-		}
-		filtered = append(filtered, p)
-	}
-	if len(filtered) == 0 {
-		delete(cfg, "plugin")
-	} else {
-		cfg["plugin"] = filtered
 	}
 }
 
@@ -880,5 +1001,240 @@ func TestMigrateOpencodeJsonToJsonc_NoJsonPresent(t *testing.T) {
 	// opencode.json must not have been created.
 	if _, err := os.Stat(filepath.Join(dir, "opencode.json")); !os.IsNotExist(err) {
 		t.Errorf("opencode.json unexpectedly created by migration")
+	}
+}
+
+// --- config write safety (YM-87) ---
+//
+// A config that Go cannot parse must never be replaced by the defaults: the
+// user's file survives and the merge reports the problem. Before the fix both
+// merges treated a parse failure as "empty config" and wrote back only
+// yesmem's keys (plus $schema), which deleted the user's providers and MCP
+// entries.
+
+func readFileOrFail(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
+func TestMergeOpencodeSettingsWith_LeavesUnparseableConfigUntouched(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	// JSONC with a comment: valid for opencode, invalid for encoding/json.
+	writeOpencodeJSONC(t, home, `{
+	  // my providers
+	  "$schema": "https://opencode.ai/config.json",
+	  "model": "deepseek/deepseek-reasoner"
+	}`)
+	cfgPath := filepath.Join(home, ".config", "opencode", "opencode.jsonc")
+	before := readFileOrFail(t, cfgPath)
+
+	if err := mergeOpencodeSettingsWith(home, "", "", ""); err == nil {
+		t.Fatal("expected an error for an unparseable config, got nil")
+	}
+
+	after := readFileOrFail(t, cfgPath)
+	if string(before) != string(after) {
+		t.Errorf("config was rewritten despite the parse failure\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+func TestMergeOpencodeSettingsWith_RejectsNonObjectConfig(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	writeOpencodeJSONC(t, home, `null`)
+	cfgPath := filepath.Join(home, ".config", "opencode", "opencode.jsonc")
+	before := readFileOrFail(t, cfgPath)
+
+	if err := mergeOpencodeSettingsWith(home, "", "", ""); err == nil {
+		t.Fatal("expected an error for a non-object config, got nil")
+	}
+	if after := readFileOrFail(t, cfgPath); string(before) != string(after) {
+		t.Errorf("config was rewritten: %s", after)
+	}
+}
+
+// A readable, valid config still merges: the guard must not block the normal path.
+func TestMergeOpencodeSettingsWith_StillMergesValidConfig(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	writeOpencodeJSONC(t, home, `{"$schema": "https://opencode.ai/config.json", "model": "my/model"}`)
+
+	if err := mergeOpencodeSettingsWith(home, "", "", ""); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	data := readFileOrFail(t, filepath.Join(home, ".config", "opencode", "opencode.jsonc"))
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("merged config is not valid JSON: %v", err)
+	}
+	if cfg["model"] != "my/model" {
+		t.Errorf("user model was overwritten: %v", cfg["model"])
+	}
+	if cfg["mcp"] == nil {
+		t.Error("mcp block missing after merge")
+	}
+}
+
+// The uninstall follows the same fail-closed policy as the merge paths: a
+// config yesmem cannot parse is reported, not silently treated as "nothing to
+// remove". Reporting it as a clean uninstall leaves the user with a config
+// nobody touched and no hint why.
+func TestRemoveOpencodeSettings_ReportsUnparseableConfig(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	// JSONC with a comment: valid for opencode, invalid for encoding/json.
+	writeOpencodeJSONC(t, home, `{
+	  // hand-written
+	  "$schema": "https://opencode.ai/config.json",
+	  "provider": {"deepseek": {"options": {"baseURL": "http://localhost:9099/v1"}}}
+	}`)
+	cfgPath := filepath.Join(home, ".config", "opencode", "opencode.jsonc")
+	before := readFileOrFail(t, cfgPath)
+
+	err := removeOpencodeSettings(home)
+	if err == nil {
+		t.Fatal("expected an error naming the unparseable config, got nil")
+	}
+	if !strings.Contains(err.Error(), "opencode.jsonc") {
+		t.Errorf("error does not name the config: %v", err)
+	}
+	if after := readFileOrFail(t, cfgPath); string(after) != string(before) {
+		t.Errorf("config rewritten despite the parse failure: %s", after)
+	}
+}
+
+// Migration writes the jsonc through the same atomic path as every other
+// config write: a truncate-in-place write that is interrupted leaves a torn
+// file that the fail-closed readers cannot repair. Observable difference: the
+// atomic path replaces the directory entry, so the inode changes.
+func TestMigrateOpencodeJsonToJsonc_ReplacesTheFileInsteadOfTruncatingIt(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	writeOpencodeJSON(t, home, `{
+	  "$schema": "https://opencode.ai/config.json",
+	  "mcp": {"yesmem": {"type": "local"}}
+	}`)
+	writeOpencodeJSONC(t, home, `{"$schema": "https://opencode.ai/config.json"}`)
+	jsonc := filepath.Join(home, ".config", "opencode", "opencode.jsonc")
+
+	before, err := os.Stat(jsonc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateOpencodeJsonToJsonc(home); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	after, err := os.Stat(jsonc)
+	if err != nil {
+		t.Fatalf("jsonc gone after migrate: %v", err)
+	}
+
+	if os.SameFile(before, after) {
+		t.Error("jsonc was written in place; an interrupted write would leave a torn config")
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(readFileOrFail(t, jsonc), &cfg); err != nil {
+		t.Fatalf("migrated jsonc is not valid JSON: %v", err)
+	}
+	if mcp, ok := cfg["mcp"].(map[string]any); !ok || mcp["yesmem"] == nil {
+		t.Errorf("mcp.yesmem not migrated: %v", cfg["mcp"])
+	}
+}
+
+// A zero-byte config is empty, not broken: uninstall has nothing to remove and
+// must not demand that the user "remove comments" from an empty file.
+func TestRemoveOpencodeSettings_EmptyConfigIsNotAParseError(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	writeOpencodeJSONC(t, home, "")
+
+	if err := removeOpencodeSettings(home); err != nil {
+		t.Errorf("removeOpencodeSettings on an empty config: %v", err)
+	}
+	if data := readFileOrFail(t, filepath.Join(home, ".config", "opencode", "opencode.jsonc")); len(data) != 0 {
+		t.Errorf("empty config was rewritten: %q", data)
+	}
+}
+
+// Whitespace only is as blank as zero bytes: no comments to remove, nothing to
+// report.
+func TestRemoveOpencodeSettings_WhitespaceOnlyConfigIsNotAParseError(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	writeOpencodeJSONC(t, home, "\n\n  \n")
+
+	if err := removeOpencodeSettings(home); err != nil {
+		t.Errorf("removeOpencodeSettings on a whitespace-only config: %v", err)
+	}
+	if data := readFileOrFail(t, filepath.Join(home, ".config", "opencode", "opencode.jsonc")); string(data) != "\n\n  \n" {
+		t.Errorf("whitespace-only config was rewritten: %q", data)
+	}
+}
+
+// A failed plugin-dir cleanup must not disappear when the config write fails as
+// well: both are uninstall problems and the user needs to see both.
+func TestRemoveOpencodePlugin_ReportsBothErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not bind as root")
+	}
+	home := filepath.Join(t.TempDir(), "home")
+	pluginsDir := filepath.Join(home, ".config", "opencode", "plugins")
+	if err := os.MkdirAll(filepath.Join(pluginsDir, "opencode-yesmem"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeOpencodeJSONC(t, home, "{ // hand-written\n}\n")
+	// The plugin entry cannot be removed without write permission on its parent.
+	if err := os.Chmod(pluginsDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(pluginsDir, 0755) })
+
+	err := removeOpencodePlugin(home)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "opencode.jsonc") {
+		t.Errorf("the config error is missing: %v", err)
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("the plugin-dir error is missing: %v", err)
+	}
+}
+
+// An install can be reached through a symlinked HOME (dotfiles, /home on
+// another volume). The entry then names the resolved path while uninstall sees
+// the link, so a string comparison leaves the entry pointing at a directory
+// the same run deletes.
+func TestRemoveOpencodeSettings_DropsEntryWrittenUnderTheResolvedHome(t *testing.T) {
+	base := t.TempDir()
+	realHome := filepath.Join(base, "real-home")
+	if err := os.MkdirAll(realHome, 0755); err != nil {
+		t.Fatal(err)
+	}
+	linkHome := filepath.Join(base, "link-home")
+	if err := os.Symlink(realHome, linkHome); err != nil {
+		t.Skipf("symlinks not supported here: %v", err)
+	}
+
+	entry := filepath.Join(v1InstallDir(realHome), "index.ts")
+	writeOpencodeJSONC(t, realHome, `{"plugin": ["`+entry+`"]}`)
+
+	if err := removeOpencodeSettings(linkHome); err != nil {
+		t.Fatalf("removeOpencodeSettings: %v", err)
+	}
+
+	if got := readPluginEntries(t, linkHome); len(got) != 0 {
+		t.Errorf("plugin entries = %v, want none: the entry points at the source tree this run deletes", got)
+	}
+}
+
+// A plugin entry proves a working install only while the file it names exists.
+// The dev-tree shape is accepted from any home, so a leftover entry there
+// reports "configured" for a plugin that cannot load.
+func TestReadOpencodeConfigState_MissingPluginFileIsNotConfigured(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	entry := filepath.Join(v1InstallDir(home), "index.ts")
+	writeOpencodeJSONC(t, home, `{"plugin": ["`+entry+`"]}`)
+
+	if state := readOpencodeConfigState(home); state.PluginConfigured {
+		t.Error("plugin entry names a file that does not exist and was reported as configured")
 	}
 }

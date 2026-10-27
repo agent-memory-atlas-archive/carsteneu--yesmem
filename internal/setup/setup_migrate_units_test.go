@@ -50,7 +50,7 @@ WantedBy=default.target
 		}
 	}
 
-	changed, err := MigrateSystemdUnits(home)
+	changed, err := MigrateSystemdUnits(home, t.TempDir())
 	if err != nil {
 		t.Fatalf("MigrateSystemdUnits: %v", err)
 	}
@@ -85,23 +85,13 @@ func TestMigrateSystemdUnits_Idempotent(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	clean := `[Unit]
-Description=YesMem — Long-term memory for coding agents
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/yesmem daemon --replace
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-`
+	// A unit exactly as this binary writes it: migration must leave it alone.
+	clean := buildDaemonUnit("/usr/local/bin/yesmem", ":0", "/home/u/.Xauthority", "unix:path=/run/user/1000/bus", "http://localhost:9099")
 	if err := os.WriteFile(filepath.Join(dir, "yesmem.service"), []byte(clean), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	changed, err := MigrateSystemdUnits(home)
+	changed, err := MigrateSystemdUnits(home, t.TempDir())
 	if err != nil {
 		t.Fatalf("MigrateSystemdUnits: %v", err)
 	}
@@ -112,7 +102,7 @@ WantedBy=default.target
 
 func TestMigrateSystemdUnits_MissingDirIsNoop(t *testing.T) {
 	home := t.TempDir() // no .config/systemd/user created
-	changed, err := MigrateSystemdUnits(home)
+	changed, err := MigrateSystemdUnits(home, t.TempDir())
 	if err != nil {
 		t.Fatalf("MigrateSystemdUnits: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -63,18 +64,31 @@ func TestRunWithProfile_NoneSkipsLookup(t *testing.T) {
 	}
 }
 
-func TestBuildSandboxedCommand_NoneSkipsLookup(t *testing.T) {
-	count, cleanup := withLookupSpy(t, true)
-	defer cleanup()
+// A rendered shell command line is the one API shape the sandbox must not
+// expose: ai-jail flags are built as an argument vector and exec gets a binary
+// plus args (Run, RunWithProfile, WrapExecArgs). The pin covers the exported
+// method set, and only the exact shape (command string, profile SandboxProfile)
+// with a string first result — a bare string as much as (string, error). A
+// renderer with the two parameters swapped or with an extra parameter slips
+// past it, as do unexported methods and free functions; for those the argument
+// is the deleted caller, not this pin. No live method matches it today: it is a
+// reintroduction tripwire, not evidence about the current API (YM-224 /
+// DEV-DT39).
+func TestSandbox_DoesNotRenderShellCommandString(t *testing.T) {
+	stringType := reflect.TypeOf("")
+	profileType := reflect.TypeOf(ProfileNone)
 
-	sb := NewSandbox(SandboxConfig{Enabled: true})
-	got := sb.BuildSandboxedCommand("echo hi", ProfileNone)
-
-	if got != "echo hi" {
-		t.Errorf("BuildSandboxedCommand(None) = %q, want pass-through", got)
-	}
-	if *count != 0 {
-		t.Errorf("ProfileNone triggered %d lookup(s), want 0", *count)
+	sandboxType := reflect.TypeOf(&Sandbox{})
+	for i := 0; i < sandboxType.NumMethod(); i++ {
+		m := sandboxType.Method(i)
+		// (command string, profile SandboxProfile) with a string first result.
+		// In(0) is the receiver.
+		if m.Type.NumIn() != 3 || m.Type.In(1) != stringType || m.Type.In(2) != profileType {
+			continue
+		}
+		if m.Type.NumOut() >= 1 && m.Type.Out(0) == stringType {
+			t.Errorf("Sandbox.%s renders a shell command line; jobs and agents get a binary plus an argument vector (Run, RunWithProfile, WrapExecArgs)", m.Name)
+		}
 	}
 }
 
@@ -94,7 +108,7 @@ func TestEnsureBinary_CachesResult(t *testing.T) {
 
 func TestSandbox_DisabledRunsDirectly(t *testing.T) {
 	sb := NewSandbox(SandboxConfig{Enabled: false})
-	output, exitCode, err := sb.Run("echo no-sandbox", 10)
+	output, exitCode, err := sb.Run("echo no-sandbox", 10, ProfileStandard)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -114,7 +128,7 @@ func TestSandbox_FallbackWhenMissing(t *testing.T) {
 	if sb.Available() {
 		t.Skip("ai-jail is installed or was auto-downloaded; cannot exercise fallback path")
 	}
-	output, exitCode, err := sb.Run("echo fallback-works", 10)
+	output, exitCode, err := sb.Run("echo fallback-works", 10, ProfileStandard)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -131,7 +145,7 @@ func TestSandbox_NoFallbackErrors(t *testing.T) {
 	if sb.Available() {
 		t.Skip("ai-jail is installed, cannot test no-fallback path")
 	}
-	_, _, err := sb.Run("echo should-fail", 10)
+	_, _, err := sb.Run("echo should-fail", 10, ProfileStandard)
 	if err == nil {
 		t.Error("expected error when ai-jail missing and fallback disabled")
 	}
@@ -139,7 +153,7 @@ func TestSandbox_NoFallbackErrors(t *testing.T) {
 
 func TestSandbox_Timeout(t *testing.T) {
 	sb := NewSandbox(SandboxConfig{Enabled: false})
-	_, _, err := sb.Run("sleep 30", 1)
+	_, _, err := sb.Run("sleep 30", 1, ProfileStandard)
 	if err == nil {
 		t.Error("expected timeout error")
 	}
@@ -150,7 +164,7 @@ func TestSandbox_Timeout(t *testing.T) {
 
 func TestSandbox_NonZeroExit(t *testing.T) {
 	sb := NewSandbox(SandboxConfig{Enabled: false})
-	output, exitCode, err := sb.Run("echo stderr-msg >&2; exit 42", 10)
+	output, exitCode, err := sb.Run("echo stderr-msg >&2; exit 42", 10, ProfileStandard)
 	if exitCode != 42 {
 		t.Errorf("exit = %d, want 42", exitCode)
 	}

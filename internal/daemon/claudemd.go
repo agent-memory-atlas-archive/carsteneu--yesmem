@@ -23,6 +23,16 @@ func RunRulesRefresh(store *storage.Store, client extraction.LLMClient) {
 		return
 	}
 	for _, rp := range projects {
+		// A relative path was registered against a working directory nobody
+		// recorded; re-reading it from the daemon's cwd would condense a foreign
+		// CLAUDE.md into this project's rules block.
+		if rp.Path == "" {
+			continue
+		}
+		if !filepath.IsAbs(rp.Path) {
+			log.Printf("[rules-refresh] %s: skipped relative path %q (re-register it with an absolute path)", rp.Project, rp.Path)
+			continue
+		}
 		if _, err := os.Stat(rp.Path); err != nil {
 			continue
 		}
@@ -64,6 +74,13 @@ func startRulesWatch(ctx context.Context, store *storage.Store, client extractio
 
 	watched := 0
 	for _, rp := range projects {
+		if rp.Path == "" {
+			continue
+		}
+		if !filepath.IsAbs(rp.Path) {
+			log.Printf("[rules-watch] %s: skipped relative path %q (re-register it with an absolute path)", rp.Project, rp.Path)
+			continue
+		}
 		if _, err := os.Stat(rp.Path); err != nil {
 			continue
 		}

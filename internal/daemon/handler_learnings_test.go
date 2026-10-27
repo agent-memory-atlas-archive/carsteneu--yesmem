@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
+	"github.com/carsteneu/yesmem/internal/storage"
 )
 
 func TestHandleRememberStoresExplicitModel(t *testing.T) {
@@ -454,6 +456,633 @@ func TestHandleRememberSupersedes(t *testing.T) {
 	}
 }
 
+// TestHandleRememberHighTrustSupersedeRecordsContradiction (YM-43 / Decision D6)
+// verifies the confirmation path: superseding a high-trust learning must not
+// park a status nobody reads. The old learning stays active and the conflict is
+// recorded as a contradicts edge instead.
+func TestHandleRememberHighTrustSupersedeRecordsContradiction(t *testing.T) {
+	h, s := mustHandler(t)
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "decision", Content: "Always run the full baseline before merging",
+		Project: "yesmem", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "user_stated", Importance: 5,
+	})
+	if err != nil {
+		t.Fatalf("insert old learning: %v", err)
+	}
+	// InsertLearning never persists use_count; pin it so the learning is TrustHigh.
+	if _, err := s.DB().Exec("UPDATE learnings SET use_count = 2 WHERE id = ?", oldID); err != nil {
+		t.Fatalf("set use_count: %v", err)
+	}
+	old, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if storage.ClassifyTrust(storage.TrustScore(old)) != storage.TrustHigh {
+		t.Fatalf("test setup: old learning #%d must be TrustHigh", oldID)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":       "Run the baseline suite before any merge to main",
+			"category":   "decision",
+			"project":    "yesmem",
+			"supersedes": float64(oldID),
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("remember error: %s", resp.Error)
+	}
+	var r map[string]any
+	json.Unmarshal(resp.Result, &r)
+	newID := int64(r["id"].(float64))
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning after: %v", err)
+	}
+	if after.SupersededBy != nil {
+		t.Fatalf("high-trust learning #%d must stay active, got superseded_by=%d", oldID, *after.SupersededBy)
+	}
+	if after.SupersedeStatus == "pending_confirmation" {
+		t.Fatalf("retired pending_confirmation status must not be written (#%d)", oldID)
+	}
+	pairs, err := s.GetContradictingPairs([]int64{oldID}, []int64{newID})
+	if err != nil {
+		t.Fatalf("get contradicting pairs: %v", err)
+	}
+	if len(pairs) == 0 {
+		t.Fatalf("expected a contradicts edge between #%d and #%d", oldID, newID)
+	}
+}
+
+// insertLos11eHighTrust stores a TrustHigh learning (user_stated plus a pinned
+// use_count) — the setup every blocked-supersede path needs.
+func insertLos11eHighTrust(t *testing.T, s *storage.Store) int64 {
+	t.Helper()
+	id, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "BuildSandboxedCommand ist der Weg, einen Befehl einzusperren",
+		Project: "yesmem", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "user_stated", Importance: 3,
+	})
+	if err != nil {
+		t.Fatalf("insert high trust learning: %v", err)
+	}
+	if _, err := s.DB().Exec("UPDATE learnings SET use_count = 2 WHERE id = ?", id); err != nil {
+		t.Fatalf("set use_count: %v", err)
+	}
+	old, err := s.GetLearning(id)
+	if err != nil {
+		t.Fatalf("get high trust learning: %v", err)
+	}
+	if storage.ClassifyTrust(storage.TrustScore(old)) != storage.TrustHigh {
+		t.Fatalf("test setup: learning #%d must be TrustHigh", id)
+	}
+	return id
+}
+
+// TestHandleRememberSupersedeConfirmsAcrossReaderPool runs the read back on a
+// file backed store, where GetLearning reads through a second connection pool
+// (production topology, unlike the shared handle of ":memory:").
+func TestHandleRememberSupersedeConfirmsAcrossReaderPool(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "yesmem.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	h := NewHandler(s, nil)
+	h.dataDir = t.TempDir()
+	h.disableAgentProcesses = true
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Datei-Store: Sandbox laeuft ueber WrapCommand",
+		Project: "yesmem", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "llm_extracted",
+	})
+	if err != nil {
+		t.Fatalf("insert old learning: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":       "Datei-Store: Sandbox laeuft ueber Run",
+			"category":   "gotcha",
+			"project":    "yesmem",
+			"supersedes": float64(oldID),
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("remember error: %s", resp.Error)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r["supersede_outcome"].(string); got != "replaced" {
+		t.Fatalf("supersede_outcome: got %q, want \"replaced\": the read back must see the commit (response: %s)", got, resp.Result)
+	}
+}
+
+// TestHandleRememberHighTrustSupersedeReportsOutcome (YM-278) fixes the
+// misreport: the blocked case must be visible as a field, not only as prose
+// inside "message" that the MCP formatter drops.
+func TestHandleRememberHighTrustSupersedeReportsOutcome(t *testing.T) {
+	h, s := mustHandler(t)
+	oldID := insertLos11eHighTrust(t, s)
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":       "internal/daemon/sandbox.go hat kein BuildSandboxedCommand mehr",
+			"category":   "gotcha",
+			"project":    "yesmem",
+			"supersedes": float64(oldID),
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("remember error: %s", resp.Error)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r["supersede_outcome"].(string); got != "blocked" {
+		t.Fatalf("supersede_outcome: got %q, want \"blocked\" (response: %s)", got, resp.Result)
+	}
+	if trust, ok := r["supersede_trust"].(float64); !ok || trust < 3.0 {
+		t.Fatalf("blocked supersede must report the trust that blocked it, got %v (response: %s)", r["supersede_trust"], resp.Result)
+	}
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy != nil {
+		t.Fatalf("high-trust learning #%d must stay active, got superseded_by=%d", oldID, *after.SupersededBy)
+	}
+}
+
+// TestHandleRememberSupersedeReportsReplaced pins the other outcome of the same
+// field: a low-trust supersede really replaces, and says so.
+func TestHandleRememberSupersedeReportsReplaced(t *testing.T) {
+	h, s := mustHandler(t)
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Alte Fassung: Sandbox laeuft ueber WrapCommand",
+		Project: "yesmem", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "llm_extracted",
+	})
+	if err != nil {
+		t.Fatalf("insert old learning: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":       "Neue Fassung: Sandbox laeuft ueber Run(command, timeoutSec)",
+			"category":   "gotcha",
+			"project":    "yesmem",
+			"supersedes": float64(oldID),
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("remember error: %s", resp.Error)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r["supersede_outcome"].(string); got != "replaced" {
+		t.Fatalf("supersede_outcome: got %q, want \"replaced\" (response: %s)", got, resp.Result)
+	}
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy == nil {
+		t.Fatalf("low-trust learning #%d should be superseded", oldID)
+	}
+}
+
+// TestHandleRememberSupersedeMissingTargetReportsNotFound: a target that cannot
+// be loaded must not be reported as replaced (same bug class as the misreported
+// blocked supersede).
+func TestHandleRememberSupersedeMissingTargetReportsNotFound(t *testing.T) {
+	h, _ := mustHandler(t)
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":       "Sandbox bietet Run und RunWithEnv",
+			"category":   "gotcha",
+			"project":    "yesmem",
+			"supersedes": float64(999999),
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("remember error: %s", resp.Error)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r["supersede_outcome"].(string); got != "not_found" {
+		t.Fatalf("supersede_outcome: got %q, want \"not_found\" (response: %s)", got, resp.Result)
+	}
+	if msg, _ := r["message"].(string); strings.Contains(msg, "Supersedes #999999.") {
+		t.Fatalf("message must not claim a replacement: %s", msg)
+	}
+}
+
+// TestHandleRememberForceSupersedeAcceptsCanonicalProjectMatch: the target may
+// store the path while the caller passes the short name. Both name the same
+// project, so the guard must compare canonical forms.
+func TestHandleRememberForceSupersedeAcceptsCanonicalProjectMatch(t *testing.T) {
+	h, s := mustHandler(t)
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Pfadform: BuildSandboxedCommand gibt es",
+		Project: "/home/tester/memory/yesmem", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "user_stated", Importance: 3,
+	})
+	if err != nil {
+		t.Fatalf("insert old learning: %v", err)
+	}
+	if _, err := s.DB().Exec("UPDATE learnings SET use_count = 2 WHERE id = ?", oldID); err != nil {
+		t.Fatalf("set use_count: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "Kurzname: Sandbox bietet Run",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"supersedes":       float64(oldID),
+			"force_supersede":  true,
+			"supersede_reason": "seit YM-224 entfernt",
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("canonical project match must not be refused: %s", resp.Error)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r["supersede_outcome"].(string); got != "forced" {
+		t.Fatalf("supersede_outcome: got %q, want \"forced\" (response: %s)", got, resp.Result)
+	}
+}
+
+// TestHandleRememberForceSupersedeFailsClosedOnMissingProject: without a
+// project on the target side the guard cannot prove ownership, so it refuses.
+func TestHandleRememberForceSupersedeFailsClosedOnMissingProject(t *testing.T) {
+	h, s := mustHandler(t)
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Global: BuildSandboxedCommand gibt es",
+		Project: "", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "user_stated", Importance: 3,
+	})
+	if err != nil {
+		t.Fatalf("insert old learning: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "yesmem: Sandbox bietet Run",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"supersedes":       float64(oldID),
+			"force_supersede":  true,
+			"supersede_reason": "veraltet",
+		},
+	})
+	if resp.Error == "" {
+		t.Fatalf("force_supersede without a target project must be refused, got result: %s", resp.Result)
+	}
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy != nil {
+		t.Fatalf("learning #%d must stay active", oldID)
+	}
+}
+
+// TestHandleRememberForceSupersedeRejectedSavesNothing closes the gap between
+// the promise in the rejection message and the store state.
+func TestHandleRememberForceSupersedeRejectedSavesNothing(t *testing.T) {
+	h, s := mustHandler(t)
+	oldID := insertLos11eHighTrust(t, s)
+
+	var before int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM learnings").Scan(&before); err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "Sandbox hat nur noch Run",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"supersedes":       float64(oldID),
+			"force_supersede":  true,
+			"supersede_reason": "   ",
+		},
+	})
+	if resp.Error == "" {
+		t.Fatalf("whitespace-only supersede_reason must be rejected, got result: %s", resp.Result)
+	}
+
+	var after int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM learnings").Scan(&after); err != nil {
+		t.Fatalf("count after: %v", err)
+	}
+	if after != before {
+		t.Fatalf("rejected force must not insert: before=%d after=%d", before, after)
+	}
+}
+
+// TestHandleRememberForceSupersedeRefusesForeignProject: the override retires
+// knowledge of one project; a foreign project's learning is a wrong-project
+// typo far more often than intent.
+func TestHandleRememberForceSupersedeRefusesForeignProject(t *testing.T) {
+	h, s := mustHandler(t)
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Fremdes Projekt: BuildSandboxedCommand gibt es",
+		Project: "/other/project", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "user_stated", Importance: 3,
+	})
+	if err != nil {
+		t.Fatalf("insert foreign learning: %v", err)
+	}
+	if _, err := s.DB().Exec("UPDATE learnings SET use_count = 2 WHERE id = ?", oldID); err != nil {
+		t.Fatalf("set use_count: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "yesmem: Sandbox bietet Run",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"supersedes":       float64(oldID),
+			"force_supersede":  true,
+			"supersede_reason": "veraltet",
+		},
+	})
+	if resp.Error == "" {
+		t.Fatalf("force_supersede across projects must be refused, got result: %s", resp.Result)
+	}
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get foreign learning: %v", err)
+	}
+	if after.SupersededBy != nil {
+		t.Fatalf("foreign learning #%d must stay active", oldID)
+	}
+}
+
+// TestHandleRememberSupersedeAlreadySupersededReportsFailed: the store's UPDATE
+// matches only an active row and reports no error when it matches none, so the
+// outcome must come from a read back, not from a nil error.
+func TestHandleRememberSupersedeAlreadySupersededReportsFailed(t *testing.T) {
+	h, s := mustHandler(t)
+
+	oldID, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Alte Fassung: WrapCommand",
+		Project: "yesmem", Confidence: 1.0, CreatedAt: time.Now(),
+		ModelUsed: "test", Source: "llm_extracted",
+	})
+	if err != nil {
+		t.Fatalf("insert old learning: %v", err)
+	}
+
+	first := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":       "Erste Korrektur: Run statt WrapCommand",
+			"category":   "gotcha",
+			"project":    "yesmem",
+			"supersedes": float64(oldID),
+		},
+	})
+	if first.Error != "" {
+		t.Fatalf("first supersede error: %s", first.Error)
+	}
+	var r1 map[string]any
+	json.Unmarshal(first.Result, &r1)
+	winnerID := int64(r1["id"].(float64))
+
+	second := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "Zweite Korrektur: Run(command, timeoutSec)",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"supersedes":       float64(oldID),
+			"force_supersede":  true,
+			"supersede_reason": "nochmal praeziser",
+		},
+	})
+	if second.Error != "" {
+		t.Fatalf("second supersede error: %s", second.Error)
+	}
+	var r2 map[string]any
+	if err := json.Unmarshal(second.Result, &r2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r2["supersede_outcome"].(string); got != "failed" {
+		t.Fatalf("supersede_outcome: got %q, want \"failed\" (response: %s)", got, second.Result)
+	}
+	if msg, _ := r2["supersede_error"].(string); msg == "" {
+		t.Fatalf("failed supersede must carry the reason in supersede_error: %s", second.Result)
+	}
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy == nil || *after.SupersededBy != winnerID {
+		t.Fatalf("the chain must still point at #%d, got %v", winnerID, after.SupersededBy)
+	}
+}
+
+// TestHandleRememberSupersedeDuplicateSkipsAndSaysSo: the hash dedup returns
+// before the supersede is applied. Saying nothing would repeat the original bug
+// one level higher.
+func TestHandleRememberSupersedeDuplicateSkipsAndSaysSo(t *testing.T) {
+	h, s := mustHandler(t)
+	oldID := insertLos11eHighTrust(t, s)
+
+	const text = "Derselbe Wortlaut, zweimal gespeichert"
+	first := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text": text, "category": "gotcha", "project": "yesmem",
+		},
+	})
+	if first.Error != "" {
+		t.Fatalf("first remember error: %s", first.Error)
+	}
+	var r1 map[string]any
+	json.Unmarshal(first.Result, &r1)
+	if dedup, _ := r1["deduplicated"].(bool); dedup {
+		t.Fatalf("first remember must insert, got: %s", first.Result)
+	}
+
+	second := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text": text, "category": "gotcha", "project": "yesmem",
+			"supersedes": float64(oldID),
+		},
+	})
+	if second.Error != "" {
+		t.Fatalf("second remember error: %s", second.Error)
+	}
+	var r2 map[string]any
+	if err := json.Unmarshal(second.Result, &r2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r2["supersede_outcome"].(string); got != "duplicate" {
+		t.Fatalf("supersede_outcome: got %q, want \"duplicate\" (response: %s)", got, second.Result)
+	}
+	if msg, _ := r2["message"].(string); !strings.Contains(msg, "NOT performed") {
+		t.Fatalf("duplicate response must say the supersede was skipped, got: %s", msg)
+	}
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy != nil {
+		t.Fatalf("skipped supersede must leave #%d active", oldID)
+	}
+}
+
+// TestHandleRememberSupersedeRejectsNonIntegerID: 0.5 truncates to 0 and used to
+// vanish into the not_found branch without a response line.
+func TestHandleRememberSupersedeRejectsNonIntegerID(t *testing.T) {
+	h, _ := mustHandler(t)
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text": "Sandbox bietet Run", "category": "gotcha", "project": "yesmem",
+			"supersedes": 1.5,
+		},
+	})
+	if resp.Error == "" {
+		t.Fatalf("non-integer supersedes must be rejected, got result: %s", resp.Result)
+	}
+}
+
+// TestHandleRememberForceSupersedeRequiresReason (YM-278) keeps the override
+// from becoming a silent production lever against the trust gate.
+func TestHandleRememberForceSupersedeRequiresReason(t *testing.T) {
+	h, s := mustHandler(t)
+	oldID := insertLos11eHighTrust(t, s)
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":            "Sandbox hat nur noch Run, kein BuildSandboxedCommand",
+			"category":        "gotcha",
+			"project":         "yesmem",
+			"supersedes":      float64(oldID),
+			"force_supersede": true,
+		},
+	})
+	if resp.Error == "" {
+		t.Fatalf("force_supersede without supersede_reason must be rejected, got result: %s", resp.Result)
+	}
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy != nil {
+		t.Fatalf("rejected force must leave #%d active, got superseded_by=%d", oldID, *after.SupersededBy)
+	}
+}
+
+// TestHandleRememberForceSupersedeRequiresTarget: the override is meaningless
+// without a learning to retire.
+func TestHandleRememberForceSupersedeRequiresTarget(t *testing.T) {
+	h, _ := mustHandler(t)
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "Sandbox hat nur noch Run",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"force_supersede":  true,
+			"supersede_reason": "veraltet",
+		},
+	})
+	if resp.Error == "" {
+		t.Fatalf("force_supersede without supersedes must be rejected, got result: %s", resp.Result)
+	}
+}
+
+// TestHandleRememberForceSupersedeReplacesHighTrust (YM-278) is the documented
+// way out: an explicit, justified override retires a high-trust learning and
+// records the reason in the supersede chain.
+func TestHandleRememberForceSupersedeReplacesHighTrust(t *testing.T) {
+	h, s := mustHandler(t)
+	oldID := insertLos11eHighTrust(t, s)
+	reason := "seit YM-224 entfernt: BuildSandboxedCommand existiert nicht mehr"
+
+	resp := h.Handle(Request{
+		Method: "remember",
+		Params: map[string]any{
+			"text":             "internal/daemon/sandbox.go bietet Run, RunWithEnv, ... aber kein BuildSandboxedCommand",
+			"category":         "gotcha",
+			"project":          "yesmem",
+			"supersedes":       float64(oldID),
+			"force_supersede":  true,
+			"supersede_reason": reason,
+		},
+	})
+	if resp.Error != "" {
+		t.Fatalf("forced supersede error: %s", resp.Error)
+	}
+	var r map[string]any
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := r["supersede_outcome"].(string); got != "forced" {
+		t.Fatalf("supersede_outcome: got %q, want \"forced\" (response: %s)", got, resp.Result)
+	}
+	newID := int64(r["id"].(float64))
+
+	after, err := s.GetLearning(oldID)
+	if err != nil {
+		t.Fatalf("get old learning: %v", err)
+	}
+	if after.SupersededBy == nil {
+		t.Fatalf("forced supersede must retire #%d", oldID)
+	}
+	if *after.SupersededBy != newID {
+		t.Fatalf("superseded_by: got %d, want %d", *after.SupersededBy, newID)
+	}
+	if !strings.Contains(after.SupersedeReason, reason) {
+		t.Fatalf("supersede_reason must carry the justification, got %q", after.SupersedeReason)
+	}
+}
+
 // --- handleGetLearnings ---
 
 func TestHandleGetLearningsEmpty(t *testing.T) {
@@ -843,6 +1472,70 @@ func TestHandleQuarantineSessionNoLearnings(t *testing.T) {
 	}
 }
 
+// --- handleUnquarantineSession (YM-44) ---
+
+func TestHandleUnquarantineSessionMissingID(t *testing.T) {
+	h, _ := mustHandler(t)
+
+	resp := h.Handle(Request{
+		Method: "unquarantine_session",
+		Params: map[string]any{},
+	})
+
+	if resp.Error != "session_id (string) required" {
+		t.Fatalf("unexpected error: %q", resp.Error)
+	}
+}
+
+// A quarantine without a way back is a one-way door: the RPC must lift it again.
+func TestHandleUnquarantineSessionLiftsQuarantine(t *testing.T) {
+	h, s := mustHandler(t)
+
+	sid := "test-session-unquarantine-001"
+	if _, err := s.InsertLearning(&models.Learning{
+		Category:  "pattern",
+		Content:   "Learning from a session quarantined by mistake",
+		SessionID: sid,
+	}); err != nil {
+		t.Fatalf("insert learning: %v", err)
+	}
+	if n, err := s.QuarantineSession(sid); err != nil || n != 1 {
+		t.Fatalf("quarantine: affected=%d err=%v", n, err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "unquarantine_session",
+		Params: map[string]any{"session_id": sid},
+	})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("parse result: %v", err)
+	}
+	if result["session_id"] != sid {
+		t.Fatalf("session_id: got %v, want %q", result["session_id"], sid)
+	}
+	if got := result["unquarantined"].(float64); got != 1 {
+		t.Fatalf("unquarantined count: got %v, want 1", got)
+	}
+
+	// Second call is a no-op: the rows are already active again.
+	resp = h.Handle(Request{
+		Method: "unquarantine_session",
+		Params: map[string]any{"session_id": sid},
+	})
+	if resp.Error != "" {
+		t.Fatalf("second call error: %s", resp.Error)
+	}
+	json.Unmarshal(resp.Result, &result)
+	if got := result["unquarantined"].(float64); got != 0 {
+		t.Fatalf("second call unquarantined: got %v, want 0", got)
+	}
+}
+
 // --- handleSkipIndexing ---
 
 func TestHandleSkipIndexingMissingSessionID(t *testing.T) {
@@ -1128,5 +1821,202 @@ func TestHandleRememberExplicitProjectSource(t *testing.T) {
 	}
 	if got.CanonicalProject != models.CanonicalProject(attrYesmem) {
 		t.Errorf("CanonicalProject = %q", got.CanonicalProject)
+	}
+}
+
+// --- handleRemember: emotional intensity ---
+//
+// The emotional intensity is a session rating: the extraction produces it once
+// and stamps it on every learning it creates. Learnings saved later through
+// remember() were inserted with the 0.0 default instead (live: every
+// user_stated/agreed_upon/claude_suggested learning sits at 0), so they now
+// inherit the rating their session already carries.
+
+func TestHandleRemember_InheritsSessionIntensity(t *testing.T) {
+	h, s := mustHandler(t)
+	const sessionID = "opencode:ses_RATED"
+	if _, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "the extraction rated this session",
+		Project: attrYesmem, SessionID: sessionID, Source: "llm_extracted",
+		Confidence: 1.0, EmotionalIntensity: 0.7, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed sibling learning: %v", err)
+	}
+
+	resp := h.Handle(Request{Method: "remember", Params: map[string]any{
+		"text": "a later remember call in the same session", "category": "decision",
+		"project": attrYesmem, "_session_id": sessionID,
+	}})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+	got, err := s.GetLearning(int64(resultMap(t, resp)["id"].(float64)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.EmotionalIntensity != 0.7 {
+		t.Errorf("EmotionalIntensity = %v, want the session's 0.7", got.EmotionalIntensity)
+	}
+}
+
+func TestHandleRemember_UnratedSessionStaysAtZero(t *testing.T) {
+	h, s := mustHandler(t)
+
+	resp := h.Handle(Request{Method: "remember", Params: map[string]any{
+		"text": "first learning of a session that was never rated", "category": "decision",
+		"project": attrYesmem, "_session_id": "opencode:ses_UNRATED",
+	}})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+	got, err := s.GetLearning(int64(resultMap(t, resp)["id"].(float64)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.EmotionalIntensity != 0 {
+		t.Errorf("EmotionalIntensity = %v, want 0 for an unrated session", got.EmotionalIntensity)
+	}
+}
+
+// The fallbacks name whichever session wrote last, not the caller. Lending their
+// rating would push a foreign session's intensity (and its +30% emotionalBoost
+// in ComputeScore) onto a hand-written learning.
+func TestHandleRemember_SessionFallbackDoesNotLendIntensity(t *testing.T) {
+	h, s := mustHandler(t)
+	const foreign = "opencode:ses_OTHER_RATED"
+	if _, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "a different session carried this rating",
+		Project: attrYesmem, SessionID: foreign, Source: "llm_extracted",
+		Confidence: 1.0, EmotionalIntensity: 0.9, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed sibling learning: %v", err)
+	}
+	h.activeSessionMu.Lock()
+	h.activeSessionID = foreign
+	h.activeSessionMu.Unlock()
+
+	resp := h.Handle(Request{Method: "remember", Params: map[string]any{
+		"text": "remember call without a session of its own", "category": "decision",
+		"project": attrYesmem,
+	}})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+	got, err := s.GetLearning(int64(resultMap(t, resp)["id"].(float64)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.SessionID != foreign {
+		t.Errorf("SessionID = %q, want the fallback %q", got.SessionID, foreign)
+	}
+	if got.EmotionalIntensity != 0 {
+		t.Errorf("EmotionalIntensity = %v — borrowed from a session the caller never proved", got.EmotionalIntensity)
+	}
+}
+
+// --- handleRemember: session attribution ---
+//
+// The per-call _session_id the MCP layer injects names the session that really
+// made the call. activeSessionID is whichever session wrote last — in opencode
+// v2 one `opencode serve --service` hosts every session, so the global value
+// routinely belongs to a different session than the caller.
+
+func TestHandleRemember_UsesCallerSessionNotActive(t *testing.T) {
+	h, s := mustHandler(t)
+	h.activeSessionMu.Lock()
+	h.activeSessionID = "opencode:ses_OTHER_ACTIVE"
+	h.activeSessionMu.Unlock()
+
+	resp := h.Handle(Request{Method: "remember", Params: map[string]any{
+		"text":          "session attribution: the caller's per-call session wins over the global active session",
+		"category":      "decision",
+		"project":       attrYesmem,
+		"_session_id":   "opencode:ses_CALLER",
+		"_source_agent": "opencode",
+	}})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+	got, err := s.GetLearning(int64(resultMap(t, resp)["id"].(float64)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.SessionID != "opencode:ses_CALLER" {
+		t.Errorf("SessionID = %q, want opencode:ses_CALLER", got.SessionID)
+	}
+}
+
+func TestHandleRemember_FallsBackToActiveSession(t *testing.T) {
+	h, s := mustHandler(t)
+	h.activeSessionMu.Lock()
+	h.activeSessionID = "opencode:ses_ACTIVE_ONLY"
+	h.activeSessionMu.Unlock()
+
+	resp := h.Handle(Request{Method: "remember", Params: map[string]any{
+		"text":     "session attribution: without per-call context the active session stays the fallback",
+		"category": "decision",
+		"project":  attrYesmem,
+	}})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+	got, err := s.GetLearning(int64(resultMap(t, resp)["id"].(float64)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.SessionID != "opencode:ses_ACTIVE_ONLY" {
+		t.Errorf("SessionID = %q, want the active-session fallback opencode:ses_ACTIVE_ONLY", got.SessionID)
+	}
+}
+
+// --- attributeLearningProject: unresolvable explicit project names ---
+//
+// resolveProjectParam resolves a short project name through the project DB; when
+// it cannot, the name reaches attributeLearningProject verbatim (live:
+// "v2-release-notes", "wal", "chief"). Stored as-is it is a project value no
+// lookup can ever match, so the caller's working directory identifies the
+// repository instead.
+
+func TestHandleRemember_UnresolvableShortProjectFallsBackToCallerRepo(t *testing.T) {
+	h, s := mustHandler(t)
+	main, worktree := gitTmpRoot(t)
+
+	resp := h.Handle(Request{Method: "remember", Params: map[string]any{
+		"text":     "release body note written from the worktree",
+		"category": "gotcha",
+		"project":  "v2-release-notes",
+		"_cwd":     worktree,
+	}})
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+	got, err := s.GetLearning(int64(resultMap(t, resp)["id"].(float64)))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Project != main {
+		t.Errorf("Project = %q, want the caller's repository root %q", got.Project, main)
+	}
+	if got.ProjectSource != "repo" {
+		t.Errorf("ProjectSource = %q, want repo", got.ProjectSource)
+	}
+}
+
+func TestAttributeLearningProjectUnresolvedShortNameWithoutCWD(t *testing.T) {
+	h, _ := mustHandler(t)
+
+	proj, source := h.attributeLearningProject("note", nil, "v2-release-notes", "", "")
+	if proj != "v2-release-notes" || source != "explicit" {
+		t.Errorf("got (%q, %q), want (v2-release-notes, explicit) — no cwd to derive from", proj, source)
+	}
+}
+
+func TestAttributeLearningProjectAbsoluteExplicitProjectUnchanged(t *testing.T) {
+	h, _ := mustHandler(t)
+	_, worktree := gitTmpRoot(t)
+
+	proj, source := h.attributeLearningProject("note", nil, attrYesmem, "", worktree)
+	if proj != attrYesmem || source != "explicit" {
+		t.Errorf("got (%q, %q), want (%q, explicit)", proj, source, attrYesmem)
 	}
 }

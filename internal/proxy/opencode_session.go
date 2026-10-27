@@ -19,22 +19,42 @@ func opencodeSessionID(h http.Header) string {
 	return headerCI(h, "x-session-affinity")
 }
 
-// anthropicThreadID resolves the thread ID for /v1/messages requests.
+// anthropicThread resolves the thread ID for /v1/messages requests and says
+// whether that key names a session.
 // Priority: X-Claude-Code-Session-Id header > opencode session header
 // ("opencode:<ses_id>", same form as the OpenAI parity path and the MCP layer)
 // > metadata.user_id session (older Claude Code) > DeriveThreadID.
 // Claude Code never sends the opencode headers, so its resolution is unchanged.
 // Without the opencode branch, all opencode sessions hash to the same thread
 // ID (identical system prompt) and share per-thread state like the briefing cache.
-func anthropicThreadID(req map[string]any, h http.Header) string {
+//
+// isSession is false exactly for the last fallback: a hash of the message
+// content is a cache key, not an identity, so anything that acts on behalf of
+// the session (skill tracking) must not treat it as one.
+//
+// The session value is client input and becomes the thread key: it is printed in
+// the "tid=" slot of every journal line of that thread and it names the
+// per-thread caches. It is therefore derived from the token form (journalToken),
+// not from the raw header: a value carrying a space or a bracket would close the
+// "[req N <project> tid=...]" frame early and pass the rest off as journal
+// decoration (YM-447). Real ids (ses_…, UUIDs) are tokens already, so nothing is
+// lost; an id that sanitizes to nothing cannot name a thread, and the next rule
+// speaks instead.
+func anthropicThread(req map[string]any, h http.Header) (threadID string, isSession bool) {
 	if cc := h.Get("X-Claude-Code-Session-Id"); cc != "" {
-		return cc
+		if key := journalToken(cc); key != "" {
+			return key, true
+		}
 	}
 	if sid := opencodeSessionID(h); sid != "" {
-		return "opencode:" + sid
+		if key := journalToken(sid); key != "" {
+			return "opencode:" + key, true
+		}
 	}
 	if tid := extractSessionID(req, "", ""); tid != "" {
-		return tid
+		if key := journalToken(tid); key != "" {
+			return key, true
+		}
 	}
-	return DeriveThreadID(req)
+	return DeriveThreadID(req), false
 }

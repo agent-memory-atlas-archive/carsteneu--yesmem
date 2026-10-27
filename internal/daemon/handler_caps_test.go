@@ -286,6 +286,190 @@ func TestHandleSaveCapability_EmbeddingTextIsCleanNotJSON(t *testing.T) {
 }
 
 
+// The parser refused sandbox=none for project-scoped caps, but save_cap — the
+// path the live caps actually arrive through (gcm_log_audit) — never checked.
+func TestHandleSaveCapability_ProjectScopeRejectsSandboxNone(t *testing.T) {
+	h, _ := mustHandler(t)
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "unsandboxed",
+		"description": "runs unsandboxed",
+		"scripts":     `[{"name":"x","kind":"handler","runtime":"bash","body":"echo hi","sandbox":"none"}]`,
+		"scope":       "project",
+		"project":     "global",
+	})
+	if resp.Error == "" {
+		t.Error("scope=project + sandbox=none must be refused")
+	}
+}
+
+// YM-210/OPS-43 + D12: save_cap stores an omitted scope as project-bound
+// (effectiveProject = project), so the lock has to key on the EFFECTIVE scope.
+// Pinning the old "an omitted scope is not covered" behaviour is what let
+// gcm_log_audit land as a project-bound cap with a sandbox=none script.
+func TestHandleSaveCap_ProjectBoundCapRejectsSandboxNoneWithoutExplicitScope(t *testing.T) {
+	h, _ := mustHandler(t)
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "unsandboxed_noscope",
+		"description": "runs unsandboxed",
+		"scripts":     `[{"name":"x","kind":"handler","runtime":"bash","body":"echo hi","sandbox":"none"}]`,
+		"project":     "global",
+	})
+	if resp.Error == "" {
+		t.Fatal("a project-bound cap with a sandbox=none script must be refused, scope omitted or not")
+	}
+	if !strings.Contains(resp.Error, "scope=user") {
+		t.Errorf("the refusal must name scope=user as the way out, got %q", resp.Error)
+	}
+}
+
+// A cap with neither project nor scope stays project-agnostic, so the lock does
+// not reach it (TestSaveCap_PreservesScriptSandboxOnMetadataOnlyUpdate lives on
+// this path).
+func TestHandleSaveCap_ProjectAgnosticCapAllowsSandboxNone(t *testing.T) {
+	h, _ := mustHandler(t)
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "unsandboxed_agnostic",
+		"description": "runs unsandboxed",
+		"scripts":     `[{"name":"x","kind":"handler","runtime":"bash","body":"echo hi","sandbox":"none"}]`,
+	})
+	if resp.Error != "" {
+		t.Fatalf("a cap bound to no project is not covered by the lock: %s", resp.Error)
+	}
+}
+
+// D12 keeps the repair path open: a metadata-only save neither adds nor changes
+// a script, so it stays allowed on a project-bound cap with an inherited
+// sandbox=none script — it logs a warning instead of refusing.
+func TestHandleSaveCap_MetadataOnlyUpdateOnInheritedSandboxNoneIsAllowed(t *testing.T) {
+	h, s := mustHandler(t)
+	seedCapMeta(t, s, CapMeta{
+		Name:        "inherited",
+		Description: "v1",
+		Version:     1,
+		Scripts: []ScriptMeta{{
+			Name: "run", Kind: "tool", Runtime: "bash", Body: "echo hi", Schema: "{}", Sandbox: "none",
+		}},
+	}, "global")
+
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "inherited",
+		"description": "v2",
+		"scope":       "project",
+		"project":     "global",
+	})
+	if resp.Error != "" {
+		t.Fatalf("a metadata-only save must keep the repair path open: %s", resp.Error)
+	}
+
+	caps := unmarshalCaps(t, h.handleGetCaps(map[string]any{"name": "inherited"}))
+	if len(caps[0].Meta.Scripts) != 1 || caps[0].Meta.Scripts[0].Sandbox != "none" {
+		t.Errorf("script sandbox = %q, want none (preserved)", caps[0].Meta.Scripts[0].Sandbox)
+	}
+}
+
+// A metadata-only save may not MOVE the binding of a cap that carries an
+// inherited sandbox=none script. The D12 exemption keeps the repair path open
+// for a cap that already is project-bound — it is not the way out of that state
+// (nor, with the project binding added, the way into it).
+func TestHandleSaveCap_MetadataOnlySaveCannotMoveTheBindingOfAnUnsandboxedCap(t *testing.T) {
+	h, s := mustHandler(t)
+	seedCapMeta(t, s, CapMeta{
+		Name:        "bound",
+		Description: "v1",
+		Version:     1,
+		Scope:       "project",
+		Scripts: []ScriptMeta{{
+			Name: "run", Kind: "tool", Runtime: "bash", Body: "echo hi", Schema: "{}", Sandbox: "none",
+		}},
+	}, "projA")
+
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "bound",
+		"description": "v2",
+	})
+	if resp.Error == "" {
+		t.Error("dropping the project of an unsandboxed cap must not pass as a metadata-only no-op")
+	}
+}
+
+// scope=project is a declaration, and the CAP.md parser refuses sandbox=none for
+// it whatever the project string says. save_cap must not be looser than that.
+func TestHandleSaveCap_DeclaredProjectScopeWithoutProjectRejectsSandboxNone(t *testing.T) {
+	h, _ := mustHandler(t)
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "declared_project",
+		"description": "runs unsandboxed",
+		"scope":       "project",
+		"scripts":     `[{"name":"x","kind":"handler","runtime":"bash","body":"echo hi","sandbox":"none"}]`,
+	})
+	if resp.Error == "" {
+		t.Error("scope=project + sandbox=none must be refused even without a project string")
+	}
+}
+
+// scope=user is the sanctioned way out of project scope: a metadata-only save
+// that leaves project scope must keep working on an unsandboxed cap.
+func TestHandleSaveCap_MetadataOnlySaveLeavingProjectScopeIsAllowed(t *testing.T) {
+	h, s := mustHandler(t)
+	seedCapMeta(t, s, CapMeta{
+		Name:        "leaving",
+		Description: "v1",
+		Version:     1,
+		Scope:       "project",
+		Scripts: []ScriptMeta{{
+			Name: "run", Kind: "tool", Runtime: "bash", Body: "echo hi", Schema: "{}", Sandbox: "none",
+		}},
+	}, "projA")
+
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "leaving",
+		"description": "v2",
+		"scope":       "user",
+	})
+	if resp.Error != "" {
+		t.Fatalf("scope=user must stay the way out: %s", resp.Error)
+	}
+}
+
+// The lock still runs on the set the save leaves behind: a scripts-edit on a
+// project-bound cap may not carry an inherited sandbox=none script along.
+func TestHandleSaveCap_ScriptsUpdateOnProjectBoundCapRejectsInheritedSandboxNone(t *testing.T) {
+	h, s := mustHandler(t)
+	seedCapMeta(t, s, CapMeta{
+		Name:        "inherited_edit",
+		Description: "v1",
+		Version:     1,
+		Scripts: []ScriptMeta{{
+			Name: "run", Kind: "tool", Runtime: "bash", Body: "echo hi", Schema: "{}", Sandbox: "none",
+		}},
+	}, "global")
+
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "inherited_edit",
+		"description": "v2",
+		"scope":       "project",
+		"project":     "global",
+		"scripts":     `[{"name":"extra","kind":"handler","runtime":"bash","body":"echo extra"}]`,
+	})
+	if resp.Error == "" {
+		t.Error("a scripts-edit must not leave an inherited sandbox=none script on a project-bound cap")
+	}
+}
+
+func TestHandleSaveCapability_UserScopeAllowsSandboxNone(t *testing.T) {
+	h, _ := mustHandler(t)
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "unsandboxed_user",
+		"description": "runs unsandboxed",
+		"scripts":     `[{"name":"x","kind":"handler","runtime":"bash","body":"echo hi","sandbox":"none"}]`,
+		"scope":       "user",
+		"project":     "global",
+	})
+	if resp.Error != "" {
+		t.Fatalf("scope=user + sandbox=none must stay allowed: %s", resp.Error)
+	}
+}
+
 func TestHandleSaveCapability_Success(t *testing.T) {
 	h, _ := mustHandler(t)
 	resp := h.handleSaveCap(map[string]any{
@@ -1490,4 +1674,31 @@ func scriptNames(scripts []ScriptMeta) []string {
 		names[i] = sc.Name
 	}
 	return names
+}
+
+// The stored binding and the incoming one are compared canonically: a save that
+// names the same project in another form (a worktree path, say) moves no
+// binding, so it stays inside the D12 exemption and the repair still works.
+func TestHandleSaveCap_MetadataOnlySaveFromWorktreePathKeepsTheExemption(t *testing.T) {
+	h, s := mustHandler(t)
+	mainDir := t.TempDir()
+	worktree := makeWorktreeDir(t, mainDir, "wt")
+	seedCapMeta(t, s, CapMeta{
+		Name:        "worktree_repair",
+		Description: "v1",
+		Version:     1,
+		Scope:       "project",
+		Scripts: []ScriptMeta{{
+			Name: "run", Kind: "tool", Runtime: "bash", Body: "echo hi", Schema: "{}", Sandbox: "none",
+		}},
+	}, mainDir)
+
+	resp := h.handleSaveCap(map[string]any{
+		"name":        "worktree_repair",
+		"description": "v2",
+		"project":     worktree,
+	})
+	if resp.Error != "" {
+		t.Fatalf("another spelling of the same project moves no binding: %s", resp.Error)
+	}
 }

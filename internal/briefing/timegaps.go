@@ -6,14 +6,9 @@ import (
 	"time"
 )
 
-var germanMonths = []string{
-	"", "January", "February", "March", "April", "May", "June",
-	"July", "August", "September", "October", "November", "December",
-}
-
 // computeTimeGaps finds gaps > 7 days between sessions and returns
-// German-formatted strings like "14 Tage im Februar".
-func computeTimeGaps(startedAts []time.Time) []string {
+// translated strings like "14 days in February".
+func computeTimeGaps(s Strings, startedAts []time.Time) []string {
 	if len(startedAts) < 2 {
 		return nil
 	}
@@ -29,9 +24,13 @@ func computeTimeGaps(startedAts []time.Time) []string {
 		diff := sorted[i].Sub(sorted[i-1])
 		days := int(diff.Hours() / 24)
 		if days > 7 {
-			month := germanMonths[sorted[i-1].Month()]
-			gaps = append(gaps, fmt.Sprintf("%d Tage im %s", days, month))
+			gaps = append(gaps, formatTimeGap(s, days, sorted[i-1].Month()))
 		}
 	}
 	return gaps
+}
+
+// formatTimeGap renders one gap note, e.g. "14 days in January".
+func formatTimeGap(s Strings, days int, month time.Month) string {
+	return fmt.Sprintf(s.LabelDaysInMonthFmt, days, monthName(s, month))
 }

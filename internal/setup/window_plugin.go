@@ -28,7 +28,7 @@ func InstallWindowPlugin(home string) (int, error) {
 		return 0, fmt.Errorf("read embedded window plugin: %w", err)
 	}
 
-	dst := filepath.Join(cfgDir, "plugins", "yesmem-window", "tui.tsx")
+	dst := filepath.Join(home, opencodePluginsRelDir, "yesmem-window", "tui.tsx")
 	if existing, err := os.ReadFile(dst); err == nil {
 		if fmt.Sprintf("%x", sha256.Sum256(existing)) == fmt.Sprintf("%x", sha256.Sum256(data)) {
 			return 0, nil

@@ -10,8 +10,15 @@ import (
 )
 
 // Deduplicate removes near-duplicate learnings using hybrid similarity
-// (max of Jaccard and containment) on normalized word tokens. Keeps the
-// newest formulation when duplicates are found.
+// (max of Jaccard and containment) on normalized word tokens. The newest
+// formulation wins its group.
+//
+// The input order is a relevance ranking (callers sort with
+// models.ContextualScoreAndSort first). Selection still runs newest-first, so
+// which learnings survive is unchanged, but the output follows the caller's
+// ranking: each group sits at the position of its best-ranked member instead of
+// being re-sorted by age. A caller that dedups before scoring (handleGetLearnings)
+// sees the DB order here and re-sorts afterwards, so the anchor is a no-op there.
 func Deduplicate(learnings []models.Learning, threshold float64) []models.Learning {
 	if threshold <= 0 {
 		threshold = 0.4
@@ -20,37 +27,45 @@ func Deduplicate(learnings []models.Learning, threshold float64) []models.Learni
 		return learnings
 	}
 
-	// Sort by CreatedAt DESC — newest first wins
-	sorted := make([]models.Learning, len(learnings))
-	copy(sorted, learnings)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+	byAge := make([]int, len(learnings))
+	for i := range byAge {
+		byAge[i] = i
+	}
+	sort.SliceStable(byAge, func(a, b int) bool {
+		return learnings[byAge[a]].CreatedAt.After(learnings[byAge[b]].CreatedAt)
 	})
 
-	var result []models.Learning
-	var keptTokens [][]string
+	type group struct {
+		member int      // representative (newest member), as an input index
+		tokens []string // tokens of the representative
+		anchor int      // best-ranked member of the group, as an input index
+	}
+	groups := make([]group, 0, len(learnings))
 
-	for _, l := range sorted {
-		tokens := normalize(l.Content)
-		if len(tokens) == 0 {
-			result = append(result, l)
-			continue
-		}
-
-		isDuplicate := false
-		for _, existing := range keptTokens {
-			if similarity(tokens, existing) >= threshold {
-				isDuplicate = true
+	for _, idx := range byAge {
+		tokens := normalize(learnings[idx].Content)
+		match := -1
+		for i := range groups {
+			if similarity(tokens, groups[i].tokens) >= threshold {
+				match = i
 				break
 			}
 		}
-
-		if !isDuplicate {
-			result = append(result, l)
-			keptTokens = append(keptTokens, tokens)
+		if match < 0 {
+			groups = append(groups, group{member: idx, tokens: tokens, anchor: idx})
+			continue
+		}
+		if idx < groups[match].anchor {
+			groups[match].anchor = idx
 		}
 	}
 
+	sort.SliceStable(groups, func(i, j int) bool { return groups[i].anchor < groups[j].anchor })
+
+	result := make([]models.Learning, 0, len(groups))
+	for _, g := range groups {
+		result = append(result, learnings[g.member])
+	}
 	return result
 }
 

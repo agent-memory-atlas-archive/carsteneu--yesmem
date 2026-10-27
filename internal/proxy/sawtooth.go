@@ -25,18 +25,19 @@ func sawtoothTTLForCacheTTL(cacheTTL string) time.Duration {
 // cache can hit on the prefix portion of the messages array.
 type FrozenStubs struct {
 	mu           sync.RWMutex
-	ttl          time.Duration       // eviction TTL — derived from CacheTTL config
-	messages     map[string][]any    // threadID → deep-copied stub messages
-	cutoff       map[string]int      // threadID → original message count at stub time
-	boundaryHash map[string]string   // threadID → hash of messages[cutoff-1]
-	prefixHash   map[string]string   // threadID → hash of marshaled frozen prefix
+	writeLocks   [persistLockSlots]sync.Mutex // hash-slot persistence locks (see persistLock)
+	ttl          time.Duration                // eviction TTL — derived from CacheTTL config
+	messages     map[string][]any             // threadID → deep-copied stub messages
+	cutoff       map[string]int               // threadID → original message count at stub time
+	boundaryHash map[string]string            // threadID → hash of messages[cutoff-1]
+	prefixHash   map[string]string            // threadID → hash of marshaled frozen prefix
 	stubTime     map[string]time.Time
 	tokens       map[string]int // threadID → token estimate of frozen stubs
 	rawTokens    map[string]int // threadID → raw token estimate at stub time (pre-compression)
 	lastAccess   map[string]time.Time
-	persistFn    PersistFunc         // optional: persist frozen state to DB
-	loadFn       LoadFunc            // optional: load frozen state from DB on cold start
-	loadedFromDB map[string]bool     // threadID → already attempted DB load
+	persistFn    PersistFunc     // optional: persist frozen state to DB
+	loadFn       LoadFunc        // optional: load frozen state from DB on cold start
+	loadedFromDB map[string]bool // threadID → already attempted DB load
 }
 
 // frozenPersisted is the JSON-serializable form of frozen stub state.
@@ -70,11 +71,39 @@ func NewFrozenStubsWithTTL(ttl time.Duration) *FrozenStubs {
 	}
 }
 
+// persistLockSlots bounds the write-lock table. The thread id comes from the
+// client, so a per-thread mutex map would grow without limit; a hash slot costs
+// a short wait on a collision and never leaks. The number only has to be large
+// enough that unrelated busy threads practically never share one; 1024 slots
+// also keep a same-UID caller from parking foreign threads on a colliding slot.
+const persistLockSlots = 1024
+
+// persistLock returns the persistence lock for threadID. Every path that writes
+// a prefix takes it BEFORE it captures state, so a payload captured before an
+// invalidation can never be written after the tombstone. Lock order is always
+// this lock before f.mu; no path holds f.mu while taking it.
+func (f *FrozenStubs) persistLock(threadID string) *sync.Mutex {
+	// FNV-1a, inlined: one import fewer for a hash that only has to spread.
+	h := uint32(2166136261)
+	for i := 0; i < len(threadID); i++ {
+		h ^= uint32(threadID[i])
+		h *= 16777619
+	}
+	return &f.writeLocks[h%persistLockSlots]
+}
+
 // Store freezes stubbed messages for a thread. Deep-copies messages and computes
 // boundary/prefix hashes for validation.
 // cutoff is the original message count (the index of the first unstubbed message).
 // boundaryMsg is originalMessages[cutoff-1] used for boundary validation.
 func (f *FrozenStubs) Store(threadID string, stubbed []any, cutoff int, boundaryMsg any, tokenEstimate int, rawTokenEstimate int) {
+	// The lock covers the state capture AND the write, not just the callback: a
+	// payload captured just before an Invalidate would otherwise land in
+	// proxy_state after the tombstone and survive a restart.
+	lk := f.persistLock(threadID)
+	lk.Lock()
+	defer lk.Unlock()
+
 	frozen := deepCopyMessages(stubbed)
 
 	frozenJSON, _ := json.Marshal(frozen)
@@ -97,7 +126,7 @@ func (f *FrozenStubs) Store(threadID string, stubbed []any, cutoff int, boundary
 	f.loadedFromDB[threadID] = true // in-memory is authoritative now
 	f.mu.Unlock()
 
-	// Persist to DB for cross-restart survival
+	// Persist to DB for cross-restart survival. writeMu is already held.
 	if f.persistFn != nil {
 		fp := frozenPersisted{
 			Messages:     frozen,
@@ -201,10 +230,21 @@ func (f *FrozenStubs) LengthFor(threadID string) int {
 // the prefix hash, so a later Get() call returns post-pipeline bytes (matching
 // the bytes that were sent on the wire on the FREEZE turn). Length must equal
 // the existing entry to guard against a second sawtooth firing inside the same
-// pipeline. Returns false if the entry does not exist or length mismatches.
+// pipeline. Returns true only when the stored prefix actually changed: the
+// snapshot runs on every request, and the prefix (several MB) must not be
+// rewritten into the daemon while its bytes are identical.
+//
+// The comparison is structural, not a hash of the marshalled prefix: the equal
+// case is the normal case and has to be answered without marshalling megabytes
+// per request. A payload the walk cannot decide is compared by its bytes below.
 func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []any) bool {
+	lk := f.persistLock(threadID)
+	lk.Lock()
+	defer lk.Unlock()
+
 	f.mu.RLock()
 	existing, ok := f.messages[threadID]
+	currentHash := f.prefixHash[threadID]
 	f.mu.RUnlock()
 	if !ok {
 		return false
@@ -213,13 +253,32 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []any) bool {
 		return false
 	}
 
-	fresh := deepCopyMessages(newMsgs)
-	if fresh == nil {
+	if los26eFrozenPrefixEqual(existing, newMsgs) {
+		f.mu.Lock()
+		f.lastAccess[threadID] = time.Now()
+		f.mu.Unlock()
 		return false
 	}
 
-	freshJSON, _ := json.Marshal(fresh)
-	pHash := sha256hex(freshJSON)
+	newJSON, err := json.Marshal(newMsgs)
+	if err != nil {
+		return false
+	}
+	pHash := sha256hex(newJSON)
+
+	if pHash == currentHash {
+		f.mu.Lock()
+		f.lastAccess[threadID] = time.Now()
+		f.mu.Unlock()
+		return false
+	}
+
+	var fresh []any
+	// The nil check is not redundant: json.Unmarshal("null") succeeds and leaves
+	// fresh nil, so only the error check would let a null payload through.
+	if json.Unmarshal(newJSON, &fresh) != nil || fresh == nil {
+		return false
+	}
 
 	f.mu.Lock()
 	f.messages[threadID] = fresh
@@ -247,20 +306,46 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []any) bool {
 	return true
 }
 
-// Invalidate removes frozen stubs for a thread.
+// Invalidate removes frozen stubs for a thread and drops the persisted prefix.
+// The persisted row is overwritten with an empty value instead of being left in
+// place, because the row can carry several megabytes and an invalidated prefix
+// must not be offered to another process through the lazy DB load.
+//
+// loadedFromDB deliberately stays set: it is the in-memory tombstone that keeps
+// this process from resurrecting the prefix. The DB write is best effort (the
+// persist callback logs its error and returns nothing), so the guarantee that an
+// invalidated prefix stays gone must not depend on it.
+//
+// The tombstone waits for an in-flight persist of the same thread (persistLock):
+// the persist callback runs a daemon round trip, so without that order a payload
+// captured just before this call could reach proxy_state after the empty value
+// and leave a loadable prefix behind. The next freeze overwrites the row again;
+// until then the in-memory tombstone holds.
 func (f *FrozenStubs) Invalidate(threadID string) {
+	// The persistence lock first: it has to cover the state drop as well, so a
+	// payload captured before this call cannot be written after the tombstone.
+	lk := f.persistLock(threadID)
+	lk.Lock()
+	defer lk.Unlock()
+
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	_, hadMessages := f.messages[threadID]
+	fn := f.persistFn
 	delete(f.messages, threadID)
 	delete(f.cutoff, threadID)
 	delete(f.boundaryHash, threadID)
 	delete(f.prefixHash, threadID)
 	delete(f.stubTime, threadID)
 	delete(f.tokens, threadID)
+	delete(f.rawTokens, threadID)
 	delete(f.lastAccess, threadID)
+	f.mu.Unlock()
+
+	if hadMessages && fn != nil {
+		fn("frozen:"+threadID, "")
+	}
 }
 
-// Evict removes entries that haven't been accessed within the TTL.
 // UpdateTTL changes the eviction TTL at runtime (e.g. after 1h cache detection).
 func (f *FrozenStubs) UpdateTTL(ttl time.Duration) {
 	f.mu.Lock()
@@ -278,6 +363,15 @@ func (f *FrozenStubs) Touch(threadID string) {
 	}
 }
 
+// Evict removes entries that haven't been accessed within the TTL. It is pure
+// in-memory work on purpose: it runs on the request path (pruneIdleThreadState at
+// the entry of every request family), so rewriting the
+// persisted row here would put one daemon round trip per evicted thread on the
+// request path and could clobber a snapshot written by a concurrent request.
+// The trade-off is that the row survives the eviction: a thread that comes back
+// after the TTL reloads a prefix that is no longer cache-warm. Reclaiming those
+// rows needs a path other than the request path (only --reset-cache does it
+// today), which is a pre-existing gap of the persistence layer.
 func (f *FrozenStubs) Evict() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -291,7 +385,9 @@ func (f *FrozenStubs) Evict() int {
 			delete(f.prefixHash, tid)
 			delete(f.stubTime, tid)
 			delete(f.tokens, tid)
+			delete(f.rawTokens, tid)
 			delete(f.lastAccess, tid)
+			delete(f.loadedFromDB, tid)
 			evicted++
 		}
 	}
@@ -361,6 +457,10 @@ func (f *FrozenStubs) Has(threadID string) bool {
 // Persist writes current in-memory frozen state for a thread to DB.
 // Used to re-persist after a failed Store() (e.g. daemon unreachable after deploy).
 func (f *FrozenStubs) Persist(threadID string) {
+	lk := f.persistLock(threadID)
+	lk.Lock()
+	defer lk.Unlock()
+
 	f.mu.RLock()
 	msgs, ok := f.messages[threadID]
 	if !ok {
@@ -372,6 +472,7 @@ func (f *FrozenStubs) Persist(threadID string) {
 	bHash := f.boundaryHash[threadID]
 	pHash := f.prefixHash[threadID]
 	tokens := f.tokens[threadID]
+	rawTokens := f.rawTokens[threadID]
 	f.mu.RUnlock()
 
 	if fn == nil {
@@ -384,6 +485,7 @@ func (f *FrozenStubs) Persist(threadID string) {
 		BoundaryHash: bHash,
 		PrefixHash:   pHash,
 		Tokens:       tokens,
+		RawTokens:    rawTokens,
 	}
 	if data, err := json.Marshal(fp); err == nil {
 		fn("frozen:"+threadID, string(data))
@@ -480,15 +582,19 @@ type LoadFunc func(key string) (string, bool)
 // SawtoothTrigger decides when to run a stub-cycle based on token usage and timing.
 type SawtoothTrigger struct {
 	mu               sync.RWMutex
-	lastTotalTokens  map[string]int       // threadID → last API response input tokens
-	lastMessageCount map[string]int       // threadID → message count at last response
-	lastRequestTime  map[string]time.Time // threadID → time of last API response
-	loadedFromDB     map[string]bool      // threadID → already attempted DB load
-	pauseThreshold   time.Duration        // cache TTL - safety margin
-	tokenThreshold   int                  // trigger stub-cycle above this (from config)
-	tokenMinimum     int                  // stub down to this floor (from config)
-	persistFn        PersistFunc          // optional: persist tokens to DB on update
-	loadFn           LoadFunc             // optional: load tokens from DB on cold start
+	lastTotalTokens  map[string]int           // threadID → last API response input tokens
+	lastMessageCount map[string]int           // threadID → message count at last response
+	lastRequestTime  map[string]time.Time     // threadID → time of last API response
+	loadedFromDB     map[string]bool          // threadID → already attempted DB load
+	estimateFactor   map[string]float64       // threadID → measured actual/estimate ratio (1.0 = uncalibrated)
+	pendingEstimate  map[string]int           // threadID → estimate of the payload about to be sent
+	loading          map[string]chan struct{} // threadID → in-flight DB load, closed when it finishes
+	lastTouch        map[string]time.Time     // threadID → last state activity (eviction baseline)
+	pauseThreshold   time.Duration            // cache TTL - safety margin
+	tokenThreshold   int                      // trigger stub-cycle above this (from config)
+	tokenMinimum     int                      // stub down to this floor (from config)
+	persistFn        PersistFunc              // optional: persist tokens to DB on update
+	loadFn           LoadFunc                 // optional: load tokens from DB on cold start
 }
 
 // NewSawtoothTrigger creates a new trigger state tracker.
@@ -498,6 +604,10 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 		lastMessageCount: make(map[string]int),
 		lastRequestTime:  make(map[string]time.Time),
 		loadedFromDB:     make(map[string]bool),
+		estimateFactor:   make(map[string]float64),
+		pendingEstimate:  make(map[string]int),
+		loading:          make(map[string]chan struct{}),
+		lastTouch:        make(map[string]time.Time),
 		pauseThreshold:   pauseThreshold,
 		tokenThreshold:   tokenThreshold,
 		tokenMinimum:     tokenMinimum,
@@ -506,11 +616,17 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 
 // ShouldTrigger checks if a stub-cycle should run for this thread.
 // rawEstimate is the pre-API-call token estimate (for emergency brake).
-func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate int) TriggerReason {
+// tokenThreshold is the effective threshold for the request's model; callers
+// resolve it through effectiveTokenThreshold so model-specific overrides are
+// honoured. A non-positive value falls back to the configured default.
+func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate, tokenThreshold int) TriggerReason {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 
-	emergencyThreshold := st.tokenThreshold + 10_000 // 10k margin above threshold
+	if tokenThreshold <= 0 {
+		tokenThreshold = st.tokenThreshold
+	}
+	emergencyThreshold := tokenThreshold + 10_000 // 10k margin above threshold
 
 	// Emergency brake — raw estimate too high, no usage data needed
 	if rawEstimate > emergencyThreshold {
@@ -518,7 +634,7 @@ func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate int) Trigg
 	}
 
 	// Token threshold based on raw estimate (works even without prior API data)
-	if rawEstimate > st.tokenThreshold {
+	if rawEstimate > tokenThreshold {
 		return TriggerTokens
 	}
 
@@ -531,7 +647,7 @@ func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate int) Trigg
 	}
 
 	// Token threshold based on last API response (more accurate than estimate)
-	if tokens > st.tokenThreshold {
+	if tokens > tokenThreshold {
 		return TriggerTokens
 	}
 
@@ -552,6 +668,18 @@ func (st *SawtoothTrigger) SetTokenThreshold(threshold int) {
 	st.mu.Unlock()
 }
 
+// SetPauseThreshold updates the idle gap that counts as a cold cache. It follows
+// the TTL detection result: a confirmed 1h cache must not be treated as cold
+// after the 5 minute gap.
+func (st *SawtoothTrigger) SetPauseThreshold(threshold time.Duration) {
+	if threshold <= 0 {
+		return
+	}
+	st.mu.Lock()
+	st.pauseThreshold = threshold
+	st.mu.Unlock()
+}
+
 // SetPersistFunc sets the callback for writing token state to persistent storage.
 func (st *SawtoothTrigger) SetPersistFunc(fn PersistFunc) {
 	st.persistFn = fn
@@ -562,23 +690,100 @@ func (st *SawtoothTrigger) SetLoadFunc(fn LoadFunc) {
 	st.loadFn = fn
 }
 
+// sawtoothStateTTL bounds how long per-thread trigger state survives without
+// activity. It exceeds the longest prompt-cache TTL (1h) plus headroom, so a
+// warm thread never loses its baseline.
+const sawtoothStateTTL = 2 * time.Hour
+
+// Prune drops the per-thread state of threads idle for longer than ttl and
+// returns the number of evicted threads. The thread id comes from the client,
+// so without this the maps grow for the lifetime of the process. Pure in-memory
+// work, called off the request path next to FrozenStubs.Evict: an evicted
+// thread that comes back has no baseline for one request and repopulates it
+// from the next response.
+func (st *SawtoothTrigger) Prune(ttl time.Duration) int {
+	if ttl <= 0 {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	cutoff := time.Now().Add(-ttl)
+	evicted := 0
+	for tid, touched := range st.lastTouch {
+		if touched.After(cutoff) {
+			continue
+		}
+		delete(st.lastTouch, tid)
+		delete(st.lastTotalTokens, tid)
+		delete(st.lastMessageCount, tid)
+		delete(st.lastRequestTime, tid)
+		delete(st.loadedFromDB, tid)
+		delete(st.estimateFactor, tid)
+		delete(st.pendingEstimate, tid)
+		evicted++
+	}
+	return evicted
+}
+
 // persistedState is the JSON structure stored in proxy_state.
 type persistedState struct {
-	Tokens   int `json:"tokens"`
-	MsgCount int `json:"msg_count"`
+	Tokens         int     `json:"tokens"`
+	MsgCount       int     `json:"msg_count"`
+	EstimateFactor float64 `json:"estimate_factor,omitempty"`
+	// TS is the unix time of the last response. ShouldTrigger needs it for the
+	// pause trigger, and without it an evicted or restarted proxy loses the
+	// cold-cache signal for the first request of a resuming thread.
+	TS int64 `json:"ts,omitempty"`
 }
 
 // UpdateAfterResponse records the actual token count, message count, and time after an API response.
+// When a sent estimate is pending for the thread, the response also yields the
+// measured actual/estimate ratio: the systematic gap between our count and what
+// the API charges is what makes a hard context limit reachable while the
+// estimate still looks harmless.
 func (st *SawtoothTrigger) UpdateAfterResponse(threadID string, totalInputTokens, messageCount int) {
 	st.mu.Lock()
+	if st.estimateFactor == nil {
+		st.estimateFactor = make(map[string]float64)
+	}
+	if st.pendingEstimate == nil {
+		st.pendingEstimate = make(map[string]int)
+	}
+	if st.lastTouch == nil {
+		st.lastTouch = make(map[string]time.Time)
+	}
 	st.lastTotalTokens[threadID] = totalInputTokens
 	st.lastMessageCount[threadID] = messageCount
-	st.lastRequestTime[threadID] = time.Now()
+	now := time.Now()
+	st.lastRequestTime[threadID] = now
 	st.loadedFromDB[threadID] = true
+	st.lastTouch[threadID] = now
+
+	if sent, ok := st.pendingEstimate[threadID]; ok {
+		delete(st.pendingEstimate, threadID)
+		if sent > 0 && totalInputTokens > 0 {
+			ratio := float64(totalInputTokens) / float64(sent)
+			// A sample outside the band is not a measurement of our counting error
+			// (foreign payload, cache-only usage, wrong unit), so it must not move
+			// the factor at all.
+			if ratio >= estimateFactorMin && ratio <= estimateFactorMax {
+				if prev, has := st.estimateFactor[threadID]; has && prev > 0 {
+					ratio = (prev + ratio) / 2
+				}
+				st.estimateFactor[threadID] = ratio
+			}
+		}
+	}
+	factor := st.estimateFactor[threadID]
 	st.mu.Unlock()
 
 	if st.persistFn != nil {
-		data, _ := json.Marshal(persistedState{Tokens: totalInputTokens, MsgCount: messageCount})
+		data, _ := json.Marshal(persistedState{
+			Tokens:         totalInputTokens,
+			MsgCount:       messageCount,
+			EstimateFactor: factor,
+			TS:             now.Unix(),
+		})
 		st.persistFn("sawtooth:"+threadID, string(data))
 	}
 }
@@ -630,29 +835,86 @@ func (st *SawtoothTrigger) GetLastMessageCount(threadID string) int {
 }
 
 // loadFromDB loads persisted token state for a thread. Called once per thread on cold start.
+// The daemon round trip runs WITHOUT the write lock: loadFn takes up to 15s on
+// a cold start, and holding st.mu across it queued every other thread's
+// ShouldTrigger/GetLastTokens behind that one call. Concurrent callers for the
+// same thread wait on the in-flight load instead of issuing a second round trip.
 func (st *SawtoothTrigger) loadFromDB(threadID string) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	// Double-check after acquiring write lock
 	if st.loadedFromDB[threadID] {
+		st.mu.Unlock()
 		return
 	}
-	st.loadedFromDB[threadID] = true
+	if wait, inflight := st.loading[threadID]; inflight {
+		st.mu.Unlock()
+		<-wait
+		return
+	}
+	loadFn := st.loadFn
+	if loadFn == nil {
+		st.loadedFromDB[threadID] = true
+		if st.lastTouch == nil {
+			st.lastTouch = make(map[string]time.Time)
+		}
+		st.lastTouch[threadID] = time.Now()
+		st.mu.Unlock()
+		return
+	}
+	if st.loading == nil {
+		st.loading = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	st.loading[threadID] = done
+	st.mu.Unlock()
 
-	if st.loadFn == nil {
-		return
-	}
-	val, ok := st.loadFn("sawtooth:" + threadID)
-	if !ok || val == "" {
-		return
-	}
+	// The release runs as a deferred call: a panicking loader (net/http
+	// recovers handler panics) would otherwise leave the thread registered
+	// forever and park every later request for it on the wait channel.
+	defer st.finishLoad(threadID, done)
+
+	val, ok := loadFn("sawtooth:" + threadID)
+
 	var state persistedState
-	if err := json.Unmarshal([]byte(val), &state); err != nil {
+	parsed := ok && val != ""
+	if parsed {
+		parsed = json.Unmarshal([]byte(val), &state) == nil
+	}
+	if !parsed {
 		return
 	}
-	st.lastTotalTokens[threadID] = state.Tokens
-	st.lastMessageCount[threadID] = state.MsgCount
+
+	st.mu.Lock()
+	// A response that landed during the load already wrote fresher state.
+	if _, answered := st.lastTotalTokens[threadID]; !answered {
+		st.lastTotalTokens[threadID] = state.Tokens
+		st.lastMessageCount[threadID] = state.MsgCount
+		if state.TS > 0 && state.TS <= time.Now().Unix() {
+			// A future timestamp would make time.Since negative and suppress the
+			// pause trigger for that thread forever; proxy_state is socket-writable.
+			st.lastRequestTime[threadID] = time.Unix(state.TS, 0)
+		}
+		if state.EstimateFactor >= estimateFactorMin && state.EstimateFactor <= estimateFactorMax {
+			if st.estimateFactor == nil {
+				st.estimateFactor = make(map[string]float64)
+			}
+			st.estimateFactor[threadID] = state.EstimateFactor
+		}
+	}
+	st.mu.Unlock()
+}
+
+// finishLoad releases the in-flight marker of a state load and registers the
+// thread for eviction, so Prune reaches threads whose load found nothing.
+func (st *SawtoothTrigger) finishLoad(threadID string, done chan struct{}) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.loading, threadID)
+	close(done)
+	st.loadedFromDB[threadID] = true
+	if st.lastTouch == nil {
+		st.lastTouch = make(map[string]time.Time)
+	}
+	st.lastTouch[threadID] = time.Now()
 }
 
 // shouldInvalidateFrozen decides whether existing frozen stubs must be
@@ -661,4 +923,66 @@ func (st *SawtoothTrigger) loadFromDB(threadID string) {
 // PRE-collapse state and must not invalidate already-good stubs.
 func shouldInvalidateFrozen(combinedTokens, threshold int) bool {
 	return combinedTokens > threshold
+}
+
+// estimateFactorFor returns the measured actual/estimate ratio for a thread.
+// 1.0 means no calibration data yet.
+func (st *SawtoothTrigger) estimateFactorFor(threadID string) float64 {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if f, ok := st.estimateFactor[threadID]; ok && f > 0 {
+		return f
+	}
+	return 1
+}
+
+// applyEstimateFactor scales a raw token estimate by the measured
+// actual/estimate ratio of the thread.
+func (st *SawtoothTrigger) applyEstimateFactor(threadID string, raw int) int {
+	factor := st.estimateFactorFor(threadID)
+	if factor == 1 {
+		return raw
+	}
+	return int(float64(raw) * factor)
+}
+
+// estimateFactorMin/Max define both the validity band for a single measured
+// sample and the bounds of the resulting factor: a response outside the band
+// does not describe our counting error, so it is discarded.
+const (
+	estimateFactorMin = 0.5
+	estimateFactorMax = 2.0
+)
+
+// SetSentEstimate records the token estimate of the payload that is about to
+// be sent. The next UpdateAfterResponse derives the actual/estimate ratio from
+// it and discards it.
+func (st *SawtoothTrigger) SetSentEstimate(threadID string, estimate int) {
+	if estimate <= 0 {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.pendingEstimate == nil {
+		st.pendingEstimate = make(map[string]int)
+	}
+	if st.lastTouch == nil {
+		st.lastTouch = make(map[string]time.Time)
+	}
+	st.pendingEstimate[threadID] = estimate
+	st.lastTouch[threadID] = time.Now()
+}
+
+// ClearSentEstimate drops a sample left over from an earlier request. Called at
+// request entry so a response is only ever paired with the estimate of the
+// request that is actually in flight (a response without usage would otherwise
+// leave a sample behind for the next response to consume).
+// The slot is per thread, not per request: two requests overlapping on one
+// thread can still pair one sample with the other response. Such a mispair is
+// bounded by the sample band (0.5..2.0) and the EMA smooths it away over the
+// next responses, so it is accepted rather than plumbed per request.
+func (st *SawtoothTrigger) ClearSentEstimate(threadID string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.pendingEstimate, threadID)
 }

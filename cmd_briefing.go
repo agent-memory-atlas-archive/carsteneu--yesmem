@@ -47,19 +47,21 @@ func runBriefing() {
 	}
 	defer store.Close()
 
-	gen := briefing.New(store, cfg.Briefing.DetailedSessions)
-	gen.SetMaxPerCategory(cfg.Briefing.MaxPerCategory)
-	gen.SetDedupThreshold(cfg.Briefing.DedupThreshold)
-	gen.SetUnfinishedTTL(cfg.Evolution.UnfinishedTTL)
-	gen.SetUserProfile(cfg.Briefing.UserProfile)
+	gen := briefing.NewFromConfig(store, cfg)
 	gen.SetStrings(briefing.ResolveStrings(filepath.Join(dataDir, "strings.yaml")))
-	// Recovery: explicit session_id, tracked session, or heuristic fallback
+	// Recovery: explicit session_id, or the one-shot handoff a /clear left behind.
+	// The CLI goes through the same consumption as the daemon path, so a manual
+	// call cannot re-inject context that a briefing already used.
 	if recoverSessionID != "" {
 		gen.SetRecovery(recoverSessionID, source)
-	} else if source == "clear" || source == "compact" {
-		if sid, err := store.GetLastEndedSession(project); err == nil && sid != "" {
-			gen.SetRecovery(sid, source)
-		} else if sessions, err := store.ListSessions(project, 1); err == nil && len(sessions) > 0 {
+	} else if source == "clear" {
+		if sid, reason, err := store.GetPendingRecovery(project, briefing.RecoveryMaxAge); err == nil && sid != "" {
+			gen.SetRecovery(sid, reason)
+		}
+	} else if source == "compact" {
+		// Compaction does not end a session, so there is no tracked handoff for it:
+		// the latest session of the project is the one that was compacted.
+		if sessions, err := store.ListSessions(project, 1); err == nil && len(sessions) > 0 {
 			gen.SetRecovery(sessions[0].ID, source)
 		}
 	}
@@ -118,6 +120,9 @@ func runBriefing() {
 			"additionalContext": text,
 		},
 	}
+	// This output is the delivered briefing: start the 12h deadline cooldown for
+	// the deadlines it actually contains.
+	gen.MarkDeadlineHits(text)
 	jsonOut, _ := json.Marshal(out)
 	fmt.Print(string(jsonOut))
 }
@@ -178,6 +183,8 @@ func runCodemapHook() {
 	}
 	defer store.Close()
 
+	// Only the code map is delivered here, so the selection knobs NewFromConfig
+	// would apply cannot change the result; no config read on the hook path.
 	gen := briefing.New(store, 3)
 	gen.Generate(project)
 	cm := gen.CodeMap()

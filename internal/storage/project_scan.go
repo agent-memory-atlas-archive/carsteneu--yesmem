@@ -14,13 +14,27 @@ type ProjectScanRow struct {
 	ScannedAt time.Time
 }
 
-// SaveProjectScan upserts a project scan result.
+// SaveProjectScan upserts a project scan result and refreshes the per-path
+// index. Both happen in one transaction: a crash or error in between would
+// leave the index silently diverging from the document it belongs to, and the
+// reader has no way to detect that (review finding I-2).
 func (s *Store) SaveProjectScan(row *ProjectScanRow) error {
-	_, err := s.db.Exec(`INSERT INTO project_scan (project, scan_json, git_head, cbm_mtime, scanned_at)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO project_scan (project, scan_json, git_head, cbm_mtime, scanned_at)
 		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(project) DO UPDATE SET scan_json=excluded.scan_json, git_head=excluded.git_head, cbm_mtime=excluded.cbm_mtime, scanned_at=CURRENT_TIMESTAMP`,
-		row.Project, row.ScanJSON, row.GitHead, row.CbmMtime)
-	return err
+		row.Project, row.ScanJSON, row.GitHead, row.CbmMtime); err != nil {
+		return err
+	}
+	if err := replaceScanFiles(tx, row.Project, row.ScanJSON); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // LoadScan implements codescan.ScanStore — returns cached scan JSON, git head, and CBM index mtime.

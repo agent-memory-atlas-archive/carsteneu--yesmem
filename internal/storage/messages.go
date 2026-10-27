@@ -253,7 +253,9 @@ func (s *Store) SearchMessagesCtx(query, since, before string, limit int) ([]Mes
 		return nil, nil
 	}
 	sql := `
-		SELECT m.id, m.session_id, COALESCE(m.source_agent, 'claude'), m.content, m.message_type, m.timestamp, COALESCE(m.sequence, 0), bm25(messages_fts) as rank
+		SELECT m.id, m.session_id, COALESCE(m.source_agent, 'claude'),
+		       COALESCE(NULLIF(m.content, ''), CAST(m.content_blob AS TEXT), ''),
+		       m.message_type, m.timestamp, COALESCE(m.sequence, 0), bm25(messages_fts) as rank
 		FROM messages_fts
 		JOIN messages m ON m.id = messages_fts.rowid
 		WHERE messages_fts MATCH ?`

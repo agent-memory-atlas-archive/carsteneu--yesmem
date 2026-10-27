@@ -1,7 +1,7 @@
 ---
 name: chrome_headless
 description: "Render any URL with headless Chrome: screenshot/png, full-page shot, PDF, dumped DOM, plain-text extraction, plus interactive Playwright runs (click, fill, scrape) via a per-use-case JS module."
-version: 2
+version: 3
 tags: [web, chrome, playwright, screenshot]
 scope: user
 tested: true

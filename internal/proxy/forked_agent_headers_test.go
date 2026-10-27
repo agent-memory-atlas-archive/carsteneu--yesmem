@@ -52,6 +52,41 @@ func TestDoForkCall_AnthropicOmitsBetaWhenAbsent(t *testing.T) {
 	}
 }
 
+// Consequence review 5.3 finding 2: with Claude Code sessions now allowed to
+// fork, the Anthropic fork call must keep the subscription credential in the
+// Authorization header. Stripping "Bearer " into x-api-key failed with 401.
+func TestDoForkCall_AnthropicKeepsBearerAuthorization(t *testing.T) {
+	gotAuth := make(chan [2]string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case gotAuth <- [2]string{r.Header.Get("Authorization"), r.Header.Get("x-api-key")}:
+		default:
+		}
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"usage":{}}`))
+	}))
+	defer srv.Close()
+
+	s := &Server{httpClient: srv.Client()}
+	orig := http.Header{}
+	orig.Set("Authorization", "Bearer sk-ant-oat01-abc")
+
+	if _, err := s.doForkCall(srv.URL, "", orig, []byte(`{}`), false); err != nil {
+		t.Fatalf("doForkCall: %v", err)
+	}
+
+	select {
+	case h := <-gotAuth:
+		if h[0] != "Bearer sk-ant-oat01-abc" {
+			t.Errorf("fork must keep Authorization %q, got %q", "Bearer sk-ant-oat01-abc", h[0])
+		}
+		if h[1] != "" {
+			t.Errorf("fork must not put an oauth token in x-api-key, got %q", h[1])
+		}
+	default:
+		t.Fatal("no fork request reached the server")
+	}
+}
+
 // The OpenAI-compatible fork path must not receive Anthropic beta headers.
 func TestDoForkCall_OpenAIDoesNotSendBetaHeader(t *testing.T) {
 	var present bool

@@ -1,6 +1,7 @@
 package codescan
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // CBMIndexPath returns the path to the CBM SQLite database for a project.
@@ -75,8 +78,12 @@ func FindCBMBinary() string {
 }
 
 func (s *CBMScanner) Scan(rootDir string) (*ScanResult, error) {
+	// Both the CBM project slug and the index lookup derive from this string,
+	// so a symlinked root has to collapse onto its real path first (YM-232).
+	rootDir = ResolveScanRoot(rootDir)
+
 	if isBlacklistedPath(rootDir) {
-		return nil, fmt.Errorf("cbm: directory %s is blacklisted (too large or system path)", rootDir)
+		return nil, fmt.Errorf("cbm: directory %q is blacklisted (too large or system path)", rootDir)
 	}
 
 	bin := s.bin
@@ -97,13 +104,19 @@ func (s *CBMScanner) Scan(rootDir string) (*ScanResult, error) {
 	if err != nil {
 		// A query error may be a timeout — never treat it as "not indexed".
 		// Indexing happens exclusively in the background (bg_index.go).
+		// One exception: a directory that has no CBM database of its own was
+		// never indexed (a worktree without its own index), so the failure is
+		// attributed to that directory instead of the repository (DT27 / YM-4).
+		if CBMIndexPath(rootDir) == "" {
+			return nil, fmt.Errorf("cbm: project %q not indexed (no CBM database for %q): %w", project, rootDir, err)
+		}
 		return nil, fmt.Errorf("query files: %w", err)
 	}
 	if len(files) == 0 {
 		if s.ensureIndex != nil {
 			s.ensureIndex(rootDir)
 		}
-		return nil, fmt.Errorf("cbm: project %s not indexed (background indexing triggered)", project)
+		return nil, fmt.Errorf("cbm: project %q not indexed (background indexing triggered)", project)
 	}
 
 	// CBM labels some files as Module instead of File (inconsistent).
@@ -286,18 +299,33 @@ func projectIndexed(rootDir string) bool {
 // them, 60s is a safe ceiling (decision: yesloop-cbm-load-fix D2).
 const cbmQueryTimeout = 60 * time.Second
 
+// cbmProjectArgOK reports whether s may be handed to the CBM CLI as the value of
+// a value-taking flag (--project, --repo-path). The slug is derived from a
+// directory path, and in cbm-gc from a cache file name, which anyone with write
+// access to the cache directory chooses; a leading "-" would be parsed as a flag
+// instead of a value.
+func cbmProjectArgOK(s string) bool {
+	return s != "" && !strings.HasPrefix(s, "-")
+}
+
 // cbmQuery executes a Cypher query via codebase-memory-mcp CLI and returns rows.
 func cbmQuery(bin, project, cypher string) ([][]interface{}, error) {
+	if !cbmProjectArgOK(project) {
+		return nil, fmt.Errorf("cbm cli: unusable project name %q", project)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cbmQueryTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, "cli", "query_graph", "--project", project, "--query", cypher, "--json")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("cbm cli: %w", err)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("cbm cli: %w%s", err, stderrSuffix(stderr.String()))
 	}
 
-	text, err := parseCBMResponse(out)
+	text, err := parseCBMResponse(stdout.Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +340,7 @@ func cbmQuery(bin, project, cypher string) ([][]interface{}, error) {
 // cbmProjectName converts a directory path to the codebase-memory-mcp project name
 // (leading "/" stripped, "/" → "-").
 func cbmProjectName(rootDir string) string {
-	clean := filepath.Clean(rootDir)
+	clean := filepath.Clean(ResolveScanRoot(rootDir))
 	clean = strings.TrimPrefix(clean, "/")
 	return strings.ReplaceAll(clean, "/", "-")
 }
@@ -320,15 +348,89 @@ func cbmProjectName(rootDir string) string {
 // cbmIndexRepository indexes a project directory in codebase-memory-mcp.
 // Called by the background indexer when the index is missing or stale.
 func cbmIndexRepository(bin, repoPath string, budget time.Duration) error {
+	// The path is handed over as the value of --repo-path, and a leading "-"
+	// would be parsed as a flag instead of a path (same predicate as --project,
+	// YM-332).
+	if !cbmProjectArgOK(repoPath) {
+		return fmt.Errorf("cbm index: unusable repo path %q", repoPath)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "cli", "index_repository", "--repo-path", repoPath, "--json")
-	out, err := cmd.Output()
-	if err != nil {
-		return err
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cbm index: %w%s", err, stderrSuffix(stderr.String()))
 	}
-	_, err = parseCBMResponse(out)
+	_, err := parseCBMResponse(stdout.Bytes())
 	return err
+}
+
+// maxStderrSuffix bounds what a failed CBM call contributes to an error string.
+// The text reaches daemon.log and the scan_cooldown row; an unbounded, multi-line
+// capture would bloat both and could forge log lines.
+const maxStderrSuffix = 2048
+
+// stderrSuffix renders captured CLI stderr for an error message. codebase-memory-mcp
+// reports the reason on stderr only ("project not found", timeouts); without it the
+// daemon log shows nothing but "exit status 1" (DT27 / YM-4).
+//
+// The text is foreign: it reaches daemon.log and the scan_cooldown row, so it is
+// flattened to one line, stripped of control characters and capped on rune
+// boundaries. A byte-wise cut through a multi-byte rune would leave invalid
+// UTF-8 behind (YM-311), and control characters could recolor or rewrite the
+// log on the reader's terminal.
+func stderrSuffix(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	// strings.Map replaces every invalid UTF-8 byte with U+FFFD on the way
+	// through, so the text is valid UTF-8 once it leaves this loop.
+	s = strings.Map(dropControlChar, s)
+	if s == "" {
+		return ""
+	}
+	if len(s) > maxStderrSuffix {
+		// Keep both ends: the reason can be the first or the last line.
+		half := maxStderrSuffix / 2
+		s = headAtRuneBoundary(s, half) + " ...(truncated)... " + tailAtRuneBoundary(s, half)
+	}
+	return ": " + s
+}
+
+// dropControlChar removes control and format characters from foreign CLI output.
+// Control covers Cc (ESC, bell), format covers Cf: a bidi override is invisible
+// itself but reverses the reading order of everything after it, so it would
+// reorder the log line the text lands in.
+func dropControlChar(r rune) rune {
+	if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		return -1
+	}
+	return r
+}
+
+// headAtRuneBoundary returns the longest prefix of s that is at most n bytes and
+// ends on a rune boundary.
+func headAtRuneBoundary(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// tailAtRuneBoundary returns the last bytes of s, starting on a rune boundary,
+// with at most n bytes.
+func tailAtRuneBoundary(s string, n int) string {
+	i := len(s) - n
+	if i < 0 {
+		i = 0
+	}
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // isBlacklistedPath returns true if rootDir should not be indexed by CBM.

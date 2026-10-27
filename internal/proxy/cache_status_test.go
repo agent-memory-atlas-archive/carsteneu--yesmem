@@ -364,13 +364,13 @@ func TestFormatStatusLines_KeepaliveUntilCalculation(t *testing.T) {
 	// Total = now + 3600 + 12960 = now + 16560
 	now := time.Now()
 	s := CacheStatus{
-		TTLSeconds:    3600,
-		RemainingS:    3600,
-		CacheState:    "warm",
-		LastRequestTS: now.Unix(),
-		TotalTokens:   100000,
-		DetectedTTL:   "1h",
-		PingIntervalS: 3240,
+		TTLSeconds:     3600,
+		RemainingS:     3600,
+		CacheState:     "warm",
+		LastRequestTS:  now.Unix(),
+		TotalTokens:    100000,
+		DetectedTTL:    "1h",
+		PingIntervalS:  3240,
 		PingsRemaining: 4,
 	}
 	lines := FormatStatusLines(s)

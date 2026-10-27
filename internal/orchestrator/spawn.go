@@ -60,9 +60,22 @@ func buildShellCmd(cmd string, args []string, title string) string {
 		// The title carries caller-supplied text (the agent section), so it is
 		// quoted like any other argument — an unescaped quote would end the
 		// echo's quoting and run whatever followed.
-		titleEsc = fmt.Sprintf("echo -ne %s; ", shellQuote("\\033]0;"+title+"\\007"))
+		titleEsc = fmt.Sprintf("echo -ne %s; ", shellQuote("\\033]0;"+escapeEchoBackslashes(title)+"\\007"))
 	}
 	return ". ~/.bashrc 2>/dev/null; " + titleEsc + "exec " + strings.Join(parts, " ")
+}
+
+// escapeEchoBackslashes doubles the backslashes in a value that is handed to
+// `echo -e`. The escape sequence around the title is written as literal text
+// because echo interprets it, so a title that itself contains a literal
+// "\033]2;…" would otherwise be reinterpreted and could set a second window title
+// or open a hyperlink — the injection YM-416 is about, reached without a single
+// control character. Titles without a backslash are returned unchanged.
+func escapeEchoBackslashes(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\\", "\\\\")
 }
 
 // shellQuote wraps a string in single quotes, escaping embedded single quotes.

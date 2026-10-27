@@ -1,7 +1,7 @@
 ---
 name: cap_delete
 description: "Completely remove a saved capability from the stores: the learnings rows (cap + proposal categories) with their FK-cascade children (entities/actions/keywords/anticipated_queries/cluster_scores) + FTS + session_active_caps, then the cap_<name>__* data tables + cap_store_meta in the cap store. Every sqlite3 call runs with -bail and a __OK__ sentinel, so a SQL error aborts instead of half-applying, and stderr stays separate so the reason survives. Safety-checks knowledge_gaps.resolved_by before any write. Returns {cap_name, found, deleted:{learnings, data_tables}, notes?}. Does NOT remove the on-disk CAP.md (a disk-backed cap returns at the next daemon start) and does not touch scheduled_jobs. Input: {cap_name: string} matching [a-zA-Z][a-zA-Z0-9_]* (normalised to lower case). Irreversible."
-version: 546
+version: 549
 tags: [capability, maintenance, destructive]
 scope: user
 auto_active: true
@@ -64,6 +64,7 @@ before use, because cap names are lower-case by construction
 
 ### cap_delete
 kind: tool
+sandbox: none
 
 ```javascript
 async ({cap_name}) => {

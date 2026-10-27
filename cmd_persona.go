@@ -76,6 +76,7 @@ func runBootstrapPersona() {
 		if err != nil {
 			log.Fatalf("LLM client: %v", err)
 		}
+		client = redacted(cfg, client)
 
 		sessions, _ := store.ListSessions("", 0)
 		limitDesc := fmt.Sprintf("%d", sessionLimit)
@@ -103,6 +104,7 @@ func runBootstrapPersona() {
 			qualityClient = client
 		} else {
 			log.Printf("  Using quality model: %s", cfg.NarrativeModelID())
+			qualityClient = redacted(cfg, qualityClient)
 		}
 		daemon.SynthesizePersonaDirective(store, qualityClient)
 	}
@@ -142,6 +144,7 @@ func runSynthesizePersona() {
 	if err != nil {
 		log.Fatalf("LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 	log.Printf("Synthesizing persona directive with %s...", cfg.NarrativeModelID())
 
 	// Invalidate hash to force regeneration
@@ -165,6 +168,22 @@ func runSynthesizePersona() {
 	}
 }
 
+// cleanupShortSessionNarratives supersedes narratives from short sessions that
+// have gone quiet. It reports the outcome and logs a cleanup error: swallowing it
+// would hide a broken cleanup for the whole run.
+func cleanupShortSessionNarratives(store *storage.Store) int {
+	cleanedIDs, err := store.SupersedeShortNarratives()
+	if err != nil {
+		log.Printf("warn: clean up short-session narratives: %v", err)
+		return 0
+	}
+	if len(cleanedIDs) > 0 {
+		fmt.Fprintf(os.Stderr, "Cleaned up %d narratives from short sessions (<%d messages, silent >%s)\n",
+			len(cleanedIDs), storage.ShortSessionMaxMessages, storage.ShortSessionQuietPeriod)
+	}
+	return len(cleanedIDs)
+}
+
 func runRegenerateNarratives() {
 	dataDir := yesmemDataDir()
 	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
@@ -181,6 +200,7 @@ func runRegenerateNarratives() {
 	if err != nil {
 		log.Fatalf("LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 	log.Printf("Using model: %s for narrative generation", cfg.NarrativeModelID())
 
 	store, err := storage.Open(filepath.Join(dataDir, "yesmem.db"))
@@ -194,16 +214,13 @@ func runRegenerateNarratives() {
 		log.Fatalf("list sessions: %v", err)
 	}
 
-	// Supersede narratives from short sessions
-	cleanedIDs, _ := store.SupersedeShortNarratives(10)
-	if len(cleanedIDs) > 0 {
-		fmt.Fprintf(os.Stderr, "Cleaned up %d narratives from short sessions (<10 messages)\n", len(cleanedIDs))
-	}
+	// Supersede narratives from short sessions that have gone quiet
+	cleanupShortSessionNarratives(store)
 
-	// Filter sessions worth narrating
+	// Filter sessions worth narrating, using the same minimum the generator applies
 	var toProcess []models.Session
 	for _, s := range sessions {
-		if s.MessageCount >= 3 {
+		if s.MessageCount >= storage.ShortSessionMaxMessages {
 			toProcess = append(toProcess, s)
 		}
 	}

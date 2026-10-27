@@ -2,9 +2,12 @@ package extraction
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 func TestCLIClientImplementsInterface(t *testing.T) {
@@ -259,7 +262,7 @@ func TestStdinArgs_OpencodeWithSessionIncludesFormatJSON(t *testing.T) {
 func TestParseOpencodeOutput_TextOnly(t *testing.T) {
 	input := `{"type":"text","timestamp":123,"sessionID":"ses_x","part":{"text":"Hallo."}}
 {"type":"step_finish","timestamp":124,"sessionID":"ses_x","part":{"reason":"stop","tokens":{"total":100,"input":95,"output":5}}}` + "\n"
-	got, err := parseOpencodeOutput(input, "test-model")
+	got, err := parseOpencodeOutput(input, "test-model", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -272,7 +275,7 @@ func TestParseOpencodeOutput_MultipleTextParts(t *testing.T) {
 	input := `{"type":"text","timestamp":123,"sessionID":"ses_x","part":{"text":"Teil 1"}}
 {"type":"text","timestamp":124,"sessionID":"ses_x","part":{"text":" Teil 2"}}
 {"type":"step_finish","timestamp":125,"sessionID":"ses_x","part":{"reason":"stop","tokens":{"total":200,"input":180,"output":20}}}` + "\n"
-	got, err := parseOpencodeOutput(input, "test-model")
+	got, err := parseOpencodeOutput(input, "test-model", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -286,7 +289,7 @@ func TestParseOpencodeOutput_IgnoresNonTextEvents(t *testing.T) {
 {"type":"tool_use","timestamp":124,"sessionID":"ses_x","part":{"tool":"some_tool","callID":"call_00"}}
 {"type":"text","timestamp":125,"sessionID":"ses_x","part":{"text":"Antwort"}}
 {"type":"step_finish","timestamp":126,"sessionID":"ses_x","part":{"reason":"stop","tokens":{"total":150,"input":140,"output":10}}}` + "\n"
-	got, err := parseOpencodeOutput(input, "test-model")
+	got, err := parseOpencodeOutput(input, "test-model", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -296,7 +299,7 @@ func TestParseOpencodeOutput_IgnoresNonTextEvents(t *testing.T) {
 }
 
 func TestParseOpencodeOutput_EmptyInput(t *testing.T) {
-	_, err := parseOpencodeOutput("", "test-model")
+	_, err := parseOpencodeOutput("", "test-model", nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -305,7 +308,7 @@ func TestParseOpencodeOutput_EmptyInput(t *testing.T) {
 func TestParseOpencodeOutput_NoTextParts(t *testing.T) {
 	input := `{"type":"step_start","timestamp":123,"sessionID":"ses_x","part":{"type":"step-start"}}
 {"type":"step_finish","timestamp":124,"sessionID":"ses_x","part":{"reason":"stop","tokens":{"total":50,"input":50,"output":0}}}` + "\n"
-	_, err := parseOpencodeOutput(input, "test-model")
+	_, err := parseOpencodeOutput(input, "test-model", nil)
 	if err == nil {
 		t.Fatal("expected error when no text events present")
 	}
@@ -324,7 +327,7 @@ func TestParseOpencodeOutput_OnUsageCallback(t *testing.T) {
 
 	input := `{"type":"text","timestamp":123,"sessionID":"ses_x","part":{"text":"ok"}}
 {"type":"step_finish","timestamp":124,"sessionID":"ses_x","part":{"reason":"stop","tokens":{"total":100,"input":42,"output":7,"cache":{"read":10,"write":5}}}}` + "\n"
-	got, err := parseOpencodeOutput(input, "t-model")
+	got, err := parseOpencodeOutput(input, "t-model", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -334,8 +337,8 @@ func TestParseOpencodeOutput_OnUsageCallback(t *testing.T) {
 	if capturedModel != "t-model" {
 		t.Errorf("expected model 't-model', got %q", capturedModel)
 	}
-	if capturedIn != 47 {
-		t.Errorf("expected billable input 47 (42 raw + 5 cache write), got %d", capturedIn)
+	if capturedIn != 48 {
+		t.Errorf("expected billable input 48 (42 raw + 5 cache write + 1 for 10 cache reads), got %d", capturedIn)
 	}
 	if capturedOut != 7 {
 		t.Errorf("expected output 7, got %d", capturedOut)
@@ -635,5 +638,128 @@ func TestBuildOpencodeConfigOverride_NoOptionsKey(t *testing.T) {
 	}
 	if _, ok := entry.Models["bare-model"]; !ok {
 		t.Errorf("models.bare-model missing; the rewriter must preserve non-options fields; got models=%v", keys(entry.Models))
+	}
+}
+
+// writeFakeCLI writes a shell script that ignores its flags, drains stdin,
+// prints out verbatim and exits with code. The CLI transports can then be
+// driven without the real claude/opencode binaries.
+func writeFakeCLI(t *testing.T, out string, code int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-cli")
+	script := fmt.Sprintf("#!/bin/sh\ncat >/dev/null\nprintf '%%s' '%s'\nexit %d\n", out, code)
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake cli: %v", err)
+	}
+	return path
+}
+
+// A CLI that exits non-zero has still emitted one step_finish event per step it
+// ran, and the provider bills those tokens. The usage must reach the sink before
+// the error path returns, otherwise every failed extraction is free.
+func TestRunStdin_ReportsUsageOnCLIError(t *testing.T) {
+	ndjson := `{"type":"text","part":{"text":"partial answer"}}` + "\n" +
+		`{"type":"step_finish","part":{"tokens":{"total":120,"input":100,"output":20}}}` + "\n"
+	cli := NewCLIClient(writeFakeCLI(t, ndjson, 1), "test-model", models.SourceAgentOpencode)
+	cli.RateLimiter = nil // the shared limiter paces calls and would stall the test
+
+	var calls, gotIn, gotOut int
+	_, err := cli.Complete("sys", "msg", withUsageSink(func(in, out int) {
+		calls++
+		gotIn, gotOut = in, out
+	}))
+	if err == nil {
+		t.Fatal("expected an error from the failing CLI")
+	}
+	if calls != 1 {
+		t.Fatalf("usage reported %d time(s), want 1", calls)
+	}
+	if gotIn != 100 || gotOut != 20 {
+		t.Errorf("usage = (%d, %d), want (100, 20)", gotIn, gotOut)
+	}
+}
+
+// The claude transport has the same defect class: --output-format json prints an
+// envelope with usage even when the run fails, and is_error runs are billed.
+func TestRunClaude_ReportsUsageOnCLIError(t *testing.T) {
+	payload := `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","usage":{"input_tokens":1400,"output_tokens":30}}`
+	cli := NewCLIClient(writeFakeCLI(t, payload, 1), "claude-sonnet-4-6", models.SourceAgentClaude)
+	cli.RateLimiter = nil
+
+	var calls, gotIn, gotOut int
+	_, err := cli.Complete("sys", "msg", withUsageSink(func(in, out int) {
+		calls++
+		gotIn, gotOut = in, out
+	}))
+	if err == nil {
+		t.Fatal("expected an error from the failing CLI")
+	}
+	if calls != 1 {
+		t.Fatalf("usage reported %d time(s), want 1", calls)
+	}
+	if gotIn != 1400 || gotOut != 30 {
+		t.Errorf("usage = (%d, %d), want (1400, 30)", gotIn, gotOut)
+	}
+}
+
+// A 0/0 report marks the call as measured in BudgetClient.book, so the char
+// estimate that would otherwise book the call is skipped and the call costs
+// nothing. Counts that are not real must not reach the sink.
+func TestExtractAndReportUsage_SkipsZeroTokens(t *testing.T) {
+	payload := `{"type":"result","result":"ok","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0}}`
+	cli := NewCLIClient("claude", "test-model", models.SourceAgentClaude)
+
+	var calls int
+	got := cli.extractAndReportUsage(payload, func(in, out int) { calls++ })
+	if got != "ok" {
+		t.Errorf("result = %q, want \"ok\"", got)
+	}
+	if calls != 0 {
+		t.Errorf("zero token counts were reported %d time(s); the estimate is suppressed by that", calls)
+	}
+}
+
+// Same rule for the opencode path: a step that produced no tokens at all must
+// not report 0/0, because that drops the whole call from the budget. Cache reads
+// are not "nothing": they are priced as input equivalents, so a step whose whole
+// prompt was a cache hit does report.
+func TestParseOpencodeOutput_NoTokensNotReported(t *testing.T) {
+	input := `{"type":"text","part":{"text":"ok"}}` + "\n" +
+		`{"type":"step_finish","part":{"tokens":{"total":0,"input":0,"output":0,"cache":{"read":0,"write":0}}}}` + "\n"
+
+	var calls int
+	got, err := parseOpencodeOutput(input, "test-model", func(in, out int) { calls++ })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "ok" {
+		t.Errorf("text = %q, want \"ok\"", got)
+	}
+	if calls != 0 {
+		t.Errorf("zero token counts were reported %d time(s); the estimate is suppressed by that", calls)
+	}
+}
+
+// The CLI transports now report usage from envelopes that come from an external
+// process. clampTokens is the same guard the HTTP path applies: a negative count
+// would credit the budget, a count beyond any context window would block the
+// rest of the day.
+func TestExtractAndReportUsage_ClampsAbsurdCounts(t *testing.T) {
+	payload := `{"type":"result","result":"ok","usage":{"input_tokens":-5000,"output_tokens":999999999}}`
+	cli := NewCLIClient("claude", "test-model", models.SourceAgentClaude)
+
+	var calls, gotIn, gotOut int
+	cli.extractAndReportUsage(payload, func(in, out int) {
+		calls++
+		gotIn, gotOut = in, out
+	})
+	if calls != 1 {
+		t.Fatalf("usage reported %d time(s), want 1", calls)
+	}
+	if gotIn != 0 {
+		t.Errorf("negative input tokens reported as %d, want 0", gotIn)
+	}
+	if gotOut != maxReportedTokens {
+		t.Errorf("output tokens reported as %d, want the %d cap", gotOut, maxReportedTokens)
 	}
 }

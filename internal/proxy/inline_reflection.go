@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,7 +29,16 @@ type InlineSignals struct {
 	UsedIDs        []int64
 	GapTopics      []string
 	Contradictions []string
-	HasToolErrors  bool // true if last user message contains tool_result with is_error:true
+	// ToolErrorText is the failure text of the last user message, empty when the
+	// turn carries no visible tool failure. The text, not a bool, is what the
+	// fail counter needs: it is the identity of the error, and only a new error
+	// may raise fail_count again (one failing build loop used to push a learning
+	// to the hook's hard-block threshold on its own).
+	ToolErrorText string
+	// Scanned is true when an assistant response was actually found and read.
+	// Callers must only treat injected learnings as noise when it is true —
+	// otherwise "not referenced" just means "nothing was there to reference".
+	Scanned bool
 }
 
 // ScanAssistantSignals is the exported wrapper around scanAssistantSignals.
@@ -38,13 +48,42 @@ func ScanAssistantSignals(messages []any) InlineSignals {
 	return scanAssistantSignals(messages)
 }
 
-// scanAssistantSignals scans the last assistant message(s) in the message history
-// for inline reflection signals. It looks at both thinking blocks and text blocks.
-// It only scans assistant messages that come after the last user message.
+// scanInlineSignals is the entry point for the automatic inline reflection.
+// It is the one place where signals.enabled is consulted: with the gate closed
+// nothing is scanned, so no use/noise/gap/contradiction signal can be raised.
+func (s *Server) scanInlineSignals(messages []any) InlineSignals {
+	if !s.cfg.InlineReflectionEnabled {
+		return InlineSignals{}
+	}
+	return scanAssistantSignals(messages)
+}
+
+// scanAssistantSignals scans the assistant response of the previous turn in the
+// message history for inline reflection signals. It looks at both thinking
+// blocks and text blocks.
+//
+// Requests always end with the user message of the current turn, so the scan
+// first skips trailing non-assistant messages and then walks back to the
+// previous user message — the answer of the last turn is the only text it reads.
 func scanAssistantSignals(messages []any) InlineSignals {
-	// Collect text from all assistant messages since the last user turn.
+	// Skip the trailing user message of the current turn (and any other
+	// trailing non-assistant entries) to reach the last assistant response.
+	i := len(messages) - 1
+	for i >= 0 {
+		msg, ok := messages[i].(map[string]any)
+		if !ok {
+			i--
+			continue
+		}
+		if role, _ := msg["role"].(string); role == "assistant" {
+			break
+		}
+		i--
+	}
+
+	// Collect text from the assistant messages of that single turn.
 	var texts []string
-	for i := len(messages) - 1; i >= 0; i-- {
+	for ; i >= 0; i-- {
 		msg, ok := messages[i].(map[string]any)
 		if !ok {
 			continue
@@ -152,13 +191,16 @@ func scanAssistantSignals(messages []any) InlineSignals {
 		UsedIDs:        usedIDs,
 		GapTopics:      gapTopics,
 		Contradictions: contradictions,
-		HasToolErrors:  hasToolErrors(messages),
+		ToolErrorText:  toolErrorText(messages),
+		Scanned:        true,
 	}
 }
 
-// hasToolErrors checks the last user message for tool_result blocks with is_error:true.
-// This detects whether Claude's previous action resulted in errors.
-func hasToolErrors(messages []any) bool {
+// toolErrorText returns the failure text of the first failed tool_result in the
+// last user message. The text doubles as the identity of the failure: the fail
+// counter must not fire twice for the same error, or an error loop alone drives
+// a used learning to the hook's hard-block threshold.
+func toolErrorText(messages []any) string {
 	// Find last user message (contains tool_results from previous assistant turn)
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg, ok := messages[i].(map[string]any)
@@ -177,14 +219,27 @@ func hasToolErrors(messages []any) bool {
 			if !ok {
 				continue
 			}
-			if blk["type"] != "tool_result" {
+			if !toolResultIsError(blk) {
 				continue
 			}
-			if isErr, ok := blk["is_error"].(bool); ok && isErr {
-				return true
+			text, _ := blk["content"].(string)
+			if text == "" {
+				// Anthropic allows block-shaped tool result content. Serialize it
+				// rather than falling back to a constant, or every such failure of
+				// the thread would share one fingerprint and count only once.
+				if raw, err := json.Marshal(blk["content"]); err == nil {
+					text = string(raw)
+				}
 			}
+			if text == "" {
+				text = "tool_result marked is_error"
+			}
+			if len(text) > 200 {
+				text = text[:200]
+			}
+			return text
 		}
 		break // only check the last user message
 	}
-	return false
+	return ""
 }

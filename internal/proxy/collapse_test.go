@@ -234,6 +234,55 @@ func TestCalcCollapseCutoff_SkipsOrphanToolResult(t *testing.T) {
 	}
 }
 
+func TestCalcCollapseCutoff_KeepRecentClampDoesNotLandOnToolResult(t *testing.T) {
+	// YM-140: the tool_result alignment only ran BEFORE the keepRecent clamp.
+	// When the budget cutoff exceeds maxCutoff, the clamp pulled the cutoff back
+	// onto messages[maxCutoff] — a user message with tool_result blocks whose
+	// tool_use sat at maxCutoff-1 and was collapsed. The pair got split and
+	// every such collapse was "repaired" downstream by deleting the tool_result.
+	n := 20
+	msgs := make([]any, n)
+	msgs[0] = map[string]any{"role": "user", "content": "start"}
+	for i := 1; i < n; i++ {
+		msgs[i] = map[string]any{"role": "user", "content": "filler"}
+	}
+	// messages[14] = assistant tool_use, messages[15] = its tool_result.
+	// keepRecent=5 → maxCutoff = 15 → the clamp lands exactly on the pair.
+	msgs[14] = map[string]any{
+		"role": "assistant",
+		"content": []any{
+			map[string]any{"type": "tool_use", "id": "toolu_14", "name": "Read",
+				"input": map[string]any{"file_path": "/a.go"}},
+		},
+	}
+	msgs[15] = map[string]any{
+		"role": "user",
+		"content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "toolu_14", "content": "ok"},
+		},
+	}
+
+	// Every message costs perMessageOverhead, so floor=12 stops the backward
+	// walk at index 17; maxCutoff (15) is the binding constraint here.
+	zeroTokens := func(string) int { return 0 }
+
+	cutoff := CalcCollapseCutoff(msgs, 5, 12, zeroTokens)
+	if cutoff <= 0 {
+		t.Fatalf("expected a cutoff, got %d", cutoff)
+	}
+	if maxCutoff := n - 5; cutoff > maxCutoff {
+		t.Fatalf("cutoff=%d exceeds keepRecent clamp %d", cutoff, maxCutoff)
+	}
+
+	first, _ := msgs[cutoff].(map[string]any)
+	if first["role"] == "user" && hasToolResultContent(first["content"]) {
+		t.Fatalf("cutoff=%d lands on a tool_result whose tool_use is collapsed — pair split", cutoff)
+	}
+	if !hasToolUseContent(first["content"]) {
+		t.Errorf("cutoff=%d should start at the assistant tool_use message, got role=%v", cutoff, first["role"])
+	}
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

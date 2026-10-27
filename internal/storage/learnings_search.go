@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/carsteneu/yesmem/internal/models"
 )
@@ -21,12 +22,16 @@ import (
 //   - Empty requested matches anything (no filter applied).
 //   - Empty stored values (legacy rows without project/canonical_project) match any
 //     requested value so these rows remain discoverable, mirroring the
-//     `OR canonical_project = ''` clause in SearchUnfinished.
+//     `OR canonical_project = ”` clause in SearchUnfinished.
 //   - Direct equality on either stored field (canonical or raw) matches.
-//   - Otherwise: canonicalize both sides via models.CanonicalProject (basename +
-//     .worktrees/ strip) and compare. Skip canonicalization when BOTH sides are
-//     absolute paths — this preserves the strict-equality guarantee for the
-//     same-basename-different-parent case (e.g., /a/foo vs /b/foo must NOT match).
+//   - A row that names its repository by PATH is compared through that path: two paths
+//     describe the same project when their cluster keys agree, which folds the worktrees
+//     of a repository onto its root. Two repositories that share a basename keep separate
+//     keys, so they stay apart even though CanonicalProject is equal for both (YM-424).
+//   - A row WITHOUT a path (a legacy bare name) has no other handle than its name, so it
+//     stays discoverable under any request that carries the same basename. That is the
+//     deliberate difference between the legacy and the unassigned state: an unassigned
+//     row matches every request, a legacy row only a same-named one.
 func projectMatchesTolerant(storedProject, storedCanonical, requested string) bool {
 	if requested == "" {
 		return true
@@ -34,27 +39,22 @@ func projectMatchesTolerant(storedProject, storedCanonical, requested string) bo
 	if storedCanonical == "" && storedProject == "" {
 		return true
 	}
-	reqIsAbs := strings.HasPrefix(requested, "/")
-	reqCanon := models.CanonicalProject(requested)
-	for _, stored := range []string{storedCanonical, storedProject} {
-		if stored == "" {
-			continue
-		}
-		if stored == requested {
-			return true
-		}
-		// Canonicalize only when at least one side is a short name. When both are
-		// absolute paths that didn't compare equal above, treat as no-match to
-		// avoid /a/foo matching /b/foo (different repos sharing a basename).
-		storedIsAbs := strings.HasPrefix(stored, "/")
-		if storedIsAbs && reqIsAbs {
-			continue
-		}
-		if models.CanonicalProject(stored) == reqCanon {
-			return true
-		}
+	if storedProject != "" && storedProject == requested {
+		return true
 	}
-	return false
+	if storedCanonical != "" && storedCanonical == requested {
+		return true
+	}
+	reqCanon := models.CanonicalProject(requested)
+	if models.ClassifyProject(storedProject) == models.ProjectOriginPath {
+		if strings.HasPrefix(requested, "/") {
+			key := models.ClusterProjectKey(storedProject)
+			return key != "" && key == models.ClusterProjectKey(requested)
+		}
+		return models.CanonicalProject(storedProject) == reqCanon
+	}
+	return models.CanonicalProject(storedCanonical) == reqCanon ||
+		models.CanonicalProject(storedProject) == reqCanon
 }
 
 // QueryFactsOpts defines filters for structured fact queries on learning metadata.
@@ -89,10 +89,9 @@ func (s *Store) QueryFacts(opts QueryFactsOpts) ([]models.Learning, error) {
 	var where []string
 	var args []any
 
-	where = append(where, `l.superseded_by IS NULL`)
-	where = append(where, `(l.expires_at IS NULL OR l.expires_at > ?)`)
+	where = append(where, models.RecallableLearningSQLAlias)
+	where = append(where, `(l.expires_at IS NULL OR julianday(l.expires_at) > julianday(?))`)
 	args = append(args, fmtTime(time.Now()))
-	where = append(where, `COALESCE(l.quarantined_at, '') = ''`)
 
 	if opts.Entity != "" {
 		joins = append(joins, `JOIN learning_entities le ON le.learning_id = l.id`)
@@ -138,25 +137,202 @@ func (s *Store) QueryFacts(opts QueryFactsOpts) ([]models.Learning, error) {
 	return scanLearnings(rows)
 }
 
+// MinResolveTerms is the number of query words a text search must carry before
+// an unfinished item may be resolved without an explicit id. Below that, the
+// overlap is too likely to come from a coincidence shared with an unrelated item.
+const MinResolveTerms = 3
+
+// maxUnfinishedQueryTerms caps the AND tier width so a pasted paragraph cannot
+// turn one search into dozens of FTS queries.
+const maxUnfinishedQueryTerms = 10
+
+// UnfinishedSearch is the result of a ranked unfinished-item search.
+//
+// Items holds candidates, best first: the hits of the first AND tier that
+// produced any, or, when no tier found anything, the ranked hits of a
+// single-word fallback (MatchedTerms == 0). Terms is the number of distinct
+// words in the query, MatchedTerms the number of words the winning tier
+// required. Candidates from a relaxed tier may still contain some of the
+// dropped words, so Items must not be read as "contains every term" unless
+// FullMatch reports true.
+type UnfinishedSearch struct {
+	Items        []models.Learning
+	Terms        int
+	MatchedTerms int
+	// IndexedTerms counts the query words that occur anywhere in the knowledge
+	// base. Words below Terms can never be matched, so they rule out a full match.
+	IndexedTerms int
+}
+
+// FullMatch reports whether the winning tier required every query word.
+func (r *UnfinishedSearch) FullMatch() bool {
+	return r != nil && r.Terms > 0 && r.MatchedTerms == r.Terms && len(r.Items) > 0
+}
+
+// SkipReason explains why nothing may be resolved automatically. It is empty
+// exactly when AutoResolveTarget succeeds.
+func (r *UnfinishedSearch) SkipReason() string {
+	switch {
+	case r == nil || r.Terms == 0:
+		return "empty search text"
+	case len(r.Items) == 0:
+		return "no matching unfinished items found"
+	case r.Terms < MinResolveTerms:
+		return fmt.Sprintf("search text has %d term(s), at least %d are required to resolve without an explicit id", r.Terms, MinResolveTerms)
+	case r.Terms > maxUnfinishedQueryTerms:
+		return fmt.Sprintf("search text has %d terms, only the first %d are searched; pass a shorter distinctive phrase", r.Terms, maxUnfinishedQueryTerms)
+	case r.IndexedTerms < r.Terms:
+		return fmt.Sprintf("%d of %d search terms occur in no learning at all, so no unfinished item can contain them all", r.Terms-r.IndexedTerms, r.Terms)
+	case !r.FullMatch():
+		if r.MatchedTerms == 0 {
+			return fmt.Sprintf("no unfinished item contains all %d search terms, the candidates below only share single words", r.Terms)
+		}
+		return fmt.Sprintf("no unfinished item contains all %d search terms (closest candidates match %d of them)", r.Terms, r.MatchedTerms)
+	case len(r.Items) > 1:
+		return fmt.Sprintf("%d unfinished items contain all %d search terms, pass the learning_id instead", len(r.Items), r.Terms)
+	}
+	return ""
+}
+
+// AutoResolveTarget returns the only item that may be resolved without an
+// explicit id: a unique candidate that contains every query word, with the query
+// carrying at least MinResolveTerms words.
+func (r *UnfinishedSearch) AutoResolveTarget() (models.Learning, bool) {
+	if r == nil || r.SkipReason() != "" {
+		return models.Learning{}, false
+	}
+	return r.Items[0], true
+}
+
 // SearchUnfinished searches active unfinished items using FTS5 full-text search.
-// Words are joined with OR so partial matches work (e.g. "Signal-to-Noise verbessern"
-// finds "Signal-to-Noise 60/40→90/10" even though "verbessern" is absent).
-// Results are ranked by FTS5 relevance (bm25).
+// The result is a display list: when no conjunction matched, it can contain items
+// that share only a single query word. Resolving decisions must use
+// SearchUnfinishedRanked (resolve_by_text) or ResolveCommit (commit subjects);
+// neither this function nor a plain first hit may close an item.
 func (s *Store) SearchUnfinished(query, project string) ([]models.Learning, error) {
+	found, err := s.SearchUnfinishedRanked(query, project)
+	if err != nil {
+		return nil, err
+	}
+	return found.Items, nil
+}
+
+// SearchUnfinishedRanked searches active unfinished items with AND matching and
+// reports how complete the match is.
+//
+// The query words are joined with AND, never OR: the project convention is BM25
+// over all terms. When the full conjunction finds nothing, the search relaxes by
+// dropping the most common word first (lowest IDF) until a tier produces hits.
+// That order keeps a single shared word from outranking a document that contains
+// the whole query, which is how learning #66092 got resolved by mistake.
+func (s *Store) SearchUnfinishedRanked(query, project string) (*UnfinishedSearch, error) {
 	words := splitWords(query)
 	if len(words) == 0 {
-		return nil, nil
+		return &UnfinishedSearch{}, nil
+	}
+	// Punctuation-only tokens have no FTS5 tokens at all and would make the MATCH
+	// fail with a syntax error; they cannot carry a match either way.
+	searchable := make([]string, 0, len(words))
+	keys := make([]string, 0, len(words))
+	for _, w := range words {
+		key := searchKey(w)
+		if key == "" {
+			continue
+		}
+		searchable = append(searchable, w)
+		keys = append(keys, key)
+	}
+	// Repeated words count once, keyed on the alphanumeric core so that "proxy,",
+	// "proxy." and "proxy" cannot pose as three terms and satisfy the three-word
+	// minimum with a single one.
+	seen := make(map[string]bool, len(keys))
+	words = searchable[:0]
+	for i, w := range searchable {
+		if !seen[keys[i]] {
+			seen[keys[i]] = true
+			words = append(words, w)
+		}
+	}
+	if len(words) == 0 {
+		return &UnfinishedSearch{}, nil
+	}
+	// Count before the cap: a long text that was truncated must never look like a
+	// full match, otherwise the dropped words would be silently unchecked.
+	totalTerms := len(words)
+	if len(words) > maxUnfinishedQueryTerms {
+		words = words[:maxUnfinishedQueryTerms]
 	}
 
-	// Build FTS5 query: "word1" OR "word2" OR "word3"
-	// Quoting prevents FTS5 from interpreting hyphens as column operators
-	quoted := make([]string, len(words))
-	for i, w := range words {
-		quoted[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+	// Quoting prevents FTS5 from reading hyphens as column operators.
+	type termFreq struct {
+		term  string
+		count int
 	}
-	ftsQuery := strings.Join(quoted, " OR ")
+	var freqs []termFreq
+	for _, w := range words {
+		term := `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+		var cnt int
+		if err := s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH ?`, term).Scan(&cnt); err != nil {
+			return nil, fmt.Errorf("search unfinished term frequency: %w", err)
+		}
+		if cnt > 0 {
+			freqs = append(freqs, termFreq{term: term, count: cnt})
+		}
+	}
+	sort.Slice(freqs, func(i, j int) bool { return freqs[i].count < freqs[j].count })
 
-	base := `SELECT l.id, l.session_id, l.category, l.content, l.project, l.confidence,
+	found := &UnfinishedSearch{Terms: totalTerms, IndexedTerms: len(freqs)}
+	for width := len(freqs); width >= 1; width-- {
+		terms := make([]string, width)
+		for i := 0; i < width; i++ {
+			terms[i] = freqs[i].term
+		}
+		items, err := s.searchUnfinishedTier(terms, project, " AND ")
+		if err != nil {
+			return nil, err
+		}
+		if len(items) > 0 {
+			found.Items = items
+			found.MatchedTerms = width
+			return found, nil
+		}
+	}
+
+	// Nothing matched a conjunction. Still return the items that share a single
+	// word so the caller can list them as candidates: the AND tiers only ever try
+	// the rarest words first, and in a small project those can be the ones whose
+	// open tasks are gone. This fallback is display-only, never a resolve basis
+	// (MatchedTerms == 0 keeps FullMatch false).
+	if len(freqs) > 0 {
+		orTerms := make([]string, len(freqs))
+		for i, f := range freqs {
+			orTerms[i] = f.term
+		}
+		items, err := s.searchUnfinishedTier(orTerms, project, " OR ")
+		if err != nil {
+			return nil, err
+		}
+		found.Items = items
+	}
+	return found, nil
+}
+
+// searchKey reduces a query word to its alphanumeric core, which is what the
+// FTS5 tokenizer makes of it. An empty key means the word carries no token.
+func searchKey(w string) string {
+	var b strings.Builder
+	b.Grow(len(w))
+	for _, r := range w {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// unfinishedSelectColumns is the scan order shared by every unfinished-item
+// query: scanLearnings expects exactly this column list.
+const unfinishedSelectColumns = `l.id, l.session_id, l.category, l.content, l.project, l.confidence,
 		l.superseded_by, l.supersede_reason, l.created_at, l.expires_at, l.model_used, l.source,
 		COALESCE(l.hit_count, 0), COALESCE(l.emotional_intensity, 0.0), l.last_hit_at, COALESCE(l.session_flavor, ''), l.valid_until, l.supersedes, COALESCE(l.importance, 3), l.supersede_status, COALESCE(l.noise_count, 0), COALESCE(l.fail_count, 0),
 		COALESCE(l.match_count, 0), COALESCE(l.inject_count, 0), COALESCE(l.use_count, 0), COALESCE(l.save_count, 0), COALESCE(l.stability, 30.0),
@@ -164,12 +340,18 @@ func (s *Store) SearchUnfinished(query, project string) ([]models.Learning, erro
 		COALESCE(l.source_file, ''), COALESCE(l.source_hash, ''), COALESCE(l.doc_chunk_ref, 0), COALESCE(l.task_type, ''), COALESCE(l.turns_at_creation, 0), COALESCE(l.origin_tool, ''), COALESCE(l.source_msg_from, -1), COALESCE(l.source_msg_to, -1),
 		COALESCE(l.canonical_project, ''),
 		COALESCE(l.attribution, ''),
-		COALESCE(l.staleness_score, 0.0), COALESCE(l.staleness_reason, ''), l.staleness_checked_at, COALESCE(l.staleness_type, ''), COALESCE(l.code_fingerprint, ''), COALESCE(l.project_source, '')
+		COALESCE(l.staleness_score, 0.0), COALESCE(l.staleness_reason, ''), l.staleness_checked_at, COALESCE(l.staleness_type, ''), COALESCE(l.code_fingerprint, ''), COALESCE(l.project_source, '')`
+
+// searchUnfinishedTier runs one tier of the unfinished search. joiner is
+// " AND " for a real tier and " OR " only for the display-only candidate
+// fallback.
+func (s *Store) searchUnfinishedTier(terms []string, project, joiner string) ([]models.Learning, error) {
+	base := `SELECT ` + unfinishedSelectColumns + `
 		FROM learnings_fts
 		JOIN learnings l ON l.id = learnings_fts.rowid
 		WHERE learnings_fts MATCH ?
-		AND l.superseded_by IS NULL AND l.category = 'unfinished'`
-	args := []any{ftsQuery}
+		AND ` + models.RecallableLearningSQLAlias + ` AND l.category = 'unfinished'`
+	args := []any{strings.Join(terms, joiner)}
 
 	if project != "" {
 		base += ` AND (l.canonical_project = ? OR l.canonical_project = '')`
@@ -212,6 +394,9 @@ func (s *Store) SearchLearningsBM25Ctx(ctx context.Context, query, project, sinc
 	}
 	if limit <= 0 {
 		limit = 3
+	}
+	if err := validateFilterBounds(since, before); err != nil {
+		return nil, err
 	}
 
 	// Quote each word for FTS5
@@ -345,17 +530,17 @@ func (s *Store) SearchLearningsBM25Ctx(ctx context.Context, query, project, sinc
 		args[i] = h.id
 	}
 
-	metaSQL := `SELECT CAST(id AS TEXT), COALESCE(project, ''), COALESCE(canonical_project, ''), category, created_at FROM learnings WHERE id IN (` + strings.Join(placeholders, ",") + `) AND quarantined_at IS NULL`
+	metaSQL := `SELECT CAST(id AS TEXT), COALESCE(project, ''), COALESCE(canonical_project, ''), category, created_at FROM learnings WHERE id IN (` + strings.Join(placeholders, ",") + `) AND ` + models.RecallableLearningSQL
 	metaRows, err := s.readerDB().QueryContext(ctx, metaSQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search learnings meta: %w", err)
 	}
 
 	type meta struct {
-		project           string
-		canonicalProject  string
-		category          string
-		createdAt         string
+		project          string
+		canonicalProject string
+		category         string
+		createdAt        string
 	}
 	metaMap := make(map[string]meta, len(hits))
 	for metaRows.Next() {
@@ -367,6 +552,10 @@ func (s *Store) SearchLearningsBM25Ctx(ctx context.Context, query, project, sinc
 	metaRows.Close()
 
 	// Step 3: Merge and filter
+	// Compare parsed instants: created_at carries the writer's offset, so a
+	// string comparison against a UTC or date-only bound shifts the window.
+	sinceT := ParseFilterTime(since)
+	beforeT := ParseFilterTime(before)
 	var results []LearningSearchResult
 	for _, h := range hits {
 		m, ok := metaMap[h.id]
@@ -383,10 +572,11 @@ func (s *Store) SearchLearningsBM25Ctx(ctx context.Context, query, project, sinc
 		if project != "" && !projectMatchesTolerant(m.project, m.canonicalProject, project) {
 			continue
 		}
-		if since != "" && m.createdAt < since {
+		createdT := ParseTimestamp(m.createdAt)
+		if !sinceT.IsZero() && createdT.Before(sinceT) {
 			continue
 		}
-		if before != "" && m.createdAt >= before {
+		if !beforeT.IsZero() && !createdT.Before(beforeT) {
 			continue
 		}
 		results = append(results, LearningSearchResult{
@@ -429,7 +619,7 @@ func (s *Store) FindLearningsByEntityMatch(entities []string, project string) ([
 		JOIN learning_entities le ON le.learning_id = l.id
 		WHERE le.value IN (` + strings.Join(placeholders, ",") + `)
 		AND l.superseded_by IS NULL
-		AND l.valid_until IS NULL`
+		AND (l.valid_until IS NULL OR julianday(l.valid_until) > julianday('now'))`
 
 	if project != "" {
 		query += ` AND (l.canonical_project = ? OR l.canonical_project = '')`
@@ -454,6 +644,9 @@ func (s *Store) SearchAnticipatedQueries(query, project string, limit int, since
 	if len(words) < 2 {
 		return nil, nil
 	}
+	if err := validateFilterBounds(since, before); err != nil {
+		return nil, err
+	}
 	terms := make([]string, 0, len(words))
 	for _, w := range words {
 		w = strings.ReplaceAll(w, `"`, "")
@@ -477,15 +670,17 @@ func (s *Store) SearchAnticipatedQueries(query, project string, limit int, since
 }
 
 func (s *Store) runAQFTSQuery(ftsQuery, project string, limit int, since, before string) ([]LearningSearchResult, error) {
-	where := `MATCH ? AND l.superseded_by IS NULL`
+	where := `MATCH ? AND ` + models.RecallableLearningSQLAlias
 	args := []any{ftsQuery}
+	// julianday() on the column makes the mixed offsets in created_at comparable;
+	// the bound is normalized so its spelling never matters.
 	if since != "" {
-		where += ` AND l.created_at >= ?`
-		args = append(args, since)
+		where += ` AND julianday(l.created_at) >= julianday(?)`
+		args = append(args, SQLiteFilterTime(since))
 	}
 	if before != "" {
-		where += ` AND l.created_at < ?`
-		args = append(args, before)
+		where += ` AND julianday(l.created_at) < julianday(?)`
+		args = append(args, SQLiteFilterTime(before))
 	}
 
 	rows, err := s.readerDB().Query(`

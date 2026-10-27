@@ -25,8 +25,13 @@ import (
 //     first-entry, or built-in defaults).
 //   - Models containing "/" are returned verbatim (already provider-qualified).
 //   - Bare model names are looked up in providerMap (lowercased). On hit,
-//     "providerID/modelID" is returned. Coding variants are excluded from
-//     providerMap upstream, so they are never auto-selected.
+//     "providerID/modelID" is returned. Note that coding-plan providers
+//     (e.g. "zai-coding-plan") ARE part of providerMap — they are ordinary
+//     providers, not a separate class, and they often carry models the free
+//     tier also lists. When several providers carry the same bare modelID, a
+//     credential-backed provider wins over a credential-free one, then the
+//     alphabetically-first ProviderID; the user resolves the rest explicitly
+//     with "provider/model".
 //   - Unknown bare names log a warning and pass through unchanged (best-effort,
 //     no error — user may know something the auto-discovery doesn't).
 //
@@ -48,12 +53,10 @@ func resolveSpawnModel(model, backend string, providerMap map[string]string) str
 	return model
 }
 
-// resolvedAgentModel wraps resolveSpawnModel with lazy-cached auto-discovery.
-// The provider map is built once on first call (sync.Once) and reused for all
-// subsequent spawns. Daemon restart re-runs discovery.
+// resolvedAgentModel resolves a bare model name through auto-discovery. The map
+// comes from a file-stamp cache, so a credential added after start ("opencode
+// auth login") resolves on the next spawn without a daemon restart, and the
+// megabyte-sized models.json is not re-parsed for every spawn (YM-262).
 func (h *Handler) resolvedAgentModel(model, backend string) string {
-	h.modelProviderMapOnce.Do(func() {
-		h.modelProviderMap = proxy.BuildModelProviderMap()
-	})
-	return resolveSpawnModel(model, backend, h.modelProviderMap)
+	return resolveSpawnModel(model, backend, proxy.BuildModelProviderMapCached())
 }

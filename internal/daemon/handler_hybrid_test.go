@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -319,54 +320,6 @@ func TestAugmentWithGraphNeighbors_SupportsSource(t *testing.T) {
 	t.Error("supports neighbor not found in results")
 }
 
-func TestFilterResultsByTime_Empty(t *testing.T) {
-	h, _ := mustHandler(t)
-	results := h.filterResultsByTime(nil, "", "")
-	if len(results) != 0 {
-		t.Errorf("expected empty, got %d", len(results))
-	}
-}
-
-func TestFilterResultsByTime_WithSince(t *testing.T) {
-	h, s := mustHandler(t)
-
-	old := &models.Learning{Content: "old learning", Category: "pattern", Source: "user_stated"}
-	idOld, _ := s.InsertLearning(old)
-	s.DB().Exec("UPDATE learnings SET created_at = '2026-01-01T00:00:00Z' WHERE id = ?", idOld)
-
-	recent := &models.Learning{Content: "recent learning", Category: "pattern", Source: "user_stated"}
-	idRecent, _ := s.InsertLearning(recent)
-	s.DB().Exec("UPDATE learnings SET created_at = '2026-03-30T00:00:00Z' WHERE id = ?", idRecent)
-
-	results := []embedding.RankedResult{
-		{ID: fmt.Sprintf("%d", idOld), Score: 0.9},
-		{ID: fmt.Sprintf("%d", idRecent), Score: 0.8},
-	}
-
-	filtered := h.filterResultsByTime(results, "2026-03-01", "")
-	if len(filtered) != 1 {
-		t.Fatalf("expected 1 result after since filter, got %d", len(filtered))
-	}
-	if filtered[0].ID != fmt.Sprintf("%d", idRecent) {
-		t.Error("expected only the recent learning")
-	}
-}
-
-func TestFilterResultsByTime_WithBefore(t *testing.T) {
-	h, s := mustHandler(t)
-
-	l := &models.Learning{Content: "march learning", Category: "pattern", Source: "user_stated"}
-	id, _ := s.InsertLearning(l)
-	s.DB().Exec("UPDATE learnings SET created_at = '2026-03-15T00:00:00Z' WHERE id = ?", id)
-
-	results := []embedding.RankedResult{{ID: fmt.Sprintf("%d", id), Score: 0.9}}
-
-	filtered := h.filterResultsByTime(results, "", "2026-02-01")
-	if len(filtered) != 0 {
-		t.Error("should be filtered out by before='2026-02-01'")
-	}
-}
-
 func TestResolveSupersededResults(t *testing.T) {
 	h, s := mustHandler(t)
 
@@ -393,10 +346,441 @@ func TestResolveSupersededResults(t *testing.T) {
 	}
 }
 
+// TestResolveSupersededResults_DropsResolvedChainEnd guards against promoting a
+// learning that is itself inactive: X was superseded by Y, Y was later resolved
+// (superseded_by = -2). Y must not surface as X's "active successor".
+func TestResolveSupersededResults_DropsResolvedChainEnd(t *testing.T) {
+	h, s := mustHandler(t)
+
+	l1 := &models.Learning{Content: "old decision text", Category: "decision", Source: "user_stated"}
+	id1, err := s.InsertLearning(l1)
+	if err != nil {
+		t.Fatalf("insert l1: %v", err)
+	}
+	l2 := &models.Learning{Content: "middle decision text", Category: "decision", Source: "user_stated"}
+	id2, err := s.InsertLearning(l2)
+	if err != nil {
+		t.Fatalf("insert l2: %v", err)
+	}
+
+	if err := s.SupersedeLearning(id1, id2, "newer approach"); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	if err := s.ResolveLearning(id2, "resolved later"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	results := []embedding.RankedResult{
+		{ID: fmt.Sprintf("%d", id1), Score: 0.9},
+		{ID: fmt.Sprintf("%d", id2), Score: 0.8},
+	}
+
+	resolved := h.resolveSupersededResults(results)
+	for _, r := range resolved {
+		if r.ID == fmt.Sprintf("%d", id2) {
+			t.Fatalf("resolved learning #%d was promoted as an active successor", id2)
+		}
+	}
+}
+
 func TestEnrichRankedResults_Empty(t *testing.T) {
 	h, _ := mustHandler(t)
 	enriched := h.enrichRankedResults(nil)
 	if len(enriched) != 0 {
 		t.Errorf("expected empty, got %d", len(enriched))
+	}
+}
+
+// --- YM-38 / YM-39 / YM-41 / YM-44 regression tests ---
+
+// insertAgedLearning inserts a learning with a UTC created_at well outside the
+// 30 minute cooldown. UTC matters: the cooldown comparison is only meaningful for
+// timestamps sharing one zone representation.
+func insertAgedLearning(t *testing.T, s *storage.Store, l *models.Learning) int64 {
+	t.Helper()
+	if l.CreatedAt.IsZero() {
+		l.CreatedAt = time.Now().Add(-2 * time.Hour).UTC()
+	}
+	id, err := s.InsertLearning(l)
+	if err != nil {
+		t.Fatalf("insert learning %q: %v", l.Content, err)
+	}
+	return id
+}
+
+// mustVectorHandler wires a vector store with a deterministic test provider.
+func mustVectorHandler(t *testing.T) (*Handler, *storage.Store, *embedding.Indexer) {
+	t.Helper()
+	h, s := mustHandlerWithEmbedding(t)
+	store, err := embedding.NewVectorStore(s.DB(), 4)
+	if err != nil {
+		t.Fatalf("new vector store: %v", err)
+	}
+	provider := &testEmbedProvider{dims: 4}
+	indexer := embedding.NewIndexer(provider, store)
+	h.SetEmbedding(indexer, store, provider)
+	return h, s, indexer
+}
+
+// hybridSearchRun executes hybrid_search and returns id → project of the results.
+func hybridSearchRun(t *testing.T, h *Handler, query string) map[string]string {
+	t.Helper()
+	resp := h.Handle(Request{
+		Method: "hybrid_search",
+		Params: map[string]any{"query": query, "limit": float64(20)},
+	})
+	if resp.Error != "" {
+		t.Fatalf("hybrid_search error: %s", resp.Error)
+	}
+	var out struct {
+		Results []struct {
+			ID      string `json:"id"`
+			Project string `json:"project"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		t.Fatalf("parse hybrid_search result: %v", err)
+	}
+	byID := make(map[string]string, len(out.Results))
+	for _, r := range out.Results {
+		byID[r.ID] = r.Project
+	}
+	return byID
+}
+
+// TestHybridSearchVectorHitCarriesItsProject (YM-38): a hit that only the vector
+// lane found must carry the learning's project. Project-less hits fall through the
+// proxy's fallback gate and are dropped there ([SKIP-noproj-fallback]).
+func TestHybridSearchVectorHitCarriesItsProject(t *testing.T) {
+	h, s, indexer := mustVectorHandler(t)
+
+	id := insertAgedLearning(t, s, &models.Learning{
+		Content:  "ingress tls termination sentinel",
+		Category: "pattern",
+		Project:  "proj-alpha",
+		Source:   "llm_extracted",
+	})
+	if err := indexer.Index(context.Background(), fmt.Sprintf("%d", id), "ingress tls termination sentinel", nil); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	// Query without any FTS overlap: only the vector lane can produce this hit.
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	project, ok := results[fmt.Sprintf("%d", id)]
+	if !ok {
+		t.Fatalf("vector hit %d missing from results: %v", id, results)
+	}
+	if project != "proj-alpha" {
+		t.Errorf("vector hit lost its project: got %q, want %q", project, "proj-alpha")
+	}
+}
+
+// TestHybridSearchCooldownParsesTimestampsWithOffset (YM-39): created_at carries
+// the writer's UTC offset (fmtTime writes RFC3339 in local time). Comparing that
+// string against a UTC cutoff made the 30 minute cooldown last 2.5 hours.
+func TestHybridSearchCooldownParsesTimestampsWithOffset(t *testing.T) {
+	h, s, indexer := mustVectorHandler(t)
+
+	id := insertAgedLearning(t, s, &models.Learning{
+		Content:  "cooldown offset sentinel",
+		Category: "pattern",
+		Source:   "llm_extracted",
+	})
+	// 90 minutes old, written in +02:00: far outside the cooldown, but
+	// lexicographically greater than a UTC "now minus 30 minutes" cutoff.
+	createdAt := time.Now().Add(-90 * time.Minute).In(time.FixedZone("CEST", 2*3600)).Format(time.RFC3339)
+	if _, err := s.DB().Exec("UPDATE learnings SET created_at = ? WHERE id = ?", createdAt, id); err != nil {
+		t.Fatalf("set created_at: %v", err)
+	}
+	if err := indexer.Index(context.Background(), fmt.Sprintf("%d", id), "cooldown offset sentinel", nil); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	if _, ok := results[fmt.Sprintf("%d", id)]; !ok {
+		t.Errorf("learning created 90 minutes ago was suppressed as if it were inside the cooldown (%s): %v", createdAt, results)
+	}
+}
+
+// TestHybridSearchGraphNeighborRespectsCategoryFilter (YM-41): neighbours pulled in
+// through association edges must pass the same category filter as search hits.
+func TestHybridSearchGraphNeighborRespectsCategoryFilter(t *testing.T) {
+	h, s, indexer := mustVectorHandler(t)
+
+	parentID := insertAgedLearning(t, s, &models.Learning{
+		Content:  "parent anchor about proxy restart",
+		Category: "gotcha",
+		Source:   "user_stated",
+	})
+	neighborID := insertAgedLearning(t, s, &models.Learning{
+		Content:  "narrative summary that must never be injected",
+		Category: "narrative",
+		Source:   "llm_extracted",
+	})
+	if err := s.InsertTypedAssociation(parentID, neighborID, "relates_to"); err != nil {
+		t.Fatalf("insert association: %v", err)
+	}
+	if err := indexer.Index(context.Background(), fmt.Sprintf("%d", parentID), "parent anchor about proxy restart", nil); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	if _, ok := results[fmt.Sprintf("%d", parentID)]; !ok {
+		t.Fatalf("parent anchor missing from results: %v", results)
+	}
+	if _, ok := results[fmt.Sprintf("%d", neighborID)]; ok {
+		t.Errorf("narrative learning %d was injected as a graph neighbor, bypassing the category filter", neighborID)
+	}
+}
+
+// TestHybridSearchGraphNeighborRespectsCooldown (YM-41): neighbours must respect
+// the 30 minute cooldown just like search hits.
+func TestHybridSearchGraphNeighborRespectsCooldown(t *testing.T) {
+	h, s, indexer := mustVectorHandler(t)
+
+	parentID := insertAgedLearning(t, s, &models.Learning{
+		Content:  "parent anchor about docker networking",
+		Category: "gotcha",
+		Source:   "user_stated",
+	})
+	neighborID := insertAgedLearning(t, s, &models.Learning{
+		Content:   "just written neighbour learning",
+		Category:  "gotcha",
+		Source:    "llm_extracted",
+		CreatedAt: time.Now().Add(-time.Minute).UTC(),
+	})
+	if err := s.InsertTypedAssociation(parentID, neighborID, "supports"); err != nil {
+		t.Fatalf("insert association: %v", err)
+	}
+	if err := indexer.Index(context.Background(), fmt.Sprintf("%d", parentID), "parent anchor about docker networking", nil); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	if _, ok := results[fmt.Sprintf("%d", parentID)]; !ok {
+		t.Fatalf("parent anchor missing from results: %v", results)
+	}
+	if _, ok := results[fmt.Sprintf("%d", neighborID)]; ok {
+		t.Errorf("learning %d created one minute ago was injected as a graph neighbor, bypassing the cooldown", neighborID)
+	}
+}
+
+// TestHybridSearchGraphNeighborOfFilteredParentIsNotAdded (YM-41): expanding from a
+// hit that the category filter drops would smuggle its neighbour past the same gate.
+func TestHybridSearchGraphNeighborOfFilteredParentIsNotAdded(t *testing.T) {
+	h, s, indexer := mustVectorHandler(t)
+
+	parentID := insertAgedLearning(t, s, &models.Learning{
+		Content:  "narrative parent that the filter drops",
+		Category: "narrative",
+		Source:   "llm_extracted",
+	})
+	neighborID := insertAgedLearning(t, s, &models.Learning{
+		Content:  "gotcha neighbour of a dropped parent",
+		Category: "gotcha",
+		Source:   "llm_extracted",
+	})
+	if err := s.InsertTypedAssociation(parentID, neighborID, "supports"); err != nil {
+		t.Fatalf("insert association: %v", err)
+	}
+	if err := indexer.Index(context.Background(), fmt.Sprintf("%d", parentID), "narrative parent that the filter drops", nil); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	if _, ok := results[fmt.Sprintf("%d", parentID)]; ok {
+		t.Fatalf("narrative parent %d should be filtered", parentID)
+	}
+	if _, ok := results[fmt.Sprintf("%d", neighborID)]; ok {
+		t.Errorf("neighbour %d of a filtered parent was injected", neighborID)
+	}
+}
+
+// TestAugmentWithGraphNeighborsSkipsContradictingEdges (YM-41): a contradiction is
+// surfaced separately (proxy contradiction warning), never as ordinary context.
+func TestAugmentWithGraphNeighborsSkipsContradictingEdges(t *testing.T) {
+	h, s := mustHandler(t)
+
+	id1 := insertAgedLearning(t, s, &models.Learning{
+		Content:  "decision that will be contradicted",
+		Category: "decision",
+		Source:   "user_stated",
+	})
+	id2 := insertAgedLearning(t, s, &models.Learning{
+		Content:  "opposing decision text",
+		Category: "decision",
+		Source:   "user_stated",
+	})
+	if err := s.InsertTypedAssociation(id1, id2, "contradicts"); err != nil {
+		t.Fatalf("insert association: %v", err)
+	}
+
+	result := h.augmentWithGraphNeighbors([]embedding.RankedResult{
+		{ID: fmt.Sprintf("%d", id1), Content: "decision that will be contradicted", Score: 50.0, Source: "keyword"},
+	})
+
+	for _, r := range result {
+		if r.ID == fmt.Sprintf("%d", id2) {
+			t.Errorf("contradicts edge was expanded as a normal neighbour (source=%q)", r.Source)
+		}
+	}
+}
+
+// TestAugmentWithGraphNeighborsAppliesUnfinishedDampening (YM-462): the neighbor
+// path ran the narrative filter, the cooldown, the source boost and the
+// contradicts exclusion, but not the unfinished dampening the direct path applies
+// at the metadata stage. A neighbor of the same learning therefore carried a
+// higher score than the learning itself would have had as a direct hit. Both
+// paths now go through applyLearningGates, so the 0.7 factor holds for a
+// neighbor as well.
+func TestAugmentWithGraphNeighborsAppliesUnfinishedDampening(t *testing.T) {
+	h, s := mustHandler(t)
+
+	parent := insertAgedLearning(t, s, &models.Learning{
+		Content:  "parent decision for the gate check",
+		Category: "decision",
+		Source:   "llm_extracted",
+	})
+	finished := insertAgedLearning(t, s, &models.Learning{
+		Content:  "related gotcha, finished",
+		Category: "gotcha",
+		Source:   "llm_extracted",
+	})
+	unfinished := insertAgedLearning(t, s, &models.Learning{
+		Content:  "related open thread, unfinished",
+		Category: "unfinished",
+		Source:   "llm_extracted",
+	})
+	for _, target := range []int64{finished, unfinished} {
+		if err := s.InsertTypedAssociation(parent, target, "relates_to"); err != nil {
+			t.Fatalf("insert association to %d: %v", target, err)
+		}
+	}
+
+	result := h.augmentWithGraphNeighbors([]embedding.RankedResult{
+		{ID: fmt.Sprintf("%d", parent), Content: "parent decision for the gate check", Score: 100, Source: "keyword"},
+	})
+
+	score := map[string]float64{}
+	for _, r := range result {
+		score[r.ID] = r.Score
+	}
+	got, want := fmt.Sprintf("%d", unfinished), fmt.Sprintf("%d", finished)
+	if score[got] == 0 || score[want] == 0 {
+		t.Fatalf("both neighbors must be expanded, got %v", score)
+	}
+	if ratio := score[got] / score[want]; math.Abs(ratio-0.7) > 0.001 {
+		t.Errorf("the unfinished neighbor carries %.3f of the finished neighbor's score, want 0.7 — the dampening the direct path applies is missing on this path (unfinished=%.3f finished=%.3f)",
+			ratio, score[got], score[want])
+	}
+}
+
+// TestApplyLearningGates_UnfinishedDampingAndSourceBoost guards the two
+// adjustments the direct path carried in three separate loops before the merge:
+// the unfinished dampening must reach the score, and the source boost must too.
+// The multiplication commutes, so this cannot pin their order — what it pins is
+// that neither factor disappears and that the four drop rules keep dropping. The
+// neighbour test alone would leave every direct hit's score unguarded, which is
+// user-visible.
+func TestApplyLearningGates_UnfinishedDampingAndSourceBoost(t *testing.T) {
+	gated, keep := applyLearningGates(
+		embedding.RankedResult{ID: "1", Score: 100},
+		learningGates{category: "unfinished", source: "user_stated", createdAt: time.Now().Add(-2 * time.Hour)},
+		"",
+	)
+	if !keep {
+		t.Fatal("an unfinished hit outside the cooldown must stay in the result set")
+	}
+	if want := 100 * 0.7 * 1.25; math.Abs(gated.Score-want) > 0.001 {
+		t.Errorf("score = %v, want %v (0.7 unfinished dampening times the 1.25 user_stated boost)", gated.Score, want)
+	}
+
+	drops := []struct {
+		name string
+		g    learningGates
+		rel  string
+	}{
+		{"a narrative row", learningGates{category: "narrative"}, ""},
+		{"a quarantined row", learningGates{quarantined: true}, ""},
+		{"a contradicts edge", learningGates{category: "decision"}, "contradicts"},
+		{"a hit inside the result cooldown", learningGates{createdAt: time.Now()}, ""},
+	}
+	for _, d := range drops {
+		if _, keep := applyLearningGates(embedding.RankedResult{ID: "1", Score: 10}, d.g, d.rel); keep {
+			t.Errorf("%s must be dropped", d.name)
+		}
+	}
+}
+
+// TestHybridSearchVectorLaneExcludesQuarantined (YM-44): the vector SELECTs filter
+// superseded_by but not quarantined_at, so quarantined learnings came back through
+// the semantic lane.
+func TestHybridSearchVectorLaneExcludesQuarantined(t *testing.T) {
+	h, s, indexer := mustVectorHandler(t)
+
+	id := insertAgedLearning(t, s, &models.Learning{
+		Content:   "quarantined vector sentinel",
+		Category:  "gotcha",
+		SessionID: "sess-quar-vector",
+		Source:    "llm_extracted",
+	})
+	if err := indexer.Index(context.Background(), fmt.Sprintf("%d", id), "quarantined vector sentinel", nil); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	affected, err := s.QuarantineSession("sess-quar-vector")
+	if err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("quarantine affected %d rows, want 1", affected)
+	}
+
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	if _, ok := results[fmt.Sprintf("%d", id)]; ok {
+		t.Errorf("quarantined learning %d was returned through the vector lane", id)
+	}
+}
+
+// TestHybridSearchDropsQuarantinedMetadataHit (YM-44): the bulk metadata block in
+// handleHybridSearch reads category/source without quarantined_at, so quarantined
+// rows that entered the merged set anyway (here: an anticipated-query vector that
+// carries its parent's learning_id) were still injected.
+func TestHybridSearchDropsQuarantinedMetadataHit(t *testing.T) {
+	h, s, _ := mustVectorHandler(t)
+
+	id := insertAgedLearning(t, s, &models.Learning{
+		Content:   "quarantined anticipation sentinel",
+		Category:  "gotcha",
+		SessionID: "sess-quarantine-meta",
+		Source:    "llm_extracted",
+	})
+	if _, err := s.QuarantineSession("sess-quarantine-meta"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+
+	// AQ vectors live in memory and resolve to the parent learning via learning_id;
+	// no SQL filter runs on them, so the metadata block is the last gate.
+	if err := h.VectorStore().AddBatch(context.Background(), []embedding.VectorDoc{{
+		ID:        fmt.Sprintf("%d_aq_0", id),
+		Embedding: make([]float32, 4),
+		Metadata: map[string]string{
+			"learning_id": fmt.Sprintf("%d", id),
+			"project":     "",
+			"category":    "gotcha",
+		},
+	}}); err != nil {
+		t.Fatalf("add anticipated query vector: %v", err)
+	}
+
+	results := hybridSearchRun(t, h, "zzz qqq")
+
+	if _, ok := results[fmt.Sprintf("%d", id)]; ok {
+		t.Errorf("quarantined learning %d surfaced through the metadata block", id)
 	}
 }

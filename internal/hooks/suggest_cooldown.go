@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"database/sql"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -33,7 +34,22 @@ func openCooldownDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// The daemon's startup sweep never sees this file's first version: the hook
+	// process creates it. It holds which skills were suggested, so it is as private
+	// as the rest of the data directory (audit 16.10.2026, YM-338).
+	hardenCooldownFiles(path)
 	return db, nil
+}
+
+// hardenCooldownFiles restricts the cooldown database and its sidecars to the
+// owner. Best effort: a filesystem that cannot chmod must not break the guard's
+// suggestion path, and the data directory is 0700.
+func hardenCooldownFiles(path string) {
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			log.Printf("[guard] cannot restrict %s to owner-only: %v", p, err)
+		}
+	}
 }
 
 // maybeSuppressSuggestion returns true if the SUGGEST should be silenced because

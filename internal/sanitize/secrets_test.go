@@ -1,6 +1,8 @@
 package sanitize
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -39,6 +41,20 @@ func TestSecretRedactor_GitHubPAT(t *testing.T) {
 		if !strings.Contains(out, "[REDACTED:github_pat]") {
 			t.Fatalf("expected github_pat marker for prefix %s, got %q", prefix, out)
 		}
+	}
+}
+
+// A fine-grained PAT carries no gh?_ prefix, so the coarse prefix alternation
+// never saw it: a live credential class stayed in the clear.
+func TestSecretRedactor_GitHubFineGrainedPAT(t *testing.T) {
+	r := NewSecretRedactor(nil)
+	token := "github_pat_11ABCDEFG0aBcDeFgHiJkL_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS"
+	out := r.Sanitize("found " + token + " in the log")
+	if strings.Contains(out, token) {
+		t.Fatalf("fine-grained github token not redacted: %q", out)
+	}
+	if !strings.Contains(out, "[REDACTED:github_pat]") {
+		t.Fatalf("expected github_pat marker, got %q", out)
 	}
 }
 
@@ -169,8 +185,8 @@ func TestSecretRedactor_GenericAPIKey(t *testing.T) {
 	if !strings.Contains(out, "[REDACTED:generic_api_key]") {
 		t.Fatalf("expected generic_api_key marker, got %q", out)
 	}
-	// plain regex (no capture group): keyword+value are consumed into the match,
-	// so the api_key= prefix is no longer preserved in the output.
+	// template replacement: keyword and separator stay in the output, only the
+	// value goes — the assignment form survives for a JSON parser.
 }
 
 func TestSecretRedactor_GenericAPIKey_JSON(t *testing.T) {
@@ -181,6 +197,161 @@ func TestSecretRedactor_GenericAPIKey_JSON(t *testing.T) {
 	}
 	if !strings.Contains(out, "[REDACTED:generic_api_key]") {
 		t.Fatalf("expected generic_api_key marker, got %q", out)
+	}
+}
+
+func TestSecretRedactor_GenericAPIKey_KeepsJSONValid(t *testing.T) {
+	r := NewSecretRedactor(nil)
+	in := `{"api_key": "abc123def456ghi789jkl012mno"}`
+	out := r.Sanitize(in)
+	if !strings.Contains(out, "[REDACTED:generic_api_key]") {
+		t.Fatalf("expected generic_api_key marker, got %q", out)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("redacted JSON is no longer parseable: %v (in=%q out=%q)", err, in, out)
+	}
+	if parsed["api_key"] != "[REDACTED:generic_api_key]" {
+		t.Fatalf("api_key value = %v, want the marker", parsed["api_key"])
+	}
+}
+
+func TestSecretRedactor_GenericAPIKey_KeepsQuotedValueQuotes(t *testing.T) {
+	r := NewSecretRedactor(nil)
+	in := `{"token": "abc123def456ghi789jkl012mno", "next": 1}`
+	out := r.Sanitize(in)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("redacted JSON is no longer parseable: %v (in=%q out=%q)", err, in, out)
+	}
+	if parsed["next"] != float64(1) {
+		t.Fatalf("the sibling JSON field was lost: %v", parsed)
+	}
+}
+
+func TestSecretRedactor_GenericAPIKey_KeepsBareValueJSONValid(t *testing.T) {
+	r := NewSecretRedactor(nil)
+	in := `{"token": 12345678901234567890}`
+	out := r.Sanitize(in)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("redacted JSON is no longer parseable: %v (in=%q out=%q)", err, in, out)
+	}
+	if parsed["token"] != "[REDACTED:generic_api_key]" {
+		t.Fatalf("token value = %v, want the marker", parsed["token"])
+	}
+}
+
+func TestSecretRedactor_TemplateAllowlistExemptsPasswordInURL(t *testing.T) {
+	// The allowlist compares the full regex match, which ends at the host — not
+	// the whole URL. Host without a dot: the email pattern would otherwise redact
+	// the "password@host" part and mask whether password_in_url honoured the entry.
+	match := "https://svc:hunter2@dbhost"
+	r := NewSecretRedactor([]string{match})
+	out := r.Sanitize("connect to " + match + "/app now")
+	if strings.Contains(out, "[REDACTED:password_in_url]") {
+		t.Fatalf("allowlisted password_in_url match was redacted anyway: %q", out)
+	}
+	if !strings.Contains(out, "hunter2") {
+		t.Fatalf("allowlisted password was removed: %q", out)
+	}
+}
+
+func TestSecretRedactor_TemplateAllowlistExemptsAWSSecretKey(t *testing.T) {
+	match := "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	r := NewSecretRedactor([]string{match})
+	out := r.Sanitize(match)
+	if !strings.Contains(out, "wJalrXUtnFEMI") {
+		t.Fatalf("allowlisted aws_secret_access_key match should be preserved: %q", out)
+	}
+}
+
+// A secret value is an opaque string, not a charset run. The old class stopped
+// matching at the first character outside [A-Za-z0-9._-+/=], so a JSON-escaped
+// value (backslash-n inside the quoted string) or a value with a colon went out
+// in the clear.
+func TestSecretRedactor_GenericAPIKey_ValueWithForeignChars(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		hide string
+	}{
+		{
+			name: "json_escaped_newline_in_quoted_value",
+			in:   `{"api_key": "abc\ndefghijklmnopqrstuvwxyz0123"}`,
+			hide: `defghijklmnopqrstuvwxyz0123`,
+		},
+		{
+			name: "colon_inside_quoted_value",
+			in:   `{"api_key": "abc:defghijklmnopqrstuvwxyz0123"}`,
+			hide: `defghijklmnopqrstuvwxyz0123`,
+		},
+		{
+			name: "colon_inside_bare_value",
+			in:   `{"api_key": abc:defghijklmnopqrstuvwxyz0123}`,
+			hide: `defghijklmnopqrstuvwxyz0123`,
+		},
+		{
+			// A JSON-escaped quote inside the value stopped the quoted branch at the
+			// backslash, so the assignment stayed completely unredacted.
+			name: "escaped_quote_inside_quoted_value",
+			in:   `{"api_key": "aaa\"bbbbbbbbbbbbbbbbbbbbbbbbbb"}`,
+			hide: `bbbbbbbbbbbbbbbbbbbbbbbbbb`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := NewSecretRedactor(nil).Sanitize(c.in)
+			if strings.Contains(out, c.hide) {
+				t.Fatalf("secret with a foreign character leaked: in=%q out=%q", c.in, out)
+			}
+			if !strings.Contains(out, "[REDACTED:generic_api_key]") {
+				t.Fatalf("expected generic_api_key marker: in=%q out=%q", c.in, out)
+			}
+			if strings.HasSuffix(c.in, "}") {
+				var parsed map[string]any
+				if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+					t.Fatalf("redacted JSON is no longer parseable: %v (in=%q out=%q)", err, c.in, out)
+				}
+			}
+		})
+	}
+}
+
+// An allowlist entry protects the text it covers, not only the pattern that
+// matched it: with the full URL allowlisted, the email pattern still matched
+// "pw@host.tld" inside the userinfo and removed the password anyway.
+func TestSecretRedactor_AllowlistedURLProtectsItsUserinfo(t *testing.T) {
+	match := "https://svc:hunter2@db.example.com"
+	r := NewSecretRedactor([]string{match})
+	out := r.Sanitize("connect to " + match + "/app now")
+	if strings.Contains(out, "[REDACTED:") {
+		t.Fatalf("allowlisted URL was partially redacted by a later pattern: %q", out)
+	}
+	if !strings.Contains(out, match) {
+		t.Fatalf("allowlisted URL was rewritten: in=%q out=%q", match, out)
+	}
+}
+
+// Ten or more allowlisted matches exercise the sentinel encoding: with a bare
+// decimal index, sentinel 1 would be a prefix of sentinel 10 and the restore
+// step would splice the wrong text.
+func TestSecretRedactor_ManyAllowlistedMatches(t *testing.T) {
+	var allowed, parts []string
+	for i := 0; i < 12; i++ {
+		addr := fmt.Sprintf("user%d@example.com", i)
+		allowed = append(allowed, addr)
+		parts = append(parts, addr)
+	}
+	in := "list: " + strings.Join(parts, " ") + " and leak@other.com"
+	out := NewSecretRedactor(allowed).Sanitize(in)
+	for _, addr := range allowed {
+		if !strings.Contains(out, addr) {
+			t.Fatalf("allowlisted address %q was rewritten: %q", addr, out)
+		}
+	}
+	if strings.Contains(out, "leak@other.com") {
+		t.Fatalf("non-allowlisted address survived: %q", out)
 	}
 }
 
@@ -384,6 +555,28 @@ func TestDefaultPatterns_HexSecret_Boundary32Redacted(t *testing.T) {
 	out := r.Sanitize(in)
 	if strings.Contains(out, strings.Repeat("a", 32)) {
 		t.Fatalf("32-char hex must be redacted: %q", out)
+	}
+}
+
+// An uppercase digest is the same secret as its lowercase form.
+func TestDefaultPatterns_HexSecret_UppercaseRedacted(t *testing.T) {
+	r := NewSecretRedactor(nil)
+	in := "len32 " + strings.Repeat("AB", 16) + " leak"
+	out := r.Sanitize(in)
+	if strings.Contains(out, strings.Repeat("AB", 16)) {
+		t.Fatalf("uppercase 32-char hex must be redacted: %q", out)
+	}
+}
+
+// A run longer than the old 128-char upper bound had no word boundary anywhere
+// inside it, so the pattern matched nothing at all instead of stopping early —
+// a 200-char hex secret went out in the clear.
+func TestDefaultPatterns_HexSecret_LongRunsRedacted(t *testing.T) {
+	r := NewSecretRedactor(nil)
+	secret := strings.Repeat("a1", 100) // 200 chars
+	out := r.Sanitize("len200 " + secret + " leak")
+	if strings.Contains(out, secret) {
+		t.Fatalf("a 200-char hex run must be redacted: %q", out)
 	}
 }
 

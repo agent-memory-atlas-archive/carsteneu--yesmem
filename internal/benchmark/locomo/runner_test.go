@@ -2,8 +2,12 @@
 package locomo
 
 import (
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 func TestRunnerIngestAndQuery(t *testing.T) {
@@ -164,8 +168,58 @@ func TestRunnerExtractNilError(t *testing.T) {
 	}
 
 	// Extract without setting extractor should return error
-	err = runner.Extract(samples, 1)
+	_, err = runner.Extract(samples, 1)
 	if err == nil {
 		t.Fatal("expected error when extractor is nil")
+	}
+}
+
+// los19cFailingExtractor fails every extraction, the way a provider outage or a
+// broken model would.
+type los19cFailingExtractor struct {
+	calls int32
+}
+
+func (e *los19cFailingExtractor) ExtractFromSession(string, []models.Message) ([]models.Learning, error) {
+	atomic.AddInt32(&e.calls, 1)
+	return nil, errors.New("upstream 500")
+}
+
+func (e *los19cFailingExtractor) ExtractAndStore(string, string, []models.Message, bool) error {
+	atomic.AddInt32(&e.calls, 1)
+	return errors.New("upstream 500")
+}
+
+func (e *los19cFailingExtractor) SetChunkSize(int) {}
+
+// YM-317 Key 4: a run whose extraction failed still reported "Extracted N
+// sessions total", so a broken extraction looked like a complete one. The count
+// must follow the outcome.
+func TestLos19c_ExtractCountsFailuresAsFailures(t *testing.T) {
+	store := mustStore(t)
+	runner := NewRunner(store, &mockLLM{response: "unused"}, &mockLLM{response: "unused"})
+	ext := &los19cFailingExtractor{}
+	runner.SetExtractor(ext)
+
+	samples, err := ParseDataset(strings.NewReader(miniDataset))
+	if err != nil {
+		t.Fatalf("ParseDataset: %v", err)
+	}
+	if _, err := runner.Ingest(samples); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	stats, err := runner.Extract(samples, 1)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if got := atomic.LoadInt32(&ext.calls); got == 0 {
+		t.Fatal("extractor was never called, the test proves nothing")
+	}
+	if stats.Extracted != 0 {
+		t.Errorf("stats.Extracted = %d, want 0 for a run in which every extraction failed", stats.Extracted)
+	}
+	if stats.Failed != int(ext.calls) {
+		t.Errorf("stats.Failed = %d, want %d (every attempted session failed)", stats.Failed, ext.calls)
 	}
 }

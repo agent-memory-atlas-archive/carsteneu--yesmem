@@ -39,6 +39,11 @@ func CheckForUpdate(currentVersion string) (*UpdateInfo, error) {
 	return checkRelease(defaultReleaseURL, currentVersion)
 }
 
+// checkForUpdate is the release check RunUpdate runs. A package variable so a
+// test can drive the whole update against a local asset server instead of
+// GitHub; the production value stays the real API.
+var checkForUpdate = CheckForUpdate
+
 func checkRelease(url, currentVersion string) (*UpdateInfo, error) {
 	client := &http.Client{Timeout: httpTimeout}
 	resp, err := client.Get(url)

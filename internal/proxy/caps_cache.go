@@ -72,14 +72,16 @@ func cachedQueryFn(
 // activate/deactivate changes that happened since the previous freeze.
 // Other threads sharing this project stay untouched: their briefing snapshot
 // survives because briefingCache is keyed by threadID.
-func (s *Server) invalidateThreadCaches(threadID, project, projectDir string) {
+func (s *Server) invalidateThreadCaches(threadID, project, projectDir, model string) {
 	if s.frozenStubs != nil {
 		s.frozenStubs.Invalidate(threadID)
 	}
 	if s.capsCache != nil {
 		s.capsCache.Invalidate(threadID)
 	}
-	if threadID != "" && project != "" {
+	// Regenerating a briefing that the model's gates will never inject costs an
+	// LLM refinement pass for nothing.
+	if threadID != "" && project != "" && isFeatureEnabled(&s.cfg, model, "briefing") {
 		s.refreshBriefing(threadID, project, projectDir)
 	}
 }

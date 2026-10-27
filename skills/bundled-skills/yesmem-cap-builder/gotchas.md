@@ -252,7 +252,7 @@ where: 'name = ?', args: JSON.stringify([userInput])
 
 **Root cause**: spec.md was migrated to v1.1-draft; examples/*/CAP.md and README.md were not. Format drift inside the cap-spec repo.
 
-**Fix**: Use `caps/bundled-caps/wiki_export/CAP.md` (in this repo, freshest v1.1 reference) as the template instead of the upstream cap-spec examples. When copying from upstream, update to v1.1 first.
+**Fix**: Use `caps/bundled-caps/cap_collect/CAP.md` (in this repo, freshest v1.1 reference) as the template instead of the upstream cap-spec examples. When copying from upstream, update to v1.1 first.
 
 **Direction is fixed, not open**: the v1.1 parser is the only one that exists; v1.0 is rejected with `## Scripts section missing` and there is no fallback path. Migration of `examples/*` and `README.md` to v1.1 is the only viable resolution; reverting `spec.md` is not on the table because the codebase already shipped the v1.1 parser. Treat the upstream `examples/*` as historical until the migration PR lands — see Spec feedback item 1 below.
 
@@ -314,9 +314,9 @@ where: 'name = ?', args: JSON.stringify([userInput])
 
 ### DB write-back overrides disk edit on daemon restart
 
-**Symptom**: Edit `caps/bundled-caps/<name>/CAP.md`, run `make deploy`, daemon restarts, disk version goes BACK to an older content. SHA on disk diverges from source. `grep '^version:' ~/.claude/caps/<name>/CAP.md` shows a HIGHER number than the source file.
+**Symptom**: Edit `caps/bundled-caps/<name>/CAP.md`, run `make deploy` and `yesmem migrate`, and the repo edit never appears in the installed copy. `sha256sum` diverges, and `grep '^version:' ~/.claude/caps/<name>/CAP.md` shows a HIGHER number than the source file.
 
-**Root cause**: The daemon writes the DB row back to `~/.claude/caps/<name>/CAP.md` on every restart. If a `save_cap` previously stamped a higher version (e.g. v52) into the DB, the daemon's writeback overwrites your fresh source-tree edit (v47) with the v52 DB body.
+**Root cause**: The installed copy and the DB row carry their own revision counter, and both gates compare against it. A `save_cap` (or an auto-correct repair) previously stamped a higher version (e.g. v52) into the DB, so the installer keeps the installed v52 body and the self-written v47 edit stays unshipped. The repo file itself is never touched; the divergence is between the repo source and the installed copy.
 
 The previous skill said "edit CAP.md + redeploy is enough". That's true only when the DB version equals or trails the source version. Once supersede chains kick in, you need both edits.
 
@@ -358,8 +358,8 @@ yesmem query --db yesmem --format objects \
 # 2. Bump the source version line to match
 sed -i 's/^version: 55$/version: 56/' caps/bundled-caps/<name>/CAP.md
 
-# 3. Re-verify SHA after make deploy
-make deploy && sha256sum caps/bundled-caps/<name>/CAP.md ~/.claude/caps/<name>/CAP.md
+# 3. Re-verify SHA after the install step (deploy builds, migrate installs)
+make deploy && yesmem migrate && sha256sum caps/bundled-caps/<name>/CAP.md ~/.claude/caps/<name>/CAP.md
 ```
 
 Aligning **only** the body but not `version:` is the common slip — the body matches but the frontmatter line still drifts on every restart. The auto-supersede is silent; the only signal is the working-tree diff after the next daemon start.

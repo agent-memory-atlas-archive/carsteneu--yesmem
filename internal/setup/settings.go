@@ -32,12 +32,44 @@ func writeSettingsJSON(home string, settings map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return writeSecretFile(path, data)
 }
+
+// writeSecretFile writes data to a file only its owner can read. The mode in
+// os.WriteFile applies on creation only, so a file an earlier version created
+// world-readable keeps that mode — and the env block of settings.json carries
+// ANTHROPIC_API_KEY — unless the file is chmodded. Tightening an existing file
+// happens before the write, so the new content never sits under the old mode; the
+// chmod after it also covers a file the umask narrowed on creation. Unlike
+// hardenInstallStateFile, a failing chmod is reported: the caller should know that
+// a file with a key in it stayed readable.
+func writeSecretFile(path string, data []byte) error {
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Chmod(path, 0600); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
+// claudeProxyBaseURL is the yesmem proxy endpoint written into the
+// settings.json env block while yesmem is installed.
+const claudeProxyBaseURL = "http://localhost:9099"
 
 // savePreInstallState persists settings values that install will overwrite,
 // so uninstall can restore them. Saved to dataDir/install-state.json.
+// Runs only while settings.json is untouched by yesmem: on a re-run the values
+// in it are yesmem's own, so capturing them would lose the real pre-install state.
 func savePreInstallState(dataDir string, settings map[string]any, home string) {
+	statePath := filepath.Join(dataDir, "install-state.json")
+	if yesmemApplied(settings) {
+		// Nothing to capture, but tighten a file an older version left world-readable.
+		hardenInstallStateFile(dataDir)
+		return
+	}
 	state := map[string]any{}
 	if val, ok := settings["autoCompactEnabled"]; ok {
 		state["autoCompactEnabled"] = val
@@ -74,7 +106,36 @@ func savePreInstallState(dataDir string, settings map[string]any, home string) {
 	if err != nil {
 		return
 	}
-	os.WriteFile(filepath.Join(dataDir, "install-state.json"), data, 0644)
+	// A failed write is not fatal here, and the chmod below is the only thing
+	// that repairs the mode of a file an older version created.
+	_ = os.WriteFile(statePath, data, 0600)
+	// os.WriteFile honours perm only when it creates the file, so an existing
+	// 0644 file stays 0644 unless it is chmodded explicitly.
+	hardenInstallStateFile(dataDir)
+}
+
+// hardenInstallStateFile narrows install-state.json to owner-only. It holds
+// primaryApiKey and the user's API key, so a file written by an older version
+// has to be tightened even when nothing is written.
+func hardenInstallStateFile(dataDir string) {
+	os.Chmod(filepath.Join(dataDir, "install-state.json"), 0600)
+}
+
+// yesmemApplied reports whether settings.json still carries yesmem's own
+// modifications. Either marker means the current values are not a pre-install
+// state and must not be recorded as one.
+func yesmemApplied(settings map[string]any) bool {
+	if env, ok := settings["env"].(map[string]any); ok {
+		if baseURL, ok := env["ANTHROPIC_BASE_URL"].(string); ok && baseURL == claudeProxyBaseURL {
+			return true
+		}
+	}
+	mcpServers, ok := settings["mcpServers"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, hasYesmem := mcpServers["yesmem"]
+	return hasYesmem
 }
 
 // loadPreInstallState reads the saved pre-install state.
@@ -109,7 +170,7 @@ func setProxyEnvVar(settings map[string]any) {
 	if !ok {
 		env = map[string]any{}
 	}
-	env["ANTHROPIC_BASE_URL"] = "http://localhost:9099"
+	env["ANTHROPIC_BASE_URL"] = claudeProxyBaseURL
 	env["CLAUDE_CODE_REPL"] = "true"
 	settings["env"] = env
 }
@@ -123,6 +184,9 @@ func removeProxyEnvVar(settings map[string]any) {
 	if !ok {
 		return
 	}
+	// setProxyEnvVar turned the REPL tooling on alongside the proxy; it is ours
+	// and goes away with it.
+	delete(env, "CLAUDE_CODE_REPL")
 	// If user has an API key, point to real API to bypass bridge
 	if _, hasKey := env["ANTHROPIC_API_KEY"]; hasKey {
 		env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
@@ -197,7 +261,9 @@ func clearClaudeJSONAuth(home string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0600)
+	// The file predates yesmem on most installs, so the mode literal alone would
+	// keep whatever an earlier Claude Code version left behind.
+	return writeSecretFile(path, out)
 }
 
 // registerMCPInClaudeJSON adds yesmem to ~/.claude.json (user-scope, all projects).
@@ -214,9 +280,13 @@ func registerMCPInClaudeJSON(home, binaryPath string) error {
 	// Backup before modifying (only if no backup exists yet)
 	backupPath := path + ".bak"
 	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		if err := os.WriteFile(backupPath, data, 0600); err != nil {
+		if err := writeSecretFile(backupPath, data); err != nil {
 			return fmt.Errorf("backup claude.json: %w", err)
 		}
+	} else if err := os.Chmod(backupPath, 0600); err != nil {
+		// The backup holds the pre-install primaryApiKey. A legacy file keeps the
+		// mode it was created with, and a failing chmod must not stop the install.
+		fmt.Fprintf(os.Stderr, "  warning: could not tighten %s: %v\n", backupPath, err)
 	}
 
 	var config map[string]any
@@ -241,7 +311,9 @@ func registerMCPInClaudeJSON(home, binaryPath string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0600)
+	// The file predates yesmem on most installs, so the mode literal alone would
+	// keep whatever an earlier Claude Code version left behind.
+	return writeSecretFile(path, out)
 }
 
 // registerHooks adds all yesmem hooks (SessionStart briefing, PreToolUse, PostToolUse, etc.).
@@ -257,7 +329,13 @@ func registerHooks(settings map[string]any, binaryPath string) {
 
 	// Think hook removed — reminder injection now handled by the proxy (think.go).
 	// Clean up any existing hook-think entries from previous setups.
-	removeThinkHook(hooks)
+	removeThinkHook(hooks, binaryPath)
+
+	// UserPromptSubmit — dynamic yesmem-usage reminder
+	addIdleTickHook(hooks, binaryPath)
+
+	// SessionEnd — track session ends for recovery + pin cleanup
+	addSessionEndHook(hooks, binaryPath)
 
 	// PreToolUse — warn about known gotchas before Bash execution
 	addPreToolUseHook(hooks, binaryPath)
@@ -283,7 +361,10 @@ func addSessionStartHook(hooks map[string]any, binaryPath string) {
 	for i, entry := range existing {
 		if m, ok := entry.(map[string]any); ok {
 			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "yesmem") {
+				// The verb matters here: SessionStart also carries our
+				// codemap-hook, which is a different handler and must not be
+				// rewritten into a briefing hook.
+				if cmd, ok := h["command"].(string); ok && (isYesmemHandler(cmd, "briefing-hook", binaryPath) || isLegacyBriefingScript(cmd)) {
 					// Ensure matcher is set (fix for hooks registered without matcher)
 					if _, hasMatcher := m["matcher"]; !hasMatcher {
 						m["matcher"] = "startup|resume|clear|compact"
@@ -291,7 +372,7 @@ func addSessionStartHook(hooks map[string]any, binaryPath string) {
 						hooks["SessionStart"] = existing
 					}
 					// Update command path if binary moved
-					h["command"] = binaryPath + " briefing-hook"
+					h["command"] = retargetYesmemInvocation(cmd, "briefing-hook", binaryPath)
 					return
 				}
 			}
@@ -311,77 +392,280 @@ func addSessionStartHook(hooks map[string]any, binaryPath string) {
 	hooks["SessionStart"] = existing
 }
 
+// invokesYesmem reports whether one ";"-separated command segment runs the
+// yesmem binary. Identity is the binary, not the word "yesmem" somewhere in the
+// command: a substring match claims a foreign my-yesmem-notes.sh and rewrites or
+// deletes it, while matching a subcommand alone claims a foreign
+// idle-tick-notify.sh. Recognized are binaryPath itself — as the whole segment or
+// as its prefix, which also covers a path containing spaces — the basename of
+// binaryPath (the same binary under a path it has since left) and a yesmem-named
+// program, which covers the legacy yesmem-briefing.sh script.
+func invokesYesmem(seg, binaryPath string) bool {
+	if binaryPath != "" && (seg == binaryPath || strings.HasPrefix(seg, binaryPath+" ")) {
+		return true
+	}
+	fields := strings.Fields(seg)
+	if len(fields) == 0 {
+		return false
+	}
+	base := filepath.Base(fields[0])
+	if strings.HasPrefix(base, "yesmem") {
+		return true
+	}
+	return binaryPath != "" && base == filepath.Base(binaryPath)
+}
+
+// segNamesVerb reports whether a segment names the subcommand as one of its own
+// words, so that a foreign hook-check-wrapper.sh is not taken for our hook-check.
+func segNamesVerb(seg, verb string) bool {
+	for _, f := range strings.Fields(seg) {
+		if f == verb {
+			return true
+		}
+	}
+	return false
+}
+
+// isYesmemHandler reports whether cmd is one of our hook handlers. verb names the
+// subcommand the caller looks for; it separates our handlers from each other
+// (PreToolUse carries hook-check and hook-guard side by side) and from another of
+// our handlers such as the legacy micro-reminder. An empty verb accepts any
+// invocation of the binary.
+func isYesmemHandler(cmd, verb, binaryPath string) bool {
+	for _, seg := range strings.Split(cmd, ";") {
+		if !invokesYesmem(seg, binaryPath) {
+			continue
+		}
+		if verb == "" || segNamesVerb(seg, verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLegacyBriefingScript reports whether cmd is the shell wrapper yesmem
+// registered before `briefing-hook` existed. It carries no subcommand, so the
+// verb test alone would leave it behind instead of migrating it.
+func isLegacyBriefingScript(cmd string) bool {
+	for _, seg := range strings.Split(cmd, ";") {
+		fields := strings.Fields(seg)
+		if len(fields) != 1 {
+			continue
+		}
+		if strings.HasPrefix(filepath.Base(fields[0]), "yesmem-briefing") {
+			return true
+		}
+	}
+	return false
+}
+
+// retargetYesmemInvocation points our invocation of verb at binaryPath. Only the
+// binary changes: the arguments behind the verb survive, and so does every other
+// segment of a chained command — an older version appended idle-tick to an
+// existing hook, so a chain is a real shape in settings.json. The legacy briefing
+// script carries no subcommand and is replaced as a whole.
+func retargetYesmemInvocation(cmd, verb, binaryPath string) string {
+	target := binaryPath + " " + verb
+	segs := strings.Split(cmd, ";")
+	for i, seg := range segs {
+		if off := yesmemVerbOffset(seg, verb, binaryPath); off >= 0 {
+			segs[i] = target + seg[off+len(verb):]
+			continue
+		}
+		if verb == "briefing-hook" && isLegacyBriefingScript(seg) {
+			segs[i] = target
+		}
+	}
+	return strings.Join(segs, ";")
+}
+
+// yesmemVerbOffset returns the offset of the verb token that ends our binary part,
+// or -1. Only a verb behind a prefix that is our binary counts: a path component
+// that happens to spell the verb must not be taken for the subcommand, or every
+// run would prepend another copy of the binary.
+func yesmemVerbOffset(seg, verb, binaryPath string) int {
+	offset := 0
+	for _, tok := range strings.Fields(seg) {
+		i := strings.Index(seg[offset:], tok)
+		if i < 0 {
+			return -1
+		}
+		offset += i
+		if tok == verb && invokesYesmem(seg[:offset], binaryPath) {
+			return offset
+		}
+		offset += len(tok)
+	}
+	return -1
+}
+
+// stripCommandSegment removes every ";"-separated segment that is our invocation
+// of needle, returning the remaining chain. Matching the segment instead of a
+// binaryPath+command pair also covers installs whose binary path has moved.
+// Unchanged chains are returned byte-identical, and the kept segments keep their
+// original text, so a foreign command is never reformatted — not even a quoted
+// ";" that the split above had to cut through.
+func stripCommandSegment(cmd, needle, binaryPath string) string {
+	var kept []string
+	changed := false
+	for _, seg := range strings.Split(cmd, ";") {
+		if isYesmemHandler(seg, needle, binaryPath) {
+			changed = true
+			continue
+		}
+		if strings.TrimSpace(seg) == "" {
+			continue
+		}
+		kept = append(kept, seg)
+	}
+	if !changed {
+		return cmd
+	}
+	return strings.Join(kept, ";")
+}
+
+// allHandlersAreYesmem reports whether every handler in a matcher group is a
+// yesmem hook, which is what makes it safe to rewrite group-level fields.
+func allHandlersAreYesmem(m map[string]any, binaryPath string) bool {
+	handlers := toHookSlice(m["hooks"])
+	if len(handlers) == 0 {
+		return false
+	}
+	for _, h := range handlers {
+		if cmd, _ := h["command"].(string); !isYesmemHandler(cmd, "", binaryPath) {
+			return false
+		}
+	}
+	return true
+}
+
 func addIdleTickHook(hooks map[string]any, binaryPath string) {
 	idleCmd := binaryPath + " idle-tick"
 	oldCmd := "micro-reminder"
 
 	existing, ok := hooks["UserPromptSubmit"].([]any)
 	if !ok {
-		// No existing hook — create one
-		hooks["UserPromptSubmit"] = []any{
-			map[string]any{
-				"hooks": []any{
-					map[string]any{
-						"type":    "command",
-						"command": idleCmd,
-					},
-				},
-			},
-		}
-		return
+		existing = []any{}
 	}
 
-	// Check if already registered (idle-tick) or needs migration (micro-reminder → idle-tick)
+	registered := false
 	for _, entry := range existing {
 		if m, ok := entry.(map[string]any); ok {
 			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok {
-					if strings.Contains(cmd, "idle-tick") {
-						return // Already registered
-					}
-					// Migrate: replace micro-reminder with idle-tick
-					if strings.Contains(cmd, oldCmd) {
-						h["command"] = strings.Replace(cmd, binaryPath+" "+oldCmd, idleCmd, 1)
-						m["hooks"] = toAnySlice(toHookSlice(m["hooks"]))
-						hooks["UserPromptSubmit"] = existing
-						return
-					}
+				if cmd, ok := h["command"].(string); ok && isYesmemHandler(cmd, "idle-tick", binaryPath) {
+					registered = true
+					// Update command path if binary moved — otherwise the
+					// registration keeps pointing at a path that is gone.
+					h["command"] = retargetYesmemInvocation(cmd, "idle-tick", binaryPath)
 				}
 			}
 		}
 	}
 
-	// Append to first existing hook's command chain
-	if len(existing) > 0 {
-		if first, ok := existing[0].(map[string]any); ok {
-			hooksList := toHookSlice(first["hooks"])
-			if len(hooksList) > 0 {
-				if cmd, ok := hooksList[0]["command"].(string); ok {
-					hooksList[0]["command"] = cmd + "; " + idleCmd
-					first["hooks"] = toAnySlice(hooksList)
-					existing[0] = first
-					hooks["UserPromptSubmit"] = existing
-					return
+	// Drop legacy micro-reminder segments, keep every other handler untouched.
+	// This runs even when idle-tick is already registered, so a stale legacy
+	// entry cannot survive just because the migration already ran once.
+	kept := make([]any, 0, len(existing)+1)
+	for _, entry := range existing {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			kept = append(kept, entry)
+			continue
+		}
+		var handlers []map[string]any
+		for _, h := range toHookSlice(m["hooks"]) {
+			if cmd, ok := h["command"].(string); ok {
+				if rest := stripCommandSegment(cmd, oldCmd, binaryPath); rest != cmd {
+					if rest == "" {
+						continue // handler existed only for micro-reminder
+					}
+					h["command"] = rest
 				}
+			}
+			handlers = append(handlers, h)
+		}
+		if len(handlers) == 0 {
+			continue // entry is now empty
+		}
+		m["hooks"] = toAnySlice(handlers)
+		kept = append(kept, m)
+	}
+
+	// Register as its own entry — splicing into a foreign command chain with "; "
+	// would make idle-tick's exit code mask a user hook that blocked the prompt.
+	if !registered {
+		kept = append(kept, map[string]any{
+			"hooks": []any{
+				map[string]any{
+					"type":    "command",
+					"command": idleCmd,
+				},
+			},
+		})
+	}
+	hooks["UserPromptSubmit"] = kept
+}
+
+// sessionEndTimeout is the per-handler timeout for `yesmem session-end`. Claude
+// Code gives SessionEnd hooks a shared 1.5s budget by default, but the hook dials
+// the daemon with a 3s connect and a 3s call deadline, so without a raised budget
+// a busy daemon makes the tracking fail silently.
+const sessionEndTimeout = 10
+
+// addSessionEndHook registers session-end tracking. Deliberately without a
+// matcher: every reason Claude Code can report reaches the hook and RunSessionEnd
+// selects the ones yesmem tracks. The documented SessionEnd reasons are clear,
+// resume, logout, prompt_input_exit and other — "compact" is not one of them, so
+// it must not be baked into a matcher.
+func addSessionEndHook(hooks map[string]any, binaryPath string) {
+	hookCmd := binaryPath + " session-end"
+	existing, ok := hooks["SessionEnd"].([]any)
+	if !ok {
+		existing = []any{}
+	}
+
+	for i, entry := range existing {
+		if m, ok := entry.(map[string]any); ok {
+			for _, h := range toHookSlice(m["hooks"]) {
+				// Our own canonical command, or a yesmem hook recorded under a
+				// different binary path. The subcommand alone is not enough: it
+				// also matches a foreign session-end-notify.sh.
+				cmd, _ := h["command"].(string)
+				if cmd != hookCmd && !isYesmemHandler(cmd, "session-end", binaryPath) {
+					continue
+				}
+				// Update command path if binary moved
+				h["command"] = retargetYesmemInvocation(cmd, "session-end", binaryPath)
+				h["timeout"] = sessionEndTimeout
+				// The hook fires for every reason and filters internally, so a
+				// matcher would only narrow it away — but dropping it is only safe
+				// when the whole group is ours, or a foreign handler sharing the
+				// group silently widens.
+				if allHandlersAreYesmem(m, binaryPath) {
+					delete(m, "matcher")
+				}
+				existing[i] = m
+				hooks["SessionEnd"] = existing
+				return
 			}
 		}
 	}
 
-	// Fallback: add as new entry
 	existing = append(existing, map[string]any{
 		"hooks": []any{
 			map[string]any{
 				"type":    "command",
-				"command": idleCmd,
+				"command": hookCmd,
+				"timeout": sessionEndTimeout,
 			},
 		},
 	})
-	hooks["UserPromptSubmit"] = existing
+	hooks["SessionEnd"] = existing
 }
 
 // removeThinkHook removes the deprecated hook-think entry from UserPromptSubmit.
 // Think reminder injection is now handled by the proxy (think.go).
-func removeThinkHook(hooks map[string]any) {
+func removeThinkHook(hooks map[string]any, binaryPath string) {
 	existing, ok := hooks["UserPromptSubmit"].([]any)
 	if !ok {
 		return
@@ -397,7 +681,7 @@ func removeThinkHook(hooks map[string]any) {
 		isThink := false
 		for _, h := range toHookSlice(m["hooks"]) {
 			if cmd, ok := h["command"].(string); ok {
-				if strings.Contains(cmd, "hook-think") {
+				if isYesmemHandler(cmd, "hook-think", binaryPath) {
 					isThink = true
 					break
 				}
@@ -420,8 +704,12 @@ func addPreToolUseHook(hooks map[string]any, binaryPath string) {
 	for i, entry := range existing {
 		if m, ok := entry.(map[string]any); ok {
 			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "yesmem") {
+				// Match on our binary plus the subcommand, not on "yesmem":
+				// every command containing the word also matches a foreign
+				// my-yesmem-notes.sh, and hook-guard shares the binary.
+				if cmd, ok := h["command"].(string); ok && isYesmemHandler(cmd, "hook-check", binaryPath) {
 					m["matcher"] = ".*"
+					h["command"] = retargetYesmemInvocation(cmd, "hook-check", binaryPath) // update path if the binary moved
 					existing[i] = m
 					hooks["PreToolUse"] = existing
 					return
@@ -446,6 +734,11 @@ func addPreToolUseHook(hooks map[string]any, binaryPath string) {
 // Bumping this string upgrades existing installations on the next `yesmem update`.
 const hookGuardMatcher = "Bash|REPL|Edit|Write"
 
+// hookResolveIf narrows `yesmem hook-resolve` to git commands. It sits on the
+// hook handler: Claude Code reads `if` from the individual handler, not from the
+// enclosing matcher group.
+const hookResolveIf = "Bash(git *)"
+
 func addPreToolUseGuardHook(hooks map[string]any, binaryPath string) {
 	hookCmd := binaryPath + " hook-guard"
 	existing, ok := hooks["PreToolUse"].([]any)
@@ -457,10 +750,11 @@ func addPreToolUseGuardHook(hooks map[string]any, binaryPath string) {
 	for _, entry := range existing {
 		if m, ok := entry.(map[string]any); ok {
 			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "hook-guard") {
+				if cmd, ok := h["command"].(string); ok && isYesmemHandler(cmd, "hook-guard", binaryPath) {
 					if m["matcher"] != hookGuardMatcher {
 						m["matcher"] = hookGuardMatcher
 					}
+					h["command"] = retargetYesmemInvocation(cmd, "hook-guard", binaryPath) // update path if the binary moved
 					return
 				}
 			}
@@ -480,35 +774,6 @@ func addPreToolUseGuardHook(hooks map[string]any, binaryPath string) {
 	hooks["PreToolUse"] = existing
 }
 
-func addPostToolUseFailureHook(hooks map[string]any, binaryPath string) {
-	hookCmd := binaryPath + " hook-learn"
-	existing, ok := hooks["PostToolUseFailure"].([]any)
-	if !ok {
-		existing = []any{}
-	}
-
-	for _, entry := range existing {
-		if m, ok := entry.(map[string]any); ok {
-			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "yesmem") {
-					return
-				}
-			}
-		}
-	}
-
-	existing = append(existing, map[string]any{
-		"matcher": "Bash",
-		"hooks": []any{
-			map[string]any{
-				"type":    "command",
-				"command": hookCmd,
-			},
-		},
-	})
-	hooks["PostToolUseFailure"] = existing
-}
-
 // addPostToolUseFailureCombinedHook registers the unified hook-failure command,
 // migrating from the old hook-learn + hook-assist pair.
 func addPostToolUseFailureCombinedHook(hooks map[string]any, binaryPath string) {
@@ -522,8 +787,9 @@ func addPostToolUseFailureCombinedHook(hooks map[string]any, binaryPath string) 
 	for i, entry := range existing {
 		if m, ok := entry.(map[string]any); ok {
 			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "hook-failure") {
+				if cmd, ok := h["command"].(string); ok && isYesmemHandler(cmd, "hook-failure", binaryPath) {
 					m["matcher"] = ".*"
+					h["command"] = retargetYesmemInvocation(cmd, "hook-failure", binaryPath) // update path if the binary moved
 					existing[i] = m
 					hooks["PostToolUseFailure"] = existing
 					return
@@ -541,7 +807,7 @@ func addPostToolUseFailureCombinedHook(hooks map[string]any, binaryPath string) 
 				var kept []map[string]any
 				for _, h := range toHookSlice(m["hooks"]) {
 					if cmd, ok := h["command"].(string); ok {
-						if strings.Contains(cmd, "hook-learn") || strings.Contains(cmd, "hook-assist") {
+						if isYesmemHandler(cmd, "hook-learn", binaryPath) || isYesmemHandler(cmd, "hook-assist", binaryPath) {
 							continue // Remove old
 						}
 					}
@@ -582,11 +848,12 @@ func addPostToolUseResolveHook(hooks map[string]any, binaryPath string) {
 	for _, entry := range existing {
 		if m, ok := entry.(map[string]any); ok {
 			for _, h := range toHookSlice(m["hooks"]) {
-				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "hook-resolve") {
-					// Migrate: add if-condition for older installations without it
-					if _, hasIf := m["if"]; !hasIf {
-						m["if"] = "Bash(git *)"
-					}
+				if cmd, ok := h["command"].(string); ok && isYesmemHandler(cmd, "hook-resolve", binaryPath) {
+					// Migrate installations written back when `if` sat on the
+					// matcher group, where Claude Code never reads it.
+					delete(m, "if")
+					h["if"] = hookResolveIf
+					h["command"] = retargetYesmemInvocation(cmd, "hook-resolve", binaryPath) // update path if the binary moved
 					return
 				}
 			}
@@ -595,11 +862,11 @@ func addPostToolUseResolveHook(hooks map[string]any, binaryPath string) {
 
 	existing = append(existing, map[string]any{
 		"matcher": "Bash",
-		"if":      "Bash(git *)",
 		"hooks": []any{
 			map[string]any{
 				"type":    "command",
 				"command": hookCmd,
+				"if":      hookResolveIf,
 			},
 		},
 	})
@@ -625,6 +892,10 @@ func toHookSlice(v any) []map[string]any {
 func EnsureHooks() error {
 	home, _ := os.UserHomeDir()
 	binaryPath, _ := os.Executable()
+
+	// Installations that predate the 0600 fix keep a world-readable state file;
+	// `yesmem update` is the path that reaches them.
+	hardenInstallStateFile(filepath.Join(home, ".claude", "yesmem"))
 
 	settings, err := readSettingsJSON(home)
 	if err != nil {

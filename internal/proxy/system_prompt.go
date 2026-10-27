@@ -27,9 +27,9 @@ type TemplateContext struct {
 }
 
 var (
-	osVersionCache   string
-	userEmailOnce    sync.Once
-	userEmailCache   string
+	osVersionCache string
+	userEmailOnce  sync.Once
+	userEmailCache string
 )
 
 func init() {
@@ -66,10 +66,10 @@ func loadSystemPromptFromPath(path string) []byte {
 }
 
 var modelDisplayNames = map[string]string{
-	"deepseek-v4-pro":    "DeepSeek V4 Pro",
-	"deepseek-v4-flash":  "DeepSeek V4 Flash",
-	"deepseek-chat":      "DeepSeek Chat",
-	"deepseek-reasoner":  "DeepSeek Reasoner",
+	"deepseek-v4-pro":   "DeepSeek V4 Pro",
+	"deepseek-v4-flash": "DeepSeek V4 Flash",
+	"deepseek-chat":     "DeepSeek Chat",
+	"deepseek-reasoner": "DeepSeek Reasoner",
 }
 
 func fillSystemTemplate(tpl []byte, ctx TemplateContext) []byte {
@@ -131,7 +131,7 @@ func extractSkillBlock(req map[string]any) string {
 		if end < 0 || end <= start {
 			continue
 		}
-		return "\n\n" + content[start : end+len("</available_skills>")]
+		return "\n\n" + content[start:end+len("</available_skills>")]
 	}
 	return ""
 }

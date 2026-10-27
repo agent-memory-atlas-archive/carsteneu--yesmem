@@ -697,7 +697,9 @@ func TestDescribeToolCall_Bash(t *testing.T) {
 }
 
 func TestDowngradeUnauthorizedBlock_BashBlockBecomesSuggest(t *testing.T) {
-	d := GuardDecision{Decision: "BLOCK", Violations: []string{"Rule 1: auto-commit"}}
+	// Rule 14 is advisory in the Decision Policy: the shell gate honours only
+	// rules 1, 2, 25 and 32 (YM-469).
+	d := GuardDecision{Decision: "BLOCK", Violations: []string{"Rule 14: verify before overwriting"}}
 	got := downgradeUnauthorizedBlock(d, "Bash")
 	if got.Decision != "SUGGEST" {
 		t.Errorf("expected SUGGEST, got %s", got.Decision)
@@ -705,7 +707,7 @@ func TestDowngradeUnauthorizedBlock_BashBlockBecomesSuggest(t *testing.T) {
 	if !strings.Contains(got.Suggestion, "yesmem-remember") {
 		t.Errorf("expected mandatory-check skill prefix, got %q", got.Suggestion)
 	}
-	if !strings.Contains(got.Suggestion, "Rule 1: auto-commit") {
+	if !strings.Contains(got.Suggestion, "Rule 14: verify before overwriting") {
 		t.Errorf("expected violations preserved in suggestion, got %q", got.Suggestion)
 	}
 }
@@ -803,9 +805,9 @@ func TestLoadRulesFile_Fallback(t *testing.T) {
 }
 
 func TestBuildGuardPrompt_CanBlock(t *testing.T) {
-	prompt := buildGuardPrompt("test rule", "Bash: git push", true)
+	prompt := buildGuardPrompt("test rule", "Bash: git push", "Write")
 	if !strings.Contains(prompt, "BLOCK") {
-		t.Error("expected BLOCK option in prompt for canBlock=true")
+		t.Error("expected BLOCK option in prompt for a can-block tool")
 	}
 	if !strings.Contains(prompt, "SUGGEST") {
 		t.Error("expected SUGGEST option in prompt")
@@ -816,9 +818,9 @@ func TestBuildGuardPrompt_CanBlock(t *testing.T) {
 }
 
 func TestBuildGuardPrompt_NoBlock(t *testing.T) {
-	prompt := buildGuardPrompt("test rule", "Bash: git push", false)
+	prompt := buildGuardPrompt("test rule", "Bash: git push", "Grep")
 	if strings.Contains(prompt, "BLOCK") {
-		t.Error("expected no BLOCK option for canBlock=false")
+		t.Error("expected no BLOCK option for a tool the guard never blocks")
 	}
 }
 

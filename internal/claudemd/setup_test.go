@@ -7,6 +7,34 @@ import (
 	"testing"
 )
 
+// SetupProject writes the same file name into CLAUDE.md and .gitignore, so it
+// needs the same name rule as the generator (YM-341).
+func TestSetupProjectRefusesFileNameOutsideTheTarget(t *testing.T) {
+	cases := []struct {
+		name     string
+		fileName string
+		wantErr  string
+	}{
+		{"climbs out", filepath.Join("..", "escaped.md"), "plain file name"},
+		{"newline injects a line", "yesmem-ops.md\n@sneaky", "control character"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			err := SetupProject(dir, tc.fileName)
+			if err == nil {
+				t.Fatalf("output_file %q was accepted", tc.fileName)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("refusal came from somewhere else: %v", err)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(statErr) {
+				t.Errorf("a rejected name still wrote CLAUDE.md: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestSetupProjectInjectsCLAUDEmd(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("# existing content\n"), 0644)

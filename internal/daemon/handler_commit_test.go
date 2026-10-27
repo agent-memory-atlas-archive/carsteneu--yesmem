@@ -174,7 +174,7 @@ func TestHandleInvalidateOnCommit_NoClient(t *testing.T) {
 
 func TestHandleInvalidateOnCommit_MissingHash(t *testing.T) {
 	h, _ := mustHandler(t)
-	h.CommitEvalClient = &mockCommitEvalClient{}
+	h.SetCommitEvalClient(&mockCommitEvalClient{})
 
 	resp := h.Handle(Request{
 		Method: "invalidate_on_commit",
@@ -196,7 +196,7 @@ func TestHandleInvalidateOnCommit_NoAffectedLearnings(t *testing.T) {
 	mock := &mockCommitEvalClient{
 		response: `[]`,
 	}
-	h.CommitEvalClient = mock
+	h.SetCommitEvalClient(mock)
 
 	// Insert a learning WITHOUT matching entity — won't be found by entity match
 	_, err := s.InsertLearning(&models.Learning{

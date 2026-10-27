@@ -1,7 +1,9 @@
 package setup
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -163,11 +165,10 @@ func migrateOpencodeJsonToJsonc(home string) error {
 	yesmemContent := extractYesmemManaged(jsonCfg)
 	deepMergeJSON(target, yesmemContent)
 
-	out, err := json.MarshalIndent(target, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(jsoncPath, append(out, '\n'), 0644)
+	// Same writer as every other config path: temp file plus rename. A
+	// truncate-in-place write that is interrupted leaves a torn jsonc, and the
+	// fail-closed readers cannot repair it.
+	return writeOpencodeConfig(jsoncPath, target)
 }
 
 // hasYesmemManagedContent returns true if cfg contains any provider, MCP, or
@@ -262,6 +263,35 @@ func mergeOpencodeSettings(home string) error {
 	return mergeOpencodeSettingsWith(home, "", "", "")
 }
 
+// readOpencodeConfigObject loads an opencode config as a JSON object. A missing
+// file yields an empty map; anything unreadable or unparseable is an error. The
+// merge paths write the object back, so a config they could not parse must not
+// become an empty map: that would delete every key yesmem does not manage
+// (JSONC with comments is the common case).
+func readOpencodeConfigObject(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]any{}, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return parseOpencodeConfigObject(path, data)
+}
+
+// parseOpencodeConfigObject is the parse half, split out for the callers that
+// already hold the bytes and need to tell a blank file from a broken one.
+func parseOpencodeConfigObject(path string, data []byte) (map[string]any, error) {
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse %s: %w (yesmem leaves a config it cannot read untouched; remove comments or fix the syntax)", path, err)
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("%s does not contain a JSON object (yesmem leaves it untouched)", path)
+	}
+	return cfg, nil
+}
+
 func mergeOpencodeSettingsWith(home, model, smallModel, binaryPath string) error {
 	cfgPath := opencodeConfigPath(home)
 
@@ -269,15 +299,9 @@ func mergeOpencodeSettingsWith(home, model, smallModel, binaryPath string) error
 		return fmt.Errorf("create config dir: %w", err)
 	}
 
-	var cfg map[string]any
-	data, err := os.ReadFile(cfgPath)
-	if err == nil {
-		if jsonErr := json.Unmarshal(data, &cfg); jsonErr != nil {
-			cfg = nil
-		}
-	}
-	if cfg == nil {
-		cfg = map[string]any{}
+	cfg, err := readOpencodeConfigObject(cfgPath)
+	if err != nil {
+		return err
 	}
 
 	defaults := defaultOpencodeSettings()
@@ -302,11 +326,7 @@ func mergeOpencodeSettingsWith(home, model, smallModel, binaryPath string) error
 
 	cfg["$schema"] = "https://opencode.ai/config.json"
 
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(cfgPath, append(out, '\n'), 0644)
+	return writeOpencodeConfig(cfgPath, cfg)
 }
 
 func upgradeOpencodeTimeout(cfg map[string]any) {
@@ -333,27 +353,33 @@ func removeOpencodeSettings(home string) error {
 		}
 		return err
 	}
-
-	var cfg map[string]any
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	// A blank config holds nothing of ours, and it is not a syntax problem worth
+	// reporting: the parse error would tell the user to remove comments from an
+	// empty file.
+	if len(bytes.TrimSpace(data)) == 0 {
 		return nil
+	}
+
+	// Same policy as the merge paths: a config that cannot be parsed is
+	// reported, not treated as empty. Writing the empty map back would delete
+	// every key yesmem does not manage, and reporting success would leave the
+	// user with an untouched config and no hint why.
+	cfg, err := parseOpencodeConfigObject(cfgPath, data)
+	if err != nil {
+		return err
 	}
 
 	removeOpencodeProviders(cfg)
 	removeOpencodeMCP(cfg)
 	removeOpencodeCompaction(cfg)
-	removeOpencodePluginEntry(cfg)
+	dropYesmemPluginEntry(cfg, home)
 
 	// Always write the cleaned file back. Never delete opencode.json/jsonc even
 	// if only $schema remains — opencode needs the file present (it falls back
 	// to built-in defaults without one, but users who set up the file manually
 	// for their own reasons would lose that work). An empty shell with $schema
 	// is harmless and matches what opencode itself creates on fresh install.
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(cfgPath, append(out, '\n'), 0644)
+	return writeOpencodeConfig(cfgPath, cfg)
 }
 
 func removeOpencodeProviders(cfg map[string]any) {
@@ -393,57 +419,57 @@ func removeOpencodeCompaction(cfg map[string]any) {
 	}
 }
 
-func removeOpencodePlugin(home string) error {
-	pluginsDir := filepath.Join(home, ".config", "opencode", "plugins")
-	os.RemoveAll(pluginsDir)
+// opencodePluginsRelDir is where install writes the plugin entries and uninstall
+// removes them, relative to the home directory. The announcement renders its
+// text from this constant, so a moved directory does not leave the text behind.
+const opencodePluginsRelDir = ".config/opencode/plugins"
 
-	pluginSourceDir := filepath.Join(home, ".local", "share", "yesmem", "plugins", "opencode-yesmem")
-	os.RemoveAll(pluginSourceDir)
+// opencodePluginDirEntries are the entries under opencodePluginsRelDir that
+// yesmem installs and uninstall removes. The uninstall announcement is built
+// from this list, so it cannot name fewer entries than the deletion removes.
+var opencodePluginDirEntries = []string{"yesmem.ts", "opencode-yesmem", "yesmem-window"}
+
+func removeOpencodePlugin(home string) error {
+	// Only yesmem's own entries: <config>/opencode/plugins holds plugins the
+	// user added, and removing the whole directory would delete those too.
+	// A path that cannot be removed must not stop the rest of the uninstall,
+	// so the first error is carried and reported at the end.
+	var firstErr error
+	keep := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	pluginsDir := filepath.Join(home, opencodePluginsRelDir)
+	for _, name := range opencodePluginDirEntries {
+		// The list is the authority for what RemoveAll receives, so a value that
+		// is not a plain entry name must not be followed out of the directory.
+		if !isPlainEntryName(name) {
+			keep(fmt.Errorf("refusing to remove opencode plugin entry %q: not a plain name", name))
+			continue
+		}
+		keep(os.RemoveAll(filepath.Join(pluginsDir, name)))
+	}
 
 	if err := RemoveThemes(home); err != nil {
-		// Like the two RemoveAll calls above: a leftover theme file must not
-		// stop the settings cleanup below.
+		// Like the paths above: a leftover theme file must not stop the
+		// settings cleanup.
 		fmt.Printf("⚠ removing themes: %v\n", err)
 	}
 
-	return removeOpencodeSettings(home)
-}
-
-func removeOpencodePluginEntry(cfg map[string]any) {
-	plugins, ok := cfg["plugin"].([]any)
-	if !ok || len(plugins) == 0 {
-		return
+	// The v1 source tree is what a plugin entry in the config points at, so it
+	// goes only once the config is proven rewritable. Removing it after a failed
+	// parse leaves the entry dangling and the install unrecoverable. The v2
+	// directory above is discovered by name and goes regardless: a config that
+	// cannot be parsed cannot have its stale entry dropped either way.
+	v1SourceDir := filepath.Join(home, filepath.Dir(v1PluginPersistentRelPath))
+	cfgErr := removeOpencodeSettings(home)
+	if cfgErr == nil {
+		keep(os.RemoveAll(v1SourceDir))
+	} else if _, statErr := os.Stat(v1SourceDir); statErr == nil {
+		fmt.Printf("keeping %s: the opencode config could not be rewritten\n", v1SourceDir)
 	}
-	home, _ := os.UserHomeDir()
-	yesmemPlugin := filepath.Join(home, ".local", "share", "yesmem", "plugins", "opencode-yesmem", "index.ts")
-
-	var filtered []any
-	for _, p := range plugins {
-		if s, ok := p.(string); ok {
-			if s == yesmemPlugin || filepath.Base(s) == "index.ts" && contains(s, "yesmem") {
-				continue
-			}
-		}
-		filtered = append(filtered, p)
-	}
-	if len(filtered) == 0 {
-		delete(cfg, "plugin")
-	} else {
-		cfg["plugin"] = filtered
-	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return errors.Join(firstErr, cfgErr)
 }
 
 type opencodeConfigState struct {
@@ -457,6 +483,13 @@ type opencodeConfigState struct {
 func readOpencodeConfigState(home string) opencodeConfigState {
 	state := opencodeConfigState{}
 
+	// The v2 plugin is a directory opencode discovers on its own, so it never
+	// appears in the config: check it before the config-derived early returns,
+	// or a config yesmem cannot parse reports a working install as missing.
+	if fi, err := os.Stat(filepath.Join(home, opencodePluginsRelDir, "opencode-yesmem", "index.ts")); err == nil && !fi.IsDir() {
+		state.PluginConfigured = true
+	}
+
 	data, err := os.ReadFile(opencodeConfigPath(home))
 	if err != nil {
 		return state
@@ -469,10 +502,17 @@ func readOpencodeConfigState(home string) opencodeConfigState {
 		return state
 	}
 
-	plugins, ok := cfg["plugin"].([]any)
-	if ok {
+	// Only an entry that points at a v1 install proves a yesmem plugin. Matching
+	// the substring "yesmem" reported a user's own plugin as our install. The
+	// named file has to exist: an entry that outlived its copy reports an
+	// install opencode cannot load.
+	if plugins, ok := cfg["plugin"].([]any); ok {
 		for _, p := range plugins {
-			if s, ok := p.(string); ok && contains(s, "yesmem") {
+			s, ok := p.(string)
+			if !ok || !isV1PluginEntry(s, home) {
+				continue
+			}
+			if fi, err := os.Stat(filepath.Clean(s)); err == nil && !fi.IsDir() {
 				state.PluginConfigured = true
 				break
 			}

@@ -1,14 +1,14 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
+	"github.com/carsteneu/yesmem/internal/sanitize"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -21,39 +21,28 @@ func disableSandbox(t *testing.T) {
 	t.Setenv("YESMEM_DISABLE_AIJAIL_DOWNLOAD", "1")
 }
 
-// stubClaudeReturning installs a fake `claude` on PATH that prints body to
-// stdout and exits 0. autoCorrectBashCap will see this as a successful LLM
-// fix and proceed to the test-run + persist phase. PATH retains /bin and
-// /usr/bin so bash is findable for the unsandboxed-fallback path; without
-// that, the test would pass for the wrong reason (exec("bash") would fail
-// regardless of FallbackUnsandboxed).
-func stubClaudeReturning(t *testing.T, body string) {
-	t.Helper()
-	dir := t.TempDir()
-	quoted := "'" + strings.ReplaceAll(body, "'", `'\''`) + "'"
-	script := "#!/bin/sh\nprintf '%s\\n' " + quoted + "\n"
-	path := filepath.Join(dir, "claude")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("write claude stub: %v", err)
-	}
-	t.Setenv("PATH", dir+":/bin:/usr/bin")
-}
-
-// neutralizeClaude points PATH at an empty tempdir so that exec.LookPath("claude")
-// inside diagnoseBashError / autoCorrectBashCap fails fast. Keeps these tests
-// deterministic regardless of whether the dev machine has `claude` installed.
+// neutralizeClaude points PATH at an empty tempdir so that any leftover exec of
+// the `claude` CLI fails fast. The auto-correct pass must not use it any more;
+// these tests keep the PATH clear so a regression to a CLI call fails loudly
+// instead of passing on the dev machine's installation.
 func neutralizeClaude(t *testing.T) {
 	t.Helper()
 	t.Setenv("PATH", t.TempDir())
 }
 
 // When a bash error has no matching scheduled job (or AutoCorrect=false) and
-// CapName is empty, processBashJobErrors falls into diagnoseBashError. With claude
-// unavailable, diagnose returns false, so the run row is intentionally LEFT
-// unprocessed for a later retry. This regression-protects that retry semantics.
-func TestProcessBashErrors_DiagnoseFailureLeavesUnprocessed(t *testing.T) {
+// CapName is empty, processBashJobErrors falls into diagnoseBashError. When the
+// model call fails, the run must still be marked processed: retrying the same
+// failing call every five seconds forever was the defect (YM-167), not a retry
+// contract. The failure is broadcast instead.
+func TestProcessBashErrors_DiagnoseFailureMarksProcessed(t *testing.T) {
 	neutralizeClaude(t)
 	h, s := mustHandler(t)
+	h.scheduler = newScheduler(nil, nil)
+	if err := h.scheduler.AddJob(ScheduledJob{ID: "diag-only", Name: "broken-script", Project: "/srv/los32d/diag", IntervalSeconds: 300}); err != nil {
+		t.Fatalf("add job: %v", err)
+	}
+	h.SetAutoCorrectClient(&autoCorrectStubClient{err: errAutoCorrectStub})
 
 	if err := s.SaveBashJobRun(storage.BashJobRun{
 		JobID:    "diag-only",
@@ -67,14 +56,60 @@ func TestProcessBashErrors_DiagnoseFailureLeavesUnprocessed(t *testing.T) {
 		t.Fatalf("save run: %v", err)
 	}
 
-	h.processBashJobErrors()
+	h.processBashJobErrors(context.Background())
+
+	runs, err := s.GetUnprocessedBashErrors(10)
+	if err != nil {
+		t.Fatalf("get unprocessed: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Errorf("a diagnosis that could not run must not be retried forever; got %d unprocessed", len(runs))
+	}
+
+	msgs, err := s.GetUnreadBroadcasts("test-session", "/srv/los32d/diag")
+	if err != nil {
+		t.Fatalf("get broadcasts: %v", err)
+	}
+	var found bool
+	for _, m := range msgs {
+		if strings.Contains(m.Content, "broken-script") && strings.Contains(m.Content, "exit status 1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the failed diagnosis must still be reported; got %d broadcasts", len(msgs))
+	}
+}
+
+// Without a wired client the pass must not drain its rows: the client arrives
+// from the daemon's async startup goroutine, and a run that failed during startup
+// would otherwise be marked processed without ever being looked at. The window is
+// time-bound (bashErrorNoClientGrace), so the test pins the start time instead of
+// relying on the wall clock.
+func TestProcessBashErrors_WithoutClientLeavesRunsQueued(t *testing.T) {
+	neutralizeClaude(t)
+	h, s := mustHandler(t)
+	h.startedAt = time.Now()
+
+	if err := s.SaveBashJobRun(storage.BashJobRun{
+		JobID:    "queued",
+		JobName:  "queued-script",
+		Command:  "exit 1",
+		Status:   "error",
+		ExitCode: 1,
+		ErrorMsg: "exit status 1",
+	}); err != nil {
+		t.Fatalf("save run: %v", err)
+	}
+
+	h.processBashJobErrors(context.Background())
 
 	runs, err := s.GetUnprocessedBashErrors(10)
 	if err != nil {
 		t.Fatalf("get unprocessed: %v", err)
 	}
 	if len(runs) != 1 {
-		t.Errorf("diagnose-only path with claude unavailable must NOT mark processed; got %d unprocessed", len(runs))
+		t.Errorf("a run must stay queued while there is no client to diagnose it; got %d unprocessed", len(runs))
 	}
 }
 
@@ -85,8 +120,9 @@ func TestProcessBashErrors_DiagnoseFailureLeavesUnprocessed(t *testing.T) {
 func TestProcessBashErrors_AutoCorrectMarksProcessedEvenWhenCapMissing(t *testing.T) {
 	neutralizeClaude(t)
 	h, s := mustHandler(t)
+	h.SetAutoCorrectClient(&autoCorrectStubClient{reply: "diagnosis text"})
 
-	h.scheduler = NewScheduler(func(_ ScheduledJob) {})
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
 	if err := h.scheduler.AddJob(ScheduledJob{
 		ID:          "ac-job",
 		Name:        "auto-correct-test",
@@ -95,6 +131,7 @@ func TestProcessBashErrors_AutoCorrectMarksProcessedEvenWhenCapMissing(t *testin
 		Mode:        "bash",
 		CapName:     "never-existed",
 		AutoCorrect: true,
+		Project:     "/srv/los32d/job",
 	}); err != nil {
 		t.Fatalf("add job: %v", err)
 	}
@@ -112,7 +149,7 @@ func TestProcessBashErrors_AutoCorrectMarksProcessedEvenWhenCapMissing(t *testin
 		t.Fatalf("save run: %v", err)
 	}
 
-	h.processBashJobErrors()
+	h.processBashJobErrors(context.Background())
 
 	runs, err := s.GetUnprocessedBashErrors(10)
 	if err != nil {
@@ -127,7 +164,7 @@ func TestProcessBashErrors_AutoCorrectMarksProcessedEvenWhenCapMissing(t *testin
 // tick whether or not there is work.
 func TestProcessBashErrors_NoErrorsIsNoop(t *testing.T) {
 	h, _ := mustHandler(t)
-	h.processBashJobErrors()
+	h.processBashJobErrors(context.Background())
 }
 
 // findScheduledJob is called from processBashJobErrors before any scheduler is
@@ -144,7 +181,7 @@ func TestFindScheduledJob_NilScheduler(t *testing.T) {
 // is the lookup that drives whether auto-correct fires for a given run.
 func TestFindScheduledJob_Match(t *testing.T) {
 	h, _ := mustHandler(t)
-	h.scheduler = NewScheduler(func(_ ScheduledJob) {})
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
 	if err := h.scheduler.AddJob(ScheduledJob{
 		ID:          "find-me",
 		Name:        "x",
@@ -152,6 +189,7 @@ func TestFindScheduledJob_Match(t *testing.T) {
 		Enabled:     true,
 		Mode:        "bash",
 		AutoCorrect: true,
+		Project:     "/srv/los32d/job",
 	}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
@@ -164,6 +202,13 @@ func TestFindScheduledJob_Match(t *testing.T) {
 	}
 }
 
+// minimalOriginal/minimalFixed differ by one word, so ClassifyCapDiff returns
+// DiffMinimal and the fix reaches the verification path.
+const (
+	minimalOriginal = "set -eu; echo processing one; exit 0"
+	minimalFixed    = "set -eu; echo processed one; exit 0"
+)
+
 // When the sandbox is unavailable (ai-jail missing AND download disabled), the
 // auto-correct loop must NOT persist the LLM-proposed body. The test-run is
 // supposed to verify the fix inside ai-jail; falling back to direct shell
@@ -172,10 +217,13 @@ func TestFindScheduledJob_Match(t *testing.T) {
 // for T0 of the auto-correct hardening plan.
 func TestAutoCorrect_DoesNotPersistWhenSandboxUnavailable(t *testing.T) {
 	disableSandbox(t)
-	stubClaudeReturning(t, "echo fixed; exit 0")
+	neutralizeClaude(t)
 
 	h, s := mustHandler(t)
-	h.scheduler = NewScheduler(func(_ ScheduledJob) {})
+	// A minimal diff, so the run reaches the sandbox check instead of being
+	// staged as a proposal.
+	h.SetAutoCorrectClient(&autoCorrectStubClient{reply: patchReply("echo processing one", "echo processed one")})
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
 	if err := h.scheduler.AddJob(ScheduledJob{
 		ID:          "j1",
 		Name:        "broken",
@@ -184,18 +232,18 @@ func TestAutoCorrect_DoesNotPersistWhenSandboxUnavailable(t *testing.T) {
 		Mode:        "bash",
 		CapName:     "broken_cap",
 		AutoCorrect: true,
+		Project:     "/srv/los32d/job",
 	}); err != nil {
 		t.Fatalf("add job: %v", err)
 	}
 
-	const original = "exit 1"
+	original := minimalOriginal
 	saveResp := h.Handle(Request{
 		Method: "save_cap",
 		Params: map[string]any{
 			"name":         "broken_cap",
 			"description":  "intentionally failing cap for T0 regression",
 			"handler_bash": original,
-			"project":      "yesmem",
 		},
 	})
 	if saveResp.Error != "" {
@@ -214,9 +262,9 @@ func TestAutoCorrect_DoesNotPersistWhenSandboxUnavailable(t *testing.T) {
 		t.Fatalf("save run: %v", err)
 	}
 
-	h.processBashJobErrors()
+	h.processBashJobErrors(context.Background())
 
-	caps, err := h.store.GetActiveLearnings("cap", "yesmem", "", "", 0)
+	caps, err := h.store.GetActiveLearnings("cap", "", "", "", 0)
 	if err != nil {
 		t.Fatalf("read caps: %v", err)
 	}
@@ -232,7 +280,7 @@ func TestAutoCorrect_DoesNotPersistWhenSandboxUnavailable(t *testing.T) {
 		if !strings.Contains(l.Context, original) {
 			t.Errorf("active cap lost original body %q; context:\n%s", original, l.Context)
 		}
-		if strings.Contains(l.Context, "echo fixed") {
+		if strings.Contains(l.Context, "echo processed") {
 			t.Errorf("active cap was overwritten with LLM-proposed body despite sandbox unavailable; context:\n%s", l.Context)
 		}
 	}
@@ -243,17 +291,161 @@ func TestAutoCorrect_DoesNotPersistWhenSandboxUnavailable(t *testing.T) {
 
 // TestAutoCorrect_MinimalDiffPersistsDirectly asserts that a small fix
 // (≤5 new lines, ≥0.85 token similarity) is persisted in place via save_cap
-// with source='auto_correct_accepted'. The test is gated on the claude-CLI
-// mock harness that Task 7 will introduce.
+// with source='auto_correct_accepted', and that the stored cap is a new version
+// rather than a second row.
 func TestAutoCorrect_MinimalDiffPersistsDirectly(t *testing.T) {
-	t.Skip("requires claude-CLI mock harness — implement once Task 7 adds Cmd-injection seam")
+	neutralizeClaude(t)
+	h, s := mustHandler(t)
+
+	body := "#!/bin/bash\nset -eu\nfor f in a b c d e f; do\n  echo processing $f\ndone\nexit 0\n"
+	fixed := "#!/bin/bash\nset -eu\nfor f in a b c d e f; do\n  echo processed $f\ndone\nexit 0\n"
+	if got := ClassifyCapDiff(body, fixed); got != DiffMinimal {
+		t.Fatalf("test setup: the fix must classify as DiffMinimal, got %v", got)
+	}
+
+	h.SetAutoCorrectClient(&autoCorrectStubClient{reply: patchReply("  echo processing $f", "  echo processed $f")})
+	h.autoCorrectVerify = autoCorrectPassVerifier(t)
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
+	if err := h.scheduler.AddJob(ScheduledJob{
+		ID:          "j-min",
+		Name:        "min-job",
+		Cron:        "*/5 * * * *",
+		Enabled:     true,
+		Mode:        "bash",
+		CapName:     "minimal_cap",
+		ScriptName:  "run",
+		AutoCorrect: true,
+		Project:     "/srv/los32d/job",
+	}); err != nil {
+		t.Fatalf("add job: %v", err)
+	}
+	scripts := `[{"name":"run","kind":"handler","runtime":"bash","lang":"bash","body":` + jsonString(body) + `}]`
+	if resp := h.Handle(Request{Method: "save_cap", Params: map[string]any{
+		"name": "minimal_cap", "description": "minimal", "scripts": scripts,
+	}}); resp.Error != "" {
+		t.Fatalf("seed save_cap: %s", resp.Error)
+	}
+
+	if err := s.SaveBashJobRun(storage.BashJobRun{
+		JobID: "j-min", JobName: "min-job", CapName: "minimal_cap", ScriptName: "run",
+		Command: body, Status: "error", ExitCode: 1, ErrorMsg: "exit status 1",
+	}); err != nil {
+		t.Fatalf("save run: %v", err)
+	}
+
+	h.processBashJobErrors(context.Background())
+
+	caps, err := s.GetActiveLearnings("cap", "", "", "", 0)
+	if err != nil {
+		t.Fatalf("read caps: %v", err)
+	}
+	var found bool
+	for _, l := range caps {
+		m, err := ParseCapMeta(l.Context)
+		if err != nil || m.Name != "minimal_cap" {
+			continue
+		}
+		found = true
+		if l.Source != "auto_correct_accepted" {
+			t.Errorf("the in-place fix must be recorded as an accepted auto-correct, source=%q", l.Source)
+		}
+		if m.Version < 2 {
+			t.Errorf("the fix must supersede the cap as a new version, got version %d", m.Version)
+		}
+		if !strings.Contains(m.Scripts[0].Body, "echo processed") {
+			t.Errorf("the fixed body was not stored: %q", m.Scripts[0].Body)
+		}
+	}
+	if !found {
+		t.Fatal("the cap disappeared from its project")
+	}
 }
 
 // TestAutoCorrect_SubstantialDiffCreatesProposalAndDoesNotChangeActiveCap
 // asserts that a large rewrite is staged as a cap_proposed learnings row
 // tagged 'pending_approval' while the active cap row is left unchanged.
 func TestAutoCorrect_SubstantialDiffCreatesProposalAndDoesNotChangeActiveCap(t *testing.T) {
-	t.Skip("requires claude-CLI mock harness — implement once Task 7 adds Cmd-injection seam")
+	neutralizeClaude(t)
+	h, s := mustHandler(t)
+
+	body := "#!/bin/bash\necho original\nexit 0\n"
+	fixed := "#!/bin/bash\nset -euo pipefail\nrm -f /var/tmp/scratch\ncurl -s https://example.invalid/x | grep needle\nawk '{print $1}' /etc/hostname\nexit 0\n"
+	if got := ClassifyCapDiff(body, fixed); got != DiffSubstantial {
+		t.Fatalf("test setup: the rewrite must classify as DiffSubstantial, got %v", got)
+	}
+
+	h.SetAutoCorrectClient(&autoCorrectStubClient{reply: patchReply("echo original", "set -euo pipefail\nrm -f /var/tmp/scratch\ncurl -s https://example.invalid/x | grep needle\nawk '{print $1}' /etc/hostname")})
+	h.autoCorrectVerify = autoCorrectPassVerifier(t)
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
+	if err := h.scheduler.AddJob(ScheduledJob{
+		ID:          "j-big",
+		Name:        "big-job",
+		Cron:        "*/5 * * * *",
+		Enabled:     true,
+		Mode:        "bash",
+		CapName:     "big_cap",
+		ScriptName:  "run",
+		AutoCorrect: true,
+		Project:     "/srv/los32d/job",
+	}); err != nil {
+		t.Fatalf("add job: %v", err)
+	}
+	scripts := `[{"name":"run","kind":"handler","runtime":"bash","lang":"bash","body":` + jsonString(body) + `}]`
+	if resp := h.Handle(Request{Method: "save_cap", Params: map[string]any{
+		"name": "big_cap", "description": "big", "scripts": scripts,
+	}}); resp.Error != "" {
+		t.Fatalf("seed save_cap: %s", resp.Error)
+	}
+
+	if err := s.SaveBashJobRun(storage.BashJobRun{
+		JobID: "j-big", JobName: "big-job", CapName: "big_cap", ScriptName: "run",
+		Command: body, Status: "error", ExitCode: 1, ErrorMsg: "exit status 1",
+	}); err != nil {
+		t.Fatalf("save run: %v", err)
+	}
+
+	h.processBashJobErrors(context.Background())
+
+	caps, err := s.GetActiveLearnings("cap", "yesmem", "", "", 0)
+	if err != nil {
+		t.Fatalf("read caps: %v", err)
+	}
+	for _, l := range caps {
+		m, err := ParseCapMeta(l.Context)
+		if err != nil || m.Name != "big_cap" {
+			continue
+		}
+		if strings.Contains(m.Scripts[0].Body, "curl") {
+			t.Errorf("a substantial rewrite must not be persisted as the active cap: %q", m.Scripts[0].Body)
+		}
+		if m.Version != 1 {
+			t.Errorf("the active cap must stay untouched, version=%d", m.Version)
+		}
+	}
+
+	proposals, err := s.GetActiveLearnings("cap_proposed", "yesmem", "", "", 0)
+	if err != nil {
+		t.Fatalf("read proposals: %v", err)
+	}
+	if len(proposals) != 1 {
+		t.Fatalf("expected exactly one staged proposal, got %d", len(proposals))
+	}
+	prop := proposals[0]
+	if err := s.LoadJunctionData(&prop); err != nil {
+		t.Fatalf("load proposal keywords: %v", err)
+	}
+	var hasPending bool
+	for _, k := range prop.Keywords {
+		if k == "pending_approval" {
+			hasPending = true
+		}
+	}
+	if !hasPending {
+		t.Errorf("the proposal must be tagged pending_approval, keywords=%v", prop.Keywords)
+	}
+	if !strings.Contains(prop.Context, "curl") {
+		t.Error("the proposal must carry the rewritten script")
+	}
 }
 
 // TestPersistProposalForReview_FindsBashByRuntime drives persistProposalForReview
@@ -374,9 +566,10 @@ func TestAutoCorrect_CooldownSkipsRapidRetries(t *testing.T) {
 	disableSandbox(t)
 
 	h, s := mustHandler(t)
-	seedCap(t, h, "flaky", "yesmem", "exit 1\n", []string{"flaky"})
+	h.SetAutoCorrectClient(&autoCorrectStubClient{reply: patchReply("exit 1", "exit 0")})
+	seedCap(t, h, "flaky", "", "exit 1\n", []string{"flaky"})
 
-	h.scheduler = NewScheduler(func(_ ScheduledJob) {})
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
 	if err := h.scheduler.AddJob(ScheduledJob{
 		ID:          "j1",
 		Name:        "flaky-job",
@@ -384,6 +577,7 @@ func TestAutoCorrect_CooldownSkipsRapidRetries(t *testing.T) {
 		Enabled:     true,
 		Mode:        "bash",
 		CapName:     "flaky",
+		Project:     "/srv/los32d/cooldown",
 		AutoCorrect: true,
 	}); err != nil {
 		t.Fatalf("add job: %v", err)
@@ -404,7 +598,7 @@ func TestAutoCorrect_CooldownSkipsRapidRetries(t *testing.T) {
 		}
 	}
 
-	h.processBashJobErrors()
+	h.processBashJobErrors(context.Background())
 
 	runs, err := s.GetUnprocessedBashErrors(10)
 	if err != nil {
@@ -414,7 +608,7 @@ func TestAutoCorrect_CooldownSkipsRapidRetries(t *testing.T) {
 		t.Errorf("all 3 runs must be marked processed; got %d unprocessed", len(runs))
 	}
 
-	msgs, err := s.GetUnreadBroadcasts("test-session", "yesmem")
+	msgs, err := s.GetUnreadBroadcasts("test-session", "/srv/los32d/cooldown")
 	if err != nil {
 		t.Fatalf("get broadcasts: %v", err)
 	}
@@ -442,7 +636,8 @@ func TestAutoCorrect_GenerationLimitBlocksAfter3PerDay(t *testing.T) {
 	disableSandbox(t)
 
 	h, s := mustHandler(t)
-	seedCap(t, h, "buggy", "yesmem", "exit 1\n", []string{"buggy"})
+	h.SetAutoCorrectClient(&autoCorrectStubClient{reply: patchReply("exit 1", "exit 0")})
+	seedCap(t, h, "buggy", "", "exit 1\n", []string{"buggy"})
 
 	for i := 0; i < 3; i++ {
 		_, err := s.InsertLearning(&models.Learning{
@@ -459,7 +654,7 @@ func TestAutoCorrect_GenerationLimitBlocksAfter3PerDay(t *testing.T) {
 		}
 	}
 
-	h.scheduler = NewScheduler(func(_ ScheduledJob) {})
+	h.scheduler = newScheduler(nil, func(_ ScheduledJob) {})
 	if err := h.scheduler.AddJob(ScheduledJob{
 		ID:          "j1",
 		Name:        "buggy-job",
@@ -467,6 +662,7 @@ func TestAutoCorrect_GenerationLimitBlocksAfter3PerDay(t *testing.T) {
 		Enabled:     true,
 		Mode:        "bash",
 		CapName:     "buggy",
+		Project:     "/srv/los32d/limit",
 		AutoCorrect: true,
 	}); err != nil {
 		t.Fatalf("add job: %v", err)
@@ -484,7 +680,7 @@ func TestAutoCorrect_GenerationLimitBlocksAfter3PerDay(t *testing.T) {
 		t.Fatalf("save run: %v", err)
 	}
 
-	h.processBashJobErrors()
+	h.processBashJobErrors(context.Background())
 
 	runs, err := s.GetUnprocessedBashErrors(10)
 	if err != nil {
@@ -494,7 +690,7 @@ func TestAutoCorrect_GenerationLimitBlocksAfter3PerDay(t *testing.T) {
 		t.Errorf("fresh run must be marked processed; got %d unprocessed", len(runs))
 	}
 
-	msgs, err := s.GetUnreadBroadcasts("test-session", "yesmem")
+	msgs, err := s.GetUnreadBroadcasts("test-session", "/srv/los32d/limit")
 	if err != nil {
 		t.Fatalf("get broadcasts: %v", err)
 	}
@@ -624,5 +820,88 @@ func TestPersistProposalForReview_MultiBashTargetsScriptByName(t *testing.T) {
 	}
 	if scriptKeyword != "script:reply" {
 		t.Errorf("missing or wrong script keyword: got %q, want %q", scriptKeyword, "script:reply")
+	}
+}
+
+// The fix prompt redacts its untrusted inputs itself: the output it sends is
+// arbitrary command output and leaves only after the redactor saw it.
+func TestAutoCorrectPrompt_RedactsTheJobOutput(t *testing.T) {
+	h, _ := mustHandler(t)
+	h.redactor = sanitize.NewSecretRedactor(nil)
+
+	secret := "AKIAIOSFODNN7EXAMPLE"
+	prompt := h.autoCorrectPrompt(
+		storage.BashJobRun{CapName: "backup", ErrorMsg: "upload_aws: command not found", Output: "uploaded with key=" + secret},
+		ScriptMeta{Name: "run", Kind: "handler", Runtime: "bash", Body: "#!/bin/bash\nupload_aws\nexit 0\n"},
+		&CapMeta{Name: "backup"},
+	)
+
+	if strings.Contains(prompt, secret) {
+		t.Errorf("the job output reached the model unredacted: %q", prompt)
+	}
+	if !strings.Contains(prompt, "upload_aws: command not found") {
+		t.Errorf("the error excerpt is the point of the pass: %q", prompt)
+	}
+}
+
+// A secret that straddles the truncation cut must not survive as a fragment: the
+// redactor only matches the whole literal, so redaction has to run first.
+func TestAutoCorrectPrompt_RedactsBeforeTruncating(t *testing.T) {
+	h, _ := mustHandler(t)
+	h.redactor = sanitize.NewSecretRedactor(nil)
+
+	secret := "AKIAIOSFODNN7EXAMPLE"
+	output := strings.Repeat("a", 1990) + " key=" + secret
+	prompt := h.autoCorrectPrompt(
+		storage.BashJobRun{CapName: "backup", Output: output},
+		ScriptMeta{Name: "run", Kind: "handler", Runtime: "bash", Body: "#!/bin/bash\nexit 0\n"},
+		&CapMeta{Name: "backup"},
+	)
+
+	if strings.Contains(prompt, "AKIA") {
+		t.Errorf("a fragment of the secret survived the truncation: %q", prompt[len(prompt)-80:])
+	}
+}
+
+// A model that fences its answer anyway must not make a one-line fix look like
+// a rewrite: the fence lines would count as new command tokens.
+func TestTrimCodeFence(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"no fence", "echo hi\nexit 0", "echo hi\nexit 0"},
+		{"bash fence", "```bash\necho hi\nexit 0\n```", "echo hi\nexit 0"},
+		{"bare fence", "```\necho hi\n```", "echo hi"},
+		{"opening fence only", "```bash", "```bash"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trimCodeFence(tc.in); got != tc.want {
+				t.Errorf("trimCodeFence(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The verification run has to use the runtime the script declares, exactly like
+// fireJobBash. With only the interval heuristic, a script declaring 120s (which
+// exists because it scans an hour of journal output) failed its own test run and
+// the fix was never persisted.
+func TestAutoCorrectVerifyTimeout(t *testing.T) {
+	cases := []struct {
+		name     string
+		interval int
+		declared int64
+		want     int
+	}{
+		{"no declaration, no interval", 0, 0, 10},
+		{"sub-minute interval, no declaration", 15, 0, 15},
+		{"declaration wins", 0, 120, 120},
+		{"declaration wins over the interval", 15, 120, 120},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := autoCorrectVerifyTimeout(tc.interval, tc.declared); got != tc.want {
+				t.Errorf("autoCorrectVerifyTimeout(%d, %d) = %d, want %d", tc.interval, tc.declared, got, tc.want)
+			}
+		})
 	}
 }

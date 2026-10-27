@@ -1,6 +1,11 @@
 package proxy
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/carsteneu/yesmem/internal/wikidir"
+)
 
 // stripSystemSection removes a markdown section starting with "# header\n"
 // from all system blocks. The section ends at the next "\n# " or EOF.
@@ -231,11 +236,17 @@ You must docs_search("query") before guessing API behavior, parameters, or retur
 // directs all agents to check the per-file wiki page BEFORE editing any file.
 // The wiki contains accumulated learnings, gotchas, co-edit context, and
 // session history for each file — editing blind is editing dangerous.
-func InjectWikiFirst(req map[string]any, project string) {
-	const wiki = `BEFORE editing any file, check its wiki page first for per-file learnings, gotchas, and co-edit context. The wiki lives at ~/.claude/yesmem/wiki/<project>/files/<path>.md (path encoding: / → _). This is not optional — files carry accumulated gotchas and past decisions that you cannot infer from reading the source alone. If the wiki page does not exist yet, that is fine, but you must check. Falls back to search_code_index / get_code_snippet for deep symbol exploration after the wiki check.`
-	block := wiki
+// project is the identifier shown in the block header, wikiDir the concrete
+// wiki directory to name (resolve it with wikidir.Dir); an empty wikiDir falls
+// back to the documented placeholder form.
+func InjectWikiFirst(req map[string]any, project, wikiDir string) {
+	const wiki = `BEFORE editing any file, check its wiki page first for per-file learnings, gotchas, and co-edit context. The wiki lives at %s/files/<path>.md (path encoding: / → _). This is not optional — files carry accumulated gotchas and past decisions that you cannot infer from reading the source alone. If the wiki page does not exist yet, that is fine, but you must check. Falls back to search_code_index / get_code_snippet for deep symbol exploration after the wiki check.`
+	if wikiDir == "" {
+		wikiDir = wikidir.DisplayRoot + "/<project>"
+	}
+	block := fmt.Sprintf(wiki, wikiDir)
 	if project != "" {
-		block = "Project: `" + project + "`\n\n" + wiki
+		block = "Project: `" + project + "`\n\n" + block
 	}
 	ReplaceSystemBlock(req, "yesmem-wiki-first", block)
 }

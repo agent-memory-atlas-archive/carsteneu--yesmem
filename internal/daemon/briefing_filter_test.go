@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/config"
+	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -65,10 +66,20 @@ func TestListProjectsNeedingBriefingRefresh_FiltersDeadAndInactive(t *testing.T)
 		t.Fatalf("listProjectsNeedingBriefingRefresh: %v", err)
 	}
 
+	// A cwd inside a worktree checkout resolves to the worktree path, and its
+	// repository root is a legitimate additional target (YM-382): the parent
+	// has no session of its own but must still get a briefing.
+	root := models.ClusterProjectKey(cwd)
+
 	foundCwd := false
+	foundRoot := false
 	for _, tt := range targets {
 		if tt.Project.Project == cwd || tt.Project.ProjectShort == cwd {
 			foundCwd = true
+			continue
+		}
+		if root != "" && root != cwd && tt.Project.ProjectShort == root {
+			foundRoot = true
 			continue
 		}
 		t.Errorf("unexpected target included: short=%q project=%q lastActive=%q",
@@ -76,6 +87,9 @@ func TestListProjectsNeedingBriefingRefresh_FiltersDeadAndInactive(t *testing.T)
 	}
 	if !foundCwd {
 		t.Errorf("expected cwd project %q in targets, got %d targets", cwd, len(targets))
+	}
+	if root != "" && root != cwd && !foundRoot {
+		t.Errorf("expected repository root %q of the worktree in targets, got %d targets", root, len(targets))
 	}
 }
 

@@ -59,8 +59,11 @@ func TestTemplateAlert_MinDays(t *testing.T) {
 func TestInterpretCluster_NilClient(t *testing.T) {
 	cluster := models.LearningCluster{Label: "test", AvgRecencyDays: 3}
 	learnings := make([]models.Learning, 3)
-	result := interpretCluster(nil, cluster, learnings, 2)
+	result, dismissed := interpretCluster(nil, cluster, learnings, 2)
 	if result == "" {
 		t.Fatal("nil client should produce template alert")
+	}
+	if dismissed {
+		t.Fatal("a template alert is not a kein_problem verdict")
 	}
 }

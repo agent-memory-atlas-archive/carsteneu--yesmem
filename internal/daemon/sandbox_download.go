@@ -3,6 +3,8 @@ package daemon
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,25 @@ import (
 )
 
 const aiJailRepo = "akitaonrails/ai-jail"
+
+// aiJailPinnedVersion is the release this code was tested against (see
+// sandbox.go for the flag semantics it relies on). The download asks for this
+// tag, never for releases/latest: a newer release changes sandbox behaviour
+// without a code change on our side, and an unreviewed download of whatever
+// upstream published last is a supply-chain risk (YM-205 / OPS-40).
+const aiJailPinnedVersion = "2.10.0"
+
+// aiJailAssetDigests pins the SHA256 of every archive the pinned release ships
+// (from the release's asset metadata). Only these platforms are installable; a
+// platform without an entry is refused instead of falling back to "latest".
+// Upgrading means bumping the version and every digest together.
+var aiJailAssetDigests = map[string]string{
+	"ai-jail-linux-x86_64.tar.gz":  "cd4b4b5dad69d6fb11a0cd9a17e6c2e1848cac4ba3d8da0a507a6eb535dc0714",
+	"ai-jail-macos-aarch64.tar.gz": "de065b48d7df14fc3035b8d2ce4a284081b0e70a458b6a4ee0956a7cd93a892c",
+}
+
+// aiJailAPIBase is the GitHub API root; a test seam.
+var aiJailAPIBase = "https://api.github.com"
 
 func downloadAiJail() (string, error) {
 	if os.Getenv("YESMEM_DISABLE_AIJAIL_DOWNLOAD") != "" {
@@ -32,25 +53,46 @@ func downloadAiJail() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	expectedDigest, ok := aiJailAssetDigests[assetName]
+	if !ok {
+		return "", fmt.Errorf("ai-jail: no pinned checksum for %s in release v%s — refusing to install an unverified build", assetName, aiJailPinnedVersion)
+	}
 	url, err := resolveAiJailAssetURL(assetName)
 	if err != nil {
 		return "", fmt.Errorf("resolve release: %w", err)
 	}
 
-	log.Printf("[sandbox] downloading ai-jail from %s", url)
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(url)
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		return "", err
+	}
+
+	log.Printf("[sandbox] downloading ai-jail v%s from %s", aiJailPinnedVersion, url)
+	archivePath := destPath + ".tar.gz.tmp"
+	if err := downloadToFile(url, archivePath); err != nil {
+		os.Remove(archivePath)
+		return "", err
+	}
+	defer os.Remove(archivePath)
+
+	// Fail closed: the archive is only unpacked once its bytes match the pinned
+	// release, so a moved tag or a tampered download never reaches the install
+	// path.
+	actualDigest, err := fileSHA256(archivePath)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("download failed: %s", resp.Status)
+	if actualDigest != expectedDigest {
+		return "", fmt.Errorf("ai-jail: checksum mismatch for %s (want %s, got %s) — download discarded", assetName, expectedDigest, actualDigest)
 	}
 
-	_ = os.MkdirAll(installDir, 0o755)
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		return "", err
+	}
+	defer archive.Close()
+
 	tmp := destPath + ".tmp"
-	if err := extractAiJailFromTarGz(resp.Body, tmp); err != nil {
+	if err := extractAiJailFromTarGz(archive, tmp); err != nil {
 		os.Remove(tmp)
 		return "", fmt.Errorf("extract ai-jail: %w", err)
 	}
@@ -60,18 +102,66 @@ func downloadAiJail() (string, error) {
 		return "", err
 	}
 
-	log.Printf("[sandbox] ai-jail installed to %s", destPath)
+	log.Printf("[sandbox] ai-jail v%s installed to %s", aiJailPinnedVersion, destPath)
 	return destPath, nil
 }
 
+// maxAiJailArchiveBytes bounds a release download. The pinned archive is ~1.6 MB;
+// the ceiling keeps a compromised or misbehaving source from filling the disk.
+const maxAiJailArchiveBytes = 32 << 20
+
+func downloadToFile(url, dest string) error {
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("download failed: %s", resp.Status)
+	}
+
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	written, err := io.Copy(f, io.LimitReader(resp.Body, maxAiJailArchiveBytes+1))
+	if err != nil {
+		f.Close()
+		return err
+	}
+	if written > maxAiJailArchiveBytes {
+		f.Close()
+		return fmt.Errorf("download exceeds %d bytes, refusing", maxAiJailArchiveBytes)
+	}
+	return f.Close()
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func resolveAiJailAssetURL(assetName string) (string, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", aiJailRepo)
+	apiURL := fmt.Sprintf("%s/repos/%s/releases/tags/v%s", aiJailAPIBase, aiJailRepo, aiJailPinnedVersion)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("release lookup failed: %s", resp.Status)
+	}
 
 	var release struct {
 		Assets []struct {
@@ -88,7 +178,7 @@ func resolveAiJailAssetURL(assetName string) (string, error) {
 			return a.BrowserDownloadURL, nil
 		}
 	}
-	return "", fmt.Errorf("asset %q not found in latest release", assetName)
+	return "", fmt.Errorf("asset %q not found in release v%s", assetName, aiJailPinnedVersion)
 }
 
 // aiJailAssetName maps a Go runtime.GOOS/GOARCH pair to the actual asset

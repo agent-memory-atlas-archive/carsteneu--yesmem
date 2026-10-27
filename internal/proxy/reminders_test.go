@@ -13,7 +13,7 @@ func TestStripReminders_KeepsLastMessage(t *testing.T) {
 		map[string]any{"role": "user", "content": "test <system-reminder>\nMANDATORY SKILL ACTIVATION SEQUENCE\nStep 1...\n</system-reminder> again"},
 	}
 
-	result := StripReminders(msgs, 10) // requestIdx=10, all messages are old
+	result := StripReminders(msgs) // last message keeps its reminder, older ones are stripped
 
 	// Last user message should keep its reminder
 	lastContent, _ := result[2].(map[string]any)["content"].(string)
@@ -32,7 +32,7 @@ func TestStripReminders_ReplacesOldCapabilitiesActive(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if strings.Contains(content, "registerTool") {
@@ -53,7 +53,7 @@ func TestStripReminders_ReplacesOldSkillCheck(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if strings.Contains(content, "MANDATORY SKILL") {
@@ -74,7 +74,7 @@ func TestStripReminders_ReplacesOldYesMem(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if strings.Contains(content, "Deploy-Gotcha") {
@@ -93,8 +93,8 @@ func TestStripReminders_KeepsRecentFileChange(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	// requestIdx=2, message is from request 1 → age=1, < 3 → keep full
-	result := StripReminders(msgs, 2)
+	// age of message 0 = (3-1)/2 = 1 turn, < 3 → keep full
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if !strings.Contains(content, "package proxy") {
@@ -104,14 +104,11 @@ func TestStripReminders_KeepsRecentFileChange(t *testing.T) {
 
 func TestStripReminders_SummarizesOldFileChange(t *testing.T) {
 	diff := "Note: /home/user/memory/yesmem/internal/proxy/proxy.go was modified, either by the user or by a linter. This change was intentional, so make sure to take it into account as you proceed (ie. don't revert it unless the user asks you to). Don't tell the user this, since they are already aware. Here are the relevant changes (shown with line numbers):\n     1→package proxy\n     2→import (\n     3→    \"bytes\"\n     95→\t\t\t\tResponseHeaderTimeout: 60 * time.Second,\n     96→\t\t\t},\n"
-	msgs := []any{
+	msgs := los30PadTo([]any{
 		map[string]any{"role": "user", "content": fmt.Sprintf("fix it <system-reminder>\n%s\n</system-reminder>", diff)},
-		map[string]any{"role": "assistant", "content": "done"},
-		map[string]any{"role": "user", "content": "latest"},
-	}
+	}, 19) // age of message 0 = (19-1)/2 = 9 turns → 3-10 → summary with line numbers
 
-	// requestIdx=10, message from request 1 → age=9, 3-10 → summarize with lines
-	result := StripReminders(msgs, 10)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if strings.Contains(content, "package proxy") {
@@ -127,14 +124,11 @@ func TestStripReminders_SummarizesOldFileChange(t *testing.T) {
 
 func TestStripReminders_VeryOldFileChange(t *testing.T) {
 	diff := "Note: /home/user/memory/yesmem/internal/proxy/proxy.go was modified, either by the user or by a linter. Here are the relevant changes (shown with line numbers):\n     1→package proxy\n     95→code\n"
-	msgs := []any{
+	msgs := los30PadTo([]any{
 		map[string]any{"role": "user", "content": fmt.Sprintf("<system-reminder>\n%s\n</system-reminder>", diff)},
-		map[string]any{"role": "assistant", "content": "ok"},
-		map[string]any{"role": "user", "content": "latest"},
-	}
+	}, 25) // age of message 0 = (25-1)/2 = 12 turns → > 10 → minimal
 
-	// requestIdx=20, message from request 1 → age=19, > 10 → minimal
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if !strings.Contains(content, "[file-changed: proxy.go]") {
@@ -149,7 +143,7 @@ func TestStripReminders_KeepsSessionStart(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 50)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if !strings.Contains(content, "SessionStart") {
@@ -164,7 +158,7 @@ func TestStripReminders_RemovesOldTaskReminder(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if strings.Contains(content, "task tools") {
@@ -179,7 +173,7 @@ func TestStripReminders_MixedContent(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if !strings.Contains(content, "first part") || !strings.Contains(content, "middle") || !strings.Contains(content, "last part") {
@@ -211,7 +205,7 @@ func TestStripReminders_ContentBlocks(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	newMsg, _ := result[0].(map[string]any)
 	newBlocks, ok := newMsg["content"].([]any)
@@ -236,7 +230,7 @@ func TestStripReminders_RemovesOldSkillEval(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 20)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if strings.Contains(content, "MANDATORY SKILL ACTIVATION") {
@@ -258,7 +252,7 @@ func TestStripReminders_StripsSystemRoleMessages(t *testing.T) {
 		map[string]any{"role": "user", "content": "current"},
 	}
 
-	result := StripReminders(msgs, 1)
+	result := StripReminders(msgs)
 
 	if len(result) != 3 {
 		t.Fatalf("expected 3 messages after stripping system role, got %d", len(result))
@@ -282,7 +276,7 @@ func TestStripReminders_PreservesNarrativeBlock(t *testing.T) {
 		map[string]any{"role": "user", "content": "latest"},
 	}
 
-	result := StripReminders(msgs, 50)
+	result := StripReminders(msgs)
 
 	content, _ := result[0].(map[string]any)["content"].(string)
 	if !strings.Contains(content, "Fortsetzung von 3 sessions") {

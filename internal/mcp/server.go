@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/carsteneu/yesmem/internal/buildinfo"
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -97,9 +98,23 @@ func (s *Server) ServeStdio(originPpid int) error {
 	return serveStdio(s.srv)
 }
 
+// sessionIDSourceEnv marks an _session_id that the MCP layer read from its own
+// environment. The daemon's resolveSessionID may only trust such an id for
+// opencode when the caller PID is a daemon-spawned agent's: under opencode v2
+// the `yesmem mcp` children belong to the shared service process, so their
+// environment carries the id of whichever session was created last.
+const sessionIDSourceEnv = "env"
+
 func buildProxyParams(arguments map[string]any, withThreadID bool) map[string]any {
-	params := make(map[string]any, len(arguments)+6)
+	params := make(map[string]any, len(arguments)+7)
 	for key, value := range arguments {
+		// The underscore namespace is NOT filtered here, deliberately: the opencode
+		// plugin injects the authoritative per-call _session_id into the tool
+		// arguments (tool.execute.before), and that channel is indistinguishable from
+		// a model-written argument at this point. Filtering it would take the
+		// attribution away from the agents that legitimately carry it (YM-271 cold
+		// review; the label's residual same-UID exposure is documented at
+		// daemon.broadcastSender instead).
 		params[key] = value
 	}
 
@@ -110,6 +125,7 @@ func buildProxyParams(arguments map[string]any, withThreadID bool) map[string]an
 	sessionID, sourceAgent := resolveClientSessionID()
 	if _, exists := params["_session_id"]; !exists && sessionID != "" {
 		params["_session_id"] = sessionID
+		params["_session_id_source"] = sessionIDSourceEnv
 	}
 	if _, exists := params["_source_agent"]; !exists && sourceAgent != "" && sourceAgent != "claude" {
 		params["_source_agent"] = sourceAgent
@@ -305,15 +321,18 @@ func formatSimpleMessage(raw json.RawMessage) string {
 // formatRemember renders a structured box for remember() responses.
 func formatRemember(raw json.RawMessage) string {
 	var data struct {
-		ID           int64  `json:"id"`
-		Category     string `json:"category"`
-		Project      string `json:"project"`
-		Content      string `json:"content"`
-		ModelUsed    string `json:"model_used"`
-		SupersedesID int64  `json:"supersedes_id"`
-		Message      string `json:"message"`
-		Attribution  string `json:"attribution"`
-		Deduplicated bool   `json:"deduplicated"`
+		ID               int64   `json:"id"`
+		Category         string  `json:"category"`
+		Project          string  `json:"project"`
+		Content          string  `json:"content"`
+		ModelUsed        string  `json:"model_used"`
+		SupersedesID     int64   `json:"supersedes_id"`
+		SupersedeOutcome string  `json:"supersede_outcome"`
+		SupersedeTrust   float64 `json:"supersede_trust"`
+		SupersedeError   string  `json:"supersede_error"`
+		Message          string  `json:"message"`
+		Attribution      string  `json:"attribution"`
+		Deduplicated     bool    `json:"deduplicated"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return string(raw)
@@ -344,7 +363,35 @@ func formatRemember(raw json.RawMessage) string {
 		sb.WriteString(fmt.Sprintf("  Model:      %s\n", data.ModelUsed))
 	}
 	if data.SupersedesID > 0 {
-		sb.WriteString(fmt.Sprintf("  Supersedes: #%d\n", data.SupersedesID))
+		switch data.SupersedeOutcome {
+		case "blocked":
+			// A refused supersede is not a replacement. Saying so plainly is the
+			// whole point: the caller would otherwise keep trusting stale knowledge.
+			sb.WriteString(fmt.Sprintf("  Supersedes:  #%d BLOCKED (trust %.1f): the old learning stays active. Retire it with force_supersede plus supersede_reason, and only after the user or orchestrator confirmed the old learning is wrong.\n", data.SupersedesID, data.SupersedeTrust))
+		case "failed":
+			// The write did not happen. The store's reason must reach the caller,
+			// otherwise it looks like a refused-by-trust case and invites the
+			// very retry the caller already performed.
+			reason := data.SupersedeError
+			if reason == "" {
+				reason = "the store rejected the write"
+			}
+			sb.WriteString(fmt.Sprintf("  Supersedes:  #%d FAILED: nothing was replaced (%s).\n", data.SupersedesID, reason))
+		case "not_found":
+			reason := data.SupersedeError
+			if reason == "" {
+				reason = "the learning could not be loaded"
+			}
+			sb.WriteString(fmt.Sprintf("  Supersedes:  #%d not found: nothing was replaced (%s).\n", data.SupersedesID, reason))
+		case "duplicate":
+			sb.WriteString(fmt.Sprintf("  Supersedes:  #%d (duplicate: not performed)\n", data.SupersedesID))
+		case "replaced", "forced":
+			sb.WriteString(fmt.Sprintf("  Supersedes:  #%d (%s)\n", data.SupersedesID, data.SupersedeOutcome))
+		default:
+			// Older daemon without the outcome field: keep the historical line
+			// rather than inventing a verdict.
+			sb.WriteString(fmt.Sprintf("  Supersedes: #%d\n", data.SupersedesID))
+		}
 	}
 	if data.Attribution != "" {
 		sb.WriteString(fmt.Sprintf("  Source:     %s\n", data.Attribution))
@@ -381,23 +428,41 @@ func formatPin(raw json.RawMessage) string {
 }
 
 // formatResolve renders a structured box for resolve/resolve_by_text responses.
+// When nothing was resolved, it prints the reason and the candidates so the
+// caller can pick one by id instead of guessing.
 func formatResolve(raw json.RawMessage) string {
 	var data struct {
-		ID       int64  `json:"id"`
-		Category string `json:"category"`
-		Project  string `json:"project"`
-		Content  string `json:"content"`
-		Reason   string `json:"reason"`
-		Message  string `json:"message"`
+		ID         int64  `json:"id"`
+		Category   string `json:"category"`
+		Project    string `json:"project"`
+		Content    string `json:"content"`
+		Reason     string `json:"reason"`
+		Message    string `json:"message"`
+		Candidates []struct {
+			ID      int64  `json:"id"`
+			Content string `json:"content"`
+			Project string `json:"project"`
+		} `json:"candidates"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return string(raw)
 	}
 	if data.ID == 0 {
-		if data.Message != "" {
-			return data.Message
+		if len(data.Candidates) == 0 {
+			if data.Message != "" {
+				return data.Message
+			}
+			return string(raw)
 		}
-		return string(raw)
+		var sb strings.Builder
+		if data.Message != "" {
+			sb.WriteString(data.Message + "\n")
+		}
+		sb.WriteString("Candidates:\n")
+		for _, c := range data.Candidates {
+			sb.WriteString(fmt.Sprintf("  #%d  %s\n", c.ID, shortenForList(c.Content, 100)))
+		}
+		return strings.TrimRight(sb.String(), "\n")
 	}
 
 	var sb strings.Builder
@@ -415,6 +480,16 @@ func formatResolve(raw json.RawMessage) string {
 		sb.WriteString(fmt.Sprintf("  Content:    %s", data.Content))
 	}
 	return sb.String()
+}
+
+// shortenForList collapses whitespace and cuts long content for one-line lists.
+// The cut is rune-based so a multi-byte character at the limit stays intact.
+func shortenForList(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	return string([]rune(s)[:max]) + "..."
 }
 
 // formatLearnings converts a JSON array of learnings into compact one-liners with relative time.
@@ -751,21 +826,37 @@ func formatScratchpadList(raw json.RawMessage) string {
 }
 
 // formatScratchpadDelete renders the response from scratchpad_delete.
+// The count is read from deleted_count, which is what the daemon returns
+// (handleScratchpadDelete); a daemon error arrives as a Go error from the socket
+// client and never reaches this function. The formatter used to look for
+// "deleted", so every successful deletion was reported as zero entries (YM-299).
+// A pointer keeps an absent field distinguishable from a deletion that removed
+// nothing.
 func formatScratchpadDelete(raw json.RawMessage) string {
 	var data struct {
-		Deleted int    `json:"deleted"`
-		Message string `json:"message"`
+		DeletedCount *int `json:"deleted_count"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return string(raw)
 	}
-	if data.Message != "" {
-		return data.Message
+	if data.DeletedCount == nil {
+		return string(raw)
 	}
-	return fmt.Sprintf("✓ Deleted %d entries", data.Deleted)
+	return fmt.Sprintf("✓ Deleted %d entries", *data.DeletedCount)
 }
 
 func (s *Server) proxyCallFormat(method string, formatter func(json.RawMessage) string) mcpserver.ToolHandlerFunc {
+	var withParams func(json.RawMessage, map[string]any) string
+	if formatter != nil {
+		withParams = func(raw json.RawMessage, _ map[string]any) string { return formatter(raw) }
+	}
+	return s.proxyCallFormatWithParams(method, withParams)
+}
+
+// proxyCallFormatWithParams is proxyCallFormat for a formatter that also reads
+// the request parameters: send_to advises the caller about its own client, which
+// only the resolved _source_agent tells apart.
+func (s *Server) proxyCallFormatWithParams(method string, formatter func(json.RawMessage, map[string]any) string) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		proxy, err := s.getProxy()
 		if err != nil {
@@ -776,14 +867,18 @@ func (s *Server) proxyCallFormat(method string, formatter func(json.RawMessage) 
 
 		result, err := proxy.Call(method, params)
 		if err != nil {
-			logMCPError("call_failed_after_retry", method, err)
-			s.mu.Lock()
-			s.proxy = nil
-			s.mu.Unlock()
+			// Only reset proxy on connection errors — a daemon-level error means
+			// the daemon is alive and answering, just the query had an issue.
+			if !isDaemonError(err) {
+				logMCPError("call_failed_after_retry", method, err)
+				s.mu.Lock()
+				s.proxy = nil
+				s.mu.Unlock()
+			}
 			return mcplib.NewToolResultText(fmt.Sprintf("Error: %v", err)), nil
 		}
 		if formatter != nil {
-			return mcplib.NewToolResultText(formatter(result)), nil
+			return mcplib.NewToolResultText(formatter(result, params)), nil
 		}
 		return mcplib.NewToolResultText(string(result)), nil
 	}
@@ -837,6 +932,16 @@ func formatStartDialog(raw json.RawMessage) string {
 	return fmt.Sprintf("Dialog #%d started (status: %s). Partner will be notified on next prompt.\nIMPORTANT: Start polling: CronCreate(cron='*/1 * * * *', prompt='.', recurring=true)", r.DialogID, r.Status)
 }
 
+// neutralizePlanBlockClose keeps text from closing the block it sits in: a plan
+// or message line that spells out the closing marker would end the block early,
+// and everything after it renders as a top-level instruction instead of as block
+// content. The proxy neutralizes the same marker for its plan checkpoint
+// (internal/proxy/plan_inject.go); only the closing marker is touched, because a
+// plan routinely contains paths and regexes that must come back unchanged.
+func neutralizePlanBlockClose(text string) string {
+	return strings.ReplaceAll(text, "[/Active Plan]", "[ /Active Plan]")
+}
+
 func formatPlanResult(raw json.RawMessage) string {
 	var r struct {
 		Message string `json:"message"`
@@ -848,14 +953,14 @@ func formatPlanResult(raw json.RawMessage) string {
 		return string(raw)
 	}
 	if r.Message != "" && r.Plan != "" {
-		return fmt.Sprintf("%s\n\n[Active Plan]\n%s\n[/Active Plan]", r.Message, r.Plan)
+		return fmt.Sprintf("%s\n\n[Active Plan]\n%s\n[/Active Plan]", neutralizePlanBlockClose(r.Message), neutralizePlanBlockClose(r.Plan))
 	}
 	if r.Plan != "" {
 		status := r.Status
 		if status == "" {
 			status = "active"
 		}
-		return fmt.Sprintf("[Active Plan] (status: %s)\n%s\n[/Active Plan]", status, r.Plan)
+		return fmt.Sprintf("[Active Plan] (status: %s)\n%s\n[/Active Plan]", status, neutralizePlanBlockClose(r.Plan))
 	}
 	if !r.Exists {
 		return "No active plan. Use set_plan() to create one."
@@ -866,15 +971,62 @@ func formatPlanResult(raw json.RawMessage) string {
 	return string(raw)
 }
 
-func formatSendTo(raw json.RawMessage) string {
+func formatSendTo(raw json.RawMessage, params map[string]any) string {
 	var r struct {
-		MessageID int64  `json:"message_id"`
-		Target    string `json:"target"`
+		MessageID  int64  `json:"message_id"`
+		Target     string `json:"target"`
+		AckDropped bool   `json:"ack_dropped"`
+		// Warning is set when the daemon could not address the target yet (an
+		// opencode agent whose session is still unknown): the message is stored,
+		// but nothing polls the address it was stored under.
+		Warning string `json:"warning"`
+		// DeliveredVia names the transport the daemon used: "api" when the
+		// message was pushed into the target's opencode inbox and the target
+		// reacts without polling, "stored" when it waits for the target's own
+		// next request, "unconfirmed" when the push was attempted and the
+		// service neither took nor refused it in time.
+		DeliveredVia string `json:"delivered_via"`
 	}
 	if json.Unmarshal(raw, &r) != nil {
 		return string(raw)
 	}
-	return fmt.Sprintf("✓ Message #%d sent to %s. Start polling if needed: CronCreate(cron='*/1 * * * *', prompt='.', recurring=true)", r.MessageID, r.Target)
+	if r.AckDropped {
+		return fmt.Sprintf("⚠ ACK dropped to avoid an acknowledgement loop — nothing was sent to %s", r.Target)
+	}
+	if r.Warning != "" {
+		// Report the warning instead of a plain success: the target cannot be
+		// reached right now, and "sent" would hide an undelivered message.
+		return fmt.Sprintf("⚠ Message #%d stored for %s but not delivered yet — %s", r.MessageID, r.Target, r.Warning)
+	}
+	switch r.DeliveredVia {
+	case "api":
+		return fmt.Sprintf("✓ Message #%d delivered to %s.", r.MessageID, r.Target)
+	case "unconfirmed":
+		// Do not promise a delivery that was never acknowledged, and do not
+		// advise a resend either: the message stays claimed, so a resend would
+		// be the duplicate this path works to avoid.
+		return fmt.Sprintf("⚠ Message #%d to %s: the delivery could not be confirmed — the target may already have it, so do not resend it.", r.MessageID, r.Target)
+	}
+	return fmt.Sprintf("✓ Message #%d stored for %s — it arrives with the target's next request.%s", r.MessageID, r.Target, pollAdvice(sourceAgentOf(params)))
+}
+
+// pollAdvice names how the caller can follow up on a stored message. The hint
+// names a Claude Code tool, so it is only offered to a client that has it: an
+// opencode or codex session cannot call CronCreate (YM-73).
+func pollAdvice(sourceAgent string) string {
+	switch sourceAgent {
+	case "opencode", "codex":
+		return ""
+	}
+	return " Start polling if needed: CronCreate(cron='*/1 * * * *', prompt='.', recurring=true)"
+}
+
+// sourceAgentOf reads the client backend buildProxyParams resolved, or "" when
+// the caller could not be identified (the formatter then keeps the Claude Code
+// wording, which the daemon's own callers and the v1 layout share).
+func sourceAgentOf(params map[string]any) string {
+	sa, _ := params["_source_agent"].(string)
+	return sa
 }
 
 func formatEndDialog(raw json.RawMessage) string {
@@ -921,6 +1073,8 @@ func (s *Server) registerTools() {
 			mcplib.WithString("source", mcplib.Description("user_stated|agreed_upon|claude_suggested")),
 			mcplib.WithString("origin", mcplib.Description("Origin tag for trust scoring (e.g. manual, repl_command)")),
 			mcplib.WithNumber("supersedes", mcplib.Description("ID of learning this replaces")),
+			mcplib.WithBoolean("force_supersede", mcplib.Description("Explicit override of the trust gate: retire a high-trust learning. Requires supersedes and supersede_reason. Only pass when the user or orchestrator explicitly confirmed the old learning is wrong.")),
+			mcplib.WithString("supersede_reason", mcplib.Description("Justification for a forced supersede; stored in the supersede chain. Required with force_supersede.")),
 			mcplib.WithArray("entities", mcplib.WithStringItems(), mcplib.Description("Files, systems, people affected (required for query_facts by entity)")),
 			mcplib.WithArray("actions", mcplib.WithStringItems(), mcplib.Description("Commands or operations involved")),
 			mcplib.WithString("trigger", mcplib.Description("When to surface. Deadline syntax 'before YYYY-MM-DD' auto-sets ExpiresAt.")),
@@ -955,11 +1109,11 @@ func (s *Server) registerTools() {
 	// Agent-to-Agent Channel Messaging (fire-and-forget, no dialog state)
 	s.srv.AddTool(
 		mcplib.NewTool("send_to",
-			mcplib.WithDescription("Send a message to another session. Use for inter-agent communication — target is a session ID. Message types: command, response, ack, status."),
+			mcplib.WithDescription("Send a message to another session: a session id (claude/codex/opencode), an agent id, or a named channel. A unique id prefix of at least 8 characters resolves to the full address; ambiguous or unknown short forms are rejected. Message types: command, response, ack, status."),
 			mcplib.WithString("target", mcplib.Required(), mcplib.Description("Target session ID")),
 			mcplib.WithString("content", mcplib.Required(), mcplib.Description("Message content")),
 			mcplib.WithString("msg_type", mcplib.Description("command|response|ack|status")),
-		), s.proxyCallFormat("send_to", formatSendTo))
+		), s.proxyCallFormatWithParams("send_to", formatSendTo))
 
 	s.srv.AddTool(
 		mcplib.NewTool("whoami",
@@ -1035,12 +1189,13 @@ func (s *Server) registerTools() {
 			mcplib.WithDescription("Save an executable capability (tool definition) that persists across sessions. Use to create reusable tools from working REPL snippets, bash commands, or multi-step workflows. Auto-supersedes existing caps with the same name. Scripts array supports tool (REPL) and handler (bash/JS) kinds."+contentLangDirective),
 			mcplib.WithString("name", mcplib.Required(), mcplib.Description("Capability name (e.g. 'reddit_fetch')")),
 			mcplib.WithString("description", mcplib.Description("What the cap does")),
-			mcplib.WithString("scripts", mcplib.Required(), mcplib.Description("JSON array of script objects (Cap-Spec v1.1). Each: {name, kind: 'tool'|'handler', runtime: 'repl'|'bash', body, schema?}. At least one kind='tool' script required.")),
+			mcplib.WithString("scripts", mcplib.Required(), mcplib.Description("JSON array of script objects (Cap-Spec v1.1). Each: {name, kind: 'tool'|'handler', runtime: 'repl'|'bash', body, schema?, sandbox?, allowed_hosts?}. At least one kind='tool' script required. allowed_hosts is the egress allowlist for the standard sandbox profile under ai-jail 2.x (an array of bare hostnames; empty means no network access at all).")),
 			mcplib.WithString("tags", mcplib.Description("Comma-separated tags (e.g. 'web,reddit,fetch')")),
 			mcplib.WithString("project", mcplib.Description("Project scope (omit for global)")),
 			mcplib.WithBoolean("tested", mcplib.Description("Whether the handler has been verified working")),
 			mcplib.WithString("test_date", mcplib.Description("ISO date when last tested")),
 			mcplib.WithBoolean("auto_active", mcplib.Description("When true, this cap is activated automatically for every new Claude-Code thread — no explicit activate_cap() call needed. Use for caps that should be universally available (e.g. reddit_fetch, git_log_oneline).")),
+			mcplib.WithString("requires", mcplib.Description("Comma-separated adapter declarations the cap needs, e.g. 'store,llm,sh'. Pass it to keep a CAP.md-declared list: an omitted value is re-derived from the script bodies, which does not see an adapter a script only reaches indirectly.")),
 			mcplib.WithString("actions", mcplib.Description("JSON object mapping action names to instruction text (e.g. {\"setup\": \"Ask for bot token...\", \"teardown\": \"Remove jobs...\"})")),
 		), s.proxyCallFormat("save_cap", formatSimpleMessage))
 
@@ -1167,16 +1322,29 @@ func (s *Server) registerTools() {
 
 	s.srv.AddTool(
 		mcplib.NewTool("resolve_by_text",
-			mcplib.WithDescription("Find and resolve an unfinished task by searching its text content. Use after completing work when you don't have the learning ID at hand — matches against the learning's text field. Filters by project."),
+			mcplib.WithDescription("Find and resolve an unfinished task by searching its text content. Resolves only when exactly one open item contains every word of the search text and the text has at least 3 words; otherwise nothing is resolved and the candidates are returned so you can resolve one by id. Use reopen to undo a wrong resolve. Filters by project."),
 			mcplib.WithString("text", mcplib.Required(), mcplib.Description("Search text")),
 			mcplib.WithString("project", mcplib.Description(projectFilterDesc)),
 		), s.proxyCallFormat("resolve_by_text", formatResolve))
 
 	s.srv.AddTool(
+		mcplib.NewTool("reopen",
+			mcplib.WithDescription("Make a resolved learning active again. Use when resolve or resolve_by_text closed the wrong item, or when a task was marked done too early. Also reopens items closed by the automated stale batch cleanup; a learning that points at a real successor keeps its link."),
+			mcplib.WithNumber("learning_id", mcplib.Required(), mcplib.Description("Learning ID")),
+		), s.proxyCallFormat("reopen", formatSimpleMessage))
+
+	s.srv.AddTool(
 		mcplib.NewTool("quarantine_session",
-			mcplib.WithDescription("Exclude all learnings from a session from search and injection. Use when a session produced bad data (loops, hallucinations, wrong approaches) that should not influence future work."),
+			mcplib.WithDescription("Exclude all learnings from a session from search and injection. Use when a session produced bad data (loops, hallucinations, wrong approaches) that should not influence future work. Pass project to scope the write: a session id is not unique across projects."),
 			mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Session ID")),
+			mcplib.WithString("project", mcplib.Description("Project the session belongs to. Scopes the quarantine; without it every row under the session id is quarantined.")),
 		), s.proxyCallFormat("quarantine_session", nil))
+
+	s.srv.AddTool(
+		mcplib.NewTool("unquarantine_session",
+			mcplib.WithDescription("Lift a session quarantine: its learnings become searchable and injectable again. Use when a session was quarantined by mistake or after the bad learnings were cleaned up."),
+			mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Session ID")),
+		), s.proxyCallFormat("unquarantine_session", nil))
 
 	s.srv.AddTool(
 		mcplib.NewTool("skip_indexing",
@@ -1238,7 +1406,7 @@ func (s *Server) registerTools() {
 
 	s.srv.AddTool(
 		mcplib.NewTool("set_config",
-			mcplib.WithDescription("Set a runtime configuration value. Use to adjust thresholds, tokens, or session parameters dynamically. Without session_id the change is global; with session_id it applies only to that session."),
+			mcplib.WithDescription("Set a configuration value. Without session_id the change is written to config.yaml and, for the token-threshold keys, applied to the running proxy immediately. With session_id it applies only to that session, and only for token_threshold: the proxy re-reads no other key per session, so such a call is refused."),
 			mcplib.WithString("key", mcplib.Required(), mcplib.Description("Config key")),
 			mcplib.WithString("value", mcplib.Required(), mcplib.Description("Value")),
 			mcplib.WithString("session_id", mcplib.Description("Session ID")),
@@ -1246,7 +1414,7 @@ func (s *Server) registerTools() {
 
 	s.srv.AddTool(
 		mcplib.NewTool("get_config",
-			mcplib.WithDescription("Read a runtime configuration value. Use to check current settings like token thresholds. Checks session-specific overrides first, then falls back to global."),
+			mcplib.WithDescription("Read a configuration value. Use to check current settings like token thresholds. For token_threshold a session-specific override is checked first, then the global one, then config.yaml. Other keys are read from config.yaml; passing session_id for them is refused."),
 			mcplib.WithString("key", mcplib.Required(), mcplib.Description("Config key")),
 			mcplib.WithString("session_id", mcplib.Description("Session ID")),
 		), s.proxyCall("get_config"))
@@ -1254,7 +1422,7 @@ func (s *Server) registerTools() {
 	s.srv.AddTool(
 		mcplib.NewTool("docs_search",
 			mcplib.WithDescription("Search indexed documentation by keyword or semantic meaning. Use before guessing API behavior, function signatures, or idiomatic patterns. Supports filtering by source, section, doc type, and exact BM25-only mode. For listing available sources use list_docs."),
-			mcplib.WithString("query", mcplib.Required(), mcplib.Description("Search query")),
+			mcplib.WithString("query", mcplib.Required(), mcplib.Description("Search query (maximum 2000 characters)")),
 			mcplib.WithString("source", mcplib.Description("Source name filter")),
 			mcplib.WithString("section", mcplib.Description("Section heading filter")),
 			mcplib.WithString("since", mcplib.Description(sinceDesc)),
@@ -1262,6 +1430,7 @@ func (s *Server) registerTools() {
 			mcplib.WithBoolean("exact", mcplib.Description("BM25 only, no vector search")),
 			mcplib.WithNumber("limit", mcplib.Description(limitDesc)),
 			mcplib.WithString("doc_type", mcplib.Description("reference|style")),
+			mcplib.WithString("project", mcplib.Description("Scope results to a project (plus global sources); boosts the project's own sources")),
 		), s.proxyCallFormat("docs_search", formatDocsSearchResult))
 
 	s.srv.AddTool(
@@ -1274,7 +1443,7 @@ func (s *Server) registerTools() {
 		mcplib.NewTool("ingest_docs",
 			mcplib.WithDescription("Import documentation (.md/.txt/.rst/.pdf) into the knowledge base. Use to index reference docs, style guides, or API manuals for docs_search retrieval. Supports rule extraction and auto-injection by file extension."),
 			mcplib.WithString("name", mcplib.Required(), mcplib.Description("Source name")),
-			mcplib.WithString("path", mcplib.Required(), mcplib.Description("Path to index")),
+			mcplib.WithString("path", mcplib.Required(), mcplib.Description("Absolute path to a file or directory to index (.md/.txt/.rst/.pdf). Relative paths are rejected: the daemon would resolve them against its own working directory, not the caller's.")),
 			mcplib.WithString("version", mcplib.Description("Version string")),
 			mcplib.WithString("project", mcplib.Description(projectFilterDesc)),
 			mcplib.WithString("domain", mcplib.Description("code|marketing|legal|finance|general")),
@@ -1334,13 +1503,15 @@ func (s *Server) registerTools() {
 			mcplib.WithString("project", mcplib.Required(), mcplib.Description(projectRequiredDesc)),
 			mcplib.WithString("section", mcplib.Required(), mcplib.Description("Section name")),
 			mcplib.WithString("caller_session", mcplib.Description("Callback session")),
-			mcplib.WithNumber("token_budget", mcplib.Description("Token budget (0=default)")),
+			mcplib.WithNumber("token_budget", mcplib.Description("Max output tokens per agent (0=no limit). The unit is output tokens: input tokens are cumulative and include cache reads")),
 			mcplib.WithNumber("max_turns", mcplib.Description("Max turns (0=unlimited)")),
 			mcplib.WithString("model", mcplib.Description("Model override")),
 			mcplib.WithString("theme", mcplib.Description("TUI theme for this agent (empty = the theme of the agent type, e.g. yesmem-loop for a yesloop section)")),
 			mcplib.WithString("work_dir", mcplib.Description("Working directory")),
 			mcplib.WithString("backend", mcplib.Description("claude|codex|opencode")),
 			mcplib.WithString("permission_kick", mcplib.Description("Permission-kick setting for the agent: on|off (empty = inherit config default)")),
+			mcplib.WithString("restart_strategy", mcplib.Description("What the supervisor does when the spawn fails: temporary (default, no restart)|transient (restart up to max_restarts)")),
+			mcplib.WithNumber("max_restarts", mcplib.Description("Restart attempts for a transient agent (default 3)")),
 		), s.proxyCall("spawn_agent"))
 
 	s.srv.AddTool(
@@ -1381,7 +1552,7 @@ func (s *Server) registerTools() {
 
 	s.srv.AddTool(
 		mcplib.NewTool("get_agent",
-			mcplib.WithDescription("Get detailed information about a specific agent. Use to check an agent's status, session ID, or worktree before sending commands via relay_agent or stop_agent."),
+			mcplib.WithDescription("Get detailed information about a specific agent. Use to check an agent's status, backend session (opencode_session_id / codex_session_id) or worktree before sending commands via relay_agent or stop_agent. The row's own session id is not part of the reply: it is the capability that authorizes bind and close. The reply carries the live stream fields stream_active, stream_bytes, stream_started, stream_is_subagent and subagent_streams: a non-zero subagent_streams (or an active child session) means the agent is blocked inside a task() subagent, so a relay only reaches it after that subagent returns."),
 			mcplib.WithString("to", mcplib.Required(), mcplib.Description("Agent ID or section")),
 			mcplib.WithString("project", mcplib.Description(projectFilterDesc)),
 		), s.proxyCall("get_agent"))
@@ -1472,8 +1643,8 @@ func (s *Server) registerTools() {
 
 	s.srv.AddTool(
 		mcplib.NewTool("dismiss_code_nav",
-			mcplib.WithDescription("Dismiss a code-navigation suggestion for this session. Use when the code-nav hook blocks a shell tool but you need shell access. After 5 dismissals per session, suggestions stop until next session."),
-			mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Session ID from the block message")),
+			mcplib.WithDescription("Lift the code-navigation block for a session. One call is enough: the block message names this call when the code tools do not answer the question, and the next navigation runs. The counter is kept for the session history, not as a threshold."),
+			mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Session ID the block message names")),
 		), s.proxyCall("dismiss_code_nav"))
 
 	s.srv.AddTool(
@@ -1489,11 +1660,14 @@ func (s *Server) registerTools() {
 			mcplib.WithString("mode", mcplib.Description("Execution mode: 'agent' (default), 'headless', or 'bash'")),
 			mcplib.WithString("cap_name", mcplib.Description("Cap name for bash mode (resolves handler_bash from saved cap)")),
 			mcplib.WithString("script_name", mcplib.Description("Script name within the cap to invoke (bash mode). When empty, the first handler/bash script wins; pass an explicit name to target a specific script (e.g. 'telegram_poll').")),
+			mcplib.WithString("project", mcplib.Description("Project the job belongs to, as an absolute path (create). The daemon hands it to the run as YESMEM_PROJECT so a cap can name a project to the daemon; a bare basename is refused as ambiguous. Defaults to the caller's working directory.")),
 			mcplib.WithBoolean("auto_correct", mcplib.Description("Auto-correct failed bash jobs via Sonnet (default true)")),
 			mcplib.WithString("allowed_ports", mcplib.Description("Comma-separated ports for sandbox network access (default '80,443')")),
-			mcplib.WithString("sandbox", mcplib.Description("Sandbox profile: none (no sandbox), standard (network-restricted, default), strict (filesystem + network restricted)")),
+			mcplib.WithString("allowed_hosts", mcplib.Description("Comma-separated hosts for the standard sandbox profile's egress allowlist. Takes effect under ai-jail 2.x; under 0.9.x the standard profile has an open network and this list is not applied.")),
+			mcplib.WithString("sandbox", mcplib.Description("Sandbox profile: none (no sandbox), standard (network-restricted, default), strict (filesystem + network restricted). strict cannot mount a job log directory, so a job's own log files are lost there; its command output is still stored.")),
 			mcplib.WithNumber("interval_seconds", mcplib.Description("Fire every N seconds instead of cron. Overrides cron when set. Use for sub-minute scheduling (e.g. 15 for Telegram polling).")),
 			mcplib.WithString("model", mcplib.Description("Model override for headless/agent mode (e.g. claude-opus-4-7, claude-sonnet-4-6).")),
+			mcplib.WithString("backend", mcplib.Description("Agent backend for 'agent' mode: claude, codex, or opencode (as spawn_agent accepts). Empty uses the daemon's default. Ignored by 'headless' (always claude) and 'bash'.")),
 		), s.proxyCall("schedule"))
 }
 
@@ -1549,11 +1723,14 @@ func formatDocSources(raw json.RawMessage) string {
 	var data struct {
 		Message string `json:"message"`
 		Sources []struct {
-			Name       string `json:"name"`
-			Version    string `json:"version"`
-			ChunkCount int    `json:"chunks"`
-			Project    string `json:"project"`
-			LastSync   string `json:"last_sync"`
+			Name         string `json:"name"`
+			Version      string `json:"version"`
+			ChunkCount   int    `json:"chunks"`
+			Project      string `json:"project"`
+			LastSync     string `json:"last_sync"`
+			Path         string `json:"path"`
+			PathMissing  bool   `json:"path_missing"`
+			PathRelative bool   `json:"path_relative"`
 		} `json:"sources"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -1575,7 +1752,14 @@ func formatDocSources(raw json.RawMessage) string {
 		if ver == "" {
 			ver = "-"
 		}
-		sb.WriteString(fmt.Sprintf("  %s@%s [%s] %d chunks (synced: %s)\n", s.Name, ver, proj, s.ChunkCount, s.LastSync))
+		sb.WriteString(fmt.Sprintf("  %s@%s [%s] %d chunks (synced: %s)", s.Name, ver, proj, s.ChunkCount, s.LastSync))
+		switch {
+		case s.PathMissing:
+			sb.WriteString(fmt.Sprintf("  path missing: %s", s.Path))
+		case s.PathRelative:
+			sb.WriteString(fmt.Sprintf("  relative path, never synced: %s", s.Path))
+		}
+		sb.WriteByte('\n')
 	}
 	return sb.String()
 }

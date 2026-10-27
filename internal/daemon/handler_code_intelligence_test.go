@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -280,14 +282,15 @@ func TestHandleSearchCode_FilePatternFilter(t *testing.T) {
 func TestHandleSearchCode_RealGrep(t *testing.T) {
 	h, s := mustHandler(t)
 
-	// Create temp dir with source files
-	dir := t.TempDir()
+	// The directory carries the project name: a short name resolves by basename
+	// against sessions.project, the form project_short has had since v0.65.
+	dir := filepath.Join(t.TempDir(), "greptest")
 	os.MkdirAll(filepath.Join(dir, "pkg"), 0755)
 	os.WriteFile(filepath.Join(dir, "pkg", "handler.go"), []byte("package pkg\n\nfunc HandleRequest() {\n\tprintln(\"processing request\")\n}\n"), 0644)
 	os.WriteFile(filepath.Join(dir, "pkg", "utils.go"), []byte("package pkg\n\nfunc FormatRequest(r string) string {\n\treturn r\n}\n"), 0644)
 
 	// Register project in DB so ResolveProjectPath works
-	_, err2 := s.DB().Exec("INSERT INTO sessions (id, project, project_short, started_at, message_count, jsonl_path, indexed_at) VALUES (?, ?, ?, datetime('now'), 1, '', datetime('now'))", "test-sess", dir, "greptest")
+	_, err2 := s.DB().Exec("INSERT INTO sessions (id, project, project_short, started_at, message_count, jsonl_path, indexed_at) VALUES (?, ?, ?, datetime('now'), 1, '', datetime('now'))", "test-sess", dir, dir)
 	if err2 != nil {
 		t.Fatalf("insert session: %v", err2)
 	}
@@ -336,15 +339,16 @@ func TestHandleSearchCode_RealGrep(t *testing.T) {
 func TestHandleGetFileIndex(t *testing.T) {
 	h, s := mustHandler(t)
 
-	// Create temp dir with source files
-	dir := t.TempDir()
+	// The directory carries the project name: a short name resolves by basename
+	// against sessions.project, the form project_short has had since v0.65.
+	dir := filepath.Join(t.TempDir(), "filetest")
 	os.MkdirAll(filepath.Join(dir, "pkg"), 0755)
 	os.WriteFile(filepath.Join(dir, "pkg", "handler.go"), []byte("package pkg\n\nfunc Handle() {}\n"), 0644)
 	os.WriteFile(filepath.Join(dir, "pkg", "utils.go"), []byte("package pkg\n\nfunc Util() {}\n"), 0644)
 	os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Test\n"), 0644)
 
 	// Register project in DB
-	_, err := s.DB().Exec("INSERT INTO sessions (id, project, project_short, started_at, message_count, jsonl_path, indexed_at) VALUES (?, ?, ?, datetime('now'), 1, '', datetime('now'))", "test-sess", dir, "filetest")
+	_, err := s.DB().Exec("INSERT INTO sessions (id, project, project_short, started_at, message_count, jsonl_path, indexed_at) VALUES (?, ?, ?, datetime('now'), 1, '', datetime('now'))", "test-sess", dir, dir)
 	if err != nil {
 		t.Fatalf("insert session: %v", err)
 	}
@@ -374,5 +378,141 @@ func TestHandleGetFileIndex(t *testing.T) {
 	// Should show learning annotation for handler.go
 	if !strings.Contains(data["text"], "gotcha") {
 		t.Errorf("should show gotcha annotation for handler.go, got:\n%s", data["text"])
+	}
+}
+
+// errScanner fails every scan, so the failure paths are testable without the
+// CBM binary (CI has none installed — see the integration tests' skip guards).
+type errScanner struct{}
+
+func (errScanner) Scan(string) (*codescan.ScanResult, error) {
+	return nil, errors.New("scan unavailable")
+}
+
+// After HEAD moves the cache must serve a freshly built graph, not the object
+// it held before (DT26 / YM-5). The unconditional cache lookup of origin/main
+// (and of the first version of this branch) fails this assertion by serving the
+// object from before the move.
+func TestGetCodeGraph_RebuildsAfterHeadMove(t *testing.T) {
+	h, s := mustHandler(t)
+	h.codeScanner = func() codescan.Scanner { return &codescan.DirectoryScanner{} }
+	dir := initGitRepo(t)
+
+	// Seed a stored scan so the rebuild needs no live index either. The key is
+	// the checkout root — the one the scanner writes and the handler reads
+	// (codescan.ScanCacheKey, YM-453).
+	scanJSON := `{"RootDir":"` + dir + `","Packages":[{"Files":[{"Path":"a.go"}]}]}`
+	if err := s.PersistScan(dir, scanJSON, "", 0); err != nil {
+		t.Fatalf("persist scan: %v", err)
+	}
+
+	first := h.getCodeGraph(dir)
+	if first == nil {
+		t.Fatal("first build returned no graph")
+	}
+
+	// Move HEAD: the graph built from the old commit is stale.
+	head, err := os.ReadFile(filepath.Join(dir, ".git", "HEAD"))
+	if err != nil {
+		t.Fatalf("read HEAD: %v", err)
+	}
+	ref := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(head)), "ref: "))
+	if err := os.MkdirAll(filepath.Join(dir, ".git", filepath.Dir(ref)), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git", ref), []byte("movedhead123\n"), 0644); err != nil {
+		t.Fatalf("write ref: %v", err)
+	}
+
+	second := h.getCodeGraph(dir)
+	if second == nil {
+		t.Fatal("rebuild after the HEAD move returned no graph")
+	}
+	if second == first {
+		t.Fatal("the graph cached before the HEAD move was served again")
+	}
+
+	h.codeGraphMu.RLock()
+	entry := h.codeGraphs[dir]
+	h.codeGraphMu.RUnlock()
+	if entry == nil || entry.head != "movedhead123" {
+		t.Fatalf("cache entry must record the new HEAD, got %+v", entry)
+	}
+}
+
+// A failed rebuild must not turn into an outage: the last known graph is served
+// instead of nothing (review finding I-1 — one CBM hiccup plus a cooldown used
+// to lock every code tool out for ten minutes).
+func TestGetCodeGraph_FallsBackToStaleGraphOnScanFailure(t *testing.T) {
+	h, _ := mustHandler(t)
+	h.codeScanner = func() codescan.Scanner { return errScanner{} }
+	dir := t.TempDir()
+	known := newTestCodeGraph()
+
+	h.codeGraphMu.Lock()
+	h.codeGraphs = map[string]*codeGraphEntry{dir: {graph: known, head: "old-head"}}
+	h.codeGraphMu.Unlock()
+
+	if got := h.getCodeGraph(dir); got != known {
+		t.Fatal("a failed rebuild must fall back to the cached graph")
+	}
+}
+
+// initGitRepo creates a repository so ReadGitHead yields a real cache key.
+func initGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	return dir
+}
+
+// The cache key is the project's git HEAD plus CBM index mtime: an entry that
+// still matches is fresh, one whose HEAD moved is stale (DT26 / YM-5).
+func TestCodeGraphFresh(t *testing.T) {
+	dir := initGitRepo(t)
+	head := codescan.ReadGitHead(dir)
+	if head == "" {
+		t.Fatal("fixture broken: no git HEAD")
+	}
+	entry := &codeGraphEntry{
+		graph:    newTestCodeGraph(),
+		head:     head,
+		cbmMtime: codescan.CBMIndexMtime(dir).Unix(),
+	}
+	if !codeGraphFresh(entry, dir) {
+		t.Fatal("an entry built from the current HEAD must be fresh")
+	}
+
+	entry.head = "deadbeef"
+	if codeGraphFresh(entry, dir) {
+		t.Fatal("an entry whose HEAD moved must be stale")
+	}
+
+	// A keyed entry cannot be verified without a directory to compare against.
+	entry.head = head
+	if codeGraphFresh(entry, "") {
+		t.Fatal("a keyed entry without a directory must not count as fresh")
+	}
+}
+
+// A fresh entry is served as-is — freshness tracking must not turn every call
+// into a rebuild.
+func TestGetCodeGraph_ServesFreshEntry(t *testing.T) {
+	h, _ := mustHandler(t)
+	dir := initGitRepo(t)
+	cached := newTestCodeGraph()
+
+	h.codeGraphMu.Lock()
+	h.codeGraphs = map[string]*codeGraphEntry{dir: {
+		graph:    cached,
+		head:     codescan.ReadGitHead(dir),
+		cbmMtime: codescan.CBMIndexMtime(dir).Unix(),
+	}}
+	h.codeGraphMu.Unlock()
+
+	if got := h.getCodeGraph(dir); got != cached {
+		t.Fatal("a fresh cache entry must be served without a rebuild")
 	}
 }

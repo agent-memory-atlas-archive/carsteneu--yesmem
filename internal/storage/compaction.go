@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // CompactedBlock represents a group of stage-3 stubs compressed into a summary.
@@ -17,6 +18,9 @@ type CompactedBlock struct {
 }
 
 // SaveCompactedBlock stores a new compacted block (upsert by thread_id + start_idx).
+// No production path calls it: the collapse path keeps its archive in the frozen
+// prefix, and get_compacted_stubs plus expand_context read the legacy table as a
+// fallback. Written only by tests that seed those fallbacks.
 func (s *Store) SaveCompactedBlock(threadID string, startIdx, endIdx int, content string) error {
 	_, err := s.db.Exec(`
 		INSERT INTO compacted_blocks (thread_id, start_idx, end_idx, content)
@@ -90,6 +94,67 @@ func (s *Store) SetProxyState(key, value string) error {
 	return err
 }
 
+// PruneProxyStatePrefix deletes every key under prefix that is not in keep.
+// Prefix matching is done with substr, not LIKE: project names may contain
+// wildcard characters. Returns the number of deleted rows.
+func (s *Store) PruneProxyStatePrefix(prefix string, keep map[string]bool) (int64, error) {
+	rows, err := s.proxyStateDB().Query(
+		`SELECT key FROM proxy_state WHERE substr(key, 1, ?) = ?`, len(prefix), prefix)
+	if err != nil {
+		return 0, err
+	}
+	var stale []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if !keep[key] {
+			stale = append(stale, key)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var deleted int64
+	for _, key := range stale {
+		res, err := s.proxyStateDB().Exec(`DELETE FROM proxy_state WHERE key = ?`, key)
+		if err != nil {
+			return deleted, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			deleted += n
+		}
+	}
+	return deleted, nil
+}
+
+// DeleteProxyStatePrefixOlderThan deletes every entry under prefix whose
+// updated_at lies more than age in the past. Prefix matching uses substr, not
+// LIKE, because the key space is written by clients (see PruneProxyStatePrefix).
+//
+// The comparison runs through julianday so both CURRENT_TIMESTAMP rows and
+// RFC3339 rows are dated correctly. A value julianday cannot read yields NULL,
+// which the comparison treats as false: a row of unknown age is kept, never
+// deleted.
+func (s *Store) DeleteProxyStatePrefixOlderThan(prefix string, age time.Duration) (int, error) {
+	if prefix == "" || age <= 0 {
+		return 0, nil
+	}
+	cutoff := fmt.Sprintf("-%d seconds", int(age.Seconds()))
+	res, err := s.proxyStateDB().Exec(
+		`DELETE FROM proxy_state WHERE substr(key, 1, ?) = ? AND julianday(updated_at) < julianday('now', ?)`,
+		len(prefix), prefix, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // GetProxyState retrieves a value from proxy_state. Returns "" if not found.
 func (s *Store) GetProxyState(key string) (string, error) {
 	var val string
@@ -110,9 +175,19 @@ func (s *Store) DeleteProxyState(key string) error {
 }
 
 // DeleteProxyStatePrefix deletes all proxy_state entries whose key starts with prefix.
+// Prefix matching uses instr, not LIKE, for the same reason as the sibling
+// functions: a client-written key may contain _ or %, which LIKE would read as
+// wildcards and so delete rows outside the prefix. Matching is exact, so unlike
+// LIKE it is case-sensitive, and instr keeps it character-based for a multi-byte
+// prefix (a substr with a byte length would find nothing). An empty prefix
+// matches nothing and deletes nothing.
 // Returns the number of rows deleted.
 func (s *Store) DeleteProxyStatePrefix(prefix string) (int, error) {
-	result, err := s.proxyStateDB().Exec(`DELETE FROM proxy_state WHERE key LIKE ? || '%'`, prefix)
+	if prefix == "" {
+		return 0, nil
+	}
+	result, err := s.proxyStateDB().Exec(
+		`DELETE FROM proxy_state WHERE instr(key, ?) = 1`, prefix)
 	if err != nil {
 		return 0, err
 	}

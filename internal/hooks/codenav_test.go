@@ -1,6 +1,9 @@
 package hooks
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseNavCommand_Grep(t *testing.T) {
 	tool, files, ok := ParseNavCommand(`grep -n "func Run" internal/proxy/proxy.go`)
@@ -102,7 +105,7 @@ func TestParseNavCommand_ExcludedExtensions(t *testing.T) {
 func TestParseNavCommand_NonNavCommands(t *testing.T) {
 	nonNav := []string{
 		`ls -la internal/proxy/`,
-		`find . -name "*.go"`,
+		`grep -n needle`, // no file argument: reads stdin
 		`wc -l main.go`,
 		`echo "hello"`,
 		`go test ./internal/proxy/ -count=1`,
@@ -216,6 +219,55 @@ func TestCheckCodeNav_NonNavCommand(t *testing.T) {
 	)
 	if block {
 		t.Error("should not block non-nav commands")
+	}
+}
+
+// The code index stores paths relative to the project root, so an absolute
+// path from the shell must be resolved before the lookup — otherwise cat/grep
+// on an absolute path never matches an indexed file (DT31 / YM-7).
+func TestCheckCodeNav_AbsolutePathMatched(t *testing.T) {
+	var seen []string
+	reason, block := CheckCodeNav(
+		`cat /home/user/project/internal/proxy/proxy.go`,
+		"/home/user/project",
+		"myproject",
+		"session-123",
+		func(project, path string) bool {
+			seen = append(seen, path)
+			return path == "internal/proxy/proxy.go"
+		},
+		false,
+	)
+	if !block {
+		t.Fatalf("absolute path to an indexed file must block; lookup got %v", seen)
+	}
+	if !strings.Contains(reason, "proxy.go") {
+		t.Errorf("reason should name the file, got: %s", reason)
+	}
+}
+
+// An absolute path outside the working directory cannot be expressed relative to
+// it, so it is not a project file: the target is skipped instead of looked up by
+// its bare filename, which would block the wrong file. The opencode plugin skips
+// these targets as well (YM-409).
+func TestCheckCodeNav_AbsolutePathOutsideCWD(t *testing.T) {
+	var seen []string
+	_, block := CheckCodeNav(
+		`cat /elsewhere/other/pkg/file.go`,
+		"/home/user/project",
+		"myproject",
+		"session-123",
+		func(project, path string) bool {
+			seen = append(seen, path)
+			return true
+		},
+		false,
+	)
+	if block {
+		t.Errorf("a path outside the working directory must not block; looked up %v", seen)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("an outside target must not be looked up at all, got %v", seen)
 	}
 }
 

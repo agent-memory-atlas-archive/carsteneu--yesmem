@@ -33,11 +33,11 @@ func TestLearningClusters_InsertAndGet(t *testing.T) {
 		},
 	}
 
-	if err := s.ReplaceLearningClusters("yesmem", clusters); err != nil {
+	if err := s.ReplaceLearningClusters("/home/user/yesmem", clusters); err != nil {
 		t.Fatalf("replace clusters: %v", err)
 	}
 
-	got, err := s.GetLearningClusters("yesmem")
+	got, err := s.GetLearningClusters("/home/user/yesmem")
 	if err != nil {
 		t.Fatalf("get clusters: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestLearningClusters_ReplaceDeletesOld(t *testing.T) {
 		{Project: "yesmem", Label: "Old-Cluster-1", LearningCount: 2, Confidence: 0.5, LearningIDs: "[1,2]"},
 		{Project: "yesmem", Label: "Old-Cluster-2", LearningCount: 1, Confidence: 0.3, LearningIDs: "[3]"},
 	}
-	if err := s.ReplaceLearningClusters("yesmem", old); err != nil {
+	if err := s.ReplaceLearningClusters("/home/user/yesmem", old); err != nil {
 		t.Fatalf("insert old: %v", err)
 	}
 
@@ -90,11 +90,11 @@ func TestLearningClusters_ReplaceDeletesOld(t *testing.T) {
 	fresh := []models.LearningCluster{
 		{Project: "yesmem", Label: "New-Cluster", LearningCount: 4, Confidence: 0.95, LearningIDs: "[10,11,12,13]"},
 	}
-	if err := s.ReplaceLearningClusters("yesmem", fresh); err != nil {
+	if err := s.ReplaceLearningClusters("/home/user/yesmem", fresh); err != nil {
 		t.Fatalf("replace: %v", err)
 	}
 
-	got, err := s.GetLearningClusters("yesmem")
+	got, err := s.GetLearningClusters("/home/user/yesmem")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestLearningClusters_ReplaceDeletesOld(t *testing.T) {
 
 	// Verify old clusters are gone (not just hidden)
 	var count int
-	s.DB().QueryRow(`SELECT COUNT(*) FROM learning_clusters WHERE project = 'yesmem'`).Scan(&count)
+	s.DB().QueryRow(`SELECT COUNT(*) FROM learning_clusters WHERE project = '/home/user/yesmem'`).Scan(&count)
 	if count != 1 {
 		t.Errorf("expected 1 row in DB, got %d", count)
 	}

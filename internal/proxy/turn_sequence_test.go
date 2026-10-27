@@ -38,7 +38,7 @@ func TestExtractToolTypes_NoTools(t *testing.T) {
 
 func TestExtractToolTypes_UserMessage(t *testing.T) {
 	msg := map[string]interface{}{
-		"role": "user",
+		"role":    "user",
 		"content": "hello",
 	}
 	tools := ExtractToolTypes(msg)

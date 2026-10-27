@@ -3,6 +3,7 @@ package extraction
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // looksLikePaste returns true if the content is copy-pasted output with no extraction value.
@@ -50,10 +51,7 @@ func looksLikePaste(s string) bool {
 
 // looksLikePlan returns true if the content is a structured plan or architecture doc.
 func looksLikePlan(s string) bool {
-	head := s
-	if len(head) > 2000 {
-		head = head[:2000]
-	}
+	head := truncateBytes(s, 2000)
 	headLower := strings.ToLower(head)
 	return strings.Contains(headLower, "implementation plan") ||
 		strings.Contains(headLower, "### task") ||
@@ -67,7 +65,12 @@ func keepFirstAndLast(s string, firstN, lastN int) string {
 		return s
 	}
 	removed := (len(s) - firstN - lastN) / 1000
-	return s[:firstN] + "\n... (" + strconv.Itoa(removed) + "K chars truncated) ...\n" + s[len(s)-lastN:]
+	head := truncateBytes(s, firstN)
+	tail := s[len(s)-lastN:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return head + "\n... (" + strconv.Itoa(removed) + "K chars truncated) ...\n" + tail
 }
 
 // truncateText applies content-aware truncation.
@@ -81,16 +84,16 @@ func truncateText(content, role string) string {
 	// Pasted content (HTML, logs, stdout, code blocks) → aggressive
 	if looksLikePaste(content) {
 		if len(content) > 1000 {
-			return content[:1000] + "... (truncated paste)"
+			return truncateBytes(content, 1000) + "... (truncated paste)"
 		}
 		return content
 	}
 	// Natural text — role-based limits
 	if role == "assistant" && len(content) > 1500 {
-		return content[:1500] + "... (truncated)"
+		return truncateBytes(content, 1500) + "... (truncated)"
 	}
 	if role == "user" && len(content) > 3000 {
-		return content[:3000] + "... (truncated)"
+		return truncateBytes(content, 3000) + "... (truncated)"
 	}
 	return content
 }

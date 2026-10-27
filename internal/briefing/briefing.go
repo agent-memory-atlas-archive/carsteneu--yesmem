@@ -3,11 +3,11 @@ package briefing
 import (
 	"fmt"
 	"log"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/carsteneu/yesmem/internal/codescan"
 	"github.com/carsteneu/yesmem/internal/models"
@@ -21,6 +21,8 @@ type Generator struct {
 	maxPerCategory int
 	dedupThreshold float64
 	unfinishedTTL  int // days; 0 = no limit
+	otherProjects  int // days a neighbouring project may be idle; 0 = no limit
+	maxTokens      int // briefing.max_tokens; 0 = the 20000-byte default
 	userProfile    bool
 	strings        Strings
 	recovery       *RecoveryConfig
@@ -29,6 +31,16 @@ type Generator struct {
 	codeGraph      *codescan.CodeGraph // built during briefing, available for MCP tools
 	codeMapText    string              // built during briefing, appended post-refine
 	sourceAgent    string              // claude (default), codex, opencode — drives profile-aware wording
+	deadlineHits   []DeadlineHit       // deadline items that reached the rendered open-work list
+}
+
+// DeadlineHit is a deadline item that reached the rendered open-work list.
+// Content identifies the item in the delivered text: refinement may rewrite or
+// drop the open-work block, and an item that never reaches the delivered text
+// must not silence its deadline.
+type DeadlineHit struct {
+	ID      int64
+	Content string
 }
 
 // New creates a briefing generator with auto-loaded strings.
@@ -63,6 +75,18 @@ func (g *Generator) SetDedupThreshold(t float64) {
 // SetUnfinishedTTL sets the max age in days for unfinished items. 0 = no limit.
 func (g *Generator) SetUnfinishedTTL(days int) {
 	g.unfinishedTTL = days
+}
+
+// SetOtherProjectsDays bounds how long ago a neighbouring project may have been
+// active to still appear in the gap awareness section. 0 = no limit.
+func (g *Generator) SetOtherProjectsDays(days int) {
+	g.otherProjects = days
+}
+
+// SetMaxTokens caps the rendered briefing. Bytes are derived at 4 per token,
+// the ratio the previous hardcoded 20000-byte limit was built on. 0 = default.
+func (g *Generator) SetMaxTokens(tokens int) {
+	g.maxTokens = tokens
 }
 
 // SetUserProfile enables or disables the user profile section in the briefing.
@@ -107,9 +131,49 @@ func (g *Generator) CodeMap() string {
 	return g.codeMapText
 }
 
+// DeadlineHits returns the deadline items that reached the rendered open-work
+// list during the last Generate call.
+func (g *Generator) DeadlineHits() []DeadlineHit {
+	return g.deadlineHits
+}
+
+// MarkDeadlineHits starts the 12h cooldown for those deadline items of the last
+// Generate call that are present in the delivered text. Marking must happen on
+// delivery, not during Generate: background generations feed the refine cache and
+// never reach a session. The text check covers the refine step, which may rewrite
+// or drop the open-work block, and the 20KB truncation.
+func (g *Generator) MarkDeadlineHits(delivered string) {
+	var ids []int64
+	for _, h := range g.deadlineHits {
+		if h.Content != "" && strings.Contains(delivered, h.Content) {
+			ids = append(ids, h.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	if err := g.store.UpdateLastHitAt(ids); err != nil {
+		log.Printf("[briefing] mark deadline hits failed: %v", err)
+	}
+}
+
 // Generate produces a narrative briefing for the given project directory.
 func (g *Generator) Generate(projectDir string) string {
-	projectShort := g.resolveProject(projectDir)
+	return g.generateResolved(projectDir, g.resolveProject(projectDir))
+}
+
+// GenerateForKey renders the briefing for a project key that is already resolved.
+// A caller holding the row identity (the refresh loop) must render that key, not the
+// project a re-resolution would produce: Generate resolves through OwningProject,
+// which climbs to the nearest ancestor that carries sessions. Which rows the refresh
+// loop hands over is decided by ListProjectsWithRepositoryRoots, whose gate only
+// keeps roots that OwningProject resolves to themselves, so key and read path agree.
+func (g *Generator) GenerateForKey(projectShort string) string {
+	return g.generateResolved(projectShort, projectShort)
+}
+
+func (g *Generator) generateResolved(projectDir, projectShort string) string {
+	g.deadlineHits = nil
 
 	// Load, deduplicate, and score all learnings
 	allLearnings := g.loadLearnings(projectShort)
@@ -148,25 +212,29 @@ func (g *Generator) Generate(projectDir string) string {
 		b.WriteString(fmt.Sprintf("\nState brief #%d (%s): get_learnings(id=%d)\n", brief.ID, brief.CreatedAt.Format("2006-01-02"), brief.ID))
 	}
 
-	// User profile (full Entwicklerprofil) OR standard persona directive + preferences — mutually exclusive
-	// Graceful fallback: if userProfile is enabled but no profile exists yet, show standard path
-	showStandardPersona := true
+	// User profile (full Entwicklerprofil) and persona directive are not mutually
+	// exclusive (D8): the profile describes the person, the directive carries the
+	// hard working rules. Profile first, then a short directive; when no profile
+	// exists the directive keeps its full limit and the preference learnings are
+	// rendered as well (a synthesized profile already contains them).
+	hasProfile := false
 	if g.userProfile {
-		userProfile := g.loadUserProfile()
-		if userProfile != "" {
+		if userProfile := g.loadUserProfile(); userProfile != "" {
 			b.WriteString("\n" + userProfile + "\n")
-			showStandardPersona = false
+			hasProfile = true
 		}
 	}
-	if showStandardPersona {
-		// Standard path: persona directive (limited to 10 rules) + preference learnings
-		personaDirective := g.loadPersonaDirective()
-		if personaDirective != "" {
-			re := regexp.MustCompile(`^\d+ Sessions`)
-			personaDirective = re.ReplaceAllString(personaDirective, fmt.Sprintf("%d Sessions", totalSessions))
-			b.WriteString(FormatPersonaDirectiveLimited(personaDirective, 10))
-			b.WriteString("\n")
-		}
+	directiveLimit := 10
+	if hasProfile {
+		directiveLimit = 5
+	}
+	if personaDirective := g.loadPersonaDirective(); personaDirective != "" {
+		re := regexp.MustCompile(`^\d+ Sessions`)
+		personaDirective = re.ReplaceAllString(personaDirective, fmt.Sprintf("%d Sessions", totalSessions))
+		b.WriteString(FormatPersonaDirectiveLimited(personaDirective, directiveLimit))
+		b.WriteString("\n")
+	}
+	if !hasProfile {
 		b.WriteString(g.renderPerson(s, allLearnings))
 	}
 	b.WriteString(g.renderKnowledge(s, allLearnings))
@@ -181,7 +249,7 @@ func (g *Generator) Generate(projectDir string) string {
 	// Gated behind skipUnfinished — agent sessions suppress all open-work including deadline items.
 	triggerReasons := make(map[int64]string) // learning ID → urgency reason
 	if !g.skipUnfinished {
-		triggers := checkDeadlineTriggers(g.store, projectShort)
+		triggers := checkDeadlineTriggers(g.store, projectShort, s)
 		for _, tm := range triggers {
 			triggerReasons[tm.Learning.ID] = tm.Reason
 			if !containsLearning(unfinished, tm.Learning.ID) {
@@ -210,43 +278,44 @@ func (g *Generator) Generate(projectDir string) string {
 
 	result := b.String()
 
-	// Hard limit: ~20KB (~5000 tokens). Prevents briefing from consuming too much context.
-	const maxBytes = 20000
+	// Hard limit from briefing.max_tokens (~5000 tokens at 4 bytes each).
+	// Prevents briefing from consuming too much context.
+	maxBytes := g.maxTokens * 4
+	if maxBytes <= 0 {
+		maxBytes = 20000
+	}
 	if len(result) > maxBytes {
-		result = result[:maxBytes] + "\n... (briefing truncated)"
+		// The marker is appended after the cut, so the result is maxBytes plus
+		// the marker (the same shape the previous fixed 20000-byte limit had).
+		result = truncateBytes(result, maxBytes) + "\n... (briefing truncated)"
 	}
 
 	return result
 }
 
-// resolveProject finds the best matching project_short for a directory path.
-// Tries filepath.Base first, then walks up parent directories.
+// truncateBytes cuts text to at most maxBytes without splitting a UTF-8 rune.
+// The result may be shorter than maxBytes by up to three bytes. Callers append
+// their own marker, so the returned string carries no suffix of its own.
+func truncateBytes(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut]
+}
+
+// resolveProject resolves the project a directory belongs to: the directory
+// itself when a session carries it, else the nearest ancestor that does, else the
+// path as given. The rule lives in storage.OwningProject, so pin lookups and the
+// briefing resolve a cwd to the same project.
 func (g *Generator) resolveProject(projectDir string) string {
-	if projectDir == "" {
-		return ""
+	if g.store == nil {
+		return models.ProjectShortFromPath(projectDir)
 	}
-	// Try exact match first
-	short := models.ProjectShortFromPath(projectDir)
-	sessions := g.loadSessions(short)
-	if len(sessions) > 0 {
-		return short
-	}
-	// Walk up parent directories (max 3 levels)
-	dir := projectDir
-	for i := 0; i < 3; i++ {
-		parent := filepath.Dir(dir)
-		if parent == dir || parent == "/" {
-			break
-		}
-		short = models.ProjectShortFromPath(parent)
-		sessions = g.loadSessions(short)
-		if len(sessions) > 0 {
-			return short
-		}
-		dir = parent
-	}
-	// Fallback to original
-	return models.ProjectShortFromPath(projectDir)
+	return g.store.OwningProject(projectDir)
 }
 
 // ProjectKey exposes the resolved project identifier used by Generate.
@@ -260,7 +329,10 @@ func (g *Generator) ProjectKey(projectDir string) string {
 
 // loadLearnings fetches project-specific and global learnings.
 func (g *Generator) loadLearnings(projectShort string) []models.Learning {
-	learnings, _ := g.store.GetActiveLearnings("", projectShort, "", "", 0)
+	// ActiveLearningsForProject adds the rows written below the project path: a
+	// repository whose work happens in worktree checkouts has no row under its own
+	// path, and the canonical scope alone would leave the briefing without content.
+	learnings, _ := g.store.ActiveLearningsForProject(projectShort, "", 0)
 	return learnings
 }
 
@@ -374,7 +446,7 @@ func (g *Generator) loadNarratives(projectShort string) []NarrativeSummary {
 		}
 
 		result = append(result, NarrativeSummary{
-			Ago:       relativeTime(l.CreatedAt),
+			Ago:       relativeTime(g.strings, l.CreatedAt),
 			Flavor:    l.SessionFlavor,
 			Content:   content,
 			SessionID: l.SessionID,
@@ -425,7 +497,7 @@ func (g *Generator) renderAwakening(s Strings, learnings []models.Learning, tota
 			startTimes = append(startTimes, sess.StartedAt)
 		}
 	}
-	data.TimeGaps = computeTimeGaps(startTimes)
+	data.TimeGaps = computeTimeGaps(s, startTimes)
 
 	return renderTemplate("awakening", tmplAwakening, s, data)
 }
@@ -568,7 +640,7 @@ func (g *Generator) renderProject(s Strings, projectShort, profile string, sessi
 			msg = msg[:80] + "..."
 		}
 		summaries = append(summaries, SessionSummary{
-			Ago:           relativeTime(sess.StartedAt),
+			Ago:           relativeTime(s, sess.StartedAt),
 			FirstMessage:  msg,
 			Branch:        sess.GitBranch,
 			SubagentCount: subagentCounts[sess.ID],
@@ -620,23 +692,31 @@ func (g *Generator) loadMetamemory(projectShort string) string {
 	db.QueryRow("SELECT COUNT(*) "+base, projectShort).Scan(&total)
 	db.QueryRow("SELECT COUNT(*) "+base+" AND save_count >= 3", projectShort).Scan(&solid)
 	db.QueryRow("SELECT COUNT(*) "+base+" AND noise_count > 3", projectShort).Scan(&noisy)
-	db.QueryRow("SELECT COUNT(*) "+base+" AND valid_until IS NOT NULL AND valid_until < datetime('now')", projectShort).Scan(&expired)
+	// julianday() on both sides: valid_until is written as datetime('now') by the
+	// supersede paths but as RFC3339 by legacy rows, and a lexical comparison puts
+	// the RFC3339 'T' above the space separator, hiding a same-day expiry.
+	db.QueryRow("SELECT COUNT(*) "+base+" AND valid_until IS NOT NULL AND julianday(valid_until) < julianday('now')", projectShort).Scan(&expired)
 
 	// Only render if there's something to say
 	if solid == 0 && noisy == 0 && expired == 0 {
 		return ""
 	}
 
+	return metamemoryText(g.strings, total, solid, noisy, expired)
+}
+
+// metamemoryText renders the knowledge-quality self-assessment.
+func metamemoryText(s Strings, total, solid, noisy, expired int) string {
 	var sb strings.Builder
-	sb.WriteString("My knowledge quality here:\n")
+	sb.WriteString(s.MetamemoryHeader + "\n")
 	if solid > 0 {
-		sb.WriteString(fmt.Sprintf("• %d/%d learnings proven (save_count ≥3)\n", solid, total))
+		sb.WriteString(fmt.Sprintf(s.MetamemoryProvenFmt, solid, total) + "\n")
 	}
 	if noisy > 0 {
-		sb.WriteString(fmt.Sprintf("• %d fragile (often irrelevantly injected — use with caution)\n", noisy))
+		sb.WriteString(fmt.Sprintf(s.MetamemoryFragileFmt, noisy) + "\n")
 	}
 	if expired > 0 {
-		sb.WriteString(fmt.Sprintf("• %d possibly outdated (valid_until expired)\n", expired))
+		sb.WriteString(fmt.Sprintf(s.MetamemoryOutdatedFmt, expired) + "\n")
 	}
 	return sb.String()
 }
@@ -670,8 +750,13 @@ func (g *Generator) loadGapAwareness(projectShort string) *GapAwarenessData {
 		if p.SessionCount < 5 {
 			continue
 		}
-		lastActive, _ := time.Parse(time.RFC3339, p.LastActive)
+		lastActive, parseErr := time.Parse(time.RFC3339, p.LastActive)
 		daysAgo := int(time.Since(lastActive).Hours() / 24)
+		// An unparsable last_active is unknown age, not infinite age: dropping
+		// the project would hide it from every briefing instead of listing it.
+		if g.otherProjects > 0 && parseErr == nil && daysAgo > g.otherProjects {
+			continue
+		}
 		if len(others) < 5 {
 			others = append(others, ProjectGap{
 				Name:         p.ProjectShort,
@@ -722,11 +807,13 @@ func (g *Generator) renderGapAwareness(s Strings, data *GapAwarenessData) string
 	return renderTemplate("gap", tmplGapAwareness, s, data)
 }
 
-// extractPulse finds and returns a "Puls: ..." line from narrative content.
+// extractPulse finds and returns a "Puls: ..." or "Pulse: ..." line from
+// narrative content. Both spellings are accepted: the german narrative prompt
+// used "Puls:", the english one emits "Pulse:".
 func extractPulse(content string) string {
 	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "Puls:") {
+		if strings.HasPrefix(trimmed, "Puls:") || strings.HasPrefix(trimmed, "Pulse:") {
 			return trimmed
 		}
 	}
@@ -790,7 +877,7 @@ func (g *Generator) loadMilestones(narratives []NarrativeSummary) []MilestoneIte
 			continue
 		}
 		items = append(items, MilestoneItem{
-			Ago:            relativeTime(l.CreatedAt),
+			Ago:            relativeTime(g.strings, l.CreatedAt),
 			Flavor:         truncateAtSentence(l.SessionFlavor, 300),
 			IntensityLabel: g.intensityLabel(l.EmotionalIntensity),
 		})
@@ -878,11 +965,16 @@ func (g *Generator) renderOpenWork(s Strings, unfinished []models.Learning, abse
 	}
 	unfinished = actionable
 
-	// Filter by importance when in reminder mode
+	// Filter by importance when in reminder mode. Triggered deadlines survive:
+	// an approaching deadline is urgent by definition, whatever its importance.
 	if isReminder {
 		var filtered []models.Learning
 		for _, l := range unfinished {
 			if l.Importance >= 3 {
+				filtered = append(filtered, l)
+				continue
+			}
+			if _, triggered := triggerReasons[l.ID]; triggered {
 				filtered = append(filtered, l)
 			}
 		}
@@ -915,9 +1007,12 @@ func (g *Generator) renderOpenWork(s Strings, unfinished []models.Learning, abse
 	for _, l := range unfinished {
 		deadline := ""
 		if reason, ok := triggerReasons[l.ID]; ok {
-			deadline = reason // urgency-based: "Deadline morgen", "Deadline heute!"
+			// urgency-based: "morgen", "heute"; only a deadline that actually
+			// reaches the rendered list may start the 12h cooldown.
+			deadline = reason
+			g.deadlineHits = append(g.deadlineHits, DeadlineHit{ID: l.ID, Content: l.Content})
 		} else {
-			deadline = formatDeadline(l.TriggerRule) // static: "Fr 28.03."
+			deadline = formatDeadline(s, l.TriggerRule) // static, e.g. "Sat 28 March"
 		}
 		items = append(items, OpenWorkItem{
 			Project:  l.Project,
@@ -928,15 +1023,7 @@ func (g *Generator) renderOpenWork(s Strings, unfinished []models.Learning, abse
 
 	capIdeasBlock := ""
 	if len(capIdeas) > 0 {
-		var b strings.Builder
-		// Codex: keep cap ideas visible even when no regular open-work item remains.
-		b.WriteString("\n**Cap suggestions from recent work** (workflows that came up multiple times):\n\n")
-		for _, c := range capIdeas {
-			fmt.Fprintf(&b, "- [#%d] %s - seen %dx\n", c.ID, c.Content, c.MatchCount)
-		}
-		b.WriteString("\nConfirm: `remember(text=\"<intent>\", category=\"unfinished:task\", supersedes=<ID>)`\n")
-		b.WriteString("Dismiss: `resolve_by_text(text=\"<content-substring>\", project=\"<project>\")`\n")
-		capIdeasBlock = b.String()
+		capIdeasBlock = capIdeasText(s, capIdeas)
 	}
 
 	data := OpenWorkData{
@@ -946,11 +1033,26 @@ func (g *Generator) renderOpenWork(s Strings, unfinished []models.Learning, abse
 		StaleCount: staleCount,
 	}
 	if isReminder {
-		data.AbsenceNote = formatAbsence(absenceHours)
+		data.AbsenceNote = formatAbsence(s, absenceHours)
 	}
 
 	result := capIdeasBlock + renderTemplate("openwork", tmplOpenWork, s, data)
 	return result
+}
+
+// capIdeasText renders the cap suggestions block (Codex: kept visible even when
+// no regular open-work item remains). The layout newlines and the
+// remember(...)/resolve(...) calls stay here: a translated strings.yaml must
+// never be able to rewrite a tool argument or collapse the block's spacing.
+func capIdeasText(s Strings, capIdeas []models.Learning) string {
+	var b strings.Builder
+	b.WriteString("\n" + s.CapIdeasHeader + "\n\n")
+	for _, c := range capIdeas {
+		fmt.Fprintf(&b, "- [#%d] %s - seen %dx\n", c.ID, c.Content, c.MatchCount)
+	}
+	fmt.Fprintf(&b, "\n%s: `remember(text=\"<intent>\", category=\"unfinished\", task_type=\"task\", supersedes=<ID>)`\n", s.CapIdeasConfirmLabel)
+	fmt.Fprintf(&b, "%s: `resolve(learning_id=<ID>)` — %s\n", s.CapIdeasDismissLabel, s.CapIdeasDismissNote)
+	return b.String()
 }
 
 // calcAbsenceHours returns hours since the last session started.
@@ -965,21 +1067,21 @@ func calcAbsenceHours(sessions []models.Session) float64 {
 	return time.Since(sessions[0].StartedAt).Hours()
 }
 
-// formatAbsence returns a German absence note like "Du warst 2 Tage nicht da."
-func formatAbsence(hours float64) string {
+// formatAbsence returns the translated absence note, e.g. "2 days away".
+func formatAbsence(s Strings, hours float64) string {
 	switch {
 	case hours < 24:
-		return fmt.Sprintf("Du warst %d Stunden nicht da.", int(hours))
+		return fmt.Sprintf(s.AbsenceHoursFmt, int(hours))
 	case hours < 48:
-		return "Du warst seit gestern nicht da."
+		return s.AbsenceYesterday
 	default:
-		return fmt.Sprintf("Du warst %d Tage nicht da.", int(hours/24))
+		return fmt.Sprintf(s.AbsenceDaysFmt, int(hours/24))
 	}
 }
 
 // formatDeadline extracts a human-readable deadline from a trigger_rule.
 // Returns "" if trigger is not a deadline format.
-func formatDeadline(triggerRule string) string {
+func formatDeadline(s Strings, triggerRule string) string {
 	if !strings.HasPrefix(triggerRule, "deadline:") {
 		return ""
 	}
@@ -988,6 +1090,11 @@ func formatDeadline(triggerRule string) string {
 	if err != nil {
 		return ""
 	}
-	weekday := [...]string{"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"}
-	return fmt.Sprintf("%s %02d.%02d.", weekday[t.Weekday()], t.Day(), t.Month())
+	// Layout, weekday and month come from the translated data, so the rendered
+	// date follows the installation language instead of a fixed day.month order.
+	layout := s.DeadlineDateFormat
+	if layout == "" {
+		layout = DefaultStrings().DeadlineDateFormat
+	}
+	return fmt.Sprintf(layout, weekdayShort(s, t.Weekday()), t.Day(), monthName(s, t.Month()))
 }

@@ -2,12 +2,13 @@ package plugins
 
 import "embed"
 
-// BundledOpencodePlugin contains the TypeScript plugin source files
-// for the opencode YesMem plugin. Installed to
-// ~/.local/share/yesmem/plugins/opencode-yesmem/ during setup.
+// BundledOpencodePluginV2 contains the v2 server plugin sources (opencode 2.x
+// hook API, Plugin.define). Installed to
+// ~/.config/opencode/plugins/opencode-yesmem/, a directory opencode v2
+// discovers on its own; configured file targets are dropped there.
 //
-//go:embed opencode-yesmem/*
-var BundledOpencodePlugin embed.FS
+//go:embed opencode-yesmem-v2/*.ts
+var BundledOpencodePluginV2 embed.FS
 
 // WindowPlugin contains the v2 opencode TUI plugin that registers which
 // session a terminal window shows (register_window), so spawned agents open

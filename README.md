@@ -197,7 +197,7 @@ The result is that the project remains navigable.
 
 ## Architecture
 
-Single Go binary (~120MB with embedded SSE embedding model). Three cooperating processes plus a hook layer:
+Single Go binary (~143MB, of which ~108MB is the embedded SSE embedding model). Three cooperating processes plus a hook layer:
 
 | Component | Role | Communication |
 |-----------|------|---------------|
@@ -212,7 +212,7 @@ All data local. No cloud. No external dependencies. Pure Go, no CGo, no C compil
 
 ## Features
 
-70 MCP tools · 130 daemon RPCs · 64 CLI commands. **[Full reference →](Features.md)**
+73 MCP tools · 130 daemon RPCs · 64 CLI commands. **[Full reference →](Features.md)**
 
 ### Find & Remember
 - **Find anything across all sessions**: full-text + semantic search combined via Reciprocal Rank Fusion
@@ -263,7 +263,7 @@ The proxy is **optional**. YesMem works fully without it. All MCP tools, briefin
 - **Gotcha decay**: stale gotchas fade, fresh ones surface. Precision-based scoring with tiered output eliminates noise from resolved issues
 
 ### Tools & CLI
-- **70 MCP tools**: search, remember, code intelligence, capabilities, personas, plans, agents, docs, scratchpad, config
+- **73 MCP tools**: search, remember, code intelligence, capabilities, personas, plans, agents, docs, scratchpad, config
 - **64 CLI commands**: daemon, proxy, setup, extraction, benchmarking, export/import, cost tracking
 - **130 daemon RPC methods**: full programmatic access
 

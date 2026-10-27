@@ -100,7 +100,7 @@ func TestParseDeadlineTrigger(t *testing.T) {
 		wantMon  time.Month
 		wantDay  int
 	}{
-		{"deadline:2026-03-28", true, 2026, time.March, 29},  // end of day = start of 29th
+		{"deadline:2026-03-28", true, 2026, time.March, 29},   // end of day = start of 29th
 		{"deadline:2026-12-01", true, 2026, time.December, 2}, // end of day = start of 2nd
 		{"deadline:invalid", false, 0, 0, 0},
 		{"deadline:", false, 0, 0, 0},

@@ -1,18 +1,37 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/carsteneu/yesmem/internal/textutil"
 )
 
 // createSchema creates all tables if they don't exist.
 func (s *Store) createSchema() error {
-	// Migrations FIRST — fix schema before CREATE TABLE IF NOT EXISTS skips
-	for _, mig := range migrations {
-		s.db.Exec(mig) // Ignore errors (column may already exist)
+	// Migrations FIRST — fix schema before CREATE TABLE IF NOT EXISTS skips.
+	//
+	// Two errors are expected here and are part of the design: "duplicate column
+	// name" on a database that already carries the column, and "no such table"
+	// on a fresh database, where these statements run before the CREATE TABLE
+	// list below. The repair runs again on the next open, so a database heals.
+	// Every ALTER-only column also belongs in its CREATE TABLE constant: on a
+	// fresh store these statements run before the table exists, so a column that
+	// the constant lacks stays absent for the entire first lifetime of the store
+	// and would surface as "no such column" in whatever path reads it (YM-378).
+	// A rename whose old column is gone is the same case, verified against the
+	// column list. Any other error means the repair did not happen; discarding
+	// it left a missing column and an unenforced attempt budget in place without
+	// a trace (YM-362).
+	for i, mig := range migrations {
+		if _, err := s.db.Exec(mig); err != nil &&
+			!benignMigrationError(err) &&
+			!renameAlreadyApplied(s.db, err, mig) {
+			return fmt.Errorf("migration %d failed: %w (statement: %s)", i, err, textutil.SingleLine(mig, 120))
+		}
 	}
 
 	tables := []string{
@@ -58,6 +77,8 @@ func (s *Store) createSchema() error {
 		tableCodeDescriptions,
 		tableProjectScan,
 		tableScanCooldown,
+		tableCodeNavDismissals,
+		tableProjectScanFiles,
 		tableSessionActiveCaps,
 		tableReplPatternObservations,
 		tableScheduledJobs,
@@ -67,6 +88,24 @@ func (s *Store) createSchema() error {
 		if _, err := s.db.Exec(ddl); err != nil {
 			return err
 		}
+	}
+
+	// Seed the agent-id counter after the tables exist. The upsert is monotonic:
+	// a counter left behind by an older binary (MAX()+1 writes no counter row) or
+	// by a restore heals on the next open instead of handing out ids that are
+	// already taken. A failure stays non-fatal — the counter starts at 1 and the
+	// first AgentCreate that collides surfaces the error — but it is logged, which
+	// the migration loop's blanket error ignore cannot do (YM-151).
+	if _, err := s.db.Exec(seedAgentIDSeq); err != nil {
+		log.Printf("warn: agent_id_seq seed not applied: %v", err)
+	}
+
+	// Existing installations carry the table without session attribution; the
+	// add is a repair, so a failure must not keep the daemon from starting (see
+	// ensureUniqueMessageSequence below for the same reasoning).
+	if err := ensureColumn(s.db, "pinned_learnings", "session_id",
+		`ALTER TABLE pinned_learnings ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		log.Printf("warn: pinned_learnings.session_id not added: %v", err)
 	}
 
 	for _, idx := range indices {
@@ -122,7 +161,122 @@ func (s *Store) createRuntimeSchema() error {
 	if _, err := db.Exec(tablePinnedLearnings); err != nil {
 		return err
 	}
+	// Existing runtime.db files predate session attribution of session pins.
+	if err := ensureColumn(db, "pinned_learnings", "session_id",
+		`ALTER TABLE pinned_learnings ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		log.Printf("warn: pinned_learnings.session_id not added (runtime): %v", err)
+	}
 	return nil
+}
+
+// benignMigrationError reports the errors the migration order produces by
+// design (see createSchema): an already-present column and a not-yet-created
+// table. The table check stays textual, so a future migration naming a table
+// that never exists is still swallowed; every other error stays visible.
+func benignMigrationError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate column name") || strings.Contains(msg, "no such table")
+}
+
+// renameAlreadyApplied reports whether a failed RENAME COLUMN is only the repeat
+// of an earlier run: the error names the old column and the new one is present.
+// Without both checks the whole "no such column" class would count as benign,
+// which is exactly the silent failure YM-362 is fixing.
+func renameAlreadyApplied(db *sql.DB, err error, stmt string) bool {
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "no such column") {
+		return false
+	}
+	tokens := strings.Fields(stmt)
+	upper := make([]string, len(tokens))
+	for i, tok := range tokens {
+		upper[i] = strings.ToUpper(strings.Trim(tok, "\"`[];"))
+	}
+	rename := -1
+	for i := 0; i+4 < len(tokens); i++ {
+		if upper[i] == "RENAME" && upper[i+1] == "COLUMN" && upper[i+3] == "TO" {
+			rename = i
+			break
+		}
+	}
+	if rename < 2 || upper[0] != "ALTER" || upper[1] != "TABLE" || upper[rename-2] != "TABLE" {
+		return false
+	}
+	table := strings.Trim(tokens[rename-1], "\"`[]")
+	if dot := strings.LastIndex(table, "."); dot >= 0 {
+		table = strings.Trim(table[dot+1:], "\"`[]")
+	}
+	oldColumn := strings.Trim(tokens[rename+2], "\"`[];")
+	newColumn := strings.Trim(tokens[rename+4], "\"`[];")
+	// The error has to name the old column; otherwise it is a different repair.
+	// SQLite quotes the identifier in the message, so the name is read out of it
+	// and unquoted before the comparison.
+	const marker = "no such column: "
+	at := strings.Index(msg, marker)
+	if at < 0 {
+		return false
+	}
+	named := strings.TrimSpace(msg[at+len(marker):])
+	if fields := strings.Fields(named); len(fields) > 0 {
+		named = fields[0]
+	}
+	named = strings.Trim(named, "\"`[]' ")
+	if named != strings.ToLower(oldColumn) {
+		return false
+	}
+	present, err := hasColumn(db, table, newColumn)
+	return err == nil && present
+}
+
+// ensureColumn adds a column to a table when it is missing. Both call sites run
+// after the table's CREATE TABLE, and pinned_learnings is created in yesmem.db
+// and runtime.db, so the add has to run against each database.
+//
+// Two processes can pass the existence check together (a swarm start opens the
+// same store in parallel), so the duplicate-column error of the loser is not an
+// error: the column is verified afterwards instead of trusted to an error text.
+func ensureColumn(db *sql.DB, table, column, ddl string) error {
+	present, err := hasColumn(db, table, column)
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	if _, err := db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return err
+	}
+	present, err = hasColumn(db, table, column)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return fmt.Errorf("column %s.%s is still missing after the alter", table, column)
+	}
+	return nil
+}
+
+// hasColumn reports whether a table carries a column. A missing table reports
+// false without an error: the CREATE TABLE that follows adds the column.
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // createMessagesSchema creates the messages table + FTS5 index in the separate messages.db.
@@ -452,6 +606,13 @@ var migrations = []string{
 	`ALTER TABLE scheduled_jobs ADD COLUMN backend TEXT NOT NULL DEFAULT ''`,
 	// v0.57: bundle caps — disambiguate which Scripts[] entry a job uses
 	`ALTER TABLE scheduled_jobs ADD COLUMN script_name TEXT NOT NULL DEFAULT ''`,
+	// v2.x sandbox: per-job egress allowlist for the standard profile (ai-jail
+	// 2.x --allow-host). Empty means no egress at all.
+	`ALTER TABLE scheduled_jobs ADD COLUMN allowed_hosts TEXT NOT NULL DEFAULT ''`,
+	// YM-281: the project a job was created from. A cap that names a project to
+	// the daemon cannot use a bare basename (two checkouts may share it), so the
+	// job carries the caller's project instead of guessing one at fire time.
+	`ALTER TABLE scheduled_jobs ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 	`CREATE TABLE IF NOT EXISTS bash_job_runs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		job_id TEXT NOT NULL,
@@ -478,7 +639,15 @@ var migrations = []string{
 	`UPDATE learnings SET source_agent = COALESCE((SELECT s.source_agent FROM sessions s WHERE s.id = learnings.session_id), 'claude') WHERE source_agent = ''`,
 	// v0.61: Canonical project — family-scoped learnings across worktree/main boundaries
 	`ALTER TABLE learnings ADD COLUMN canonical_project TEXT NOT NULL DEFAULT ''`,
-	`UPDATE learnings SET canonical_project = project`,
+	// The v0.61 backfill `UPDATE learnings SET canonical_project = project` is gone:
+	// canonical_project holds the project *basename* (models.CanonicalProject, worktree
+	// aware), while learnings.project holds the full path — the statement therefore wrote
+	// a path into a basename column, and because it runs on every store open it did so to
+	// every row that still carried an empty canonical (1110 rows on 2026-10-16). It also
+	// aborted outright while any row had a NULL project (NOT NULL constraint), which is
+	// what kept that damage invisible. canonical_project is derived on every insert, and
+	// the readers treat '' as "no canonical" (learnings.go:378, :564), so a database
+	// without the backfill behaves exactly as it does today.
 	`UPDATE learnings SET canonical_project = 'yesmem' WHERE project IN ('checkcodebase', 'bridge-langgraph-bridge', 'opencode-proxy', 'feat+capability-memory', 'feat+security-hardening', 'codex-anpassungen', 'worktree-scoring-fixes', 'forked-agent-proxy', 'briefing-injection')`,
 	`CREATE INDEX IF NOT EXISTS idx_learnings_canonical ON learnings(canonical_project, superseded_by)`,
 	// v0.62: Attribution field for external source tracking
@@ -494,8 +663,15 @@ var migrations = []string{
 	// v0.65: project-fullpath migration — store/query full absolute paths instead of basenames.
 	// Backfill sessions.project_short and learnings.project from the authoritative full path
 	// in sessions.project. Idempotent: rows already using a full path are left unchanged.
+	// The learnings statement only overwrites — never clears: the subquery yields NULL for a
+	// session the index does not hold (every opencode write; the table only carries indexed
+	// transcripts) and for a session whose own project is still a short name. Without the
+	// guards one store open replaces the stored project with NULL or with another short
+	// name, and the row is then out of reach for every later run (NULL does not match
+	// NOT LIKE '/%'), which is how 200 rows lost their project on 2026-10-16. Repairing
+	// rows that are already NULL is not this statement's job.
 	`UPDATE sessions SET project_short = project WHERE project LIKE '/%' AND project_short != project`,
-	`UPDATE learnings SET project = (SELECT s.project FROM sessions s WHERE s.id = learnings.session_id) WHERE learnings.session_id IS NOT NULL AND learnings.session_id != '' AND learnings.project NOT LIKE '/%'`,
+	`UPDATE learnings SET project = (SELECT s.project FROM sessions s WHERE s.id = learnings.session_id AND s.project LIKE '/%') WHERE learnings.session_id IS NOT NULL AND learnings.session_id != '' AND learnings.project NOT LIKE '/%' AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = learnings.session_id AND s.project LIKE '/%')`,
 	// v0.66: Backfill agents.project from short names to full paths.
 	// v0.65 migrated sessions.project_short and learnings.project but missed the agents table.
 	// Resolution: basename match against sessions.project; only unambiguous cases are backfilled
@@ -537,10 +713,17 @@ var migrations = []string{
 		)`,
 	// An active learning must not retain the invalidation metadata written when
 	// it was superseded. v0.67 reactivated self-linked rows but left these fields.
+	//
+	// The statement is scoped to rows that still carry a supersede_reason (YM-348).
+	// A reactivated row has one, because the supersede path always writes reason
+	// and TTL together. A row that cmd_volatile bounded with valid_until and no
+	// reason is not reactivation debris: its TTL is live state, and clearing it on
+	// every store open wiped the mechanism it was written for.
 	`UPDATE learnings SET supersede_reason = NULL, valid_until = NULL
-		WHERE superseded_by IS NULL AND (supersede_reason IS NOT NULL OR valid_until IS NOT NULL)`,
+		WHERE superseded_by IS NULL AND supersede_reason IS NOT NULL`,
 	// v0.69: project_source records the attribution basis of a learning
-	// (explicit|repo|session|content|ambiguous). Empty for legacy rows.
+	// (explicit|repo|session|content|ambiguous, plus "canonical" when the repair
+	// tool rebuilt it from canonical_project). Empty for legacy rows.
 	`ALTER TABLE learnings ADD COLUMN project_source TEXT NOT NULL DEFAULT ''`,
 	// v0.70: Agent permission-kick setting — ''=inherit config default, on/off override
 	`ALTER TABLE agents ADD COLUMN permission_kick TEXT DEFAULT ''`,
@@ -553,6 +736,48 @@ var migrations = []string{
 	// v0.72: Fingerprint of the bytes before the append watermark, so a rewrite
 	// in place cannot be mistaken for an append.
 	`ALTER TABLE index_state ADD COLUMN indexed_prefix_hash TEXT NOT NULL DEFAULT ''`,
+	// v0.73: Directory the agent's backend was started in. It is the
+	// directory-scoped half of a late opencode session bind. Also added by
+	// MigrateAgentsSchema, which the daemon runs; this entry covers every other
+	// process that opens the store without it.
+	`ALTER TABLE agents ADD COLUMN work_dir TEXT DEFAULT ''`,
+	// v0.74: The spawn parameters a replacement has to come back with — the
+	// model and the TUI theme as requested (`--model`, `--theme`). Also added by
+	// MigrateAgentsSchema, which the daemon runs; this entry covers every other
+	// process that opens the store without it (YM-64).
+	`ALTER TABLE agents ADD COLUMN model TEXT DEFAULT ''`,
+	`ALTER TABLE agents ADD COLUMN theme TEXT DEFAULT ''`,
+	// v0.75: One-shot recovery handoff — the briefing that used a tracked /clear
+	// marks the row so no later briefing injects the same context again.
+	`ALTER TABLE session_tracking ADD COLUMN consumed_at TEXT`,
+	// v0.76: Atomic agent-id allocation. The per-day counter used to be read with
+	// MAX()+1 through the reader connection and persisted nowhere, so two spawns
+	// asking at the same moment received the same id and the second AgentCreate
+	// failed on the primary key (YM-151). The counter row itself is seeded after
+	// the tables exist (seedAgentIDSeq) — as a migration it ran before CREATE
+	// TABLE on a fresh database and its error was swallowed.
+	`CREATE TABLE IF NOT EXISTS agent_id_seq (
+		day  TEXT PRIMARY KEY,
+		next INTEGER NOT NULL
+	)`,
+	// v0.77: Failed-extraction counter. A session whose extraction kept failing
+	// stayed pending and was attempted again on every cycle; the counter bounds
+	// that retry, and the batch path derives its skip from it (YM-317).
+	`ALTER TABLE sessions ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0`,
+	// v0.78: Repair learnings without an instant. InsertLearningBatch rendered a
+	// zero CreatedAt as "" and every julianday() window (since/before in the
+	// search tools, get_learnings_since, pulse) drops such a row; 332 live rows
+	// were in that state on 2026-10-16 (YM-308). The session start is the only
+	// date evidence the store holds. A row whose session carries no start stays
+	// as it is: inventing a date there would be worse than the gap. Idempotent —
+	// after the statement no matching row is left.
+	// The partial index makes the repair an index lookup instead of a full scan:
+	// the list is replayed on every store open, and created_at is NOT NULL, so the
+	// index holds exactly the rows still waiting for a date — normally none.
+	`CREATE INDEX IF NOT EXISTS idx_learnings_missing_created_at ON learnings(created_at) WHERE created_at = ''`,
+	`UPDATE learnings SET created_at = (SELECT s.started_at FROM sessions s WHERE s.id = learnings.session_id)
+		WHERE learnings.created_at = ''
+		  AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = learnings.session_id AND COALESCE(s.started_at, '') <> '')`,
 }
 
 // messagesMigrations runs against messages.db (separate from yesmem.db migrations).
@@ -582,7 +807,10 @@ const tableSessions = `CREATE TABLE IF NOT EXISTS sessions (
 	source_agent      TEXT DEFAULT 'claude',
 	extracted_at      TEXT,
 	narrative_at      TEXT,
+	fixation_ratio    REAL DEFAULT 0,
+	agent_role        TEXT DEFAULT '',
 	skip_extraction   BOOLEAN DEFAULT 0,
+	extraction_attempts INTEGER NOT NULL DEFAULT 0,
 	flavor_learnings_count INTEGER NOT NULL DEFAULT -1
 )`
 
@@ -758,6 +986,7 @@ const tableSessionTracking = `CREATE TABLE IF NOT EXISTS session_tracking (
 	session_id TEXT NOT NULL,
 	reason     TEXT NOT NULL,
 	timestamp  TEXT NOT NULL,
+	consumed_at TEXT,
 	UNIQUE(project, session_id)
 )`
 
@@ -806,11 +1035,32 @@ var indices = []string{
 	`CREATE INDEX IF NOT EXISTS idx_lcs_cluster ON learning_cluster_scores(cluster_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project)`,
 	`CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status) WHERE status = 'running'`,
+	// The code-nav check looks up a file name on every shell tool call; the
+	// primary key covers the exact path, this index covers the file name.
+	`CREATE INDEX IF NOT EXISTS idx_project_scan_files_base ON project_scan_files(project, base)`,
 	`CREATE INDEX IF NOT EXISTS idx_learnings_session ON learnings(session_id)`,
+	// The version history reads the predecessors of a chain by superseded_by.
+	// idx_learnings_active_id is partial (WHERE superseded_by IS NULL) and
+	// idx_learnings_canonical_cat leads with canonical_project, so neither serves
+	// that lookup: without this index the read scans the whole table (measured
+	// 160-190 ms on 90k rows, under 10 ms with the index).
+	`CREATE INDEX IF NOT EXISTS idx_learnings_superseded_by ON learnings(superseded_by)`,
+	// The delete paths clear the references that point at a row they remove, and
+	// they look those up by supersedes. That column has no index, so the clear
+	// scanned the whole table: 446 ms on 90k rows against 19 ms for the
+	// superseded_by direction, inside the write transaction of the narrative
+	// prune.
+	`CREATE INDEX IF NOT EXISTS idx_learnings_supersedes ON learnings(supersedes)`,
 	`CREATE INDEX IF NOT EXISTS idx_learnings_canonical_cat ON learnings(canonical_project, category, superseded_by, created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_coverage_project_touched ON file_coverage(project, last_touched DESC)`,
 	`CREATE INDEX IF NOT EXISTS idx_pinned_project ON pinned_learnings(project)`,
 	`CREATE INDEX IF NOT EXISTS idx_assoc_relation ON associations(relation_type)`,
+	// The heartbeat reads agent_messages once per second per running agent,
+	// filtered by target; the relay and the guard history read by target and
+	// sender. Without an index every one of those reads scans the whole table
+	// (2700 rows in production on 2026-10-16).
+	`CREATE INDEX IF NOT EXISTS idx_agent_messages_target ON agent_messages(target)`,
+	`CREATE INDEX IF NOT EXISTS idx_agent_messages_sender ON agent_messages(sender)`,
 }
 
 const tableClaudeMdState = `CREATE TABLE IF NOT EXISTS claudemd_state (
@@ -998,6 +1248,24 @@ const tableScanCooldown = `CREATE TABLE IF NOT EXISTS scan_cooldown (
 	error     TEXT NOT NULL DEFAULT ''
 )`
 
+// Read on every PreToolUse hook call — created with the schema, never in the
+// hook hot path (DT31 / YM-7).
+const tableCodeNavDismissals = `CREATE TABLE IF NOT EXISTS code_nav_dismissals (
+	session_id    TEXT PRIMARY KEY,
+	dismiss_count INTEGER NOT NULL DEFAULT 0
+)`
+
+// One row per indexed source path, refreshed with each scan: the code-nav check
+// must not parse the multi-MB scan document per shell call (DT31 / YM-7).
+// base is the file name and carries the index — the suffix match is bounded by
+// it, so a lookup never scans the project's whole path list.
+const tableProjectScanFiles = `CREATE TABLE IF NOT EXISTS project_scan_files (
+	project TEXT NOT NULL,
+	path    TEXT NOT NULL,
+	base    TEXT NOT NULL,
+	PRIMARY KEY (project, path)
+)`
+
 const tableSessionActiveCaps = `CREATE TABLE IF NOT EXISTS session_active_caps (
 	thread_id    TEXT NOT NULL,
 	cap_name     TEXT NOT NULL,
@@ -1016,8 +1284,10 @@ const tableScheduledJobs = `CREATE TABLE IF NOT EXISTS scheduled_jobs (
 	mode         TEXT NOT NULL DEFAULT 'agent',
 	cap_name     TEXT NOT NULL DEFAULT '',
 	script_name  TEXT NOT NULL DEFAULT '',
+	project      TEXT NOT NULL DEFAULT '',
 	auto_correct INTEGER NOT NULL DEFAULT 1,
 	allowed_ports TEXT NOT NULL DEFAULT '80,443',
+	allowed_hosts TEXT NOT NULL DEFAULT '',
 	sandbox      TEXT NOT NULL DEFAULT 'standard',
 	interval_seconds INTEGER NOT NULL DEFAULT 0,
 	model        TEXT NOT NULL DEFAULT '',

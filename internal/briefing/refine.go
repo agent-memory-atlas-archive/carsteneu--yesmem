@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -100,16 +101,17 @@ func FormatPinnedBlock(sessionPins, permanentPins []storage.PinnedLearning) stri
 	if len(sessionPins) == 0 && len(permanentPins) == 0 {
 		return ""
 	}
+	s := resolveDefaultStrings()
 	var b strings.Builder
 	b.WriteString("\n--- PINNED ---\n")
-	b.WriteString("Diese Anweisungen gelten bis sie explizit aufgehoben werden:\n")
+	b.WriteString(s.PinBlockIntro + "\n")
 	for _, p := range sessionPins {
 		b.WriteString(fmt.Sprintf("- [pin:%d] %s\n", p.ID, p.Content))
 	}
 	for _, p := range permanentPins {
 		b.WriteString(fmt.Sprintf("- [pin:%d permanent] %s\n", p.ID, p.Content))
 	}
-	b.WriteString("Zum Entfernen: unpin(id, scope)\n")
+	b.WriteString(s.PinBlockRemove + "\n")
 	b.WriteString("--- /PINNED ---\n")
 	return b.String()
 }
@@ -125,20 +127,55 @@ func RawHash(raw string) string {
 	return rawHash(raw)
 }
 
-// stripToolsBlock removes the tools section from raw briefing text.
-func stripToolsBlock(raw string) string {
-	if idx := strings.Index(raw, "How I can work with my memory:"); idx >= 0 {
-		return strings.TrimSpace(raw[:idx])
-	}
-	if idx := strings.Index(raw, "How my memory works:"); idx >= 0 {
-		return strings.TrimSpace(raw[:idx])
-	}
+// toolCatalogPrefix opens the tools catalog line. tmplAwakening renders that
+// line verbatim, so it identifies the tools paragraph even when the label above
+// it was translated (strings.yaml is written by an LLM pass).
+const toolCatalogPrefix = "search(query), hybrid_search(query), deep_search(query),"
+
+// toolSectionLabels are the known labels opening the tools paragraph.
+var toolSectionLabels = []string{
+	"How I can work with my memory:",
+	"How my memory works:",
 	// Legacy German patterns
-	if idx := strings.Index(raw, "So kann ich mit meinem Gedächtnis arbeiten:"); idx >= 0 {
-		return strings.TrimSpace(raw[:idx])
+	"So kann ich mit meinem Gedächtnis arbeiten:",
+	"So funktioniert mein Gedächtnis:",
+}
+
+// stripToolsBlock removes the tools paragraph from raw briefing text. The
+// paragraph sits inside the awakening section, which Generate renders first, so
+// it has to be cut out of the middle: truncating at the tools line drops every
+// section that follows it (person, knowledge, project, open work).
+func stripToolsBlock(raw string) string {
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		// A prefix test, not Contains: a learning that quotes the catalog mid
+		// sentence must not be mistaken for the paragraph.
+		if !strings.HasPrefix(strings.TrimSpace(line), toolCatalogPrefix) {
+			continue
+		}
+		start := i
+		if start > 0 && strings.TrimSpace(lines[start-1]) != "" {
+			// tmplAwakening always puts the label line directly above the
+			// catalog, and the label text itself is translated.
+			start--
+		}
+		// Label, catalog and hint form the paragraph. Cutting one line further
+		// would eat the first line of the next section; a hint that wraps onto
+		// a second line leaks that continuation into the prompt, which pollutes
+		// but loses nothing.
+		end := i + 2
+		if end > len(lines) {
+			end = len(lines)
+		}
+		kept := append(append([]string{}, lines[:start]...), lines[end:]...)
+		return strings.TrimSpace(strings.Join(kept, "\n"))
 	}
-	if idx := strings.Index(raw, "So funktioniert mein Gedächtnis:"); idx >= 0 {
-		return strings.TrimSpace(raw[:idx])
+	// Raw briefings from before the catalog line existed: only the tools text
+	// follows the label, so truncating there is correct.
+	for _, label := range toolSectionLabels {
+		if idx := strings.Index(raw, label); idx >= 0 {
+			return strings.TrimSpace(raw[:idx])
+		}
 	}
 	return raw
 }
@@ -175,7 +212,9 @@ func stripLLMToolsBlock(text string) string {
 }
 
 // GetCachedBriefing returns the cached refined briefing if available and not expired.
-// Cache is time-based (2h TTL), not hash-based — raw briefing changes every call due to dynamic data.
+// The cache is time-based (storage.refinedBriefingTTL, aligned with the daemon's
+// refresh cadence), not hash-based, because the raw briefing changes on every call
+// due to dynamic data.
 func GetCachedBriefing(store *storage.Store, project, raw string) string {
 	if store == nil {
 		return ""
@@ -199,6 +238,57 @@ func RefineBriefing(raw string, store *storage.Store, project string, logger *lo
 		logger.Printf("[briefing] refine: cache miss for %s, using raw", project)
 	}
 	return raw
+}
+
+var (
+	// learningIndexPattern matches a rendered learning entry: the briefing
+	// templates emit them as "- [ID:n] label" bullets. Anchoring on the bullet
+	// keeps IDs that a learning merely cites in its own text out of the index —
+	// they would be collected as injected and misattribute use counts.
+	learningIndexPattern = regexp.MustCompile(`(?m)^- \[ID:(\d+)\][ \t]*([^\n]*)`)
+	// idCitationPattern strips IDs cited inside a learning's text from its label.
+	idCitationPattern = regexp.MustCompile(`\[ID:\d+\]\s*`)
+)
+
+const (
+	maxIndexEntries    = 40
+	maxIndexLabelChars = 100
+)
+
+// learningIndex renders the [ID:n] entries of the raw briefing as a compact
+// reference list. Refinement rewrites the briefing as prose and drops the
+// markers, which silences the proxy's inline-reflection tracking — it collects
+// the injected IDs from the briefing text (see the ID collector in proxy.go).
+// The index is appended after refinement, so the markers survive; the labels
+// keep the IDs assignable to a topic.
+func learningIndex(raw string) string {
+	matches := learningIndexPattern.FindAllStringSubmatch(raw, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n---\nLearnings behind this text — cite the ID when one shapes your answer:\n")
+	seen := make(map[string]bool, len(matches))
+	n := 0
+	for _, m := range matches {
+		id, label := m[1], m[2]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		label = strings.Join(strings.Fields(idCitationPattern.ReplaceAllString(label, " ")), " ")
+		if runes := []rune(label); len(runes) > maxIndexLabelChars {
+			label = string(runes[:maxIndexLabelChars]) + "…"
+		}
+		fmt.Fprintf(&b, "[ID:%s] %s\n", id, label)
+		n++
+		if n >= maxIndexEntries {
+			break
+		}
+	}
+	b.WriteString("---\n")
+	return b.String()
 }
 
 // RegenerateRefinedBriefing generates a new refined briefing via LLM and caches it.
@@ -230,8 +320,14 @@ func RegenerateRefinedBriefing(store *storage.Store, project, raw string, llmCli
 		logger.Printf("[briefing] refine: post-validation applied (LLM output was missing Arrival text or too short)")
 	}
 
-	// Strip any tools block the LLM generated, append our constant one
-	result := fmt.Sprintf("%s\n%s\n", stripLLMToolsBlock(refined), toolsBlock)
+	// Strip any tools block the LLM generated, append the learning index and
+	// our constant tools block.
+	parts := []string{stripLLMToolsBlock(refined)}
+	if index := learningIndex(rawClean); index != "" {
+		parts = append(parts, index)
+	}
+	parts = append(parts, toolsBlock)
+	result := strings.Join(parts, "\n") + "\n"
 	hash := rawHash(raw)
 	if len(changeHash) > 0 && changeHash[0] != "" {
 		hash = changeHash[0]

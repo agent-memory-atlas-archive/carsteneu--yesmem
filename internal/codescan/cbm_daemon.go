@@ -42,7 +42,7 @@ func EnsureCBMDaemon(bin string) error {
 		return fmt.Errorf("cbm: daemon start failed: %w", err)
 	}
 	if daemonOutputPermanent(out) {
-		log.Printf("cbm: permanent daemon ensured: %s", daemonStatusLine(out))
+		log.Printf("cbm: permanent daemon ensured: %s", quoteForeignText(daemonStatusLine(out)))
 		return nil
 	}
 	if daemonOutputSessionManaged(out) {
@@ -58,15 +58,15 @@ func EnsureCBMDaemon(bin string) error {
 			return fmt.Errorf("cbm: daemon start failed: %w", err)
 		}
 		if daemonOutputPermanent(out) {
-			log.Printf("cbm: permanent daemon ensured: %s", daemonStatusLine(out))
+			log.Printf("cbm: permanent daemon ensured: %s", quoteForeignText(daemonStatusLine(out)))
 			return nil
 		}
 		if daemonOutputSessionManaged(out) {
 			return ErrDaemonSessionManaged
 		}
-		return fmt.Errorf("cbm: daemon start did not report a permanent daemon: %s", daemonStatusLine(out))
+		return fmt.Errorf("cbm: daemon start did not report a permanent daemon: %s", quoteForeignText(daemonStatusLine(out)))
 	}
-	return fmt.Errorf("cbm: daemon start did not report a permanent daemon: %s", daemonStatusLine(out))
+	return fmt.Errorf("cbm: daemon start did not report a permanent daemon: %s", quoteForeignText(daemonStatusLine(out)))
 }
 
 // indexFlightEmpty reports whether no background index job is running. The
@@ -86,7 +86,8 @@ func cbmDaemonExec(bin string, timeout time.Duration, args ...string) ([]byte, e
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
 	if err != nil {
-		return out, fmt.Errorf("%v: %s", err, out)
+		// Same bound as the query path: this error reaches daemon.log.
+		return out, fmt.Errorf("%v%s", err, stderrSuffix(string(out)))
 	}
 	return out, nil
 }

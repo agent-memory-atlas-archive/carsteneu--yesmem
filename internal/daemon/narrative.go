@@ -13,8 +13,13 @@ import (
 
 const (
 	minNarrativeSentences  = 3
-	minNarrativeMessages   = 6 // sessions with < 6 messages are too short for meaningful narratives
+	minNarrativeMessages   = storage.ShortSessionMaxMessages // shorter sessions carry no narrative worth writing
 	maxNarrativeInputChars = 25000
+	// narrativeKeep is the retention floor a project keeps for briefing and
+	// profiles; older ones have no standalone value. The prune keeps the newest
+	// rows by session time and by insertion order, so a project can hold slightly
+	// more than this number while its sessions are still being summarized.
+	narrativeKeep = 2
 )
 
 // NarrativePrompt returns the system prompt for narrative generation.
@@ -319,7 +324,7 @@ func generateNarrativeForSession(store *storage.Store, s models.Session, client 
 	// Inherit flavor + intensity from peer learnings of same session
 	flavor, intensity := getSessionFlavorAndIntensity(store, s.ID)
 
-	store.InsertLearning(&models.Learning{
+	narrativeID, err := store.InsertLearning(&models.Learning{
 		Category:           "narrative",
 		Content:            narrative,
 		Project:            s.ProjectShort,
@@ -331,8 +336,14 @@ func generateNarrativeForSession(store *storage.Store, s models.Session, client 
 		SessionFlavor:      flavor,
 		EmotionalIntensity: intensity,
 	})
+	if err != nil {
+		log.Printf("  narrative %s: insert failed: %v", truncID(s.ID), err)
+		return
+	}
 	// Keep only last 2 narratives per project — old ones have no standalone value.
-	if n, _ := store.DeleteOldNarratives(s.ProjectShort, 2); n > 0 {
+	if n, err := store.DeleteOldNarratives(s.ProjectShort, narrativeKeep, narrativeID); err != nil {
+		log.Printf("  narrative %s: cleanup failed: %v", truncID(s.ID), err)
+	} else if n > 0 {
 		log.Printf("  Narrative cleanup: deleted %d old narratives for %s", n, s.ProjectShort)
 	}
 	log.Printf("  Narrative saved: %s (%s)", truncID(s.ID), s.ProjectShort)
@@ -342,6 +353,16 @@ func generateNarrativeForSession(store *storage.Store, s models.Session, client 
 // Returns true if a new narrative was generated.
 func RegenerateNarrativeForSession(store *storage.Store, s models.Session, client extraction.LLMClient) bool {
 	if client == nil {
+		return false
+	}
+	// A quarantined session must not get a fresh narrative: the mark exists to keep
+	// the content of a failed session out of recall, and this path is a second entry
+	// point into generation.
+	if quarantined, err := store.SessionQuarantined(s.ID); err != nil {
+		log.Printf("  regen %s: quarantine check failed: %v", truncID(s.ID), err)
+		return false
+	} else if quarantined {
+		log.Printf("  regen %s: skipped (session is quarantined)", truncID(s.ID))
 		return false
 	}
 
@@ -383,7 +404,7 @@ func RegenerateNarrativeForSession(store *storage.Store, s models.Session, clien
 	flavor, intensity := getSessionFlavorAndIntensity(store, s.ID)
 
 	// Insert new narrative
-	_, err = store.InsertLearning(&models.Learning{
+	narrativeID, err := store.InsertLearning(&models.Learning{
 		Category:           "narrative",
 		Content:            narrative,
 		Project:            s.ProjectShort,
@@ -399,8 +420,16 @@ func RegenerateNarrativeForSession(store *storage.Store, s models.Session, clien
 		log.Printf("  regen %s: insert failed: %v", truncID(s.ID), err)
 		return false
 	}
-	if n, _ := store.DeleteOldNarratives(s.ProjectShort, 2); n > 0 {
+	if n, err := store.DeleteOldNarratives(s.ProjectShort, narrativeKeep, narrativeID); err != nil {
+		log.Printf("  regen %s: cleanup failed: %v", truncID(s.ID), err)
+	} else if n > 0 {
 		log.Printf("  Narrative cleanup: deleted %d old narratives for %s", n, s.ProjectShort)
+	}
+	// The marker follows the stored narrative, and only after the prune: it may
+	// have removed the fresh row (an old session carries an old created_at), and a
+	// marker without a narrative keeps the session unnarrated.
+	if err := store.MarkSessionNarrative(s.ID); err != nil {
+		log.Printf("  regen %s: mark narrative: %v", truncID(s.ID), err)
 	}
 	log.Printf("  Narrative regenerated: %s (%s)", truncID(s.ID), s.ProjectShort)
 	return true

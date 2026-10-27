@@ -12,8 +12,8 @@
 - `yesmem cost` — CLI shows daily spend history with totals
 - **Persistent** — survives daemon restarts (restored from DB)
 - **Per-bucket limits:**
-  - `daily_budget_extract_usd: 5.0` (extraction + evolution)
-  - `daily_budget_quality_usd: 2.0` (narrative + quality)
+  - `daily_budget_extract_usd: 20.0` (extraction + evolution)
+  - `daily_budget_quality_usd: 10.0` (narrative + quality)
 - 80% warning logged when approaching limit
 
 ### Rate-Limit Awareness
@@ -76,10 +76,12 @@ locomo10.json → Ingest → Extract → Query → Judge → Report
 ### CLI
 
 ```bash
-yesmem locomo-bench --data ./locomo10.json --eval-llm gpt-5.4-mini
+yesmem locomo-bench run --data ./locomo10.json --eval-llm gpt-5.4-mini
 yesmem locomo-bench ingest --data ./locomo10.json    # step-by-step
 yesmem locomo-bench run --eval-llm sonnet             # full pipeline
 ```
+
+The subcommand is required: `yesmem locomo-bench --data …` without one is read as an unknown subcommand (`os.Args[2]` is the subcommand slot, so the flag lands there).
 
 Note: Individual subcommands (`extract`, `query`, `judge`, `report`) are recognized but not yet wired — use `run` for the full pipeline.
 
@@ -96,9 +98,8 @@ Note: Individual subcommands (`extract`, `query`, `judge`, `report`) are recogni
 
 ## 3. Sync-Public Script
 
-The `scripts/sync-public.sh` script synchronizes the private repository to the public GitHub mirror. Recent additions:
+The `scripts/sync-public.sh` script synchronizes the private repository to the public GitHub mirror. It works with an **exclude list** plus an explicit **allowlist for `docs/`** (rsync filter rules): everything is mirrored except the excluded paths, and under `docs/` only the named files are copied — including `docs/images/**` **and the whole `docs/features/` tree** (`+ docs/features/`, `+ docs/features/**`). There is no whitelist mode that would require listing every file explicitly, and `docs/features/` must be assumed **public**: do not put unpublished material there.
 - **`--branch` flag**: sync a specific branch instead of main
-- **Whitelist mode**: only copies files explicitly listed — prevents accidental leak of private content
 - **`--per-commit` mode**: replays commits individually instead of squashing into one
 - **Auto-CHANGELOG generation**: generates CHANGELOG entries from git log automatically
 
@@ -117,7 +118,7 @@ Self-updating binary distribution via GitHub Releases — no Git required on tar
 ### Safety
 
 - **SHA256 checksum verification** — archive validated before extraction
-- **io.LimitReader** (100 MB) — prevents memory exhaustion from malicious payloads
+- **io.LimitReader** (200 MB) — prevents memory exhaustion from malicious payloads
 - **Extraction guard** — daemon skips update while extraction or indexing is running (atomic `extractionActive` flag)
 - **Atomic binary swap** — temp file + rename, never partial writes to live binary
 - **Backup** — old binary always preserved as `yesmem.bak` for manual rollback
@@ -177,9 +178,15 @@ A `CAP.md` file declares one or more **scripts**, each with a runtime and a kind
 
 ### Bundled Caps
 
-`caps/bundled-caps/<name>/CAP.md` is embedded into the binary. On install/migrate, the bundled body is written to `~/.claude/caps/<name>/CAP.md` via `InstallBundledCaps` (sha256 content-compare; **no version-compare** — embed wins over disk on any byte difference). A separate write-back path, `WriteCapToDisk`, exports DB rows to disk and **does** respect version: it skips when `disk_version >= db_version` (T1 version-guard, commit `4d28e34`).
+`caps/bundled-caps/<name>/CAP.md` is embedded into the binary. The installer `InstallBundledCaps` (`internal/setup/setup.go`) writes the bundled body into the configured caps dir, `~/.claude/caps` by default; it runs on `yesmem setup`, on `yesmem migrate` and, once an update has installed a release, through `yesmem update`. `make deploy` rolls out no cap at all: it builds the binary, swaps `~/.local/bin/yesmem`, copies the injector and the plugins and restarts the services (measured 2026-10-23: the rocketchat cap stood at v15 before and after a deploy).
 
-The two paths together mean: after editing a bundled cap, run `make deploy` first (rebuilds the binary embedding the new source), then `yesmem migrate`. Reversing the order risks a v62-Source-Edit + v58-Embed downgrade because the InstallBundledCaps content-compare wins on any byte difference.
+The installer decides from provenance, not from the revision (`installBundledCaps`, `internal/setup/setup.go`). The provenance lives in `manifest.yaml`, which ships as `caps/bundled-caps/manifest.yaml` and exists again as `<caps_dir>/manifest.yaml` next to the installed caps. One entry per cap, and it is a claim about one body: `derived_from_hash` is the digest of the CAP.md the bundle was cut from, `revision` counts the installs that reached that installation. The digest is `textutil.BodyDigest`: line endings and trailing newlines are normalized, everything else is compared byte for byte, because inside a bash or python body the case and the indentation are the program. The frontmatter `version:` is display only, it gates nothing.
+
+Three cases decide an install, and the installation's own manifest wins over the bundle's claim, because it records what that installation actually took. *(1) No entry.* Neither file names a body. A cap that sits nowhere is installed and tracked from that body on; a cap that already has a body is kept and reported. *(2) The provenance agrees with the file on disk.* The bundled body hashing like the installed body means there is nothing to write and only the mode is repaired. An entry naming the installed body means the bundle is its successor and is written, whatever `version:` says (live: telegram bundled v195 over a live body at v603). *(3) The entry names a different body.* The bundle is not that body's successor, so the installed body is kept and the conflict is reported. The report is one line per cap with both hashes and with the hash to record, because the bundle alone cannot end it: reconcile `caps/bundled-caps/<name>/CAP.md` with the installed body, then record that body's digest as `derived_from_hash`.
+
+Both daemon paths answer to the same provenance. The import (`handleSaveCap`, `internal/daemon/handler_caps.go`) refuses a file whose version is below `cap_imported_version` and a file at exactly that revision while the row has been changed since that import, with two exceptions: a body the installation's manifest names was put there by the installer on purpose, so it is imported and the row adopts its revision; and a row that carries a repair on top of the body it imported is the later state, so a delivery below its watermark is refused and reported instead of overwriting the edit. A delivery ABOVE the watermark takes the file, repaired row or not: an installation that was auto-corrected still has to receive a newer bundle. The export (`WriteCapToDisk`, `internal/daemon/cap_sync.go`) writes the row over a file whose version is below the row's, except when the file is a body the manifest names and the row is clean: either the row's own source is a later revision than the file (a deliberate step back, logged with both numbers) or the row was imported from exactly this file and has nothing of its own to add. Rewriting a clean file is what must not happen, because a rewritten file no longer hashes to its manifest entry and the next release would only be reported as a conflict. Where the manifest names something else, both paths keep the counters' decision and log the pair (`the file hashes to X, the installed manifest names Y`), so a hand-edited body and a lost install stay distinguishable. Versions are per-cap revision counters, not release numbers: `save_cap` raises them, and the repo copy stays where it was. Measured 2026-10-23, under the revision gate that is gone: telegram bundled v195 against live v603, cap_search v97 against 549, adapter_e2e_test v69 against 518, changelog_check v63 against 517, cap_collect v97 against 551, chrome_headless v2 against 3. All six were silently inert. Under provenance they surface on the next `yesmem migrate` as conflicts, because the shipped manifest is self-hashed and claims nothing about a live body.
+
+Order of a rollout: `make deploy` first (rebuilds the binary that carries the new bundled source), then `yesmem migrate` (runs `InstallBundledCaps`). Reversed, the old binary's embedded copy is what gets installed. A repo copy that goes back to an older body is a divergent bundle: it is reported, not installed. Shipping an older body means recording it as the derivation of the body it replaces.
 
 ### Storage
 
@@ -198,24 +205,20 @@ Cap scripts declared with `runtime: bash` execute in the daemon's sandboxed envi
 **`store()` — Key-Value Persistence**
 
 ```bash
-store mykey "my value"
+store '{"capability":"proxy_health","action":"upsert","table":"reports","data":"{...}"}'
 ```
 
-Writes a key-value pair directly to `caps.db` via the `cap_store` RPC. No round-trip through the MCP server needed. Used by cap handlers that need to persist state between invocations (e.g. Telegram last-read-message cursor, RSS last-fetch timestamp).
+Takes **one positional argument: a JSON document**, forwarded verbatim to `yesmem store` (which writes to `caps.db` via the `cap_store` RPC). There are no key/value flags — the shape is the same as the REPL `store({...})` call, just serialized by hand. Used by cap handlers that need to persist state between invocations (e.g. Telegram last-read-message cursor, RSS last-fetch timestamp).
 
 **`llm()` — LLM Completion**
 
 ```bash
-result=$(llm "summarize this text: $long_text" --model haiku --max-tokens 500)
+result=$(llm "haiku" "You are a summarizer" "summarize this text: $long_text" "" "")
 ```
 
-Calls the daemon's `llm_complete` RPC with the configured quality model. Supports:
-- `--model <tier>` — `haiku`, `sonnet`, or `opus` (resolved per provider)
-- `--max-tokens <N>` — output token limit
-- Session-resume — subsequent calls in the same bash job reuse the prompt cache
-- Provider-aware — works with Anthropic, DeepSeek, and OpenAI providers via the standard LLM provider routing
+Takes **five positional arguments, in this order**: `model` (`haiku`, `sonnet`, `opus` or a full ID; empty = configured default), `system`, `prompt`, `session` (empty = new session), `tools` (the literal `tools` enables tool calling). The shell function builds a JSON body with `yesmem json` and calls `yesmem llm-complete`. There are no `--model` or `--max-tokens` flags, and no output-token limit is passed.
 
-Both polyfills are defined in `internal/daemon/handler_cap_exec.go` and injected into the AI-jail environment via the bun wrapper. They make bash caps functionally equivalent to REPL caps — the same scripts work identically under Claude Code (REPL VM), opencode (bun MCP wrapper), and the CLI (direct daemon execution).
+Both polyfills are defined in `internal/daemon/handler_cap_exec.go` and injected into the sandboxed shell before the handler body (after `set -e`). The socket and the `yesmem` CLI they need are registered as read-only mounts, and a missing mount refuses the run instead of failing later with an unnamed symptom.
 
 Cap-Spec v1.1 lives in the sibling project `~/projects/cap-spec`. The `yesmem-cap-builder` bundled skill (336-line `SKILL.md` + recipes, api-reference, gotchas side-files) is the canonical reference for landing a working cap in one pass — it covers the REPL VM allowlist, the `sh` 30 KB wall, `sanitize_where`, schema rules, the bundled-cap DB write-back lifecycle (including pre-commit version sync), and the jq label/apostrophe quirks.
 
@@ -223,7 +226,7 @@ Cap-Spec v1.1 lives in the sibling project `~/projects/cap-spec`. The `yesmem-ca
 
 ## 6. Secret Sanitization
 
-`SecretRedactor` (`internal/sanitize`) is a single-pass regex-based redactor that replaces matches with `[redacted:<kind>]` markers. It runs at every persistence boundary so a leaked credential never reaches durable storage — neither in summaries, scheduled-job logs, briefings, nor extraction results.
+`SecretRedactor` (`internal/sanitize`) is a single-pass regex-based redactor that replaces matches with `[REDACTED:<kind>]` markers. With `secrets_sanitization.enabled` switched on it runs at every persistence boundary so a leaked credential never reaches durable storage — neither in summaries, scheduled-job logs, briefings, nor extraction results. The switch defaults to `false`: without it no path wraps its clients for redaction, and persisted text keeps its secrets verbatim.
 
 ### Pattern Kinds (15)
 
@@ -250,25 +253,25 @@ Cap-Spec v1.1 lives in the sibling project `~/projects/cap-spec`. The `yesmem-ca
 - **Sanitize-after** — inbound responses pass through again so model-echo of unredacted prompts cannot recontaminate logs.
 - **Inner-error path** — even when the wrapped client fails, the partial response is sanitized before the error bubbles up.
 
-The decorator wraps **all six** LLM call sites in the daemon: extraction, briefing, summarize, quickstart, quality, and the headless+briefing fallback. Wiring is done at assignment time rather than post-replacement to avoid a window where an unwrapped client could be reused.
+The decorator wraps the daemon's LLM clients where the redaction is part of the contract — extraction, briefing, summarize and the headless fallback among them. It is not a blanket "all six call sites" rule: wiring happens at assignment time so no unwrapped client can be reused, and a path that constructs its client directly bypasses it.
 
 The scheduler also redacts `Command`, `ErrorMsg`, headless stdout, and stderr (`cf66345`) before persisting to `bash_job_runs`.
 
 ### Allowed Exceptions
 
-`AllowedExceptions` in `config.yaml` lists strings that bypass redaction. Match is **full-match** (anchored both ends), not substring, so `MY_PUBLIC_TOKEN` does not unmask `MY_PUBLIC_TOKEN_FOR_TEST`. The decorator-order contract (sanitize wraps client, never the other way around) is documented in `internal/extraction/SANITIZING_CLIENT.md`.
+`AllowedExceptions` in `config.yaml` lists strings that bypass redaction. Match is **full-match** (anchored both ends), not substring, so `MY_PUBLIC_TOKEN` does not unmask `MY_PUBLIC_TOKEN_FOR_TEST`. Redacted spans are replaced with `[REDACTED:<kind>]` (e.g. `[REDACTED:aws_secret_access_key]`). The decorator-order contract (sanitize wraps the client, never the other way around) is documented in `internal/extraction/sanitizing_client.go`; there is no `SANITIZING_CLIENT.md` in the repository.
 
 ### Configuration
 
 ```yaml
-sanitization:
+secrets_sanitization:
   enabled: true
   allowed_exceptions:
     - "TEST_FIXTURE_KEY"
     - "EXAMPLE_BEARER_PUBLIC_DEMO"
 ```
 
-When `enabled: false` (default in dev), the wrapper is a no-op pass-through; production deployments should enable it. Defense-in-depth rollout status is tracked in `yesdocs/plans/2026-04-30-defense-in-depth-rollout-roadmap.md`.
+When `enabled: false` (the config default), the wrapper is a no-op pass-through; production deployments should enable it.
 
 ---
 
@@ -319,13 +322,13 @@ What makes YesMem fundamentally different — not "also does X", but "nobody els
 
 5. **Source Attribution** — Every learning tracks its origin: `user_stated > agreed_upon > claude_suggested > llm_extracted`. We analyzed 31 memory-related research papers. None of them track provenance. This means YesMem can distinguish "the user told me this" from "I inferred this" — and weight them differently.
 6. **Fixation Detection** — When the model gets stuck in a loop (same error, same fix attempt, same failure), YesMem detects it automatically and penalizes the scoring of the learnings that caused the loop. Other systems let you spiral; YesMem breaks the cycle.
-7. **Gotcha Prevention** — The hook system intercepts tool calls *before execution*. Failed commands are auto-learned; on the next attempt, relevant gotchas are injected as warnings so the model can course-correct. After 3+ repeated failures of the same pattern, the command is hard-blocked — the model can't make the same mistake a fourth time. Prevention escalates: context first, then a wall.
+7. **Gotcha Prevention** — The hook system intercepts tool calls *before execution*. Failed commands are auto-learned; on the next attempt, relevant gotchas are injected as warnings so the model can course-correct. After 5 repeated failures of the same pattern (and a match score of at least 4), the command is hard-blocked — the model can't make the same mistake a sixth time. Prevention escalates: context first, then a wall.
 8. **Multi-Agent Memory Safety** — Multiple Claude Code agents share long-term memory with conflict detection, dialog-extract-block protocol, agent-role scoping, and auto-broadcast. This isn't "shared database" — it's coordinated memory with write isolation.
 9. **Emotional Memory** — Sessions are rated by intensity (breakthroughs, frustration, pivots). Learnings from high-intensity sessions score higher in retrieval. The system remembers *what mattered*, not just what happened.
 
 ### Architectural Advantages
 
-10. **Zero-Dependency Binary** — Single Go binary, ~30MB, with a 512-dimensional embedding model compiled in via `go:embed`. No Python, no pip, no Docker, no external services. `curl | sh` and you're running.
+10. **Zero-Dependency Binary** — Single Go binary, about 143 MiB (the embedded SSE weight parts account for roughly 103 MiB of that), with the 512-dimensional embedding model compiled in via `go:embed`. No Python, no pip, no Docker, no external services. `curl | sh` and you're running.
 11. **Two-Layer Architecture** — Raw material (full session transcripts, indexed documents) is preserved for deep search. Distilled learnings provide fast access. You get both precision and recall — grep through old conversations *or* get instant structured answers.
 12. **Trust-Based Evolution** — Learnings have trust levels. A `user_stated` fact resists being overwritten by an `llm_extracted` inference. High-trust knowledge requires high-trust evidence to supersede. This prevents hallucination-driven memory corruption.
 13. **Ebbinghaus Decay** — Memory fading follows spaced-repetition curves grounded in cognitive science, not arbitrary TTLs. Frequently accessed learnings stay fresh; unused ones fade predictably. Decisions and pivot moments decay slower than routine observations.
@@ -374,8 +377,8 @@ Content: ## SCHEDULED TASK [<job-name>]
 ### Agent Lifecycle
 
 - **Pre-spawn cleanup** — stops any existing agent on the same section
-- **Idle timeout** — 10-minute unified timeout across all agent states (running, frozen, idle)
-- **Watchdog goroutine** — polls agent status every 30 seconds, stops idle agents
+- **Idle timeout** — 10-minute unified timeout for running, paused and idle agent states
+- **Watchdog goroutine** — the scheduler's own poll loop runs every 15 seconds and stops idle agents
 
 ### Headless Mode
 
@@ -393,7 +396,7 @@ Caps are ideal for scheduled tasks because they are predictable: defined schema,
 
 Bash-mode jobs execute a single named script from a capability's `CAP.md` (`runtime: bash`). The scheduler resolves the script via `findBashScript(meta, job.ScriptName)` — explicit `script_name` is mandatory whenever a cap declares multiple bash scripts, otherwise the first declared script wins silently and the job appears to "succeed" while running the wrong code.
 
-A heartbeat-driven error handler (1 s tick, down from 2 s) processes failed runs in the background:
+A heartbeat-driven error handler (every 5th beat of the daemon's 1s ticker, so every 5 s) processes failed runs in the background:
 
 1. **Diff classifier** — compares the cap's current body against a Sonnet-suggested fix and labels the diff as *trivial* (1-2 line typo, regex tweak) or *substantial* (logic change, new branch, removed assertion).
 2. **Trivial path** — auto-applies the fix via `save_cap` and re-fires the job.
@@ -438,33 +441,9 @@ Verified on the `telegram` cap (poll + reply merged into the `telegram_poll` scr
 | Cost | API tokens + $0.08/h | Subscription | Subscription |
 | Limits | Pro: 5/day, Max: 15/day | Desktop-bound | Unlimited (self-hosted) |
 
-What makes YesMem fundamentally different — not "also does X", but "nobody else can do X":
+The differentiator list lives once, in the "Differentiators" section above (§ between Sandbox Execution and Scheduled Agents). It is not repeated here.
 
-### The Moat: Wire-Level Control
-
-1. **Invisible Memory** — YesMem sits between Claude Code and the Anthropic API as an HTTP proxy. Memory is injected, context is compressed, and sessions are managed *before the model sees anything*. The user never calls a "remember" tool — it just happens. No other memory system operates at the wire level.
-2. **Infinite Thread** — Conversations don't hit context limits. The proxy progressively compresses old messages through 4 decay stages (full → summary → stub → collapsed), with sawtooth cache management that recovers context on demand. Other systems tell you to start a new chat.
-3. **Real-Time Background Extraction** — A forked agent pipeline extracts learnings *while the session is still running*, not after it ends. By the time you finish a debugging session, the insights are already indexed and searchable.
-4. **Associative Priming** — Every user message triggers automatic semantic search. Relevant memories are injected into the next model response — invisibly, at the proxy layer. The model gets context it didn't ask for, and the user gets answers informed by past sessions without doing anything.
-
-### Things Nobody Else Has
-
-5. **Source Attribution** — Every learning tracks its origin: `user_stated > agreed_upon > claude_suggested > llm_extracted`. We analyzed 31 memory-related research papers. None of them track provenance. This means YesMem can distinguish "the user told me this" from "I inferred this" — and weight them differently.
-6. **Fixation Detection** — When the model gets stuck in a loop (same error, same fix attempt, same failure), YesMem detects it automatically and penalizes the scoring of the learnings that caused the loop. Other systems let you spiral; YesMem breaks the cycle.
-7. **Gotcha Prevention** — The hook system intercepts tool calls *before execution*. Failed commands are auto-learned; on the next attempt, relevant gotchas are injected as warnings so the model can course-correct. After 3+ repeated failures of the same pattern, the command is hard-blocked — the model can't make the same mistake a fourth time. Prevention escalates: context first, then a wall.
-8. **Multi-Agent Memory Safety** — Multiple Claude Code agents share long-term memory with conflict detection, dialog-extract-block protocol, agent-role scoping, and auto-broadcast. This isn't "shared database" — it's coordinated memory with write isolation.
-9. **Emotional Memory** — Sessions are rated by intensity (breakthroughs, frustration, pivots). Learnings from high-intensity sessions score higher in retrieval. The system remembers *what mattered*, not just what happened.
-
-### Architectural Advantages
-
-10. **Zero-Dependency Binary** — Single Go binary, ~30MB, with a 512-dimensional embedding model compiled in via `go:embed`. No Python, no pip, no Docker, no external services. `curl | sh` and you're running.
-11. **Two-Layer Architecture** — Raw material (full session transcripts, indexed documents) is preserved for deep search. Distilled learnings provide fast access. You get both precision and recall — grep through old conversations *or* get instant structured answers.
-12. **Trust-Based Evolution** — Learnings have trust levels. A `user_stated` fact resists being overwritten by an `llm_extracted` inference. High-trust knowledge requires high-trust evidence to supersede. This prevents hallucination-driven memory corruption.
-13. **Ebbinghaus Decay** — Memory fading follows spaced-repetition curves grounded in cognitive science, not arbitrary TTLs. Frequently accessed learnings stay fresh; unused ones fade predictably. Decisions and pivot moments decay slower than routine observations.
-14. **Orthogonal Scoring** — Five independent counters (use, citation, retrieval, injection, feedback) prevent a learning from becoming "important" just because it was retrieved often. A learning that gets injected 50 times but never cited is noise, not signal.
-15. **Persona Continuity** — Not just fact storage — a persistent identity model that evolves across sessions. Traits, preferences, communication style, expertise areas. Session 1036 knows who you are because sessions 1–1035 built that understanding incrementally.
-
-## Internal Packages (30)
+## Internal Packages (39)
 
 | Package | Purpose |
 |---------|---------|
@@ -474,7 +453,10 @@ What makes YesMem fundamentally different — not "also does X", but "nobody els
 | `briefing` | Session briefing generation, milestones, dedup, i18n, formatting |
 | `buildinfo` | Build-time version injection |
 | `capfile` | Cap-Spec v1.1 parser/serializer for `CAP.md` files: scripts (tool/handler), runtimes (repl/bash), per-script sandbox metadata, `DatabaseSQL` hydration via DDL extraction |
+| `capblob` | Chunked blob store for cap payloads above the REPL output wall (`DefaultChunkSize` 20 KB) |
+| `channeltext` | Neutralization helpers for text that is injected into a channel block (one-line, marker-safe) |
 | `claudemd` | Operative reference generation from learnings |
+| `codescan` | Code intelligence: CBM scanner, scan cache keys (repo-root based), Code Map rendering, `project_scan` persistence |
 | `clustering` | Agglomerative clustering on learning embeddings (cosine 0.85) |
 | `config` | YAML configuration loader |
 | `daemon` | RPC handlers (~70 methods), lifecycle, Unix socket server, extraction orchestration, scheduler with three execution modes (agent/headless/bash) and heartbeat-driven auto-correct loop |
@@ -487,17 +469,23 @@ What makes YesMem fundamentally different — not "also does X", but "nobody els
 | `indexer` | File watcher, session tracking, subagent detection, JSONL archiving |
 | `ingest` | Doc ingestion, format-aware chunkers (Markdown via goldmark, RST via custom parser), rich metadata extraction, hash tracking, skill detection |
 | `ivf` | Inverted file index for vector search |
-| `mcp` | MCP server (stdio), daemon proxy client, tool registration (~60 tools, including `cap_proposal_decide`, `schedule`, `cap_store`) |
-| `models` | Shared data types, scoring (5-count, Ebbinghaus, contextual, origin-aware multiplier), model ID resolution |
+| `logrotate` | Size-based rotation for the daemon log (50 MB, 5 backups) |
+| `mcp` | MCP server (stdio), daemon proxy client, tool registration (73 tools, including `cap_proposal_decide`, `schedule`, `cap_store`) |
+| `models` | Shared data types, scoring (turn-based decay, contextual, origin-aware multiplier), model ID resolution |
+| `opencode` | Reader for opencode's own config surfaces (`opencode.json`, models.json, auth.json) |
 | `orchestrator` | Multi-agent lifecycle: PTY bridge, spawn, heartbeat, crash recovery |
 | `parser` | JSONL session parser (Claude Code + Codex) |
+| `repair` | Attribution repair for learnings filed under the wrong session |
+| `repo` | Repository root resolution (worktree → main repo, submodule boundaries) |
 | `proxy` | Infinite-thread HTTP proxy (stubs, decay, narrative, collapse, reexpand, sawtooth, signals, reminders, associative context, compression, fixation detection, skill injection); FREEZE/RESTORE symmetry with eager-stub memory layer; prompt-flow isolation between `claude` and `codex` client paths |
 | `sanitize` | `Sanitizer` interface and `SecretRedactor` with 15 pattern kinds (Anthropic/OpenAI/AWS/GitHub/JWT/Bearer/SSH/GPG/IPv4-public/hex/email/phone/...); `AllowedExceptions` whitelist with full-match semantics |
-| `setup` | Interactive configuration wizard, bundled-caps installer (sha256 content-compare write-back to `~/.claude/caps/`) |
+| `setup` | Interactive configuration wizard, bundled-caps installer (sha256 compare, an installed body with a higher revision is kept; writes to `~/.claude/caps/`) |
 | `storage` | SQLite persistence (~37 tables across 4 DB files: `yesmem.db`, `messages.db`, `runtime.db`, `caps.db`), migrations, FTS5, CRUD, read-only `OpenReadOnly` for CLI subcommands; full schema reference in `yesdocs/architecture/db-schema.md` |
-| `telegram` | Telegram integration for notifications |
-| `textutil` | Token estimation, text similarity, bigram-Jaccard |
+| `terminals` | Terminal emulator detection and launch helpers for agent windows |
+| `textutil` | Token estimation, text similarity, bigram-Jaccard, one-line log sanitising |
 | `update` | Auto-update: semver parsing, GitHub Release checker, download + checksum, atomic swap, orchestrator |
+| `wikidir` | Wiki output directory ownership: marker files and safe target resolution |
+| `wikirender` | Renders learnings, sessions, files and code intelligence into the Markdown wiki |
 
 ---
 
@@ -515,9 +503,13 @@ After deploy: `/mcp reconnect` in Claude Code to restart MCP server.
 ### CI/CD Pipeline
 
 GitHub Actions workflows (`.github/workflows/`):
-- **ci.yml** — Runs on every push to `main` + PRs. Test matrix: Ubuntu + macOS. Validates build and tests on both platforms.
+- **ci.yml** — Runs on every push to `main` + PRs. Three jobs: `test` (build and tests on an Ubuntu + macOS matrix), `plugin` (Bun suite of `plugins/opencode-yesmem-v2`, with `bun install --frozen-lockfile` first), and `race` (`go test -race` with an explicit `-timeout`). The workflow token is read-only (`permissions: contents: read`).
 - **release.yml** — Runs on version tags (`v*`). Tests on Ubuntu + macOS must pass, then GoReleaser builds binaries for `linux/darwin × amd64/arm64`. Creates GitHub Release with checksums.
 - Release flow: `git tag v1.0.3 && git push origin v1.0.3` → GitHub Actions builds + publishes.
+
+**Race gate.** `-race` runs in the `race` job and in `make test-race`, and nowhere else. It is deliberately not a whole-package run: on this host with a warm cache `go test -race ./internal/hooks` takes 653s and `./internal/storage` 875s, and the whole daemon suite exceeds go test's 600s default and panics in `TestLos57eClaudeResumeCarriesTheAllowlist`. The gate therefore runs `internal/proxy` whole and, for `internal/storage`, `internal/daemon` and `internal/hooks`, only the tests that exercise the concurrent wiring, selected by `RACE_RUN` in the Makefile (24 tests: 10 storage, 9 daemon, 5 hooks, about 50s in total instead of roughly 26 minutes). `RACE_RUN` is the single source for that selection: the Makefile target uses it directly and the CI job repeats it verbatim. The package list stands in three places (`RACE_PKGS`, the Makefile recipe, the CI job) and is cross-checked in both directions, so a package present on one side only turns the guard red instead of silently changing the gate. The guard also rejects a run without a raised timeout, a commented-out command, a swallowed exit status, a disabled job, and any name in the selection that no longer exists as a test function (`go test -run Ghost` exits 0 with "no tests to run"). The boundary stays honest rather than complete: a race in a test outside the selection is not caught here, `release.yml` runs neither the plugin suite nor `-race`, so a tag push is gated on neither, and nothing requires the `race` job in the repository's branch protection.
+
+**Test surface.** `make test` runs the Go suite (`test-go`) and the plugin's bun suite (`test-plugin`); `make test-go` and `make test-plugin` run either half alone. The plugin suite is not self-contained: `code_nav_test.ts` reads the shared fixture `internal/hooks/testdata/codenav_parity.json`, so it only runs inside the repository, and `bun` has to be found through `BUN` (PATH lookup with a `~/.bun/bin/bun` fallback) because it is not on PATH in every shell. `make update` validates through `make test`, so it now needs bun too; without it the target stops after the dependency update with the message from `test-plugin`. CI never runs `make test` itself, so the recipes are covered by the guard test's structure scan and by local runs, not by a workflow.
 
 **systemd:** User services with `After=network-online.target` + `Wants=network-online.target` (required for DNS after suspend/resume).
 

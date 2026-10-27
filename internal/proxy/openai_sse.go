@@ -98,8 +98,8 @@ func (t *sseTranslator) handleContentBlockStart(block json.RawMessage) [][]byte 
 				Index: 0,
 				Delta: OpenAIDelta{
 					ToolCalls: []OpenAIToolCall{{
-						ID:   b.ID,
-						Type: "function",
+						ID:       b.ID,
+						Type:     "function",
 						Function: OpenAIFunctionCall{Name: b.Name},
 					}},
 				},

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -15,10 +16,51 @@ import (
 
 	"github.com/carsteneu/yesmem/internal/config"
 	"github.com/carsteneu/yesmem/internal/extraction"
+	"github.com/carsteneu/yesmem/internal/ingest"
 	"github.com/carsteneu/yesmem/internal/models"
-	"github.com/carsteneu/yesmem/internal/parser"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
+
+// cleanupFinishedShortSessionLearnings supersedes learnings of sessions that are
+// too short to extract and have gone quiet. Narrative rows of those sessions go
+// with them, so the narrative marker is cleared here as well: the daemon is the
+// only place that cleanup runs, and a marker left behind keeps the session
+// unnarrated once it grows. It reports the outcome and logs a cleanup error:
+// swallowing it would hide a broken cleanup for the whole run.
+func cleanupFinishedShortSessionLearnings(store *storage.Store) int {
+	cleanedIDs, err := store.SupersedeShortSessionLearnings()
+	if err != nil {
+		log.Printf("warn: clean up finished short sessions: %v", err)
+		return 0
+	}
+	if _, err := store.ClearSupersededNarrativeMarkers(); err != nil {
+		log.Printf("warn: clear narrative markers of finished short sessions: %v", err)
+	}
+	if len(cleanedIDs) > 0 {
+		log.Printf("  Cleaned %d learnings from finished short sessions (<%d messages, silent >%s)",
+			len(cleanedIDs), storage.ShortSessionMaxMessages, storage.ShortSessionQuietPeriod)
+	}
+	return len(cleanedIDs)
+}
+
+// markSessionsExtracted marks daemon-internal extraction sessions (cluster
+// labeling etc.) and then the remaining short sessions as extracted, so neither
+// shows up as pending. The targeted pass must run FIRST: once every short session
+// is marked, it finds nothing. Both marks log their error: a silently failed mark
+// re-surfaces the same sessions as pending on every extraction run.
+func markSessionsExtracted(store *storage.Store) {
+	if marked, err := store.MarkExtractionSessionsExtracted(); err != nil {
+		log.Printf("warn: mark extraction-internal sessions as extracted: %v", err)
+	} else if marked > 0 {
+		log.Printf("  Marked %d extraction-internal sessions as extracted", marked)
+	}
+	if marked, err := store.MarkShortSessionsExtracted(storage.ShortSessionMaxMessages - 1); err != nil {
+		log.Printf("warn: mark short sessions as extracted: %v", err)
+	} else if marked > 0 {
+		log.Printf("  Marked %d short sessions (≤%d messages) as extracted",
+			marked, storage.ShortSessionMaxMessages-1)
+	}
+}
 
 // runInitialExtraction processes sessions in 5 phases to avoid API quota competition.
 // Phase 1 (Indexing) already happened before this function is called.
@@ -40,28 +82,18 @@ func runInitialExtraction(ext extraction.SessionExtractor, evoExt *extraction.Ex
 		return
 	}
 
-	// Cleanup: supersede learnings from trivially short sessions
-	if cleanedIDs, err := store.SupersedeShortSessionLearnings(6); err == nil && len(cleanedIDs) > 0 {
-		log.Printf("  Cleaned %d learnings from short sessions (<6 messages)", len(cleanedIDs))
-	}
+	// Cleanup: supersede learnings from trivially short sessions that have gone
+	// quiet. User-stated learnings and sessions still in flight stay untouched.
+	cleanupFinishedShortSessionLearnings(store)
 
 	// Mark daemon-internal extraction sessions (cluster labeling etc.) as extracted
 	// so they don't clutter the pending count or trigger self-referential re-extraction.
-	// Must run BEFORE MarkShortSessionsExtracted — otherwise all short sessions are
-	// already marked and this targeted pass finds nothing.
-	if marked, err := store.MarkExtractionSessionsExtracted(); err == nil && marked > 0 {
-		log.Printf("  Marked %d extraction-internal sessions as extracted", marked)
-	}
-
-	// Mark short sessions as extracted so they don't show as pending
-	if marked, err := store.MarkShortSessionsExtracted(5); err == nil && marked > 0 {
-		log.Printf("  Marked %d short sessions (≤5 messages) as extracted", marked)
-	}
+	markSessionsExtracted(store)
 
 	// Check which sessions already have been extracted (persistent marker)
 	var toExtract []models.Session
 	for _, s := range sessions {
-		if s.ExtractedAt.IsZero() && s.MessageCount > 5 {
+		if s.ExtractedAt.IsZero() && s.MessageCount >= storage.ShortSessionMaxMessages {
 			toExtract = append(toExtract, s)
 		}
 	}
@@ -86,13 +118,22 @@ func runInitialExtraction(ext extraction.SessionExtractor, evoExt *extraction.Ex
 	est := EstimateExtractionCost(store, toExtract, cfg.Extraction.Model)
 	LogExtractionEstimate(est, client)
 
-	pendingNarratives, _ := countPendingNarratives(store)
-	pendingProfiles, _ := countPendingProfiles(store)
+	pendingNarratives, narrativeErr := pendingNarrativeSessions(store)
+	if narrativeErr != nil {
+		log.Printf("warn: pending narratives: %v", narrativeErr)
+	}
+	pendingProfiles, profileErr := countPendingProfiles(store)
+	if profileErr != nil {
+		log.Printf("warn: count pending profiles: %v", profileErr)
+	}
 	existingTraits, _ := store.GetActivePersonaTraits("default", 0.0)
 	personaNeedsWork := len(existingTraits) == 0 || len(toExtract) > 0
 
-	if len(toExtract) == 0 && pendingNarratives == 0 && pendingProfiles == 0 && !personaNeedsWork {
-		log.Println("━━━ Initial background scan skipped: no extraction/profile/narrative/persona work pending ━━━")
+	if len(toExtract) == 0 && len(pendingNarratives) == 0 && pendingProfiles == 0 && !personaNeedsWork {
+		// A failed pending query yields empty sets too, so the early exit must name
+		// the failure: "nothing pending" and "could not ask" are different states.
+		log.Printf("━━━ Initial background scan skipped: no extraction/profile/narrative/persona work pending (narratives: %s, profiles: %s) ━━━",
+			pendingSkipReason(narrativeErr), pendingSkipReason(profileErr))
 		return
 	}
 	evolutionAfterID, _ := store.GetMaxLearningID()
@@ -186,15 +227,15 @@ func runInitialExtraction(ext extraction.SessionExtractor, evoExt *extraction.Ex
 	GenerateCodeDescriptions(store, cfg, qualityClient)
 
 	// ━━━ Phase 4: Narratives (LLM — session handovers, uses quality model) ━━━
-	if pendingNarratives > 0 {
+	if len(pendingNarratives) > 0 {
 		if !extraction.HasBudget(qualityClient) {
-			log.Printf("━━━ Phase 4: Session Narratives skipped (quality budget exhausted, %d pending) ━━━", pendingNarratives)
+			log.Printf("━━━ Phase 4: Session Narratives skipped (quality budget exhausted, %d pending) ━━━", len(pendingNarratives))
 		} else {
-			log.Printf("━━━ Phase 4: Session Narratives (%d pending) ━━━", pendingNarratives)
-			GenerateMissingNarratives(store, sessions, cfg, qualityClient)
+			log.Printf("━━━ Phase 4: Session Narratives (%d pending) ━━━", len(pendingNarratives))
+			GenerateMissingNarratives(store, sessions, cfg, qualityClient, pendingNarratives)
 		}
 	} else {
-		log.Printf("━━━ Phase 4: Session Narratives skipped (up to date) ━━━")
+		log.Printf("━━━ Phase 4: Session Narratives skipped (%s) ━━━", pendingSkipReason(narrativeErr))
 	}
 
 	// ━━━ Phase 4.5: Learning Clustering (Metamemory) ━━━
@@ -216,7 +257,7 @@ func runInitialExtraction(ext extraction.SessionExtractor, evoExt *extraction.Ex
 			GenerateProfiles(store, cfg, qualityClient)
 		}
 	} else {
-		log.Printf("━━━ Phase 5: Profiles skipped (up to date) ━━━")
+		log.Printf("━━━ Phase 5: Profiles skipped (%s) ━━━", pendingSkipReason(profileErr))
 	}
 
 	// ━━━ Phase 6: Persona Signals ━━━
@@ -257,63 +298,43 @@ func runInitialExtraction(ext extraction.SessionExtractor, evoExt *extraction.Ex
 	log.Printf("━━━ All phases complete ━━━")
 }
 
-func countPendingNarratives(store *storage.Store) (int, error) {
-	var count int
-	err := store.DB().QueryRow(`SELECT COUNT(*)
-		FROM sessions s
-		WHERE s.message_count >= ?
-		AND s.narrative_at IS NULL`, minNarrativeMessages).Scan(&count)
-	return count, err
+// pendingNarrativeSessions names the Phase-4 workload: sessions that still owe a
+// narrative and that the generator can summarize. The phase gate and the
+// generator read the same set, so the count can never promise work the generator
+// then declines (a session below the text-message threshold stays pending forever
+// and is reloaded every cycle).
+func pendingNarrativeSessions(store *storage.Store) (map[string]struct{}, error) {
+	return store.PendingNarrativeSessionIDs(minNarrativeMessages)
 }
 
 func countPendingProfiles(store *storage.Store) (int, error) {
 	var count int
+	// Top-level sessions only: the stored session count comes from
+	// CountProjectSessions, which filters the same way. Counting subagent rows
+	// here made the profile look stale forever (YM-49).
 	err := store.DB().QueryRow(`SELECT COUNT(*)
 		FROM (
 			SELECT project_short, COUNT(*) AS session_count
 			FROM sessions
+			WHERE parent_session_id IS NULL
 			GROUP BY project_short
 			HAVING COUNT(*) >= 3
 		) p
 		LEFT JOIN project_profiles pp ON pp.project = p.project_short
 		WHERE pp.project IS NULL
-		OR (pp.model_used != 'manual' AND pp.session_count < MIN(p.session_count, 20))`).Scan(&count)
+		OR (pp.model_used != 'manual' AND pp.session_count < p.session_count)`).Scan(&count)
 	return count, err
 }
 
-func countPendingRefinedBriefings(store *storage.Store) (int, error) {
-	var count int
-	err := store.DB().QueryRow(`SELECT COUNT(*)
-		FROM (
-			SELECT DISTINCT project_short
-			FROM sessions
-			WHERE project_short != ''
-		) p
-		LEFT JOIN refined_briefings rb ON rb.project = p.project_short
-		WHERE rb.project IS NULL`).Scan(&count)
-	return count, err
-}
-
-func listProjectsMissingRefinedBriefings(store *storage.Store) ([]storage.ProjectSummary, error) {
-	projects, err := store.ListProjects()
+// pendingSkipReason renders the reason a phase was skipped. "up to date" is a
+// statement about the data, so it must not stand in for a query that never
+// answered (YM-367): a broken gate query used to read exactly like a finished
+// cycle, on every start.
+func pendingSkipReason(err error) string {
 	if err != nil {
-		return nil, err
+		return "pending query failed: " + err.Error()
 	}
-
-	missing := make([]storage.ProjectSummary, 0, len(projects))
-	for _, project := range projects {
-		if project.ProjectShort == "" {
-			continue
-		}
-		hash, err := store.GetRefinedBriefingHash(project.ProjectShort)
-		if err != nil {
-			return nil, err
-		}
-		if hash == "" {
-			missing = append(missing, project)
-		}
-	}
-	return missing, nil
+	return "up to date"
 }
 
 func hasDocSyncWork(store *storage.Store) bool {
@@ -322,7 +343,38 @@ func hasDocSyncWork(store *storage.Store) bool {
 		return false
 	}
 	for _, src := range sources {
+		// Mirrors runDocSync: rules and skill sources are not chunk sources, so
+		// their file mtime never means "there is work to do".
+		if src.IsRules || src.IsSkill {
+			continue
+		}
 		if src.Path == "" {
+			// Nothing to walk, so this source is normally not work. It can still
+			// hold documents: a registration that lost its path keeps its chunks
+			// until a sync sweeps them, and runDocSync is the only place that
+			// does. Without this line a path-less source that is the only one is
+			// never swept, because the tick never calls runDocSync.
+			files, err := store.GetDocChunkFiles(src.ID)
+			if err != nil {
+				// A failed read is not the observation "this source is clean";
+				// take the conservative direction like the stat branch below,
+				// which treats any error other than "not found" as work.
+				return true
+			}
+			if len(files) > 0 {
+				return true
+			}
+			continue
+		}
+		// The daemon's working directory is not the caller's: a relative path
+		// would stat or walk whatever tree sits at that name next to the
+		// daemon, while runDocSync skips the source as unresolvable. That
+		// combination schedules a full sync on every tick forever.
+		if !filepath.IsAbs(src.Path) {
+			// Without this line the operator loses the only hint that the
+			// source is unusable: runDocSync is the place that logs it, and the
+			// gate never lets the source reach runDocSync.
+			log.Printf("[doc-sync] %q: skipped relative path %q (re-register it with an absolute path)", src.Name, src.Path)
 			continue
 		}
 		info, err := os.Stat(src.Path)
@@ -332,7 +384,31 @@ func hasDocSyncWork(store *storage.Store) bool {
 			}
 			return true
 		}
-		if info.ModTime().After(src.LastSync) {
+		mod := info.ModTime()
+		// One clock reading per source: a document touched while this loop is
+		// still iterating must not look like a future mtime to a later source.
+		now := time.Now()
+		if info.IsDir() {
+			// A directory's mtime only moves when an entry is added or removed
+			// directly inside it, so an edit in a subdirectory is invisible to
+			// a stat. Ask the walk for the newest document instead. A removal
+			// is NOT covered while any document remains: the survivor is older
+			// than last_sync and the directory's own moved mtime is never
+			// consulted. The fallback below only keeps a tree that lost its
+			// last document from going quiet without a trace.
+			if newest, ok := ingest.NewestDocMtime(src.Path, now); ok {
+				mod = newest
+			}
+		}
+		if mod.After(now) {
+			// A mtime ahead of the wall clock cannot be ordered against
+			// last_sync, which is CURRENT_TIMESTAMP: it stays "after the last
+			// sync" on every tick and would run the full sync forever. It
+			// becomes a change signal once the clock passes it.
+			log.Printf("[doc-sync] %q: skipped a modification time ahead of the clock (%s)", src.Name, mod.Format(time.RFC3339))
+			continue
+		}
+		if mod.After(src.LastSync) {
 			return true
 		}
 	}
@@ -388,6 +464,27 @@ func countEvolutionScope(scope map[string]map[string]struct{}) int {
 	return total
 }
 
+// The retry budget of a session is storage.ExtractionAttemptLimit: the counter
+// lives on the session row, the batch path reads it as a derived skip. The limit
+// is never written into skip_extraction, because that column carries the marker
+// the skip_indexing tool sets on the user's behalf — one column with two meanings
+// would make a re-extraction either override the user's instruction or leave a
+// session excluded with no way back. ResetSessionExtracted and a session that
+// grows both clear the counter, so the budget is consecutive failures, not a
+// lifetime sentence.
+
+// recordExtractionFailure counts a failed attempt for the session and returns the
+// new count. A failed write is logged and ignored: the extraction already failed,
+// and losing the count only costs one more retry.
+func recordExtractionFailure(store *storage.Store, sessionID string) int {
+	attempts, err := store.RecordExtractionAttempt(sessionID)
+	if err != nil {
+		log.Printf("warn: count failed extraction for %s: %v", truncID(sessionID), err)
+		return 0
+	}
+	return attempts
+}
+
 // runExtractionPhase processes sessions with parallel workers (no evolution).
 func RunExtractionPhase(ext extraction.SessionExtractor, store *storage.Store, sessions []models.Session, cfg *config.Config, client extraction.LLMClient) {
 	workers := 3
@@ -398,9 +495,9 @@ func RunExtractionPhase(ext extraction.SessionExtractor, store *storage.Store, s
 	total := len(sessions)
 
 	var (
-		mu     sync.Mutex
-		done   int
-		errors int
+		mu       sync.Mutex
+		done     int
+		errCount int
 	)
 
 	work := make(chan models.Session, total)
@@ -423,8 +520,9 @@ func RunExtractionPhase(ext extraction.SessionExtractor, store *storage.Store, s
 					mu.Unlock()
 					continue // drain queue without API calls
 				}
-				// Skip sessions marked for no extraction
-				if store.IsExtractionSkipped(s.ID) {
+				// Skip sessions marked for no extraction, and sessions that
+				// exhausted their extraction attempts.
+				if store.IsExtractionSkipped(s.ID) || store.ExtractionAttemptsExhausted(s.ID) {
 					mu.Lock()
 					done++
 					mu.Unlock()
@@ -432,12 +530,27 @@ func RunExtractionPhase(ext extraction.SessionExtractor, store *storage.Store, s
 				}
 				if err := extractSession(ext, store, s.ID, false); err != nil {
 					mu.Lock()
-					errors++
+					errCount++
 					done++
 					d := done
 					mu.Unlock()
 					log.Printf("  [%d/%d] ⚠ %s: %v", d, total, truncID(s.ID), err)
-					consecutiveErrors++
+					if errors.Is(err, extraction.ErrPartial) {
+						log.Printf("  %s: partial extraction, the session stays pending", truncID(s.ID))
+					}
+					if attempts := recordExtractionFailure(store, s.ID); attempts == storage.ExtractionAttemptLimit {
+						log.Printf("  %s: gave up after %d failed extraction attempts, it is not retried until the session is extracted again", truncID(s.ID), attempts)
+					}
+
+					// An answer that arrives proves the API is up, even when it
+					// does not parse. Only a pass in which every chunk's call
+					// failed is evidence of an outage, so only that trips the
+					// breaker (YM-317, YM-362).
+					if extraction.IsOutage(err) {
+						consecutiveErrors++
+					} else {
+						consecutiveErrors = 0
+					}
 
 					if consecutiveErrors >= 5 {
 						log.Printf("  Extraction worker: %d consecutive errors — marking API as down", consecutiveErrors)
@@ -452,6 +565,14 @@ func RunExtractionPhase(ext extraction.SessionExtractor, store *storage.Store, s
 				} else {
 					consecutiveErrors = 0
 					store.MarkSessionExtracted(s.ID)
+					// Certify the message range this pass saw, so a session that a
+					// fork had already marked cannot be re-extracted every cycle.
+					// Full passes use fork_index 0; fork rows start at 1.
+					if s.MessageCount > 0 {
+						if err := store.InsertForkCoverage(s.ID, 0, s.MessageCount-1, 0); err != nil {
+							log.Printf("warn: coverage for %s: %v", truncID(s.ID), err)
+						}
+					}
 					mu.Lock()
 					done++
 					d := done
@@ -465,84 +586,7 @@ func RunExtractionPhase(ext extraction.SessionExtractor, store *storage.Store, s
 	}
 
 	wg.Wait()
-	log.Printf("  Extraction: %d processed, %d errors, %v (%d workers)", done, errors, time.Since(startTime).Round(time.Second), workers)
-}
-
-// extractFromSession extracts learnings from a single newly-indexed session.
-func extractFromSession(ext extraction.SessionExtractor, store *storage.Store, jsonlPath string, cfg *config.Config, client extraction.LLMClient, qualityClient extraction.LLMClient) {
-	msgs, meta, err := parser.ParseAuto(jsonlPath)
-	if err != nil || meta.SessionID == "" || len(msgs) <= 5 {
-		return
-	}
-	meta.SourceAgent = models.NormalizeSourceAgent(meta.SourceAgent)
-	meta.SessionID = models.NormalizeSessionID(meta.SourceAgent, meta.SessionID)
-
-	if err := extractSession(ext, store, meta.SessionID, cfg.Evolution.AutoResolve); err != nil {
-		log.Printf("warn: extract new session %s: %v", truncID(meta.SessionID), err)
-		return
-	}
-	store.MarkSessionExtracted(meta.SessionID)
-
-	// Generate session narrative (handover to next Claude) — uses quality model
-	narrativeClient := qualityClient
-	if narrativeClient == nil {
-		narrativeClient = client
-	}
-	generateSessionNarrative(store, msgs, meta, narrativeClient)
-
-}
-
-// generateSessionNarrative creates a narrative summary for the session.
-func generateSessionNarrative(store *storage.Store, msgs []models.Message, meta *parser.SessionMeta, client extraction.LLMClient) {
-	if client == nil {
-		return
-	}
-
-	summaries := SummarizeMessages(msgs)
-	if len(summaries) < minNarrativeMessages {
-		return // Too short to narrate
-	}
-
-	project := models.ProjectShortFromPath(meta.Project)
-	sessionTime := ""
-	if !meta.StartedAt.IsZero() {
-		sessionTime = meta.StartedAt.Format("2006-01-02 15:04")
-	}
-	userMsg := BuildNarrativeUserMessageWithTime(summaries, project, sessionTime)
-
-	response, err := client.Complete(NarrativePrompt(), userMsg)
-	if err != nil {
-		log.Printf("warn: narrative for %s: %v", truncID(meta.SessionID), err)
-		return
-	}
-
-	narrative := CleanNarrativeResponse(response)
-	if narrative == "" {
-		log.Printf("warn: narrative for %s too short, skipping", truncID(meta.SessionID))
-		return
-	}
-
-	_, err = store.InsertLearning(&models.Learning{
-		Category:   "narrative",
-		Content:    narrative,
-		Project:    project,
-		SessionID:  meta.SessionID,
-		CreatedAt:  time.Now(),
-		ModelUsed:  client.Model(),
-		Confidence: 1.0,
-	})
-	if err != nil {
-		log.Printf("warn: save narrative: %v", err)
-		return
-	}
-	if project != "" {
-		if n, _ := store.DeleteOldNarratives(project, 2); n > 0 {
-			log.Printf("  Narrative cleanup: deleted %d old narratives for %s", n, project)
-		}
-	}
-
-	store.MarkSessionNarrative(meta.SessionID)
-	log.Printf("Narrative saved for session %s (%s)", truncID(meta.SessionID), project)
+	log.Printf("  Extraction: %d processed, %d errors, %v (%d workers)", done, errCount, time.Since(startTime).Round(time.Second), workers)
 }
 
 // extractSession runs extraction for a single session by ID.
@@ -588,12 +632,7 @@ func GenerateProfiles(store *storage.Store, cfg *config.Config, client extractio
 				log.Printf("  profile %s: skipped (manual)", p.ProjectShort)
 				continue
 			}
-			// ListSessions caps at 20, so normalize the comparison
-			maxSessions := p.SessionCount
-			if maxSessions > 20 {
-				maxSessions = 20
-			}
-			if existing.SessionCount >= maxSessions {
+			if existing.SessionCount >= p.SessionCount {
 				log.Printf("  profile %s: skipped (up to date, %d sessions)", p.ProjectShort, existing.SessionCount)
 				continue
 			}
@@ -615,8 +654,11 @@ func GenerateProfiles(store *storage.Store, cfg *config.Config, client extractio
 // narrativeBudgetBackoff tracks when to retry narrative generation after budget exhaustion.
 var narrativeBudgetBackoff time.Time
 
-// generateMissingNarratives creates narrative summaries for sessions that don't have one.
-func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, cfg *config.Config, client extraction.LLMClient) {
+// generateMissingNarratives creates narrative summaries for the sessions the
+// pending set names. The set already carries the gates (text messages,
+// quarantine), so the loop can rely on it and never loads a session the
+// generator would have to reject.
+func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, cfg *config.Config, client extraction.LLMClient, pending map[string]struct{}) {
 	if client == nil {
 		log.Println("  Skipped: no LLM client")
 		return
@@ -630,13 +672,13 @@ func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, 
 	// Filter to sessions needing narratives (persistent marker, min messages)
 	var toProcess []models.Session
 	for _, s := range sessions {
-		if s.NarrativeAt.IsZero() && s.MessageCount >= minNarrativeMessages {
+		if _, ok := pending[s.ID]; ok {
 			toProcess = append(toProcess, s)
 		}
 	}
 
 	if len(toProcess) == 0 {
-		log.Println("  All sessions have narratives")
+		log.Println("  All narratable sessions have narratives")
 		return
 	}
 
@@ -650,6 +692,7 @@ func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, 
 	var (
 		mu        sync.Mutex
 		generated int
+		written   = make(map[string][]int64)
 	)
 
 	work := make(chan models.Session, total)
@@ -697,7 +740,7 @@ func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, 
 					continue
 				}
 
-				store.InsertLearning(&models.Learning{
+				narrativeID, err := store.InsertLearning(&models.Learning{
 					Category:   "narrative",
 					Content:    narrative,
 					Project:    project,
@@ -707,10 +750,14 @@ func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, 
 					Confidence: 1.0,
 					Source:     "llm_extracted",
 				})
+				if err != nil {
+					log.Printf("  narrative %s: insert failed: %v", truncID(s.ID), err)
+					continue
+				}
 				if project != "" {
-					if n, _ := store.DeleteOldNarratives(project, 2); n > 0 {
-						log.Printf("  Narrative cleanup: deleted %d old narratives for %s", n, project)
-					}
+					mu.Lock()
+					written[project] = append(written[project], narrativeID)
+					mu.Unlock()
 				}
 				store.MarkSessionNarrative(s.ID)
 
@@ -739,7 +786,72 @@ func GenerateMissingNarratives(store *storage.Store, sessions []models.Session, 
 	}
 
 	wg.Wait()
+	pruneNarratives(store, written)
 	log.Printf("  Narratives complete: %d generated", generated)
+}
+
+// pruneNarratives applies the per-project retention once per run and spares every
+// row this run wrote. Pruning per insert instead would let a concurrent worker's
+// prune drop a story another worker just paid for: a narrative carries its
+// session's start time, so one written for an older session sorts to the bottom
+// of its project, and the session keeps the marker that calls it narrated.
+//
+// The rows are grouped by repository root because that is the scope the prune
+// uses. One call per worktree path would spare only that worktree's rows and
+// delete the stories the other workers wrote seconds ago.
+func pruneNarratives(store *storage.Store, written map[string][]int64) {
+	byRoot := make(map[string][]int64, len(written))
+	for project, ids := range written {
+		if project == "" {
+			continue
+		}
+		scope := models.RepositoryRoot(project)
+		if scope == "" {
+			scope = project
+		}
+		byRoot[scope] = append(byRoot[scope], ids...)
+	}
+	for scope, ids := range byRoot {
+		n, err := store.DeleteOldNarratives(scope, narrativeKeep, ids...)
+		if err != nil {
+			log.Printf("  narrative cleanup for %s: %v", scope, err)
+			continue
+		}
+		if n > 0 {
+			log.Printf("  Narrative cleanup: deleted %d old narratives for %s", n, scope)
+		}
+	}
+}
+
+// forkCoverageSlack is how many trailing messages a session must accumulate
+// beyond its last certified range before the batch pass reopens it. Without it a
+// session that is still growing would be fully re-extracted on every cycle.
+const forkCoverageSlack = 20
+
+// batchExtractionNeeded reports whether the batch pass owes this session an
+// extraction pass.
+func batchExtractionNeeded(store *storage.Store, s models.Session) bool {
+	if s.MessageCount < storage.ShortSessionMaxMessages {
+		return false
+	}
+	if s.ExtractedAt.IsZero() {
+		return true
+	}
+	// A fork covers only the messages that existed when it ran, and the fork
+	// handler marks the whole session as extracted. The tail that arrived after
+	// the last fork was never extracted (YM-51).
+	//
+	// A session that is still growing would otherwise be re-extracted in full on
+	// every cycle, so only a tail of at least forkCoverageSlack messages counts.
+	// A session that has been silent long enough to be finished gets its tail in
+	// full, however short it is.
+	slack := forkCoverageSlack
+	// Only a session with an end timestamp and enough silence counts as finished.
+	// Without one there is no evidence the session stopped growing.
+	if storage.SessionFinished(s.EndedAt, time.Now()) {
+		slack = 1
+	}
+	return store.ForkCoverageIncomplete(s.ID, s.MessageCount, slack)
 }
 
 // extractionNeeded checks if the session has already been extracted.
@@ -762,12 +874,7 @@ func runBatchExtraction(ext extraction.SessionExtractor, evoExt *extraction.Extr
 
 	// Cleanup: mark daemon-internal extraction sessions first (targeted),
 	// then mark remaining short sessions (generic catch-all).
-	if marked, err := store.MarkExtractionSessionsExtracted(); err == nil && marked > 0 {
-		log.Printf("  Marked %d extraction-internal sessions as extracted", marked)
-	}
-	if marked, err := store.MarkShortSessionsExtracted(5); err == nil && marked > 0 {
-		log.Printf("  Marked %d short sessions (≤5 messages) as extracted", marked)
-	}
+	markSessionsExtracted(store)
 
 	// Build pending list — skip sessions younger than min_session_age_hours (default 24h)
 	// because the forked agent proxy handles real-time extraction for active sessions.
@@ -778,7 +885,7 @@ func runBatchExtraction(ext extraction.SessionExtractor, evoExt *extraction.Extr
 	cutoff := time.Now().Add(-time.Duration(minAgeH) * time.Hour)
 	var toExtract []models.Session
 	for _, s := range sessions {
-		if s.ExtractedAt.IsZero() && s.MessageCount > 5 && s.StartedAt.Before(cutoff) {
+		if batchExtractionNeeded(store, s) && s.StartedAt.Before(cutoff) {
 			toExtract = append(toExtract, s)
 		}
 	}

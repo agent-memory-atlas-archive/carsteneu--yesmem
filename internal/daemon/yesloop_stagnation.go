@@ -45,6 +45,9 @@ type stagnationState struct {
 	lastChangedAt time.Time
 	lastRelayAt   time.Time
 	refireCount   int
+	// subagentFrozenAt is when the freeze was last reported, so a frozen guard
+	// reports itself on a clock instead of once per tick.
+	subagentFrozenAt time.Time
 }
 
 var (
@@ -79,11 +82,11 @@ func buildStagnationRelayMessage(staleFor time.Duration) string {
 // sendStagnationRelay sends the stagnation relay via the PTY inject socket.
 // Mirrors sendDoneGuardRelay.
 func (h *Handler) sendStagnationRelay(agent storage.Agent, msg string) {
-	if agent.SockPath == "" {
-		log.Printf("[stagnation] relay to agent %s skipped: no sock_path", agent.ID)
+	injectPath := h.agentInjectPath(agent.ID)
+	if injectPath == "" {
+		log.Printf("[stagnation] relay to agent %s skipped: no derivable socket path", safeAgentText(agent.ID))
 		return
 	}
-	injectPath := agent.SockPath + ".inject"
 	wrapped := fmt.Sprintf("[RELAY from=stagnation-guard] %s", msg)
 
 	conn, err := net.DialTimeout("unix", injectPath, 3*time.Second)
@@ -106,6 +109,7 @@ func (h *Handler) checkYesloopStagnation() {
 	if err != nil {
 		return
 	}
+	h.pruneStagnationStates(agents)
 	for _, agent := range agents {
 		if agent.Status != "running" {
 			continue
@@ -116,7 +120,11 @@ func (h *Handler) checkYesloopStagnation() {
 		if agent.SessionID == "" || agent.Project == "" {
 			continue
 		}
-		if !isPIDAlive(agent.PID) {
+		// The guard's action is a relay into the agent's socket, so it needs the
+		// agent's own process: a recycled PID would be nudged on the strength of
+		// a row it no longer owns (Learning #101907). Dead rows are
+		// crashRecovery's case.
+		if agentProcessGone(agent) {
 			continue
 		}
 
@@ -136,14 +144,38 @@ func (h *Handler) checkYesloopStagnation() {
 			continue
 		}
 
-		h.checkOneStagnationAgent(agent, content)
+		// The child gate is the expensive part (it opens opencode's session DB and
+		// may bind an unbound agent), so it runs after every cheap filter. The
+		// stream fields are already in hand, so only the authoritative lookup is
+		// left to pay for.
+		agent = *h.ensureOpencodeSession(&agent)
+		inSubagent := h.agentWaitingInSubagentWith(agent, streamFields)
+
+		h.checkOneStagnationAgent(agent, content, inSubagent)
+	}
+}
+
+// pruneStagnationStates drops the bookkeeping of agents that no longer have a
+// row. Same leak as the done-guard map before YM-285: the state is in-memory and
+// outlives the row it was written for.
+func (h *Handler) pruneStagnationStates(agents []storage.Agent) {
+	live := make(map[string]struct{}, len(agents))
+	for i := range agents {
+		live[agents[i].ID] = struct{}{}
+	}
+	yesloopStagnationAgentsMu.Lock()
+	defer yesloopStagnationAgentsMu.Unlock()
+	for id := range yesloopStagnationAgents {
+		if _, ok := live[id]; !ok {
+			delete(yesloopStagnationAgents, id)
+		}
 	}
 }
 
 // checkOneStagnationAgent is the per-agent tracking/refire state machine.
 // Lock discipline mirrors checkOneDoneGuardAgent: mutex held for map access
 // only, released around relay/pause I/O.
-func (h *Handler) checkOneStagnationAgent(agent storage.Agent, content string) {
+func (h *Handler) checkOneStagnationAgent(agent storage.Agent, content string, inSubagent bool) {
 	sig := stagnationSig(content, agent.Progress)
 	now := time.Now()
 
@@ -167,6 +199,28 @@ func (h *Handler) checkOneStagnationAgent(agent storage.Agent, content string) {
 		yesloopStagnationAgentsMu.Unlock()
 		return
 	}
+
+	// An agent blocked inside a task() subagent is working, not stagnant: the
+	// child is its work. A relay would only queue behind the child (#89428), so
+	// nothing is sent and nothing is counted. The windows move forward, so the
+	// threshold and the refire interval restart when the child ends instead of
+	// firing on the very first tick after it returns. The reachable case is the
+	// child's tail: while the child runs the parent has no stream of its own, and
+	// the sweep above skips an inactive stream already.
+	if inSubagent {
+		if now.Sub(state.subagentFrozenAt) >= subagentFreezeLogEvery {
+			log.Printf("[stagnation] agent %s (%s) frozen: a task() subagent is active",
+				safeAgentText(agent.ID), safeAgentText(agent.Section))
+			state.subagentFrozenAt = now
+		}
+		state.lastChangedAt = now
+		if !state.lastRelayAt.IsZero() {
+			state.lastRelayAt = now
+		}
+		yesloopStagnationAgentsMu.Unlock()
+		return
+	}
+	state.subagentFrozenAt = time.Time{}
 
 	// No change yet — past threshold?
 	staleFor := now.Sub(state.lastChangedAt)

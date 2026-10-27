@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,62 +89,51 @@ func TestRunSessionEnd_CallsDaemon(t *testing.T) {
 	}
 }
 
-func TestRunSessionEnd_CompactAlsoWorks(t *testing.T) {
-	dir, err := os.MkdirTemp("", "t")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+// "compact" is not a SessionEnd reason: Claude Code fires PreCompact for it and
+// never ends the session, so the hook must not report it. The documented
+// SessionEnd reasons are clear, resume, logout, prompt_input_exit and other.
+func TestRunSessionEnd_IgnoresReasonsThatDoNotEndASession(t *testing.T) {
+	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "daemon.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
 
-	var receivedReason string
-	done := make(chan struct{})
-
+	accepted := make(chan struct{}, 1)
 	go func() {
-		defer close(done)
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		if conn, err := ln.Accept(); err == nil {
+			conn.Close()
+			accepted <- struct{}{}
 		}
-		defer conn.Close()
-		var req struct {
-			Params map[string]any `json:"params"`
-		}
-		json.NewDecoder(conn).Decode(&req)
-		receivedReason, _ = req.Params["reason"].(string)
-		json.NewEncoder(conn).Encode(map[string]any{"result": map[string]any{"status": "tracked"}})
 	}()
 
-	input := `{"session_id":"sess-xyz","cwd":"/tmp/proj","reason":"compact"}`
-	r, w, _ := os.Pipe()
-	w.Write([]byte(input))
-	w.Close()
 	oldStdin := os.Stdin
-	os.Stdin = r
-	defer func() { os.Stdin = oldStdin }()
-
 	oldStdout := os.Stdout
-	_, wOut, _ := os.Pipe()
+	rOut, wOut, _ := os.Pipe()
 	os.Stdout = wOut
+	defer func() { os.Stdin = oldStdin; os.Stdout = oldStdout }()
 
-	RunSessionEnd(dir)
-
+	for _, reason := range []string{"compact", "logout", "prompt_input_exit", "other"} {
+		input := `{"session_id":"sess-xyz","cwd":"/tmp/proj","reason":"` + reason + `"}`
+		r, w, _ := os.Pipe()
+		w.Write([]byte(input))
+		w.Close()
+		os.Stdin = r
+		RunSessionEnd(dir)
+	}
 	wOut.Close()
-	os.Stdout = oldStdout
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("mock server timed out")
+	buf := make([]byte, 1024)
+	n, _ := rOut.Read(buf)
+	if want := strings.Repeat("{}", 4); string(buf[:n]) != want {
+		t.Errorf("expected %q output, got %q", want, string(buf[:n]))
 	}
 
-	if receivedReason != "compact" {
-		t.Errorf("expected reason='compact', got %q", receivedReason)
+	select {
+	case <-accepted:
+		t.Error("the hook contacted the daemon for a reason that does not end a session")
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 

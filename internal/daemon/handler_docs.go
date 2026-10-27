@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/carsteneu/yesmem/internal/extraction"
 	"github.com/carsteneu/yesmem/internal/ingest"
@@ -20,6 +22,26 @@ import (
 
 var embedDocChunksMu sync.Mutex
 
+const (
+	// maxDocsSearchQueryRunes bounds the query. Every call pays one BM25 pass
+	// and one embedding request, so an unbounded query is unbounded cost.
+	maxDocsSearchQueryRunes = 2000
+
+	docsSearchDefaultLimit = 5
+	// docsSearchMaxLimit caps the caller supplied limit. It sits far above any
+	// real use on purpose: its job is to stop an absurd value, not to police
+	// callers. The clamp is mandatory because limit reaches a slice bound, an
+	// oversampling multiply and two SQL LIMITs.
+	docsSearchMaxLimit = 1000
+
+	// contextualDocsDefaultLimit is what the caller gets when it names no limit.
+	contextualDocsDefaultLimit = 3
+	// contextualDocsMaxLimit bounds the response. These chunks do not go to a
+	// caller that asked for a list, they go into a prompt, so the bound sits
+	// tighter than docsSearchMaxLimit.
+	contextualDocsMaxLimit = 100
+)
+
 // handleDocsSearch handles the "docs_search" daemon command.
 // Parameters: query (required), source (optional), section (optional), project (optional),
 // exact (optional bool), limit (optional int), extensions (optional []string), doc_type (optional string)
@@ -28,6 +50,9 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 	if query == "" {
 		return errorResponse("query is required")
 	}
+	if n := utf8.RuneCountInString(query); n > maxDocsSearchQueryRunes {
+		return errorResponse(fmt.Sprintf("query is too long: %d runes, maximum is %d", n, maxDocsSearchQueryRunes))
+	}
 	source := stringOr(params, "source", "")
 	section := stringOr(params, "section", "")
 	// Canonicalize the caller project (git worktree -> main repo) so the
@@ -35,7 +60,21 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 	project := repo.RootOrSelf(stringOr(params, "project", ""))
 	since, _ := params["since"].(string)
 	before, _ := params["before"].(string)
-	limit := intOr(params, "limit", 5)
+	limit := docsSearchDefaultLimit
+	// Read the float directly instead of going through intOr: above MaxInt64 the
+	// conversion wraps to a negative value, which no later clamp can tell apart
+	// from a caller's negative limit. limit=0 keeps meaning "no results".
+	if v, ok := params["limit"].(float64); ok {
+		// NaN fails both comparisons and int(NaN) is a negative slice bound.
+		if v < 0 || math.IsNaN(v) {
+			return errorResponse(fmt.Sprintf("limit must not be negative (got %v)", v))
+		}
+		if v > docsSearchMaxLimit {
+			limit = docsSearchMaxLimit
+		} else {
+			limit = int(v)
+		}
+	}
 	exact, _ := params["exact"].(bool)
 	docType := stringOr(params, "doc_type", "")
 
@@ -43,6 +82,7 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 	// When extensions provided: only search sources whose trigger_extensions match.
 	// When only doc_type provided: filter all sources by type.
 	var sourceIDFilter []int64
+	filterActive := false
 	if rawExts, ok := params["extensions"].([]any); ok && len(rawExts) > 0 {
 		var exts []string
 		for _, e := range rawExts {
@@ -52,26 +92,68 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 		}
 		if len(exts) > 0 {
 			sources, err := h.store.GetDocSourcesByExtensions(exts, docType)
-			if err == nil {
-				for _, src := range sources {
-					if project == "" || src.Project == "" || src.Project == project {
-						sourceIDFilter = append(sourceIDFilter, src.ID)
-					}
+			if err != nil {
+				return errorResponse(fmt.Sprintf("resolve sources for extensions %v: %v", exts, err))
+			}
+			filterActive = true
+			for _, src := range sources {
+				if project == "" || src.Project == "" || src.Project == project {
+					sourceIDFilter = append(sourceIDFilter, src.ID)
 				}
 			}
 		}
 	} else if docType != "" {
 		// No extensions but doc_type specified — filter all sources by type
 		allSources, err := h.store.ListDocSources("")
-		if err == nil {
-			for _, src := range allSources {
-				if src.DocType == docType {
-					if project == "" || src.Project == "" || src.Project == project {
-						sourceIDFilter = append(sourceIDFilter, src.ID)
-					}
+		if err != nil {
+			return errorResponse(fmt.Sprintf("list sources for doc_type %q: %v", docType, err))
+		}
+		filterActive = true
+		for _, src := range allSources {
+			if src.DocType == docType {
+				if project == "" || src.Project == "" || src.Project == project {
+					sourceIDFilter = append(sourceIDFilter, src.ID)
 				}
 			}
 		}
+	}
+
+	// Project scope is resolved to source IDs BEFORE the search, so the limit
+	// applies to hits from this project (plus global sources). Filtering after
+	// the truncation emptied the list whenever a foreign project filled the top
+	// of the ranking, and the vector path used to ignore the scope entirely.
+	// boostIDs holds the project's own sources (globals are not boosted).
+	boostIDs := map[int64]bool{}
+	if project != "" {
+		scoped, err := h.store.ListDocSourcesForProject(project)
+		if err != nil {
+			// Never fall back to an unscoped search: the caller asked for this
+			// project and a silent widening is indistinguishable from "no hits".
+			return errorResponse(fmt.Sprintf("resolve project sources for %q: %v", project, err))
+		}
+		projectIDs := make([]int64, 0, len(scoped))
+		for _, src := range scoped {
+			projectIDs = append(projectIDs, src.ID)
+			if src.Project != "" {
+				boostIDs[src.ID] = true
+			}
+		}
+		if filterActive {
+			sourceIDFilter = intersectIDs(sourceIDFilter, projectIDs)
+		} else {
+			sourceIDFilter = projectIDs
+			filterActive = true
+		}
+	}
+
+	// The filter matched no source at all — no chunk can answer this query.
+	if filterActive && len(sourceIDFilter) == 0 {
+		return jsonResponse(map[string]any{
+			"results": []any{},
+			"total":   0,
+			"method":  "bm25",
+			"message": fmt.Sprintf("Doc search: 0 results for %q", query),
+		})
 	}
 
 	// BM25 via FTS5 (always)
@@ -79,19 +161,28 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 	if err != nil {
 		return errorResponse(fmt.Sprintf("doc search failed: %v", err))
 	}
+	// Normalise to one convention before anything sorts on scores: FTS5's bm25()
+	// returns negative values ordered ascending (best = most negative), the
+	// vector/RRF paths return positive values where higher is better.
+	for i := range bm25Results {
+		bm25Results[i].Score = -bm25Results[i].Score
+	}
 
-	// Vector search via SSE embeddings — only as fallback when BM25 found nothing (unless exact mode).
-	// Design decision: BM25-first is intentional because exact=true queries benefit from precise term matching.
-	// Full hybrid (parallel BM25+vector with RRF merge) is a future option but not currently needed.
+	// Vector search via SSE embeddings. exact=true stays BM25-only: it asks for
+	// precise term matching. Every other query runs both paths and merges them,
+	// so a semantically matching chunk is found even when BM25 already has hits.
 	method := "bm25"
 	var vectorResults []storage.DocChunkResult
-	if !exact && len(bm25Results) == 0 {
+	if !exact {
 		if provider := h.EmbedProvider(); provider != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			vecs, err := provider.Embed(ctx, []string{query})
 			if err == nil && len(vecs) > 0 {
-				vectorResults, _ = h.store.SearchDocChunksSemantic(vecs[0], limit*2, source)
+				vectorResults, err = h.store.SearchDocChunksSemantic(vecs[0], limit*2, source, sourceIDFilter, since, before)
+				if err != nil {
+					log.Printf("docs_search: semantic lane: %v", err)
+				}
 			}
 		}
 	}
@@ -108,40 +199,26 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 		merged = bm25Results
 	}
 
-	// Trim to requested limit
-	if len(merged) > limit {
-		merged = merged[:limit]
-	}
-
-	// Project boost + filter: when project is set, boost project-matching sources 1.2x
-	// (re-ranks them above global docs) then remove any sources belonging to a different project.
-	if project != "" {
-		sourceProjects := h.store.DocSourceProjectMap()
-		// Boost first — promotes project docs within the scored list.
-		// BM25 scores are negative (higher = better, i.e. closer to zero).
-		// To boost a negative score upward: divide the magnitude (divide by 1.2).
-		// Hybrid/semantic scores are positive (higher = better): multiply by 1.2.
+	// Project boost: lift the project's own sources above the global ones they
+	// compete with. Scoping itself already happened in the query above.
+	// Scores are normalised (higher = better) at this point, so a plain factor
+	// works for every path. boostIDs holds doc_sources.id, the results carry
+	// doc_chunks.source_id.
+	if len(boostIDs) > 0 {
 		for i := range merged {
-			if sourceProjects[merged[i].SourceName] == project {
-				if merged[i].Score < 0 {
-					merged[i].Score /= 1.2 // less negative = higher = better rank
-				} else {
-					merged[i].Score *= 1.2
-				}
+			if !boostIDs[merged[i].SourceID] {
+				continue
 			}
+			merged[i].Score *= 1.2
 		}
 		sort.Slice(merged, func(i, j int) bool {
 			return merged[i].Score > merged[j].Score
 		})
-		// Filter: keep results from matching project or global (no project)
-		var filtered []storage.DocChunkResult
-		for _, r := range merged {
-			srcProject := sourceProjects[r.SourceName]
-			if srcProject == "" || srcProject == project {
-				filtered = append(filtered, r)
-			}
-		}
-		merged = filtered
+	}
+
+	// Trim to requested limit — after filtering, so the limit counts usable hits.
+	if len(merged) > limit {
+		merged = merged[:limit]
 	}
 
 	// Format results
@@ -158,17 +235,13 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 
 	items := make([]resultItem, 0, len(merged))
 	for _, r := range merged {
-		score := r.Score
-		if method == "bm25" {
-			score = -score // BM25 returns negative (lower=better), normalize to positive
-		}
 		items = append(items, resultItem{
 			ID:          r.ID,
 			Source:      r.SourceName,
 			Version:     r.Version,
 			HeadingPath: r.HeadingPath,
 			Content:     r.Content,
-			Score:       score,
+			Score:       r.Score,
 			SourceFile:  r.SourceFile,
 			Tokens:      r.TokensApprox,
 		})
@@ -180,6 +253,22 @@ func (h *Handler) handleDocsSearch(params map[string]any) Response {
 		"method":  method,
 		"message": fmt.Sprintf("Doc search: %d results for %q", len(items), query),
 	})
+}
+
+// intersectIDs keeps the values of a that are also present in b. Used when an
+// extension/doc_type filter and a project scope are both active.
+func intersectIDs(a, b []int64) []int64 {
+	keep := make(map[int64]bool, len(b))
+	for _, id := range b {
+		keep[id] = true
+	}
+	var out []int64
+	for _, id := range a {
+		if keep[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // mergeDocResults performs Reciprocal Rank Fusion on BM25 and vector results.
@@ -213,7 +302,11 @@ func mergeDocResults(bm25, vector []storage.DocChunkResult, limit int) []storage
 		all = append(all, *s)
 	}
 	sort.Slice(all, func(i, j int) bool {
-		return all[i].score > all[j].score
+		if all[i].score != all[j].score {
+			return all[i].score > all[j].score
+		}
+		// Equal RRF scores are common; the id keeps the order stable between calls.
+		return all[i].result.ID < all[j].result.ID
 	})
 
 	if len(all) > limit {
@@ -242,10 +335,18 @@ func (h *Handler) handleListDocs(params map[string]any) Response {
 		Project           string `json:"project"`
 		LastSync          string `json:"last_sync"`
 		TriggerExtensions string `json:"trigger_extensions,omitempty"`
+		Path              string `json:"path,omitempty"`
+		PathMissing       bool   `json:"path_missing,omitempty"`
+		PathRelative      bool   `json:"path_relative,omitempty"`
 	}
 
+	missing := 0
 	items := make([]sourceItem, 0, len(sources))
 	for _, s := range sources {
+		gone := ingest.PathMissing(s.Path)
+		if gone {
+			missing++
+		}
 		items = append(items, sourceItem{
 			Name:              s.Name,
 			Version:           s.Version,
@@ -253,6 +354,12 @@ func (h *Handler) handleListDocs(params map[string]any) Response {
 			Project:           s.Project,
 			LastSync:          s.LastSync.Format("2006-01-02 15:04"),
 			TriggerExtensions: s.TriggerExtensions,
+			Path:              s.Path,
+			PathMissing:       gone,
+			// A relative path cannot be verified or re-read, so doc-sync skips
+			// it forever. It is not "missing" (--prune must not act on it), but
+			// it is not healthy either.
+			PathRelative: s.Path != "" && !filepath.IsAbs(s.Path),
 		})
 	}
 
@@ -261,6 +368,9 @@ func (h *Handler) handleListDocs(params map[string]any) Response {
 		sb.WriteString("No documentation sources indexed yet.")
 	} else {
 		sb.WriteString(fmt.Sprintf("%d documentation source(s) indexed.", len(items)))
+	}
+	if missing > 0 {
+		sb.WriteString(fmt.Sprintf(" %d source(s) point at a path that no longer exists; doc-sync skips them.", missing))
 	}
 
 	return jsonResponse(map[string]any{
@@ -276,6 +386,10 @@ func (h *Handler) handleRemoveDocs(params map[string]any) Response {
 	name := stringOr(params, "name", "")
 	if name == "" {
 		return errorResponse("name is required")
+	}
+	// The clone directory is derived from the name and removed recursively.
+	if !ingest.ValidSourceName(name) {
+		return errorResponse(fmt.Sprintf("invalid doc source name %q", name))
 	}
 	project := stringOr(params, "project", "")
 
@@ -295,28 +409,26 @@ func (h *Handler) handleRemoveDocs(params map[string]any) Response {
 
 	// Clean up clone directory
 	if delResult != nil && delResult.SourcePath != "" {
-		home, _ := os.UserHomeDir()
-		if home != "" {
-			cloneDir := filepath.Join(home, ".claude", "yesmem", "docs", name)
-			if _, statErr := os.Stat(cloneDir); statErr == nil {
-				os.RemoveAll(cloneDir)
-				log.Printf("Clone directory removed: %s", cloneDir)
-			}
+		if cloneDir, dirErr := ingest.CloneDir(h.dataDir, name); dirErr != nil {
+			log.Printf("warn: skip clone dir cleanup: %q", dirErr)
+		} else if _, statErr := os.Stat(cloneDir); statErr == nil {
+			os.RemoveAll(cloneDir)
+			log.Printf("Clone directory removed: %q", cloneDir)
 		}
 	}
 
 	// Clean up orphaned embeddings
-	if h.vectorStore != nil && len(delResult.DeletedLearningIDs) > 0 {
+	if vecStore := h.VectorStore(); vecStore != nil && len(delResult.DeletedLearningIDs) > 0 {
 		for _, lid := range delResult.DeletedLearningIDs {
-			h.vectorStore.Delete(context.Background(), fmt.Sprintf("l:%d", lid))
+			vecStore.Delete(context.Background(), fmt.Sprintf("l:%d", lid))
 		}
 	}
 
 	return jsonResponse(map[string]any{
-		"message":            fmt.Sprintf("Removed '%s' — %d chunks + %d learnings deleted", name, chunkCount, learningsDeleted),
-		"name":               name,
-		"chunks_deleted":     chunkCount,
-		"learnings_deleted":  learningsDeleted,
+		"message":           fmt.Sprintf("Removed '%s' — %d chunks + %d learnings deleted", name, chunkCount, learningsDeleted),
+		"name":              name,
+		"chunks_deleted":    chunkCount,
+		"learnings_deleted": learningsDeleted,
 	})
 }
 
@@ -344,7 +456,22 @@ func (h *Handler) handleContextualDocs(params map[string]any) Response {
 	}
 
 	project := repo.RootOrSelf(stringOr(params, "project", ""))
-	limit := intOr(params, "limit", 3)
+	limit := contextualDocsDefaultLimit
+	// Read the float directly instead of going through intOr: above MaxInt64 the
+	// conversion wraps to a negative value, which no later clamp can tell apart
+	// from a caller's negative limit. A negative limit is not a smaller result
+	// set either, because SQLite reads LIMIT -1 as "no limit". limit=0 keeps
+	// meaning "no results".
+	if v, ok := params["limit"].(float64); ok {
+		switch {
+		case v < 0 || math.IsNaN(v):
+			limit = contextualDocsDefaultLimit
+		case v > contextualDocsMaxLimit:
+			limit = contextualDocsMaxLimit
+		default:
+			limit = int(v)
+		}
+	}
 
 	var sourceIDs []int64
 	srcNames := make(map[int64]string)
@@ -368,20 +495,20 @@ func (h *Handler) handleContextualDocs(params map[string]any) Response {
 
 	type resultItem struct {
 		Source      string `json:"source"`
-		Version    string `json:"version"`
+		Version     string `json:"version"`
 		HeadingPath string `json:"heading_path"`
-		Content    string `json:"content"`
-		Tokens     int    `json:"tokens_approx"`
+		Content     string `json:"content"`
+		Tokens      int    `json:"tokens_approx"`
 	}
 
 	items := make([]resultItem, 0, len(chunks))
 	for _, c := range chunks {
 		items = append(items, resultItem{
 			Source:      srcNames[c.SourceID],
-			Version:    srcVersions[c.SourceID],
+			Version:     srcVersions[c.SourceID],
 			HeadingPath: c.HeadingPath,
-			Content:    c.Content,
-			Tokens:     c.TokensApprox,
+			Content:     c.Content,
+			Tokens:      c.TokensApprox,
 		})
 	}
 
@@ -406,9 +533,19 @@ func (h *Handler) handleIngestDocs(params map[string]any) Response {
 	if name == "" {
 		return errorResponse("name is required")
 	}
+	// The name becomes a path element on delete, so it must be one from the start.
+	if !ingest.ValidSourceName(name) {
+		return errorResponse(fmt.Sprintf("invalid doc source name %q", name))
+	}
 	path := stringOr(params, "path", "")
 	if path == "" {
 		return errorResponse("path is required")
+	}
+	// The daemon's working directory is not the caller's, so a relative path
+	// here has no base to resolve against and would index whatever tree
+	// happens to sit at that name next to the daemon.
+	if !filepath.IsAbs(path) {
+		return errorResponse(fmt.Sprintf("path %q must be absolute", path))
 	}
 	version := stringOr(params, "version", "")
 	project := stringOr(params, "project", "")
@@ -454,8 +591,8 @@ func (h *Handler) handleIngestDocs(params map[string]any) Response {
 	}
 
 	// Wire LLM client for destillation
-	if cfg.Destill && h.SummarizeClient != nil {
-		cfg.LLMClient = h.SummarizeClient
+	if summarize := h.summarizeLLM(); cfg.Destill && summarize != nil {
+		cfg.LLMClient = summarize
 	} else if cfg.Destill {
 		log.Printf("  warn: --destill requested but no LLM client available, skipping destillation")
 		cfg.Destill = false
@@ -472,10 +609,12 @@ func (h *Handler) handleIngestDocs(params map[string]any) Response {
 	}
 
 	return jsonResponse(map[string]any{
-		"message": fmt.Sprintf("Ingest complete: %d files processed, %d skipped, %d chunks created",
-			result.FilesProcessed, result.FilesSkipped, result.ChunksCreated),
+		"message": fmt.Sprintf("Ingest complete: %d files processed, %d skipped, %d removed, %d chunks created, %d unreadable entries skipped",
+			result.FilesProcessed, result.FilesSkipped, result.FilesRemoved, result.ChunksCreated, result.UnreadableEntries),
 		"files_processed":      result.FilesProcessed,
 		"files_skipped":        result.FilesSkipped,
+		"files_removed":        result.FilesRemoved,
+		"unreadable_entries":   result.UnreadableEntries,
 		"chunks_created":       result.ChunksCreated,
 		"learnings_superseded": result.LearningsSuperseded,
 	})
@@ -484,12 +623,12 @@ func (h *Handler) handleIngestDocs(params map[string]any) Response {
 // handleIngestRules condenses a CLAUDE.md (with link resolution) into a rules block.
 func (h *Handler) handleIngestRules(name, sourcePath, project string) Response {
 	// Prefer quality client (Sonnet/Opus) for rules — Haiku hallucinates generic rules
-	client := h.QualityClient
+	client := h.qualityLLMClient()
 	if client == nil {
-		client = h.SummarizeClient
+		client = h.summarizeLLM()
 	}
 	if client == nil {
-		client = h.CommitEvalClient
+		client = h.commitEvalLLM()
 	}
 	if client == nil {
 		return errorResponse("no LLM client available for rules condensation — run extraction cycle first or check API key config")
@@ -506,7 +645,7 @@ func (h *Handler) handleIngestRules(name, sourcePath, project string) Response {
 		return errorResponse(err.Error())
 	}
 
-	log.Printf("[rules] condensed %s → %d chars (hash=%s)", sourcePath, len(condensed), hash[:12])
+	log.Printf("[rules] condensed %q → %d chars (hash=%s)", sourcePath, len(condensed), hash[:12])
 	return jsonResponse(map[string]any{
 		"message":       fmt.Sprintf("Rules condensed: %d chars from %s", len(condensed), filepath.Base(sourcePath)),
 		"hash":          hash,
@@ -516,7 +655,8 @@ func (h *Handler) handleIngestRules(name, sourcePath, project string) Response {
 }
 
 // CondenseRules reads a CLAUDE.md, resolves links, checks hash, and condenses via LLM.
-// Returns (condensed, hash, error). Returns error "unchanged" if hash matches.
+// Returns (condensed, hash, error). Returns error "unchanged" if the source hash
+// matches AND a non-empty rules block is already stored.
 func CondenseRules(sourcePath, project string, client extraction.LLMClient, store *storage.Store) (string, string, error) {
 	expanded, err := expandWithLinks(sourcePath, 0)
 	if err != nil {
@@ -524,7 +664,10 @@ func CondenseRules(sourcePath, project string, client extraction.LLMClient, stor
 	}
 
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(expanded)))
-	if existing := store.GetRulesHash(project); existing == hash {
+	// The hash alone is not enough: a rules row whose content was cleared keeps
+	// its hash, and the shortcut would leave the block empty forever. Only skip
+	// when there is an actual block to reuse.
+	if existing := store.GetRulesHash(project); existing == hash && strings.TrimSpace(store.GetRulesContent(project)) != "" {
 		return "", hash, fmt.Errorf("unchanged")
 	}
 
@@ -567,6 +710,11 @@ Same language as input. No preamble, no introduction.`
 	condensed, err := client.Complete(condensePrompt, condenseUser)
 	if err != nil {
 		return "", "", fmt.Errorf("LLM condensation failed: %v", err)
+	}
+	// An empty answer must not be stored: it would blank the rules block and
+	// record the fresh hash, so no later run would ever re-condense it.
+	if strings.TrimSpace(condensed) == "" {
+		return "", "", fmt.Errorf("LLM returned an empty rules condensation — stored block kept")
 	}
 
 	ds := &storage.DocSource{
@@ -628,8 +776,8 @@ func mechanicalPreFilter(input string) string {
 	lines := strings.Split(input, "\n")
 	inCodeBlock := false
 	inTable := false
-	skipSection := false    // true when current section heading signals non-behavioral content
-	skipSectionLevel := 0   // heading level that triggered skip (only same or higher level ends it)
+	skipSection := false  // true when current section heading signals non-behavioral content
+	skipSectionLevel := 0 // heading level that triggered skip (only same or higher level ends it)
 	skipIndented := 0
 
 	for _, line := range lines {

@@ -300,7 +300,7 @@ func TestDoneVerify_EscalationPayload_HasHint(t *testing.T) {
 		t.Fatal("expected DEAD_AGENT_ESCALATION state")
 	}
 
-	msgs, err := s.GetChannelMessages("caller-hint-dv")
+	msgs, err := s.GetChannelMessages([]string{"caller-hint-dv"})
 	if err != nil {
 		t.Fatalf("GetChannelMessages: %v", err)
 	}
@@ -439,4 +439,82 @@ task() dispatched: yes
 
 BEWEISEN: alle 5 Phasen durch, Phase 6 finish mit commit.
 `
+}
+
+// A verdict belongs to the row it was reached for: a stale DONE_VERIFIED would
+// make both guard layers go silent for an agent that never proved anything
+// (review round 3). Since YM-151 the allocator no longer reuses ids; this test
+// simulates the remaining case where a row lands on an id the map still carries.
+func TestDoneVerify_VerdictDoesNotSurviveARecycledAgentID(t *testing.T) {
+	resetDoneVerifyState()
+	resetIdleState()
+	h, s := mustHandler(t)
+	makeYesloopAgent(t, h, s, "recycled-1", "sess-recycled-dv", testPID, false, 11*time.Minute)
+
+	row, err := s.AgentGet("recycled-1")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	yesloopDoneVerifyAgentsMu.Lock()
+	yesloopDoneVerifyAgents["recycled-1"] = &yesloopDoneVerifyState{
+		state:     yesloopDoneVerifyStateDoneVerified,
+		createdAt: row.CreatedAt,
+	}
+	yesloopDoneVerifyAgentsMu.Unlock()
+
+	if !doneVerifySettled(*row) {
+		t.Fatal("the verdict of this row must apply to this row")
+	}
+
+	// The row is replaced by a new agent under the same id.
+	if _, err := s.DB().Exec("UPDATE agents SET created_at = ? WHERE id = ?",
+		time.Now().Add(-time.Hour).Format(time.RFC3339), "recycled-1"); err != nil {
+		t.Fatalf("recycle the row: %v", err)
+	}
+	newRow, err := s.AgentGet("recycled-1")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if doneVerifySettled(*newRow) {
+		t.Error("a new agent inherited the verdict of the row that used its id before")
+	}
+}
+
+// doneVerifyTracked reports whether the done-verify map still holds an entry for
+// the agent id, regardless of state.
+func doneVerifyTracked(agentID string) bool {
+	yesloopDoneVerifyAgentsMu.Lock()
+	defer yesloopDoneVerifyAgentsMu.Unlock()
+	_, ok := yesloopDoneVerifyAgents[agentID]
+	return ok
+}
+
+// TestDoneVerify_PrunesStateOfGoneAgent (YM-203): the state map is in-memory and
+// was never cleaned, so every agent that ever emitted a DONE-claim kept an entry
+// until the daemon restarted. A row that no longer exists must lose its entry;
+// a live row must keep it (doneVerifySettled feeds the idle guard).
+func TestDoneVerify_PrunesStateOfGoneAgent(t *testing.T) {
+	resetDoneVerifyState()
+	h, s := mustHandler(t)
+
+	claim := "### Phase 6: FINISH\n**Status:** COMPLETE\n**Deploy executed:** yes\nsend_to orchestrator: yes\n"
+	makeDoneVerifyAgent(t, h, s, "gone-1", "sess-gone1", claim)
+	makeDoneVerifyAgent(t, h, s, "live-1", "sess-live1", claim)
+
+	h.checkYesloopDoneVerify()
+	if !doneVerifyTracked("gone-1") || !doneVerifyTracked("live-1") {
+		t.Fatalf("both DONE-claiming agents must be tracked after the first sweep")
+	}
+
+	if err := s.AgentDelete("gone-1"); err != nil {
+		t.Fatalf("AgentDelete: %v", err)
+	}
+	h.checkYesloopDoneVerify()
+
+	if doneVerifyTracked("gone-1") {
+		t.Error("state of an agent whose row is gone must be pruned")
+	}
+	if !doneVerifyTracked("live-1") {
+		t.Error("state of a live agent must survive the prune")
+	}
 }

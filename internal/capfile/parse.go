@@ -34,7 +34,11 @@ type Script struct {
 	Body    string
 	Schema  string // JSON schema (tool kind only)
 	Sandbox string // "none" | "standard" | "strict" | "" (inherit)
-	Timeout int64  // seconds; 0 = auto (default/llm heuristic)
+	// AllowedHosts is the script's egress allowlist for the standard sandbox
+	// profile under ai-jail 2.x (comma-separated in the metadata block). Empty
+	// means no egress at all.
+	AllowedHosts []string
+	Timeout      int64 // seconds; 0 = auto (default/llm heuristic)
 }
 
 type frontmatter struct {
@@ -56,14 +60,66 @@ var (
 )
 
 var knownMetadataKey = map[string]bool{
-	"kind":    true,
-	"runtime": true,
-	"schema":  true,
-	"sandbox": true,
-	"timeout": true,
+	"kind":          true,
+	"runtime":       true,
+	"schema":        true,
+	"sandbox":       true,
+	"allowed_hosts": true,
+	"timeout":       true,
 }
 
+// SplitHostList parses a comma-separated egress allowlist. Empty entries are
+// dropped, so an unset field yields no hosts (= no egress).
+func SplitHostList(value string) []string {
+	var hosts []string
+	for _, part := range strings.Split(value, ",") {
+		if host := strings.TrimSpace(part); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
+}
+
+// ValidateHost rejects values ai-jail's --allow-host would not take as a host:
+// it matches a hostname and its subdomains, not a URL. The accepted character
+// set is deliberately narrow — a host is a hostname, never a scheme, port or
+// path.
+func ValidateHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("empty allowed host")
+	}
+	if strings.HasPrefix(host, "-") || strings.Contains(host, "..") {
+		return fmt.Errorf("invalid allowed host %q: expected a hostname", host)
+	}
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_':
+		default:
+			return fmt.Errorf("invalid allowed host %q: expected a hostname (letters, digits, '.', '-', '_'), without scheme, port, or path", host)
+		}
+	}
+	return nil
+}
+
+// Parse reads a CAP.md with the shareable scope default.
 func Parse(data []byte) (*CapFile, error) {
+	return ParseWithDefaultScope(data, "user")
+}
+
+// ParseWithDefaultScope is Parse with an explicit default for a CAP.md that
+// omits the scope field. The scope is part of the file's location, so the
+// scanner passes "project" for the project directory — a scope-less file there
+// is project-bound, and the sandbox lock below applies to it.
+//
+// defaultScope must be "user" or "project"; anything else is refused rather
+// than stored, because an unknown default would silently reopen the gap this
+// parameter exists to close (a scope-less file below the project directory
+// loading project-agnostic).
+func ParseWithDefaultScope(data []byte, defaultScope string) (*CapFile, error) {
+	if defaultScope != "user" && defaultScope != "project" {
+		return nil, fmt.Errorf("default scope must be user or project, got %q", defaultScope)
+	}
 	fm, body, err := splitFrontmatter(data)
 	if err != nil {
 		return nil, err
@@ -83,12 +139,20 @@ func Parse(data []byte) (*CapFile, error) {
 	if meta.Description == "" {
 		return nil, fmt.Errorf("frontmatter: description is required")
 	}
+	if meta.Version < 0 {
+		return nil, fmt.Errorf("frontmatter: version %d must not be negative", meta.Version)
+	}
 	if meta.Version == 0 {
 		meta.Version = 1
 	}
-	explicitScope := meta.Scope
 	if meta.Scope == "" {
-		meta.Scope = "project"
+		meta.Scope = defaultScope
+	}
+	// The scope decides whether the sandbox lock below applies, so an unknown
+	// value must not pass as "not project": a typo would load the cap
+	// project-agnostic with sandbox=none left standing.
+	if meta.Scope != "user" && meta.Scope != "project" {
+		return nil, fmt.Errorf("frontmatter: scope %q must be user or project", meta.Scope)
 	}
 
 	sections, err := parseSections(body)
@@ -129,7 +193,7 @@ func Parse(data []byte) (*CapFile, error) {
 		requires = detectRequiresFromScripts(scripts)
 	}
 
-	if explicitScope == "project" {
+	if meta.Scope == "project" {
 		for _, sc := range scripts {
 			if sc.Sandbox == "none" {
 				// sc.Name included directly — this error returns from Parse(), not via parseScriptsSection's flush wrapper.
@@ -258,7 +322,7 @@ func parseScriptSubsection(name, content string) (Script, error) {
 		key := strings.TrimSpace(kv[0])
 		val := strings.TrimSpace(kv[1])
 		if !knownMetadataKey[key] {
-			return Script{}, fmt.Errorf("unknown metadata key %q (allowed: kind, runtime, schema, sandbox, timeout)", key)
+			return Script{}, fmt.Errorf("unknown metadata key %q (allowed: kind, runtime, schema, sandbox, allowed_hosts, timeout)", key)
 		}
 		metadata[key] = val
 		metaEnd = i + 1
@@ -330,6 +394,13 @@ func parseScriptSubsection(name, content string) (Script, error) {
 		return Script{}, fmt.Errorf("invalid sandbox %q (allowed: none, standard, strict)", sc.Sandbox)
 	}
 
+	sc.AllowedHosts = SplitHostList(metadata["allowed_hosts"])
+	for _, host := range sc.AllowedHosts {
+		if err := ValidateHost(host); err != nil {
+			return Script{}, fmt.Errorf("script %q: %w", name, err)
+		}
+	}
+
 	if to := strings.TrimSpace(metadata["timeout"]); to != "" {
 		secs, err := strconv.ParseInt(to, 10, 64)
 		if err != nil || secs <= 0 {
@@ -348,6 +419,18 @@ func validateScripts(scripts []Script) error {
 			return fmt.Errorf("duplicate script name %q", sc.Name)
 		}
 		seen[sc.Name] = true
+	}
+	return nil
+}
+
+// ValidateScriptName rejects a script name that no catalog row and no
+// execute_cap call can carry. The alphabet is the parser's own (namePattern), so
+// a CAP.md that parses also saves through the API and vice versa; the gap this
+// closes is the API path, which checked only for emptiness while
+// parseScriptSubsection already refused anything outside the set.
+func ValidateScriptName(name string) error {
+	if !namePattern.MatchString(name) {
+		return fmt.Errorf("invalid script name %q: must match [a-z][a-z0-9_]*", name)
 	}
 	return nil
 }

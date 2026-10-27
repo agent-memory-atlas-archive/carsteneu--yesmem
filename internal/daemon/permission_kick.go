@@ -15,9 +15,14 @@ import (
 // The checker sends a double-enter per the two-connection pattern from
 // handleRelayAgent (bracketed paste swallows \r within a single write).
 //
-// Accepted blast radius (per design decision): scope is ALL agents with a
-// live process, regardless of status ("paused" agents keep getting kicked so
-// a late permission dialog doesn't strand them — Design B, 2026-09-08).
+// Scope (C2): agents in a live status whose PID is *verified* as their own
+// backend process. Design B (2026-09-08) kicked every agent with a live PID
+// "regardless of status" so a late permission dialog could not strand a
+// guard-paused agent — but isPIDAlive alone cannot tell the agent's own process
+// from a zombie or a recycled PID, so agents stopped weeks earlier kept being
+// kicked. The reachability intent survives: paused is still in scope, terminal
+// statuses are not. See isAgentProcess (heartbeat.go).
+//
 // Enter reaches whatever the agent's PTY fronts — an agent inside an
 // interactive child process that reads stdin (build tool prompt, input())
 // has its defaults confirmed on kick. The no-op guarantee only holds for the
@@ -27,6 +32,16 @@ const (
 	defaultPermKickDelay    = 3 * time.Minute // stream-idle before the first kick
 	defaultPermKickInterval = 5 * time.Minute // re-kick interval (flood guard)
 )
+
+// permKickStatuses are the statuses whose process may be kicked: the agent
+// still owns it, so a stalled permission dialog can still be resolved. Terminal
+// statuses (stopped, finished, failed, crashed, error) are out of scope — their
+// PID may already belong to an unrelated process.
+var permKickStatuses = map[string]bool{
+	"running": true,
+	"paused":  true,
+	"pending": true,
+}
 
 // permKickPause separates the two enter connections so the TUI treats them
 // as two keypresses, not one bracketed paste block. Var for testability.
@@ -53,9 +68,9 @@ func resetPermissionKickState() {
 }
 
 // checkPermissionKick is the heartbeat-driven kick for permission-stuck agents.
-// Runs every 30s via h.startAgentHeartbeat. Scope: ALL spawned agents with a
-// live process, regardless of status — a guard-paused agent stuck in a
-// permission dialog would otherwise strand forever.
+// Runs every 30s via h.startAgentHeartbeat. It selects the agents in scope —
+// live status and a verified backend process — and hands each to
+// checkPermissionKickAgent.
 func (h *Handler) checkPermissionKick() {
 	agents, err := h.store.AgentList("")
 	if err != nil {
@@ -63,7 +78,12 @@ func (h *Handler) checkPermissionKick() {
 	}
 	live := make(map[string]bool, len(agents))
 	for _, agent := range agents {
-		if !isPIDAlive(agent.PID) {
+		// Polarity: the kick acts when the process is *not definitively gone*.
+		// Its only action is an Enter keypress into the agent's own socket
+		// (SockPath+".inject"), which a recycled PID cannot redirect into a
+		// stranger's PTY, so a platform that cannot establish identity keeps the
+		// pre-C2 gate (signal 0) instead of losing the kick altogether.
+		if !permKickStatuses[agent.Status] || agentProcessGone(agent) {
 			continue
 		}
 		live[agent.ID] = true
@@ -79,11 +99,10 @@ func (h *Handler) checkPermissionKick() {
 	permKickAgentsMu.Unlock()
 }
 
+// checkPermissionKickAgent evaluates one in-scope agent. The caller verified
+// its status and process identity.
 func (h *Handler) checkPermissionKickAgent(agent storage.Agent) {
-	if agent.SessionID == "" || agent.SockPath == "" {
-		return
-	}
-	if !isPIDAlive(agent.PID) {
+	if agent.SessionID == "" || h.agentInjectPath(agent.ID) == "" {
 		return
 	}
 	if !h.permissionKickEnabled(agent) {
@@ -155,10 +174,10 @@ func (h *Handler) permissionKickEnabled(agent storage.Agent) bool {
 // (confirms "Allow once" in the dialog, no-op on an empty input line),
 // then after a pause another \r in case bracketed paste swallowed the first.
 func (h *Handler) sendPermissionKick(agent storage.Agent) bool {
-	if agent.SockPath == "" {
+	injectPath := h.agentInjectPath(agent.ID)
+	if injectPath == "" {
 		return false
 	}
-	injectPath := agent.SockPath + ".inject"
 
 	conn, err := net.DialTimeout("unix", injectPath, 3*time.Second)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/carsteneu/yesmem/internal/config"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -28,8 +29,19 @@ func Status(dataDir string) error {
 	fmt.Println("YesMem Status")
 	fmt.Println("=============")
 
-	home, _ := os.UserHomeDir()
-	codexState := readCodexConfigState(home)
+	// The Codex and Opencode sections are read from the home directory. Without a
+	// usable one they are reported as unknown instead of being read from a
+	// relative path, which would describe the working directory (YM-350).
+	var codexState codexConfigState
+	var opencodeState opencodeConfigState
+	home, homeErr := UserHome()
+	if homeErr == nil {
+		codexState = readCodexConfigState(home)
+		opencodeState = readOpencodeConfigState(home)
+	} else {
+		fmt.Printf("\nHome directory: unknown (%v)\n", homeErr)
+		fmt.Println("The Codex and Opencode sections cannot be read.")
+	}
 	sessionSources := sessionSourceCounts(store)
 
 	// Projects
@@ -47,21 +59,25 @@ func Status(dataDir string) error {
 		}
 	}
 
-	fmt.Println("\nCodex:")
-	fmt.Printf("  config.toml:     %s\n", statusText(codexState.ConfigPresent, "present", "missing"))
-	fmt.Printf("  provider:        %s\n", statusText(codexState.ProviderConfigured, "configured", "missing"))
-	fmt.Printf("  MCP server:      %s\n", statusText(codexState.MCPConfigured, "configured", "missing"))
-	fmt.Printf("  MCP auto-approve:%s\n", statusText(codexState.ApprovalConfigured, "configured", "missing"))
-	fmt.Printf("  instructions:    %s\n", statusText(codexState.InstructionsReferenced && codexState.InstructionsPresent, "configured", "missing"))
-	fmt.Printf("  proxy /health:   %s\n", statusText(codexProxyReachable(), "reachable", "unreachable"))
+	if homeErr != nil {
+		fmt.Println("\nCodex: unknown")
+	} else {
+		fmt.Println("\nCodex:")
+		fmt.Printf("  config.toml:     %s\n", statusText(codexState.ConfigPresent, "present", "missing"))
+		fmt.Printf("  provider:        %s\n", statusText(codexState.ProviderConfigured, "configured", "missing"))
+		fmt.Printf("  MCP server:      %s\n", statusText(codexState.MCPConfigured, "configured", "missing"))
+		fmt.Printf("  MCP auto-approve:%s\n", statusText(codexState.ApprovalConfigured, "configured", "missing"))
+		fmt.Printf("  instructions:    %s\n", statusText(codexState.InstructionsReferenced && codexState.InstructionsPresent, "configured", "missing"))
+		fmt.Printf("  proxy /health:   %s\n", statusText(codexProxyReachable(), "reachable", "unreachable"))
 
-	opencodeState := readOpencodeConfigState(home)
-	fmt.Println("\nOpencode:")
-	fmt.Printf("  config.json:     %s\n", statusText(opencodeState.ConfigPresent, "present", "missing"))
-	fmt.Printf("  plugin:          %s\n", statusText(opencodeState.PluginConfigured, "configured", "missing"))
-	fmt.Printf("  mcp.yesmem:      %s\n", statusText(opencodeState.MCPConfigured, "configured", "missing"))
-	fmt.Printf("  provider.llm:    %s\n", statusText(opencodeState.ProviderConfigured, "configured", "missing"))
-	fmt.Printf("  compaction.auto: %s\n", statusText(opencodeState.CompactionConfigured, "disabled", "not set"))
+		fmt.Println("\nOpencode:")
+		fmt.Printf("  config.json:     %s\n", statusText(opencodeState.ConfigPresent, "present", "missing"))
+		// Only probe the binary when the config has no plugin entry to go on.
+		fmt.Printf("  plugin:          %s\n", opencodePluginStatusText(opencodeState.PluginConfigured, opencodePluginBuiltin))
+		fmt.Printf("  mcp.yesmem:      %s\n", statusText(opencodeState.MCPConfigured, "configured", "missing"))
+		fmt.Printf("  provider.llm:    %s\n", statusText(opencodeState.ProviderConfigured, "configured", "missing"))
+		fmt.Printf("  compaction.auto: %s\n", statusText(opencodeState.CompactionConfigured, "disabled", "not set"))
+	}
 
 	// Learnings
 	learnings, err := store.GetActiveLearnings("", "", "", "", 0)
@@ -76,13 +92,13 @@ func Status(dataDir string) error {
 		}
 	}
 
-	// Superseded/resolved learnings
-	var supersededCount, resolvedCount, totalLearnings int
-	store.DB().QueryRow(`SELECT COUNT(*) FROM learnings`).Scan(&totalLearnings)
-	store.DB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by > 0`).Scan(&supersededCount)
-	store.DB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by < 0`).Scan(&resolvedCount)
-	if supersededCount > 0 || resolvedCount > 0 {
-		fmt.Printf("\nSuperseded: %d, Resolved: %d, Total: %d\n", supersededCount, resolvedCount, totalLearnings)
+	// Superseded/resolved learnings, read from the same statistics `yesmem stats`
+	// prints. Two surfaces of one quantity must not carry two definitions
+	// (YM-445): the counts, their total and their words come from one place now.
+	if lstats, err := store.GetLearningStatsF(storage.StatsFilter{}); err == nil {
+		if line := supersedeSummaryLine(lstats); line != "" {
+			fmt.Printf("\n%s\n", line)
+		}
 	}
 
 	// Embedding / VectorStore
@@ -116,7 +132,7 @@ func Status(dataDir string) error {
 	fmt.Println("\nPipeline:")
 	var sessTotal, sessExtracted, sessNarrative, sessShort int
 	store.DB().QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&sessTotal)
-	store.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE message_count <= 5`).Scan(&sessShort)
+	store.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE message_count <= ?`, storage.ShortSessionMaxMessages-1).Scan(&sessShort)
 	store.DB().QueryRow(`SELECT COUNT(DISTINCT session_id) FROM learnings WHERE session_id IS NOT NULL AND session_id != ''`).Scan(&sessExtracted)
 	store.DB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE category = 'narrative'`).Scan(&sessNarrative)
 	sessEligible := sessTotal - sessShort
@@ -136,11 +152,16 @@ func Status(dataDir string) error {
 	store.DB().QueryRow(`SELECT COUNT(*) FROM persona_traits`).Scan(&traits)
 	fmt.Printf("  Persona traits:  %d\n", traits)
 
-	var profiles, briefings int
+	var profiles int
 	store.DB().QueryRow(`SELECT COUNT(*) FROM project_profiles`).Scan(&profiles)
-	store.DB().QueryRow(`SELECT COUNT(*) FROM refined_briefings`).Scan(&briefings)
+	// No invented zero: an unreadable count must not read as "cache empty", the
+	// very statement this line exists to get right.
+	briefingCount := "n/a"
+	if freshBriefings, err := store.CountFreshRefinedBriefings(); err == nil {
+		briefingCount = fmt.Sprintf("%d", freshBriefings)
+	}
 	fmt.Printf("  Profiles:        %d\n", profiles)
-	fmt.Printf("  Briefings:       %d\n", briefings)
+	fmt.Printf("  Briefings:       %s\n", briefingCount)
 
 	var docSources, docChunks int
 	store.DB().QueryRow(`SELECT COUNT(*) FROM doc_sources`).Scan(&docSources)
@@ -150,11 +171,17 @@ func Status(dataDir string) error {
 	}
 
 	// Disk usage
+	// The archive can live outside the data dir (paths.archive), so the reported
+	// location comes from the same resolution the daemon uses.
+	appCfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
 	fmt.Println("\nDisk usage:")
 	printSize("  Database", dbPath)
+	// The Bleve index is legacy: nothing writes it any more and yesmem migrate
+	// deletes it. Its size still explains disk usage on installations from
+	// before the switch to SQLite FTS5.
 	printSize("  Bleve index", filepath.Join(dataDir, "bleve-index"))
 	printSize("  Vectors", filepath.Join(dataDir, "vectors"))
-	printSize("  Archive", filepath.Join(dataDir, "archive"))
+	printSize("  Archive", appCfg.ArchiveDir(dataDir))
 
 	// Live MCP helpers — one per connected client session. Orphans and stale
 	// binaries point at clients that died without closing stdin.
@@ -165,6 +192,21 @@ func Status(dataDir string) error {
 	}
 
 	return nil
+}
+
+// supersedeSummaryLine renders the retirement line of the status output from the
+// shared statistics. `yesmem stats` prints the same fields of the same struct,
+// so the two surfaces cannot report one quantity as two different numbers
+// (YM-445). An empty string means there is nothing to report.
+func supersedeSummaryLine(st *storage.LearningStats) string {
+	if st == nil {
+		return ""
+	}
+	if st.SupersededCount == 0 && st.DeletedPredecessorCount == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Superseded: %d (%d replaced, %d retired), deleted predecessor: %d, Total: %d",
+		st.SupersededCount, st.ReplacedCount, st.RetiredCount, st.DeletedPredecessorCount, st.TotalCount)
 }
 
 func statusDatePrefix(value string) string {
@@ -240,6 +282,25 @@ func statusText(ok bool, yes, no string) string {
 		return yes
 	}
 	return no
+}
+
+// opencodePluginStatusText names where the plugin comes from. A build that
+// carries the plugin itself needs no external copy (setup skips it), so
+// "missing" would be wrong there. The probe is passed in and runs only when the
+// config has no plugin entry: it reads the opencode binary, which is not free.
+//
+// The answer is scoped to the probed file on purpose. One home has one plugin
+// directory, so setup cannot act on a second build and the status line cannot
+// check one; naming the probe and its limit is all this line can honestly
+// claim about the build that runs.
+func opencodePluginStatusText(configured bool, builtin func() (string, bool)) string {
+	if configured {
+		return "configured"
+	}
+	if bin, ok := builtin(); ok {
+		return "built into " + setupLogText(bin) + " (probed binary, not necessarily the running build)"
+	}
+	return "missing"
 }
 
 func sessionSourceCounts(store *storage.Store) map[string]int {

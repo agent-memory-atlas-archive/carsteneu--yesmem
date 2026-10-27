@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +23,9 @@ import (
 // Runs as Phase 4.5 between Narratives and Profiles.
 // Embeddings are read from the VectorStore — no on-the-fly computation.
 // If vecStore is nil or empty, clustering is skipped.
-// Uses ProjectChangeFingerprint for change detection — skips projects with unchanged learnings.
+// Operates on one group per repository: the worktree copies of one repository
+// form one group, so their learnings land in one cluster set and each cluster is
+// labelled once. Uses the cluster fingerprint for change detection.
 func ClusterLearnings(store *storage.Store, client extraction.LLMClient, vecStore *embedding.VectorStore) {
 	if vecStore == nil || vecStore.Count() == 0 {
 		log.Printf("  Clustering: skipped (no embeddings in vector store)")
@@ -37,22 +40,37 @@ func ClusterLearnings(store *storage.Store, client extraction.LLMClient, vecStor
 
 	skipped := 0
 	clustered := 0
-	for _, p := range projects {
-		if p.SessionCount < 3 {
+	for _, p := range storage.GroupByCanonicalProject(projects) {
+		if p.Sessions < 3 {
 			continue
 		}
-		// Change detection: compare DB fingerprint with stored cluster hash
-		fingerprint := store.ProjectChangeFingerprint(p.ProjectShort)
-		storedHash, _ := store.GetClusterHash(p.ProjectShort)
-		if storedHash == fingerprint {
+		// A group whose key is no repository path (a legacy bare name) has no cluster
+		// key to write: the writer refuses it (YM-424). Clustering it would relabel the
+		// same learnings on every run without ever converging, so it is skipped once.
+		if models.ClusterProjectKey(p.ClusterKey) == "" {
 			skipped++
 			continue
 		}
-		if err := clusterProjectLearnings(store, client, vecStore, p.ProjectShort); err != nil {
-			log.Printf("warn: cluster %s: %v", p.ProjectShort, err)
+		// Change detection: compare the learning-set fingerprint with the stored hash
+		fingerprint, fpErr := store.ClusterChangeFingerprint(p.Canonical)
+		if fpErr != nil {
+			// Fail open: cluster anyway, but do not store a hash that would make
+			// the next run believe the project is up to date.
+			log.Printf("warn: cluster fingerprint %s: %v", p.ClusterKey, fpErr)
+			fingerprint = ""
+		}
+		storedHash, _ := store.GetClusterHash(p.ClusterKey)
+		if fingerprint != "" && storedHash == fingerprint {
+			skipped++
 			continue
 		}
-		store.SetClusterHash(p.ProjectShort, fingerprint)
+		if err := clusterProjectLearnings(store, client, vecStore, p.Canonical, p.ClusterKey); err != nil {
+			log.Printf("warn: cluster %s: %v", p.ClusterKey, err)
+			continue
+		}
+		if fingerprint != "" {
+			store.SetClusterHash(p.ClusterKey, fingerprint)
+		}
 		clustered++
 	}
 	if skipped > 0 {
@@ -60,40 +78,90 @@ func ClusterLearnings(store *storage.Store, client extraction.LLMClient, vecStor
 	}
 }
 
-func clusterProjectLearnings(store *storage.Store, client extraction.LLMClient, vecStore *embedding.VectorStore, project string) error {
+// learningBelongsToClusterKey reports whether a learning written in project is a
+// member of the repository whose cluster rows live under clusterKey. The scope of
+// the learnings query is the canonical basename, so two checkouts named "repo"
+// return each other's rows; the cluster rows are keyed per project path, so the
+// membership follows the path the learning was written in (worktrees folded onto
+// their repository, which is exactly what the key does). A row whose project is a
+// legacy short name carries no path, cannot be placed, and stays in the basename
+// scope, which is the fallback the cluster key uses for a bare name.
+func learningBelongsToClusterKey(project, clusterKey string) bool {
+	if project == "" || !filepath.IsAbs(project) || !filepath.IsAbs(clusterKey) {
+		return true
+	}
+	return models.ClusterProjectKey(project) == clusterKey
+}
+
+// capClusterable trims the learning set to the clustering budget by taking an
+// even stride over the population, ordered by ID. A hit-count head would only
+// cluster the learnings that were already surfaced, so the tail never reached
+// the three-member floor that distillation and recurrence require.
+func capClusterable(learnings []models.Learning, limit int) []models.Learning {
+	if limit <= 0 || len(learnings) <= limit {
+		return learnings
+	}
+	sort.Slice(learnings, func(i, j int) bool { return learnings[i].ID < learnings[j].ID })
+	step := float64(len(learnings)) / float64(limit)
+	sampled := make([]models.Learning, limit)
+	for i := 0; i < limit; i++ {
+		// Centered grid: anchoring at index 0 would drop the newest tail every
+		// time, and the newest learnings are what recurrence looks for.
+		sampled[i] = learnings[int((float64(i)+0.5)*step)]
+	}
+	return sampled
+}
+
+// clusterProjectLearnings clusters the learnings of one repository. project is the
+// learnings scope (the canonical basename on the learning rows), clusterKey the key
+// its cluster rows live under. The two differ whenever two project paths share a
+// basename (two checkouts named "repo") or when a directory inside a checkout has
+// its own scope; the membership is resolved per learning through
+// models.ClusterProjectKey, so a key only ever holds its own scope's learnings.
+func clusterProjectLearnings(store *storage.Store, client extraction.LLMClient, vecStore *embedding.VectorStore, project, clusterKey string) error {
 	// Get all active learnings for project (excluding narrative, unfinished)
 	learnings, err := store.GetActiveLearnings("", project, "", "", 0)
-	if err != nil || len(learnings) < 5 {
-		return nil // Not enough to cluster
+	if err != nil {
+		return nil
+	}
+	if len(learnings) < 5 {
+		// Too few to cluster, so no cluster set is the truthful answer, and the rows
+		// on record have to match it. Leaving them would keep a set that was built
+		// before the membership was narrowed, still serving learnings this
+		// repository does not own.
+		return store.ReplaceLearningClusters(clusterKey, nil)
 	}
 
-	// Filter to clusterworthy categories
+	// Filter to clusterworthy categories. recurrence_alert and narrative are
+	// derived rows: clustering them would feed meta text back into distillation
+	// and shift cluster membership on every alert. Global learnings
+	// (canonical_project = '') belong to no repository: GetActiveLearnings returns
+	// them for every project, so leaving them in would make one learning a member
+	// of each project's cluster set and inflate every cluster by the same rows.
 	var clusterable []models.Learning
 	for _, l := range learnings {
+		if l.CanonicalProject == "" {
+			continue
+		}
 		switch l.Category {
-		case "narrative", "unfinished", "strategic":
+		case "narrative", "unfinished", "strategic", "recurrence_alert":
+			continue
+		}
+		if !learningBelongsToClusterKey(l.Project, clusterKey) {
 			continue
 		}
 		clusterable = append(clusterable, l)
 	}
 
 	if len(clusterable) < 5 {
-		return nil
+		return store.ReplaceLearningClusters(clusterKey, nil)
 	}
 
 	// Cap at 300 to avoid O(n³) freeze with large projects
 	const maxClusterable = 300
 	if len(clusterable) > maxClusterable {
-		// Sort by relevance: hit_count desc, then recency desc
-		sort.Slice(clusterable, func(i, j int) bool {
-			hi, hj := clusterable[i].HitCount, clusterable[j].HitCount
-			if hi != hj {
-				return hi > hj
-			}
-			return clusterable[i].CreatedAt.After(clusterable[j].CreatedAt)
-		})
 		log.Printf("  Clustering: capping %d → %d learnings for %s", len(clusterable), maxClusterable, project)
-		clusterable = clusterable[:maxClusterable]
+		clusterable = capClusterable(clusterable, maxClusterable)
 	}
 
 	// Build documents using pre-computed embeddings from VectorStore
@@ -125,6 +193,12 @@ func clusterProjectLearnings(store *storage.Store, client extraction.LLMClient, 
 	}
 
 	if len(docs) < 5 {
+		// Not enough with embeddings. The set on record is deliberately KEPT here: what
+		// is missing is an embedding, not a learning. Replacing it with an empty set
+		// would erase a valid cluster set on every backfill in progress and on every
+		// provider change, and the rows would come back one run later with different
+		// labels. A membership that really shrank is caught above (len(clusterable) < 5),
+		// which is the branch that clears the rows.
 		return nil // Not enough with embeddings
 	}
 
@@ -173,7 +247,7 @@ func clusterProjectLearnings(store *storage.Store, client extraction.LLMClient, 
 		}
 
 		dbClusters = append(dbClusters, models.LearningCluster{
-			Project:        project,
+			Project:        clusterKey,
 			Label:          label,
 			LearningCount:  len(c.Documents),
 			AvgRecencyDays: avgRecency,
@@ -183,7 +257,7 @@ func clusterProjectLearnings(store *storage.Store, client extraction.LLMClient, 
 		})
 	}
 
-	return store.ReplaceLearningClusters(project, dbClusters)
+	return store.ReplaceLearningClusters(clusterKey, dbClusters)
 }
 
 // labelCluster generates a short German label for a cluster.

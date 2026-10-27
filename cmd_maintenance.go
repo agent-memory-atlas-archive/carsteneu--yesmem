@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,8 +19,21 @@ import (
 	"github.com/carsteneu/yesmem/internal/embedding"
 	"github.com/carsteneu/yesmem/internal/extraction"
 	"github.com/carsteneu/yesmem/internal/models"
+	"github.com/carsteneu/yesmem/internal/sanitize"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
+
+// redacted wraps a provider client in the secret redactor when
+// secrets_sanitization.enabled is on. Package main builds its own clients — the
+// factory in internal/daemon/llm_client_factory.go covers the daemon paths only —
+// so without this the maintenance commands would send raw session text to the
+// provider. runQuickstart's pair is wrapped inside daemon.RunQuickstart.
+func redacted(cfg *config.Config, c extraction.LLMClient) extraction.LLMClient {
+	if cfg == nil || c == nil || !cfg.SecretsSanitization.Enabled {
+		return c
+	}
+	return extraction.NewSanitizingClient(c, sanitize.NewSecretRedactor(cfg.SecretsSanitization.AllowedExceptions))
+}
 
 func runReextract() {
 	dataDir := yesmemDataDir()
@@ -84,13 +98,14 @@ func runReextract() {
 	if err != nil {
 		log.Fatalf("LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 
 	// Respect extraction mode from config (two-pass vs single-pass)
 	var ext extraction.SessionExtractor
 	if cfg.Extraction.Mode == "two-pass" {
 		extractClient, qErr := extraction.NewLLMClient(cfg.LLM.Provider, apiKey, cfg.QualityModelID(), cfg.LLM.ClaudeBinary, cfg.ResolvedOpenAIBaseURL())
 		if qErr == nil && extractClient != nil {
-			ext = extraction.NewTwoPassExtractor(client, extractClient, store)
+			ext = extraction.NewTwoPassExtractor(client, redacted(cfg, extractClient), store)
 			fmt.Fprintf(os.Stderr, "Mode: two-pass (summarize=%s, extract=%s)\n", client.Model(), extractClient.Model())
 		} else {
 			ext = extraction.NewExtractor(client, store)
@@ -100,6 +115,7 @@ func runReextract() {
 		ext = extraction.NewExtractor(client, store)
 		fmt.Fprintf(os.Stderr, "Mode: single-pass (%s)\n", client.Model())
 	}
+	ext.SetChunkSize(cfg.Extraction.ChunkSize)
 
 	workers := 3
 	if client.Name() == "cli" {
@@ -324,9 +340,377 @@ func runResolveStale() {
 
 	fmt.Fprintf(os.Stderr, "\nMarked %d items as stale (>30 days old).\n", len(staleIDs))
 
-	// Regenerate MEMORY.md
-	daemon.GenerateAllMemoryMDs(store)
+	// Regenerate MEMORY.md. The Claude projects directory comes from the
+	// configuration, the same path the running daemon uses.
+	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
+	daemon.GenerateAllMemoryMDs(store, cfg.ClaudeProjectsDir())
 	fmt.Fprintf(os.Stderr, "MEMORY.md updated.\n")
+}
+
+// runRestoreShortSessionLearnings reports the learnings that a cleanup discarded
+// although the user stated them, and reactivates them on request. Two cleanup
+// classes are covered: the short-session rule and the junk cleanup. Listing runs
+// on a read-only connection; --apply and --ids are the only writers, and they
+// write only rows of the damaged classes.
+func runRestoreShortSessionLearnings() {
+	dataDir := yesmemDataDir()
+
+	fs := flag.NewFlagSet("restore-short-session-learnings", flag.ExitOnError)
+	apply := fs.Bool("apply", false, "reactivate every listed learning")
+	idsFlag := fs.String("ids", "", "comma-separated learning ids to reactivate (implies --apply)")
+	limit := fs.Int("limit", 0, "list at most N learnings per cleanup class (0: all)")
+	fs.Parse(os.Args[2:])
+
+	var ids []int64
+	if *idsFlag != "" {
+		var err error
+		ids, err = parseLearningIDs(*idsFlag)
+		if err != nil {
+			log.Fatalf("--ids: %v", err)
+		}
+		*apply = true
+	}
+
+	dbPath := filepath.Join(dataDir, "yesmem.db")
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		fmt.Fprintf(os.Stderr, "No yesmem database at %s. Nothing to inspect.\n", dbPath)
+		return
+	}
+	var store *storage.Store
+	var err error
+	if *apply {
+		store, err = storage.Open(dbPath)
+	} else {
+		store, err = storage.OpenReadOnly(dbPath)
+	}
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	// printClass lists one cleanup class, so the operator can tell the reasons
+	// apart before deciding what to restore.
+	printClass := func(label string, rows []models.Learning) {
+		if len(rows) == 0 {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "%d learnings were discarded by the %s cleanup although the user stated them:\n\n", len(rows), label)
+		for _, l := range rows {
+			session := l.SessionID
+			if session == "" {
+				session = "no session"
+			}
+			fmt.Fprintf(os.Stderr, "  #%d %s %s (%s) %s\n",
+				l.ID, clipText(l.Source, 14), l.CreatedAt.Format("2006-01-02"),
+				clipText(session, 40), clipText(l.Content, 100))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+
+	if !*apply {
+		foundShort, err := store.FindWronglySupersededShortSessionLearnings(*limit)
+		if err != nil {
+			log.Fatalf("find wrongly superseded: %v", err)
+		}
+		foundJunk, err := store.FindWronglySupersededJunkLearnings(*limit)
+		if err != nil {
+			log.Fatalf("find wrongly superseded junk learnings: %v", err)
+		}
+		if len(foundShort)+len(foundJunk) == 0 {
+			fmt.Fprintln(os.Stderr, "No learnings were wrongly superseded by a cleanup.")
+			return
+		}
+		printClass("short-session", foundShort)
+		printClass("junk", foundJunk)
+		fmt.Fprintln(os.Stderr, "Nothing restored. Run again with --apply or --ids 1,2,3 once the list is reviewed.")
+		return
+	}
+
+	if len(ids) == 0 {
+		foundShort, err := store.FindWronglySupersededShortSessionLearnings(*limit)
+		if err != nil {
+			log.Fatalf("find wrongly superseded: %v", err)
+		}
+		foundJunk, err := store.FindWronglySupersededJunkLearnings(*limit)
+		if err != nil {
+			log.Fatalf("find wrongly superseded junk learnings: %v", err)
+		}
+		for _, l := range foundShort {
+			ids = append(ids, l.ID)
+		}
+		for _, l := range foundJunk {
+			ids = append(ids, l.ID)
+		}
+	}
+	if len(ids) == 0 {
+		fmt.Fprintln(os.Stderr, "Nothing to restore.")
+		return
+	}
+
+	// A repeated id would otherwise read as an unrestored remainder.
+	seenID := make(map[int64]bool, len(ids))
+	unique := ids[:0]
+	for _, id := range ids {
+		if !seenID[id] {
+			seenID[id] = true
+			unique = append(unique, id)
+		}
+	}
+	ids = unique
+
+	restoredShort, err := store.RestoreWronglySupersededShortSessionLearnings(ids)
+	if err != nil {
+		log.Fatalf("restore: %v", err)
+	}
+	restoredJunk, err := store.RestoreWronglySupersededJunkLearnings(ids)
+	if err != nil {
+		log.Fatalf("restore junk victims: %v", err)
+	}
+	restored := restoredShort + restoredJunk
+	fmt.Fprintf(os.Stderr, "Restored %d of %d learnings.\n", restored, len(ids))
+	if restored < int64(len(ids)) {
+		fmt.Fprintln(os.Stderr, "The remainder does not match the damaged classes (a cleanup reason plus a user-stated source) and stays superseded.")
+	}
+	fmt.Fprintln(os.Stderr, "Restored learnings are searchable immediately; with embedding.search.method: ivf the daemon rebuilds its vector index only on restart.")
+}
+
+// runRestoreRuleBasedLearnings reports the learnings that the rule-based dedup
+// displaced although the user owns them, and reactivates them on request. The
+// dedup leaves two shapes of damage behind, and each one has its own listing and
+// its own apply: a row that lost against a displacer, and a row the
+// substance-free retire discarded (sentinel 0, no successor at all, YM-467). Dry
+// run by default: the listing runs on a read-only connection, and --apply /
+// --apply-no-displacer (or their id lists) are the only writers. No scheduler, no
+// background run: this is a decision someone reviews, not a job that fires.
+//
+// Restoring the no-successor class can bring back rows whose content is
+// junk-shaped ("[retired #123]"), because the class is defined by the sentinel
+// and the source, not by the content, and no cleanup removes a user-owned row
+// any more. That is the operator's decision, which is why every row is listed
+// with its source and its reason before anything is written.
+func runRestoreRuleBasedLearnings() {
+	dataDir := yesmemDataDir()
+
+	fs := flag.NewFlagSet("restore-rulebased-learnings", flag.ExitOnError)
+	apply := fs.Bool("apply", false, "reactivate every listed learning of the displacer class")
+	idsFlag := fs.String("ids", "", "comma-separated learning ids of the displacer class to reactivate (implies --apply)")
+	applyNoDisplacer := fs.Bool("apply-no-displacer", false, "reactivate every listed learning of the no-successor class")
+	noDisplacerIDsFlag := fs.String("no-displacer-ids", "", "comma-separated learning ids of the no-successor class to reactivate (implies --apply-no-displacer)")
+	limit := fs.Int("limit", 0, "list at most N candidates per class; the whole damaged class is scanned either way")
+	fs.Parse(os.Args[2:])
+
+	var ids, noDisplacerIDs []int64
+	if *idsFlag != "" {
+		var err error
+		ids, err = parseLearningIDs(*idsFlag)
+		if err != nil {
+			log.Fatalf("--ids: %v", err)
+		}
+		*apply = true
+	}
+	if *noDisplacerIDsFlag != "" {
+		var err error
+		noDisplacerIDs, err = parseLearningIDs(*noDisplacerIDsFlag)
+		if err != nil {
+			log.Fatalf("--no-displacer-ids: %v", err)
+		}
+		*applyNoDisplacer = true
+	}
+
+	dbPath := filepath.Join(dataDir, "yesmem.db")
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		fmt.Fprintf(os.Stderr, "No yesmem database at %s. Nothing to inspect.\n", dbPath)
+		return
+	}
+	var store *storage.Store
+	var err error
+	if *apply || *applyNoDisplacer {
+		store, err = storage.Open(dbPath)
+	} else {
+		store, err = storage.OpenReadOnly(dbPath)
+	}
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	scan, err := store.FindRuleBasedSupersededUserLearnings(*limit)
+	if err != nil {
+		log.Fatalf("find rule-based superseded: %v", err)
+	}
+
+	// noSuccessor switches the headline and the per-row line: the no-successor
+	// class has no displacer to name, so printing one would be a lie.
+	printVictims := func(victims []storage.RuleBasedSupersedeVictim, noSuccessor bool) {
+		if len(victims) == 0 {
+			return
+		}
+		if noSuccessor {
+			fmt.Fprintf(os.Stderr, "%d user-owned learnings were retired as substance-free with no successor at all:\n\n", len(victims))
+		} else {
+			fmt.Fprintf(os.Stderr, "%d learnings were displaced by the rule-based dedup although the user owns them:\n\n", len(victims))
+		}
+		for _, v := range victims {
+			if v.DisplacerID <= 0 {
+				fmt.Fprintf(os.Stderr, "  #%d %s %s no displacer %s | %s\n",
+					v.ID, clipText(v.Source, 14), v.CreatedAt.Format("2006-01-02"),
+					clipText(v.Reason, 46), clipText(v.Content, 60))
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "  #%d %s %s displacer=#%d (%s) %s\n",
+				v.ID, clipText(v.Source, 14), v.CreatedAt.Format("2006-01-02"),
+				v.DisplacerID, clipText(v.DisplacerSource, 14), clipText(v.Reason, 46))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+
+	// Every excluded class is named with its count. The dry run is the only
+	// surface the operator decides on, so a report that lists the candidates and
+	// drops the rest silently would read as the whole damage.
+	reportSkipped := func(sc *storage.RuleBasedSupersedeScan) {
+		if sc.Skipped() == 0 {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "%d user-owned learnings with a rule-based reason stay superseded:\n", sc.Skipped())
+		if sc.SkippedHighTrustDisplacer > 0 {
+			fmt.Fprintf(os.Stderr, "  %d: their displacer is user-owned too, which makes it a legitimate supersede chain\n", sc.SkippedHighTrustDisplacer)
+		}
+		if sc.SkippedInactiveDisplacer > 0 {
+			fmt.Fprintf(os.Stderr, "  %d: their displacer was itself replaced, has expired, or no longer exists\n", sc.SkippedInactiveDisplacer)
+		}
+		if sc.SkippedSentinel > 0 {
+			fmt.Fprintf(os.Stderr, "  %d: retired with a negative sentinel instead of a successor (a cleanup, a resolve, or a deleted successor), so the reason still says why\n", sc.SkippedSentinel)
+		}
+		if sc.SkippedEmptyContent > 0 {
+			fmt.Fprintf(os.Stderr, "  %d: their content is empty\n", sc.SkippedEmptyContent)
+		}
+		if sc.UnlistedByLimit > 0 {
+			fmt.Fprintf(os.Stderr, "  %d: beyond the --limit\n", sc.UnlistedByLimit)
+		}
+		fmt.Fprintln(os.Stderr, "This command clears none of them; each class needs its own decision.")
+	}
+
+	if !*apply && !*applyNoDisplacer {
+		if len(scan.Victims) == 0 && len(scan.NoDisplacer) == 0 && scan.Skipped() == 0 {
+			fmt.Fprintln(os.Stderr, "No user-owned learning carries a rule-based reason. Nothing to repair.")
+			return
+		}
+		printVictims(scan.Victims, false)
+		printVictims(scan.NoDisplacer, true)
+		if len(scan.Victims) > 0 || len(scan.NoDisplacer) > 0 {
+			fmt.Fprintln(os.Stderr, "Nothing restored. Run again with --apply (displacer class) or --apply-no-displacer (no-successor class) once the list is reviewed.")
+		}
+		reportSkipped(scan)
+		return
+	}
+
+	// applyClass writes one class: its own id list, its own re-check in the
+	// storage layer, its own listing as the record of what the write clears. The
+	// listing is printed before the write and is built from the ids that are
+	// really written: an id the operator added by hand is not part of the
+	// candidate list and must not appear as if it were.
+	applyClass := func(label string, classIDs []int64, candidates []storage.RuleBasedSupersedeVictim,
+		noSuccessor bool, restore func([]int64) (int64, error)) int64 {
+		if len(classIDs) == 0 {
+			for _, v := range candidates {
+				classIDs = append(classIDs, v.ID)
+			}
+		}
+		if len(classIDs) == 0 {
+			fmt.Fprintf(os.Stderr, "Nothing to restore in the %s class.\n", label)
+			return 0
+		}
+
+		// A repeated id would otherwise read as an unrestored remainder.
+		seenID := make(map[int64]bool, len(classIDs))
+		unique := classIDs[:0]
+		for _, id := range classIDs {
+			if !seenID[id] {
+				seenID[id] = true
+				unique = append(unique, id)
+			}
+		}
+		classIDs = unique
+
+		known := make(map[int64]storage.RuleBasedSupersedeVictim, len(candidates))
+		for _, v := range candidates {
+			known[v.ID] = v
+		}
+		chosen := make([]storage.RuleBasedSupersedeVictim, 0, len(classIDs))
+		for _, id := range classIDs {
+			if v, ok := known[id]; ok {
+				chosen = append(chosen, v)
+			}
+		}
+		printVictims(chosen, noSuccessor)
+		if outside := len(classIDs) - len(chosen); outside > 0 {
+			fmt.Fprintf(os.Stderr, "%d of the %d given ids are not candidates of the %s class; the update leaves them superseded.\n\n", outside, len(classIDs), label)
+		}
+
+		restored, err := restore(classIDs)
+		if err != nil {
+			log.Fatalf("restore the %s class: %v", label, err)
+		}
+		fmt.Fprintf(os.Stderr, "Restored %d of %d learnings of the %s class.\n", restored, len(classIDs), label)
+		displacerNote := ", an active displacer"
+		if noSuccessor {
+			displacerNote = ""
+		}
+		if restored < int64(len(classIDs)) {
+			fmt.Fprintf(os.Stderr, "The remainder no longer matches the %s class (a rule-based reason, a user-owned source, non-empty content%s) and stays superseded.\n",
+				label, displacerNote)
+		}
+		return restored
+	}
+
+	var restored int64
+	if *apply {
+		restored += applyClass("displacer", ids, scan.Victims, false, store.RestoreRuleBasedSupersededUserLearnings)
+	}
+	if *applyNoDisplacer {
+		restored += applyClass("no-successor", noDisplacerIDs, scan.NoDisplacer, true, store.RestoreRuleBasedSupersededUserLearningsNoDisplacer)
+	}
+
+	// A --limit or an interrupted run leaves candidates behind, and the class the
+	// run did not ask for stays as it is either way. Both are reported from a
+	// fresh scan: the pre-write one would name rows this run just restored.
+	after, err := store.FindRuleBasedSupersededUserLearnings(0)
+	if err != nil {
+		log.Fatalf("find rule-based superseded after the restore: %v", err)
+	}
+	if n := len(after.Victims); n == 1 {
+		fmt.Fprintln(os.Stderr, "1 displacer candidate is still listed; run the dry run again to see it, or --apply to restore it.")
+	} else if n > 1 {
+		fmt.Fprintf(os.Stderr, "%d displacer candidates are still listed; run the dry run again to see them, or --apply to restore them.\n", n)
+	}
+	if n := len(after.NoDisplacer); n == 1 {
+		fmt.Fprintln(os.Stderr, "1 no-successor candidate is still listed; run the dry run again to see it, or --apply-no-displacer to restore it.")
+	} else if n > 1 {
+		fmt.Fprintf(os.Stderr, "%d no-successor candidates are still listed; run the dry run again to see them, or --apply-no-displacer to restore them.\n", n)
+	}
+	reportSkipped(after)
+	if restored > 0 {
+		fmt.Fprintln(os.Stderr, "Restored learnings are searchable in the BM25 and vector lanes immediately; the anticipated-query lane sees them again only after a re-embed. With embedding.search.method: ivf the daemon rebuilds its vector index only on restart.")
+	}
+}
+
+func parseLearningIDs(raw string) ([]int64, error) {
+	var ids []int64
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("not a learning id: %q", part)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no ids given")
+	}
+	return ids, nil
 }
 
 func runResolveCheck() {
@@ -343,40 +727,34 @@ func runResolveCheck() {
 	}
 	defer store.Close()
 
-	// Extract significant keywords from commit message (skip common prefixes)
-	// e.g. "NEW: unfinished TTL filter" → search for "unfinished TTL filter"
-	query := stripCommitPrefix(commitMsg)
-	if len(query) < 5 {
-		return // Too short to match meaningfully
-	}
-
-	matches, err := store.SearchUnfinished(query, "")
-	if err != nil || len(matches) == 0 {
-		return // No candidates, exit silently
-	}
-
-	// For now: resolve the best match directly if keyword match is strong
-	// (single word matches multiple words in content = good signal)
-	// Future: add Haiku LLM confirmation for ambiguous cases
-	best := matches[0]
-
-	reason := fmt.Sprintf("git commit: %s", commitMsg)
-	if len(reason) > 200 {
-		reason = reason[:200]
-	}
-
-	if err := store.ResolveLearning(best.ID, reason); err != nil {
-		log.Printf("resolve-check: could not resolve #%d: %v", best.ID, err)
+	// The same message the hook and the plugin send: the decision layer knows how
+	// to read a subject, and a local prefix rewrite would make the CLI disagree
+	// with the other two entry points about the same commit.
+	// Same scope as the hook: a git hook runs with cwd = repository, and an empty
+	// project would be an unscoped lookup.
+	project, _ := os.Getwd()
+	decision, err := store.ResolveCommit(commitMsg, project)
+	if err != nil {
+		log.Printf("resolve-check: %v", err)
 		return
 	}
+	if decision.Target == nil {
+		// Nothing is resolved when the subject references nothing or references too
+		// much. The reason goes to stderr so a no-op stays explainable.
+		if decision.Reason != "" {
+			fmt.Fprintf(os.Stderr, "resolve-check: no resolution: %s\n", decision.Reason)
+		}
+		return
+	}
+	best := decision.Target
 
 	fmt.Fprintf(os.Stderr, "resolve-check: resolved #%d (%s) via commit: %s\n", best.ID, best.Content, commitMsg)
 
-	// Update MEMORY.md
-	daemon.GenerateAllMemoryMDs(store)
+	// Update MEMORY.md, in the Claude projects directory the configuration names.
+	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
+	daemon.GenerateAllMemoryMDs(store, cfg.ClaudeProjectsDir())
 }
 
-// stripCommitPrefix removes conventional commit prefixes like "NEW:", "FIX:", "UPD:" etc.
 func stripCommitPrefix(msg string) string {
 	prefixes := []string{
 		"NEW:", "FIX:", "UPD:", "FEAT:", "REFACTOR:", "CHORE:", "DOC:", "TEST:",
@@ -457,6 +835,7 @@ func runBackfillFlavor() {
 	if err != nil {
 		log.Fatalf("LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 
 	const flavorPrompt = `Du bist ein Session-Analyst. Du bekommst eine Transkription einer Programmier-Session.
 
@@ -696,4 +1075,79 @@ func truncID(id string) string {
 		return id[:8]
 	}
 	return id
+}
+
+// runPendingConfirmation lists the learnings parked in the retired
+// "pending_confirmation" status so the historical conflicts can be sifted by
+// hand (Decision D6). Nothing is rewritten automatically.
+func runPendingConfirmation() {
+	dataDir := yesmemDataDir()
+
+	fs := flag.NewFlagSet("pending-confirmation", flag.ExitOnError)
+	project := fs.String("project", "", "filter by project")
+	fs.StringVar(project, "p", "", "filter by project (short)")
+	limit := fs.Int("limit", storage.PendingConfirmationListLimit, "max rows")
+	fs.IntVar(limit, "l", storage.PendingConfirmationListLimit, "max rows (short)")
+	asJSON := fs.Bool("json", false, "print JSON")
+	fs.Parse(os.Args[2:])
+
+	store, err := storage.Open(filepath.Join(dataDir, "yesmem.db"))
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	learnings, total, err := store.GetPendingConfirmationLearnings(*project, *limit)
+	if err != nil {
+		log.Fatalf("query pending confirmation: %v", err)
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(map[string]any{
+			"total":     total,
+			"shown":     len(learnings),
+			"learnings": learnings,
+		}); err != nil {
+			log.Fatalf("encode: %v", err)
+		}
+		return
+	}
+
+	if total == 0 {
+		fmt.Fprintln(os.Stderr, "No active learnings in the retired pending_confirmation status.")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%d of %d active learning(s) carry the retired pending_confirmation status.\n\n", len(learnings), total)
+	for _, l := range learnings {
+		proj := l.Project
+		if proj == "" {
+			proj = "(global)"
+		}
+		fmt.Printf("#%-6d %-28s %-14s %-14s %s\n", l.ID, clipText(proj, 28), clipText(l.Category, 14), clipText(l.Source, 14), clipText(l.Content, 120))
+	}
+	if len(learnings) < total {
+		fmt.Fprintf(os.Stderr, "\n... %d more not shown — raise --limit to see them.\n", total-len(learnings))
+	}
+	fmt.Fprintln(os.Stderr, "\nThe status is no longer written (Decision D6). These rows carry no recorded counterpart, so decide per row: supersede the outdated one, or link the pair explicitly (relate_learnings).")
+}
+
+// clipText trims stored content for terminal display and replaces control
+// characters, so escape sequences from ingested text cannot reach the terminal.
+func clipText(s string, max int) string {
+	var b strings.Builder
+	count := 0
+	for _, r := range strings.TrimSpace(s) {
+		if count >= max {
+			b.WriteRune('…')
+			break
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			r = ' '
+		}
+		b.WriteRune(r)
+		count++
+	}
+	return b.String()
 }

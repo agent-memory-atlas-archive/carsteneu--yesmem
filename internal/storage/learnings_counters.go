@@ -123,7 +123,7 @@ func (s *Store) IncrementMatchCounts(ids []int64) error {
 // Used as a fast check to decide whether to inject the open work reminder instruction.
 func (s *Store) CountActiveUnfinished(project string) (int, error) {
 	var count int
-	err := s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE category = 'unfinished' AND superseded_by IS NULL AND (expires_at IS NULL OR expires_at > ?) AND (project = ? OR project IS NULL OR project = '')`, fmtTime(time.Now()), project).Scan(&count)
+	err := s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE category = 'unfinished' AND `+models.RecallableLearningSQL+` AND (expires_at IS NULL OR julianday(expires_at) > julianday(?)) AND (project = ? OR project IS NULL OR project = '')`, fmtTime(time.Now()), project).Scan(&count)
 	return count, err
 }
 
@@ -300,7 +300,7 @@ func (s *Store) CountAutoCorrectGenerations(capName string, since time.Time) (in
 		`SELECT COUNT(*) FROM learnings
 		 WHERE source IN ('auto_correct_accepted', 'auto_correct_proposal')
 		   AND trigger_rule IN (?, ?)
-		   AND created_at >= ?`,
+		   AND julianday(created_at) >= julianday(?)`,
 		"cap:"+capName,
 		"cap_proposed:"+capName,
 		fmtTime(since),

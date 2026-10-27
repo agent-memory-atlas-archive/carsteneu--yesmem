@@ -24,7 +24,8 @@ func testDBWithVectors(t *testing.T, dim int, vecs map[uint64][]float32) *sql.DB
 		category TEXT NOT NULL DEFAULT '',
 		project TEXT NOT NULL DEFAULT '',
 		embedding_vector BLOB,
-		superseded_by INTEGER
+		superseded_by INTEGER,
+		quarantined_at TEXT
 	)`)
 
 	for id, vec := range vecs {
@@ -97,6 +98,47 @@ func TestBuildAndSearch(t *testing.T) {
 	}
 	if results[0].Similarity < 0.99 {
 		t.Errorf("expected high similarity, got %f", results[0].Similarity)
+	}
+}
+
+// TestSearchSkipsQuarantined (YM-44): Search hydrates its candidates through
+// loadVectorsByIDs. Without a quarantine filter there, quarantined learnings came
+// back from the IVF path even though brute force already excluded them.
+func TestSearchSkipsQuarantined(t *testing.T) {
+	dim := 16
+	db := testDBWithVectors(t, dim, map[uint64][]float32{
+		1: makeTestVec(dim, 0.1),
+		2: makeTestVec(dim, 0.11),
+		3: makeTestVec(dim, 0.12),
+	})
+	idx, err := Build(db, dim, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := idx.Search(context.Background(), makeTestVec(dim, 0.1), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 3 {
+		t.Fatalf("expected 3 results before quarantine, got %d", len(before))
+	}
+
+	if _, err := db.Exec(`UPDATE learnings SET quarantined_at = '2026-01-01T00:00:00Z' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := idx.Search(context.Background(), makeTestVec(dim, 0.1), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("expected 2 results after quarantine, got %d", len(after))
+	}
+	for _, r := range after {
+		if r.ID == "1" {
+			t.Fatal("quarantined learning was returned by IVF search")
+		}
 	}
 }
 
@@ -207,9 +249,11 @@ func TestIsStale(t *testing.T) {
 		t.Error("50% gap should be stale")
 	}
 
-	// Edge: DB has fewer than index (shouldn't happen, but safe)
-	if idx.IsStale(90) {
-		t.Error("DB < index should not be stale")
+	// Edge: the index holds more than the DB. That is a normal state now (a
+	// quarantine or a supersede after the build leaves rows the DB no longer
+	// offers), and it is a rebuild reason just like under-coverage.
+	if !idx.IsStale(90) {
+		t.Error("index covering rows the DB no longer offers should be stale")
 	}
 }
 

@@ -13,7 +13,7 @@ type TrustLevel int
 const (
 	TrustLow    TrustLevel = iota // < 1.0 — supersede immediately
 	TrustMedium                   // 1.0-3.0 — supersede with warning
-	TrustHigh                     // >= 3.0 — only as proposal (pending_confirmation)
+	TrustHigh                     // >= 3.0 — not superseded; kept active with a relation edge to the conflicting learning
 )
 
 // ClassifyTrust maps a trust score to a TrustLevel.

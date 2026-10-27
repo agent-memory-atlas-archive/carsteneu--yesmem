@@ -2,12 +2,16 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/carsteneu/yesmem/internal/buildinfo"
+	"github.com/carsteneu/yesmem/internal/capfile"
 	"github.com/carsteneu/yesmem/internal/config"
+	"github.com/carsteneu/yesmem/internal/daemon"
 	"github.com/carsteneu/yesmem/internal/setup"
 	"github.com/carsteneu/yesmem/internal/storage"
 	"github.com/carsteneu/yesmem/internal/update"
@@ -92,6 +96,22 @@ func runMigrateCmd() {
 		fmt.Println("  Config migration: OK (no changes needed)")
 	}
 
+	// 3b. Proxy keys sitting on the top level are inert: the loader reads them
+	// under proxy:. Move them there (timestamped backup) instead of leaving a
+	// setting that looks configured and does nothing.
+	if moved, err := config.MoveMisplacedProxyKeys(cfgPath); err != nil {
+		fmt.Fprintf(os.Stderr, "  Config placement warning: %v\n", err)
+	} else if len(moved) > 0 {
+		for _, key := range moved {
+			fmt.Printf("  Config placement: moved %q to proxy.%s (the proxy applies config.yaml at start)\n", key, key)
+		}
+	}
+
+	// 3c. Report what the schema cannot read. Unknown keys stay untouched, a
+	// misplaced key that proxy: already sets stays where it is as well. `yesmem
+	// setup` prints the same lines from the same function.
+	setup.PrintConfigCheck(cfgPath, os.Stdout, os.Stderr)
+
 	// 4. Hooks: ensure all yesmem hooks are registered in settings.json
 	if err := setup.EnsureHooks(); err != nil {
 		fmt.Fprintf(os.Stderr, "  Hooks update warning: %v\n", err)
@@ -99,8 +119,15 @@ func runMigrateCmd() {
 		fmt.Println("  Hooks: OK")
 	}
 
-	// 5. Bundled skills
-	home, _ := os.UserHomeDir()
+	// 5. Bundled skills. Every step below writes into the home directory, so an
+	// unusable one stops the migration here instead of scattering files relative
+	// to the working directory (YM-350).
+	home, homeErr := setup.UserHome()
+	if homeErr != nil {
+		fmt.Fprintf(os.Stderr, "  Home directory warning: %v\n", homeErr)
+		fmt.Printf("Migration incomplete (version: %s)\n", buildinfo.Version)
+		return
+	}
 	if n, err := setup.InstallBundledSkills(home); err != nil {
 		fmt.Fprintf(os.Stderr, "  Skills warning: %v\n", err)
 	} else {
@@ -108,15 +135,44 @@ func runMigrateCmd() {
 	}
 
 	// 5b. Bundled capabilities
-	if n, err := setup.InstallBundledCaps(home); err != nil {
+	// The installer has to write where the daemon imports from: setup always wrote
+	// ~/.claude/caps and ignored a configured caps_dir (YM-353). A cap whose body
+	// the bundle was not derived from is kept and reported here (YM-450).
+	appCfg, _ := config.Load(cfgPath)
+	if n, conflicts, err := setup.InstallBundledCaps(config.CapsDirPath(appCfg.CapsDir, dataDir)); err != nil {
 		fmt.Fprintf(os.Stderr, "  Caps warning: %v\n", err)
 	} else {
 		fmt.Printf("  Caps: %d updated\n", n)
+		setup.PrintCapConflicts(os.Stdout, conflicts)
+	}
+
+	// 5b2. Retired caps leave the catalog. The import path ignores their CAP.md
+	// and the export path never rewrites it; the row an earlier version stored is
+	// superseded here (YM-181, YM-197).
+	if store, err := storage.Open(dbPath); err != nil {
+		fmt.Fprintf(os.Stderr, "  Retired caps warning: %v\n", err)
+	} else {
+		n, retireErr := retireObsoleteCaps(store, os.Stdout)
+		store.Close()
+		if retireErr != nil {
+			fmt.Fprintf(os.Stderr, "  Retired caps warning: %v\n", retireErr)
+		} else if n == 0 {
+			fmt.Println("  Retired caps: OK")
+		}
+	}
+
+	// 5b3. Database files nothing opens any more (YM-180).
+	if removed := setup.RemoveLegacyDBFiles(dataDir); len(removed) > 0 {
+		fmt.Printf("  Legacy database files: %s\n", setup.DescribeLegacyDBRemoval(removed))
+	} else {
+		fmt.Println("  Legacy database files: OK")
 	}
 
 	// 5c. Opencode plugin (rule_guard, code_nav, auto_resolve)
-	if n, err := setup.InstallOpencodePlugin(home); err != nil {
+	if n, detail, err := setup.InstallOpencodePlugin(home); err != nil {
 		fmt.Fprintf(os.Stderr, "  Plugin warning: %v\n", err)
+	} else if detail != "" {
+		fmt.Printf("  Plugin: %s\n", detail)
 	} else {
 		fmt.Printf("  Plugin: %d files updated\n", n)
 	}
@@ -132,6 +188,16 @@ func runMigrateCmd() {
 	} else if n > 0 {
 		fmt.Printf("  Themes: %d updated in ~/.config/opencode/themes/\n", n)
 	}
+	// 5f. Opencode commands (~/.config/opencode/commands). A full setup writes
+	// them, so an update left them stale or missing entirely; after an uninstall
+	// only another full setup restored them (YM-386).
+	if n, err := setup.InstallOpencodeCommands(home); err != nil {
+		fmt.Fprintf(os.Stderr, "  Opencode commands warning: %v\n", err)
+	} else if n > 0 {
+		fmt.Printf("  Opencode commands: %d updated in ~/.config/opencode/commands/\n", n)
+	} else {
+		fmt.Println("  Opencode commands: OK")
+	}
 
 	// 6. Hook-guard state: clean up legacy JSON cooldown (now DB-backed)
 	if removed, err := setup.MigrateGuardState(home); err != nil {
@@ -143,13 +209,88 @@ func runMigrateCmd() {
 	}
 
 	// 7. systemd units: drop obsolete network-online.target wait (local-first services)
-	if n, err := setup.MigrateSystemdUnits(home); err != nil {
+	// and upgrade the daemon unit to the notify type with its watchdog. systemd
+	// only reads a rewritten unit after a reload, so a changed file needs one.
+	if n, err := setup.MigrateSystemdUnits(home, dataDir); err != nil {
 		fmt.Fprintf(os.Stderr, "  systemd units warning: %v\n", err)
-	} else if n > 0 {
-		fmt.Printf("  systemd units: removed network-online.target from %d unit(s)\n", n)
 	} else {
-		fmt.Println("  systemd units: OK")
+		if n > 0 {
+			fmt.Printf("  systemd units: rewrote %d unit(s) (network wait, daemon watchdog)\n", n)
+		} else {
+			fmt.Println("  systemd units: OK")
+		}
+		// systemd reads a rewritten unit only after a reload, and an install whose
+		// unit an earlier run migrated needs it too: without it the notify unit's
+		// watchdog is never armed.
+		if daemonUnitInstalled(home) {
+			if err := setup.ReloadSystemdUnits(); err != nil {
+				fmt.Fprintf(os.Stderr, "  systemd units warning: %v\n", err)
+			}
+		}
+		if hint := systemdRollbackHint(home); hint != "" {
+			fmt.Print(hint)
+		}
 	}
 
 	fmt.Printf("Migration complete (version: %s)\n", buildinfo.Version)
+}
+
+// retireObsoleteCaps supersedes the cap learning of every cap in
+// capfile.RetiredBundledCaps. The cap then leaves the catalog (which reads the
+// active cap learnings) and can no longer be executed. The import and export
+// paths ignore those names, so the CAP.md that stays on disk is inert; this step
+// clears the row an earlier version already stored.
+//
+// supersededByID 0: a retired cap has no successor. Note that SupersedeLearning
+// with a zero winner also sets valid_until, which is what withdraws the row.
+func retireObsoleteCaps(store *storage.Store, out io.Writer) (int, error) {
+	if len(capfile.RetiredBundledCaps) == 0 {
+		return 0, nil
+	}
+	learnings, err := store.GetActiveLearnings("cap", "", "", "", 0)
+	if err != nil {
+		return 0, fmt.Errorf("list caps: %w", err)
+	}
+	retired := 0
+	for _, l := range learnings {
+		meta, err := daemon.ParseCapMeta(l.Context)
+		if err != nil {
+			continue
+		}
+		if !capfile.IsRetiredCap(meta.Name) {
+			continue
+		}
+		if err := store.SupersedeLearning(l.ID, 0, "retired cap: yesmem no longer ships it (the wiki moved to yesmem wiki-render)"); err != nil {
+			return retired, fmt.Errorf("supersede cap %q: %w", meta.Name, err)
+		}
+		fmt.Fprintf(out, "  Retired cap: %s (learning %d)\n", meta.Name, l.ID)
+		retired++
+	}
+	return retired, nil
+}
+
+// systemdRollbackHint names the way back for a binary that predates the notify
+// unit. The migration keeps the unit as it was before the rewrite; without the
+// hint the copy is only found by someone who already knows about it.
+//
+// It also names the installs this fix cannot help: a unit an earlier binary already
+// migrated to the notify type has no copy, and reconstructing one would invent
+// bytes that were never there. Saying so is the honest half of that gap.
+func systemdRollbackHint(home string) string {
+	unit := filepath.Join(home, ".config", "systemd", "user", "yesmem.service")
+	backup := setup.UnitBackupPath(unit)
+	if _, err := os.Stat(backup); err == nil {
+		return fmt.Sprintf("  systemd units: an older binary needs the unit back: cp %s %s && systemctl --user daemon-reload\n", backup, unit)
+	}
+	content, err := os.ReadFile(unit)
+	if err != nil || !strings.Contains(string(content), "Type=notify") {
+		return ""
+	}
+	return fmt.Sprintf("  systemd units: %s was migrated to the notify type by an earlier version and has no copy; an older binary needs Type=simple in that file and a daemon-reload\n", unit)
+}
+
+// daemonUnitInstalled reports whether this user has a daemon unit file at all.
+func daemonUnitInstalled(home string) bool {
+	_, err := os.Stat(filepath.Join(home, ".config", "systemd", "user", "yesmem.service"))
+	return err == nil
 }

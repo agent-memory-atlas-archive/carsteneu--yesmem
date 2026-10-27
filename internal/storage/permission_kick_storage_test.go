@@ -47,7 +47,8 @@ func TestAgentPermissionKick_Roundtrip(t *testing.T) {
 func TestMigrateAgentsSchema_AddsPermissionKick(t *testing.T) {
 	s := newTestStore(t)
 
-	// Recreate the agents table with a legacy (pre-permission_kick) layout.
+	// Recreate the agents table with the original v1 layout (permission_kick
+	// and the telemetry columns arrived later).
 	if _, err := s.db.Exec(`DROP TABLE agents`); err != nil {
 		t.Fatalf("drop agents: %v", err)
 	}
@@ -55,7 +56,16 @@ func TestMigrateAgentsSchema_AddsPermissionKick(t *testing.T) {
 		id TEXT PRIMARY KEY,
 		project TEXT NOT NULL,
 		section TEXT NOT NULL,
-		status TEXT DEFAULT 'pending'
+		session_id TEXT,
+		pid INTEGER,
+		sock_path TEXT,
+		status TEXT DEFAULT 'pending',
+		caller_session TEXT,
+		error TEXT,
+		heartbeat_at TEXT,
+		progress TEXT,
+		created_at TEXT DEFAULT (datetime('now')),
+		stopped_at TEXT
 	)`); err != nil {
 		t.Fatalf("create legacy agents: %v", err)
 	}

@@ -27,7 +27,9 @@ User's session (setup only)
        └─ DELIVER    — commit + scratchpad DONE
                 │
                 ▼
-       Bereichs-Agent (per cluster, full TUI, max_runtime 2h default / 12h cap)
+       Bereichs-Agent (per cluster, full TUI; runtime ceiling is the global
+         agents.max_runtime config, set by the orchestrator convention to 2h;
+         no per-spawn max_runtime parameter exists)
          ├─ CONTEXT — read master plan + cluster file list
          ├─ PLAN    — set_plan, per-file strategy
          ├─ EXECUTE — task(general) for fetch+search+write
@@ -79,15 +81,15 @@ Success criteria: <what good output looks like>
 
 The orchestrator parses `##` as cluster boundaries. Files land in `yesdocs/<topic>/wiki/<cluster-slug>/<file>.md`.
 
-## Model rule (MANDATORY)
+## Model rule
 
-For z.ai/zhipuai coding-plan models, always use the full slash-qualified string:
+Model resolution is `resolveSpawnModel` (`spawn_model.go`): an empty `model` omits the `--model` flag for every backend, a slash-qualified string passes through verbatim, and a bare name is looked up in the auto-discovered provider map.
 
-- ✅ `zai-coding-plan/glm-5.2` — routes to Coding-Plan-Endpoint
-- ❌ `zai/glm-5.2` — regular z.ai endpoint does not carry glm-5.2
-- ❌ `glm-5.2` (bare) — filtered from auto-discovery, unreliable passthrough
+Coding-plan providers are ordinary members of that map (`zai-coding-plan` is not filtered out). When several providers carry the same bare model ID, a credential-backed provider wins over a credential-free one, then the alphabetically first ProviderID. Because that choice is easy to get wrong for your account, the unambiguous form is still the safe recommendation:
 
-Coding variants are excluded from the auto-discovered provider map upstream (`spawn_model.go:21-22`), so bare names do not resolve to the coding-plan endpoint. Always use `zai-coding-plan/<model>`.
+- ✅ `zai-coding-plan/glm-5.2` — explicit, routes to the Coding-Plan endpoint
+- ⚠️ `glm-5.2` (bare) — resolves by the rule above; the winner depends on your credentials and provider set
+- ❌ `zai/glm-5.2` — the regular z.ai endpoint does not carry glm-5.2
 
 ## Citation rule (replaces Cold Review)
 

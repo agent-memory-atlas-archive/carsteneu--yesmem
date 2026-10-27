@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/carsteneu/yesmem/internal/archive"
 	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
 
@@ -138,7 +139,7 @@ func TestOpencodeScanner_Basic(t *testing.T) {
 	}
 	defer store.Close()
 
-	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
 	scanner.MaybeScan()
 
@@ -218,7 +219,7 @@ func TestOpencodeScanner_ToolUse(t *testing.T) {
 	}
 	defer store.Close()
 
-	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
 	scanner.MaybeScan()
 
@@ -270,7 +271,7 @@ func TestOpencodeScanner_Incremental(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
 	scanner.MaybeScan()
 
@@ -352,7 +353,7 @@ func TestOpencodeScanner_ReindexSameSession(t *testing.T) {
 	}
 	ocDB.Close()
 
-	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
 	scanner.MaybeScan()
 
@@ -435,7 +436,7 @@ func TestOpencodeScanner_PersistsWatermarkAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
 	if got := scanner.MaybeScan(); got != 1 {
 		store.Close()
@@ -459,7 +460,7 @@ func TestOpencodeScanner_PersistsWatermarkAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	restarted := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	restarted := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	if !restarted.lastScanAt.Equal(updated) || restarted.lastSessionID != "ses_persist" {
 		t.Fatalf("reloaded watermark = %s/%q, want %s/%q",
 			restarted.lastScanAt, restarted.lastSessionID, updated, "ses_persist")
@@ -497,7 +498,7 @@ func TestOpencodeScanner_IncrementalCursorDisambiguatesEqualTimestamps(t *testin
 		t.Fatal(err)
 	}
 
-	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil)
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, nil)
 	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
 	if got := scanner.MaybeScan(); got != 1 {
 		t.Fatalf("first scan indexed %d sessions, want 1", got)
@@ -557,6 +558,138 @@ func TestIsExtractionPipelineSession_MoreThanFiveMessages(t *testing.T) {
 	}
 	if !isExtractionPipelineSession(msgs) {
 		t.Fatal("should detect briefing-author session with 6 messages")
+	}
+}
+
+// The archive outlives the source data, and opencode sessions have no JSONL file
+// to copy: they exist only in opencode.db. Each scanned session therefore lands in
+// the archive as a document of its own, in the same project folder the JSONL
+// copies use (D11), and the source rows stay where they are.
+func TestOpencodeScanner_ArchivesSessionDocument(t *testing.T) {
+	tmpDir := t.TempDir()
+	ocDBPath := filepath.Join(tmpDir, "opencode.db")
+	ocDB, err := createTestOpencodeDB(ocDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ocDB.Close()
+
+	const sessID = "ses_archive"
+	const projectDir = "/home/test/archived"
+	created := time.Now().Add(-1 * time.Hour)
+	updated := time.Now().Add(-30 * time.Minute)
+	if err := writeOpencodeSession(ocDB, sessID, projectDir, "Archived Session", created, updated, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOpencodeMessage(ocDB, "msg_1", sessID, "user", created, map[string]any{"role": "user"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOpencodePart(ocDB, "part_1", "msg_1", sessID, created, map[string]any{"type": "text", "text": "archive me"}); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	archiveDir := filepath.Join(tmpDir, "archive")
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, archive.New(archiveDir))
+	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
+	scanner.MaybeScan()
+
+	path := filepath.Join(archiveDir, archive.ProjectDirName(projectDir), "opencode-ses_archive.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("opencode session was not archived: %v", err)
+	}
+	var doc struct {
+		Format   string           `json:"format"`
+		Session  *models.Session  `json:"session"`
+		Messages []models.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("archive document is not valid JSON: %v", err)
+	}
+	if doc.Format == "" {
+		t.Error("archive document carries no format marker")
+	}
+	normID := models.NormalizeSessionID(models.SourceAgentOpencode, sessID)
+	if doc.Session == nil || doc.Session.ID != normID {
+		t.Errorf("archived session id: got %+v, want %q", doc.Session, normID)
+	}
+	if len(doc.Messages) != 1 || doc.Messages[0].Content != "archive me" {
+		t.Errorf("archived messages: got %+v, want the indexed text", doc.Messages)
+	}
+
+	// The source rows are untouched: the archive copies, it does not move.
+	if sess, err := store.GetSession(normID); err != nil || sess == nil {
+		t.Errorf("indexed session disappeared from the store: %v (%v)", sess, err)
+	}
+}
+
+// A session document has no appendable tail, so a grown session replaces its
+// archived copy instead of extending it — and readers never see a half file.
+func TestOpencodeScanner_RewritesArchivedDocumentOnGrowth(t *testing.T) {
+	tmpDir := t.TempDir()
+	ocDBPath := filepath.Join(tmpDir, "opencode.db")
+	ocDB, err := createTestOpencodeDB(ocDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ocDB.Close()
+
+	const sessID = "ses_regrow"
+	const projectDir = "/home/test/regrow"
+	created := time.Now().Add(-1 * time.Hour)
+	updated := created.Add(time.Minute)
+	if err := writeOpencodeSession(ocDB, sessID, projectDir, "Regrowing Session", created, updated, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOpencodeMessage(ocDB, "msg_1", sessID, "user", created, map[string]any{"role": "user"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOpencodePart(ocDB, "part_1", "msg_1", sessID, created, map[string]any{"type": "text", "text": "first"}); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	archiveDir := filepath.Join(tmpDir, "archive")
+	scanner := NewOpencodeScanner(ocDBPath, store, nil, nil, nil, archive.New(archiveDir))
+	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
+	scanner.MaybeScan()
+
+	// A later turn arrives.
+	if err := writeOpencodeMessage(ocDB, "msg_2", sessID, "assistant", updated, map[string]any{"role": "assistant"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOpencodePart(ocDB, "part_2", "msg_2", sessID, updated, map[string]any{"type": "text", "text": "second"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOpencodeSession(ocDB, sessID, projectDir, "Regrowing Session", created, time.Now(), ""); err != nil {
+		t.Fatal(err)
+	}
+	scanner.lastCheckAt = time.Now().Add(-2 * scanOpencodeInterval)
+	scanner.MaybeScan()
+
+	raw, err := os.ReadFile(filepath.Join(archiveDir, archive.ProjectDirName(projectDir), "opencode-ses_regrow.json"))
+	if err != nil {
+		t.Fatalf("read archived document: %v", err)
+	}
+	var doc struct {
+		Messages []models.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("archive document is not valid JSON: %v", err)
+	}
+	if len(doc.Messages) != 2 {
+		t.Errorf("archived messages after growth: got %d, want 2 (the document was not replaced)", len(doc.Messages))
 	}
 }
 

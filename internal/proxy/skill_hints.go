@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Skill hint markers for injection/stripping
@@ -20,14 +22,26 @@ var skillHintPattern = regexp.MustCompile(`(?s)\n?\[skill-hint\].*?\[/skill-hint
 var skillEvalPattern = regexp.MustCompile(`(?s)\n?\[skill-eval\].*?\[/skill-eval\]`)
 
 // skillHintTracker tracks which skills are active per thread.
+//
+// The thread id comes from a client header and is not validated, so the map is
+// bounded: every entry would otherwise live for the process lifetime, one per
+// invented id. Beyond the cap the least recently used thread loses its record,
+// which costs it the post-collapse re-injection of its skill content — the same
+// trade the decay tracker and the keepalive make.
 type skillHintTracker struct {
-	mu     sync.RWMutex
-	active map[string]map[string]bool // threadID → set of skill names
+	mu       sync.RWMutex
+	active   map[string]map[string]bool // threadID → set of skill names
+	lastUsed map[string]time.Time
 }
+
+// maxSkillThreads bounds the tracked threads (same order of magnitude as
+// maxDecayTrackers and keepaliveMaxThreads).
+const maxSkillThreads = 256
 
 func newSkillHintTracker() *skillHintTracker {
 	return &skillHintTracker{
-		active: make(map[string]map[string]bool),
+		active:   make(map[string]map[string]bool),
+		lastUsed: make(map[string]time.Time),
 	}
 }
 
@@ -38,6 +52,42 @@ func (t *skillHintTracker) markActive(threadID, skillName string) {
 		t.active[threadID] = make(map[string]bool)
 	}
 	t.active[threadID][skillName] = true
+	t.lastUsed[threadID] = time.Now()
+	if len(t.active) > maxSkillThreads {
+		t.evictLocked()
+	}
+}
+
+// touch stamps a thread as seen without changing its skill set. The eviction
+// order has to follow usage, not first activation: markActive runs only for a
+// skill the thread did not have yet, so a long-lived session would otherwise be
+// the oldest entry and lose its skills first (YM-349).
+func (t *skillHintTracker) touch(threadID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.active[threadID]; !ok {
+		return
+	}
+	t.lastUsed[threadID] = time.Now()
+}
+
+// evictLocked drops the least recently used threads down to the cap. Caller
+// holds the write lock; the thread being marked has just been stamped, so it is
+// never the first to go.
+func (t *skillHintTracker) evictLocked() {
+	type entry struct {
+		threadID string
+		used     time.Time
+	}
+	entries := make([]entry, 0, len(t.active))
+	for id := range t.active {
+		entries = append(entries, entry{id, t.lastUsed[id]})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].used.Before(entries[j].used) })
+	for _, e := range entries[:len(entries)-maxSkillThreads] {
+		delete(t.active, e.threadID)
+		delete(t.lastUsed, e.threadID)
+	}
 }
 
 func (t *skillHintTracker) isActive(threadID, skillName string) bool {
@@ -170,8 +220,13 @@ func buildSkillEvalBlock(mode string) string {
 	}
 }
 
-// detectSkillActivations scans message history for Skill tool_use blocks
-// and returns the list of activated skill names.
+// detectSkillActivations scans message history for skill activations and
+// returns the list of activated skill names. Both wire shapes count: the
+// Anthropic tool_use block ({"type":"tool_use","name":"Skill","input":…}) and
+// the OpenAI tool_calls shape an opencode or codex session sends
+// ({"function":{"name":"Skill","arguments":"…"}}). Without the second shape
+// those sessions were never tracked, so their skill content was never
+// re-injected after a collapse (YM-349).
 func detectSkillActivations(messages []any) []string {
 	seen := make(map[string]bool)
 	var skills []string
@@ -181,30 +236,83 @@ func detectSkillActivations(messages []any) []string {
 		if !ok || msg["role"] != "assistant" {
 			continue
 		}
-		blocks, ok := msg["content"].([]any)
-		if !ok {
-			continue
+		for _, name := range anthropicSkillNames(msg["content"]) {
+			if !seen[name] {
+				seen[name] = true
+				skills = append(skills, name)
+			}
 		}
-		for _, block := range blocks {
-			b, ok := block.(map[string]any)
-			if !ok {
-				continue
-			}
-			if b["type"] != "tool_use" || b["name"] != "Skill" {
-				continue
-			}
-			input, ok := b["input"].(map[string]any)
-			if !ok {
-				continue
-			}
-			skillName, _ := input["skill"].(string)
-			if skillName != "" && !seen[skillName] {
-				seen[skillName] = true
-				skills = append(skills, skillName)
+		for _, name := range openAISkillNames(msg["tool_calls"]) {
+			if !seen[name] {
+				seen[name] = true
+				skills = append(skills, name)
 			}
 		}
 	}
 	return skills
+}
+
+// anthropicSkillNames reads the skill names out of Anthropic content blocks.
+func anthropicSkillNames(content any) []string {
+	blocks, ok := content.([]any)
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, block := range blocks {
+		b, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		if b["type"] != "tool_use" || b["name"] != "Skill" {
+			continue
+		}
+		input, ok := b["input"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if skillName, _ := input["skill"].(string); skillName != "" {
+			names = append(names, skillName)
+		}
+	}
+	return names
+}
+
+// openAISkillNames reads the skill names out of OpenAI tool_calls entries. The
+// arguments are a JSON string; a malformed one names no skill. The tool name
+// matches case-insensitively because opencode spells it "skill".
+func openAISkillNames(raw any) []string {
+	calls, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, call := range calls {
+		c, ok := call.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := c["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if toolName, _ := fn["name"].(string); !strings.EqualFold(toolName, "skill") {
+			continue
+		}
+		args, _ := fn["arguments"].(string)
+		var parsed map[string]any
+		if args == "" || json.Unmarshal([]byte(args), &parsed) != nil {
+			continue
+		}
+		// opencode names the field "name", the Anthropic-shaped call "skill".
+		for _, key := range []string{"skill", "name"} {
+			if skillName, _ := parsed[key].(string); skillName != "" {
+				names = append(names, skillName)
+				break
+			}
+		}
+	}
+	return names
 }
 
 // buildSkillInjectionBlock wraps skill content in markers for collapse protection.
@@ -220,6 +328,11 @@ func (s *Server) syncSkillActivations(messages []any, project, threadID string) 
 	}
 
 	detected := detectSkillActivations(messages)
+	if len(detected) > 0 {
+		// The thread is using its skills right now: keep it out of the eviction
+		// order even when nothing new was activated.
+		s.skillTracker.touch(threadID)
+	}
 	var newSkills []string
 	for _, name := range detected {
 		if !s.skillTracker.isActive(threadID, name) {

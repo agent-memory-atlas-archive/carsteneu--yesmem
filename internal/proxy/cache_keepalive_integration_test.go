@@ -27,8 +27,8 @@ func TestKeepaliveWithTTLDetector_Integration(t *testing.T) {
 		Pings5m:          1,
 		Detector:         detector,
 		IntervalOverride: 20 * time.Millisecond,
-		OnPing: func(threadID string, cacheRead, cacheWrite int) {
-			detector.RecordResponse(cacheRead, cacheWrite, 0)
+		OnPing: func(threadID string, cacheRead, cacheWrite, ephemeral1h int) {
+			detector.RecordResponse(threadID, cacheRead, cacheWrite, 0)
 		},
 	})
 	defer ka.Stop()
@@ -66,10 +66,10 @@ func TestKeepaliveOnPingFeedsDetector(t *testing.T) {
 		Pings5m:          1,
 		Detector:         detector,
 		IntervalOverride: 10 * time.Millisecond,
-		OnPing: func(threadID string, cacheRead, cacheWrite int) {
-			// Ping callback doesn't pass ephemeral_1h — that's ok,
-			// detection happens on real responses, not pings
-			detector.RecordResponse(cacheRead, cacheWrite, 0)
+		OnPing: func(threadID string, cacheRead, cacheWrite, ephemeral1h int) {
+			// Pings carry their own ephemeral_1h; the detector decides whether
+			// the ping is evidence for or against a 1h cache.
+			detector.RecordResponse(threadID, cacheRead, cacheWrite, ephemeral1h)
 		},
 	})
 	defer ka.Stop()

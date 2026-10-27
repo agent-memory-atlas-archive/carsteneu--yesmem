@@ -66,3 +66,33 @@ func Root(dir string) string {
 		abs = parent
 	}
 }
+
+// CloneRoot returns the absolute path when path is itself a git working tree
+// root — a directory holding a .git DIRECTORY — and "" otherwise.
+//
+// Unlike Root it never walks up to an enclosing repository. Callers use it to
+// decide whether a doc source is a standalone checkout (the docs clones under
+// ~/.claude/yesmem/docs/<name>) or just a path inside the user's working repo
+// (e.g. <repo>/CLAUDE.md). Pulling the latter would mean running git pull on
+// the repository a session is working in.
+//
+// A .git FILE is rejected on purpose: that is a linked worktree (or submodule),
+// a checkout a session may be actively working in — the same damage class.
+func CloneRoot(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	gitInfo, err := os.Stat(filepath.Join(abs, ".git"))
+	if err != nil || !gitInfo.IsDir() {
+		return ""
+	}
+	return abs
+}

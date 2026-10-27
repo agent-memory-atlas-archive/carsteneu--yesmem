@@ -222,3 +222,52 @@ func TestExtractExpertiseFromLearningsEvidenceCount(t *testing.T) {
 func fakeSessionID(i int) string {
 	return "bootstrap-test-" + string(rune('a'+i))
 }
+
+// YM-227 (4): a write the user_override guard blocks is not a created trait.
+// The count is what the operator sees in the log, so it must follow the rows.
+func TestBootstrapPersonaFromLearningsForceDoesNotCountProtectedTrait(t *testing.T) {
+	s := mustStore(t)
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "en", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+	s.InsertLearning(&models.Learning{
+		Category: "preference", Content: "Antworte immer auf Deutsch",
+		Source: "user_stated", Confidence: 1.0, CreatedAt: time.Now(),
+	})
+
+	if n := bootstrapPersonaFromLearningsForce(s); n != 0 {
+		t.Errorf("blocked write counted as created: got %d, want 0", n)
+	}
+
+	got, _ := s.GetPersonaTrait("default", "communication", "language")
+	if got == nil || got.TraitValue != "en" || got.Source != "user_override" {
+		t.Errorf("user_override trait was changed: %+v", got)
+	}
+}
+
+// YM-227 (4): same rule for the expertise scan.
+func TestExtractExpertiseFromLearningsDoesNotCountProtectedTrait(t *testing.T) {
+	s := mustStore(t)
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "expertise", TraitKey: "php",
+		TraitValue: "low", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+	for i := 0; i < 4; i++ {
+		s.InsertLearning(&models.Learning{
+			Category: "pattern", Content: "PHP Controller Nummer " + string(rune('A'+i)),
+			Project: "myapp", Source: "llm_extracted", Confidence: 1.0, CreatedAt: time.Now(),
+		})
+	}
+
+	if n := extractExpertiseFromLearnings(s); n != 0 {
+		t.Errorf("blocked write counted as created: got %d, want 0", n)
+	}
+
+	got, _ := s.GetPersonaTrait("default", "expertise", "php")
+	if got == nil || got.TraitValue != "low" || got.Source != "user_override" {
+		t.Errorf("user_override trait was changed: %+v", got)
+	}
+}

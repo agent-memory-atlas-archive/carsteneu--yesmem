@@ -15,7 +15,7 @@ func IsRawBashTranscript(content string) bool {
 // transcript to the tool that failed. Producers write the raw tool name as
 // prefix — "<Tool> error: ..." from the Go hook (internal/hooks/failure.go) and
 // "<tool> error: ..." with the lower-cased harness tool name from the opencode
-// failure hook (plugins/opencode-yesmem/failure_learn.ts), whose shell tool is
+// failure hook (plugins/opencode-yesmem-v2/failure_learn.ts), whose shell tool is
 // called "shell". The German "Fehler" variants come from an older producer.
 var failureOriginPrefixes = []struct {
 	prefix string

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/carsteneu/yesmem/internal/storage"
 )
 
 func TestCronMatch_EveryMinute(t *testing.T) {
@@ -83,7 +85,7 @@ func TestCronParse_Invalid(t *testing.T) {
 }
 
 func TestScheduler_AddRemoveList(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	job := ScheduledJob{
 		ID:      "test-1",
 		Name:    "test job",
@@ -119,7 +121,7 @@ func TestScheduler_AddRemoveList(t *testing.T) {
 }
 
 func TestScheduler_DueJobs(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "j1", Name: "every minute", Cron: "* * * * *",
 		Prompt: "run", Enabled: true,
@@ -196,7 +198,7 @@ func TestCronMatch_List(t *testing.T) {
 
 func TestScheduler_OneShot_AutoDelete(t *testing.T) {
 	fired := make(chan string, 5)
-	s := NewScheduler(func(job ScheduledJob) {
+	s := newScheduler(nil, func(job ScheduledJob) {
 		fired <- job.ID
 	})
 	s.AddJob(ScheduledJob{
@@ -220,7 +222,7 @@ func TestScheduler_OneShot_AutoDelete(t *testing.T) {
 }
 
 func TestScheduler_IntervalSeconds_FiresOnInterval(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "poll", Name: "interval job", Cron: "",
 		Prompt: "poll", Enabled: true, Recurring: true,
@@ -253,7 +255,7 @@ func TestScheduler_IntervalSeconds_FiresOnInterval(t *testing.T) {
 }
 
 func TestScheduler_IntervalSeconds_ZeroUsesCron(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "cron", Name: "cron job", Cron: "* * * * *",
 		Prompt: "run", Enabled: true, Recurring: true,
@@ -268,7 +270,7 @@ func TestScheduler_IntervalSeconds_ZeroUsesCron(t *testing.T) {
 }
 
 func TestDueJobs_RunningExcluded(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "j1", Name: "test", Enabled: true, Recurring: true,
 		IntervalSeconds: 1,
@@ -282,7 +284,7 @@ func TestDueJobs_RunningExcluded(t *testing.T) {
 }
 
 func TestDueJobs_RunningClearedThenDue(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "j1", Name: "test", Enabled: true, Recurring: true,
 		IntervalSeconds: 1,
@@ -311,7 +313,7 @@ func TestDueJobs_RunningClearedThenDue(t *testing.T) {
 }
 
 func TestDueJobs_RunningGatesBeforeTimeCheck(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "j1", Name: "test", Enabled: true, Recurring: true,
 		IntervalSeconds: 5,
@@ -334,7 +336,7 @@ func TestDueJobs_RunningGatesBeforeTimeCheck(t *testing.T) {
 }
 
 func TestDueJobs_MultipleJobsIndependentRunning(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	s.AddJob(ScheduledJob{
 		ID: "a", Name: "alpha", Enabled: true, Recurring: true,
 		IntervalSeconds: 1,
@@ -362,10 +364,81 @@ func TestDueJobs_MultipleJobsIndependentRunning(t *testing.T) {
 	}
 }
 
+// YM-169: Tick drops a one-shot job from the in-memory map only. The row stayed
+// in scheduled_jobs, and daemon start reloads every row, so the job fired again
+// on the next start. The scheduler therefore has to hand the removal to the
+// persistence layer.
+func TestScheduler_OneShot_DoesNotSurviveARestart(t *testing.T) {
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	job := ScheduledJob{
+		ID: "once", Name: "one-shot", Cron: "* * * * *", Prompt: "run once",
+		Enabled: true, Recurring: false, Mode: "bash",
+	}
+	if err := store.SaveScheduledJob(storage.ScheduledJobRow{
+		ID: job.ID, Name: job.Name, Cron: job.Cron, Prompt: job.Prompt,
+		Enabled: job.Enabled, Recurring: job.Recurring, Mode: job.Mode,
+	}); err != nil {
+		t.Fatalf("persist job: %v", err)
+	}
+
+	sched := newScheduler(store, nil)
+	if err := sched.AddJob(job); err != nil {
+		t.Fatalf("add job: %v", err)
+	}
+	sched.Tick(time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC))
+
+	rows, err := store.ListScheduledJobs()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("one-shot job is still persisted and would fire again after a restart: %+v", rows)
+	}
+}
+
+// The removal must stay specific to one-shot jobs: a recurring job keeps its row.
+func TestScheduler_Recurring_StaysPersisted(t *testing.T) {
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	job := ScheduledJob{
+		ID: "repeat", Name: "recurring", Cron: "* * * * *", Prompt: "run always",
+		Enabled: true, Recurring: true, Mode: "bash",
+	}
+	if err := store.SaveScheduledJob(storage.ScheduledJobRow{
+		ID: job.ID, Name: job.Name, Cron: job.Cron, Prompt: job.Prompt,
+		Enabled: job.Enabled, Recurring: job.Recurring, Mode: job.Mode,
+	}); err != nil {
+		t.Fatalf("persist job: %v", err)
+	}
+
+	sched := newScheduler(store, nil)
+	if err := sched.AddJob(job); err != nil {
+		t.Fatalf("add job: %v", err)
+	}
+	sched.Tick(time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC))
+
+	rows, err := store.ListScheduledJobs()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("a recurring job must keep its row, got %d rows", len(rows))
+	}
+}
+
 func TestNewScheduler_NilExecutor(t *testing.T) {
-	s := NewScheduler(nil)
+	s := newScheduler(nil, nil)
 	if s == nil {
-		t.Fatal("NewScheduler should not return nil")
+		t.Fatal("newScheduler should not return nil")
 	}
 	_ = fmt.Sprintf("%v", s) // no panic
 }

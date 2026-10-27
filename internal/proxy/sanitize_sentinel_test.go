@@ -109,7 +109,7 @@ func TestSanitizeBillingSentinel_MultipleMessages(t *testing.T) {
 			},
 		},
 		map[string]any{
-			"role": "user",
+			"role":    "user",
 			"content": "plain string content without sentinel",
 		},
 	}

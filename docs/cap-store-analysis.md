@@ -5,7 +5,7 @@ Queryable analysis layer on top of `cap_store` namespaced SQLite tables. Three c
 ## Architecture
 
 ```
-  REPL capability            daemon                    capstore.db
+  REPL capability            daemon                    caps.db
   ----------------           ------                    -----------
   cap_search       ─── mcp__yesmem__cap_store ───→     cap_<name>__<table>
   cap_collect      ─── query / upsert / create_table    ├── posts
@@ -14,7 +14,7 @@ Queryable analysis layer on top of `cap_store` namespaced SQLite tables. Three c
                                                         └── analyses    ← new
 ```
 
-All three caps are thin JS wrappers around the existing `mcp__yesmem__cap_store` RPC — no daemon changes needed to use them. Each capability-owned table lives under `cap_<capname>__<tablename>` in the shared `capstore.db`.
+All three caps are thin JS wrappers around the existing `mcp__yesmem__cap_store` RPC — no daemon changes needed to use them. Each capability-owned table lives under `cap_<capname>__<tablename>` in the shared `caps.db`.
 
 ## The Three Capabilities
 
@@ -192,7 +192,7 @@ Future: optional proxy-passthrough route for subscription-haiku — backlog.
 
 ### MCP schema cache
 
-When you supersede a capability's schema (via `save_capability({supersedes: N})`), existing threads must `activate_capability(name)` again to pick up the new schema. Proxy caches per-thread.
+When you supersede a capability (`save_cap({supersedes: N})`), existing threads must call `mcp__yesmem__activate_cap({name: "<name>"})` again to pick up the new handler. The proxy caches per thread.
 
 ### Supersede pattern
 
@@ -213,13 +213,13 @@ Works fine up to ~10k analyses. Beyond that, consider FTS5 index (future backlog
 
 ## Lifecycle
 
-1. `save_capability` — persist cap definition in learnings DB
+1. `save_cap` — persist cap definition in the learnings DB
 2. `activate_capability` (per thread) — daemon queues the registerTool snippet for proxy injection
 3. Proxy inserts the snippet into the next user→assistant pair
 4. REPL `registerTool` call makes the capability callable as a native tool
 5. Subsequent calls use the capability directly
 
-See `internal/proxy/capabilities_inject.go` and `internal/daemon/handler_capabilities.go` for implementation.
+See `internal/proxy/caps_inject.go` and `internal/daemon/handler_caps.go` for implementation.
 
 ## Related
 

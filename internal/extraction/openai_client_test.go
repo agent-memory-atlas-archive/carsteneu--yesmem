@@ -140,6 +140,78 @@ func TestOpenAIClientFallsBackToOutputParts(t *testing.T) {
 	}
 }
 
+// YM-92: a Chat Completions response reports prompt_tokens/completion_tokens.
+// Reading them as the Responses API's input_tokens/output_tokens yields 0 and
+// books a zero-cost call, which is what switched the daily budget off.
+func TestOpenAIClientChatCompletionsReportsUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"done"}}],
+			"usage":{"prompt_tokens":2028,"completion_tokens":17,"total_tokens":2045}
+		}`))
+	}))
+	defer srv.Close()
+
+	oldOnUsage := OnUsage
+	defer func() { OnUsage = oldOnUsage }()
+
+	var calls, usageIn, usageOut int
+	OnUsage = func(model string, inputTokens, outputTokens int) {
+		calls++
+		usageIn = inputTokens
+		usageOut = outputTokens
+	}
+
+	client := NewOpenAIClient("sk-deepseek", "deepseek-v4-flash", srv.URL, "openai_compatible")
+	out, err := client.Complete("system prompt", "user prompt")
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("Complete() = %q, want %q", out, "done")
+	}
+	if calls != 1 {
+		t.Fatalf("usage reported %d times, want 1", calls)
+	}
+	if usageIn != 2028 || usageOut != 17 {
+		t.Fatalf("usage = (%d, %d), want (2028, 17)", usageIn, usageOut)
+	}
+}
+
+// YM-92: gateways that speak the Chat Completions shape sometimes also send the
+// Responses-API names. Those must keep working instead of bookkeeping zero.
+func TestOpenAIClientChatCompletionsAcceptsResponsesUsageNames(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"role":"assistant","content":"done"}}],
+			"usage":{"input_tokens":40,"output_tokens":9}
+		}`))
+	}))
+	defer srv.Close()
+
+	oldOnUsage := OnUsage
+	defer func() { OnUsage = oldOnUsage }()
+
+	var usageIn, usageOut int
+	OnUsage = func(model string, inputTokens, outputTokens int) {
+		usageIn = inputTokens
+		usageOut = outputTokens
+	}
+
+	client := NewOpenAIClient("sk-deepseek", "deepseek-v4-flash", srv.URL, "openai_compatible")
+	if _, err := client.Complete("system prompt", "user prompt"); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if usageIn != 40 || usageOut != 9 {
+		t.Fatalf("usage = (%d, %d), want (40, 9)", usageIn, usageOut)
+	}
+}
+
 func TestPricingForGPTModels(t *testing.T) {
 	tests := []struct {
 		model      string
@@ -157,5 +229,43 @@ func TestPricingForGPTModels(t *testing.T) {
 		if in != tt.inputPerM || out != tt.outputPerM {
 			t.Errorf("PricingForModel(%q) = (%v, %v), want (%v, %v)", tt.model, in, out, tt.inputPerM, tt.outputPerM)
 		}
+	}
+}
+
+// Security review: the usage numbers come from a configurable endpoint. A
+// negative count would credit the budget, an absurd one would block every
+// later call.
+func TestOpenAIChatCompletionsClampsUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		usage   string
+		wantIn  int
+		wantOut int
+	}{
+		{"negative", `{"prompt_tokens":-9000000,"completion_tokens":-3}`, 0, 0},
+		{"absurd", `{"prompt_tokens":99999999999,"completion_tokens":7}`, maxReportedTokens, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":` + tc.usage + `}`))
+			}))
+			defer srv.Close()
+
+			oldOnUsage := OnUsage
+			defer func() { OnUsage = oldOnUsage }()
+			var usageIn, usageOut int
+			OnUsage = func(model string, inputTokens, outputTokens int) {
+				usageIn, usageOut = inputTokens, outputTokens
+			}
+
+			client := NewOpenAIClient("sk-x", "deepseek-v4-flash", srv.URL, "openai_compatible")
+			if _, err := client.Complete("system", "user"); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+			if usageIn != tc.wantIn || usageOut != tc.wantOut {
+				t.Errorf("usage = (%d, %d), want (%d, %d)", usageIn, usageOut, tc.wantIn, tc.wantOut)
+			}
+		})
 	}
 }

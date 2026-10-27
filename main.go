@@ -18,6 +18,7 @@ import (
 	"github.com/carsteneu/yesmem/internal/setup"
 	"github.com/carsteneu/yesmem/internal/storage"
 	"github.com/carsteneu/yesmem/internal/terminals"
+	"github.com/carsteneu/yesmem/internal/textutil"
 )
 
 // version is set at build time via: go build -ldflags "-X main.version=..."
@@ -64,11 +65,11 @@ func main() {
 	case "install", "setup":
 		interactive := hasFlag(os.Args[2:], "-i", "--interactive")
 		if err := setup.Run(interactive); err != nil {
-			log.Fatalf("install: %v", err)
+			log.Fatalf("install: %s", textutil.ErrorLine(err))
 		}
 	case "status":
 		if err := setup.Status(yesmemDataDir()); err != nil {
-			log.Fatalf("status: %v", err)
+			log.Fatalf("status: %s", textutil.ErrorLine(err))
 		}
 	case "regenerate-narratives":
 		runRegenerateNarratives()
@@ -106,6 +107,12 @@ func main() {
 		runQuickstart()
 	case "resolve-stale":
 		runResolveStale()
+	case "restore-short-session-learnings":
+		runRestoreShortSessionLearnings()
+	case "restore-rulebased-learnings":
+		runRestoreRuleBasedLearnings()
+	case "pending-confirmation":
+		runPendingConfirmation()
 	case "embed-learnings":
 		runEmbedLearnings()
 	case "resolve-check":
@@ -114,7 +121,7 @@ func main() {
 		runBackfillFlavor()
 	case "wiki-render":
 		if err := runWikiRender(os.Args[2:]); err != nil {
-			log.Fatalf("wiki-render: %v", err)
+			log.Fatalf("wiki-render: %s", textutil.ErrorLine(err))
 		}
 	case "proxy":
 		runProxy()
@@ -122,11 +129,13 @@ func main() {
 		runStop()
 	case "restart":
 		runRestart()
+	case "reap-stale-mcp":
+		runReapStaleMCP()
 	case "claudemd":
 		runClaudeMd()
 	case "uninstall":
 		if err := setup.Uninstall(); err != nil {
-			log.Fatalf("uninstall: %v", err)
+			log.Fatalf("uninstall: %s", textutil.ErrorLine(err))
 		}
 	case "add-docs":
 		runAddDocs(os.Args[2:])
@@ -152,6 +161,12 @@ func main() {
 		runStatusline()
 	case "backup":
 		runBackup()
+	case "archive-sessions":
+		runArchiveSessions()
+	case "repair-attribution":
+		runRepairAttribution()
+	case "repair-messages-fts":
+		runRepairMessagesFTS()
 	case "volatile-sweep":
 		runVolatileSweep()
 	case "migrate-project":
@@ -196,6 +211,8 @@ func main() {
 		runRelay()
 	case "cbm-gc":
 		runCBMGc(os.Args[2:])
+	case "clusters-gc":
+		runClusterGC(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -237,7 +254,6 @@ func runDaemon() {
 
 	home, _ := os.UserHomeDir()
 	dataDir := yesmemDataDir()
-	projectsDir := filepath.Join(home, ".claude", "projects")
 	codexSessionsDir := filepath.Join(home, ".codex", "sessions")
 
 	replace := false
@@ -258,6 +274,10 @@ func runDaemon() {
 		appCfg = loaded
 	}
 
+	// The Claude projects directory is a configuration value: the indexer and the
+	// MEMORY.md sweep have to agree on where that is, and both resolve it here.
+	projectsDir := appCfg.ClaudeProjectsDir()
+
 	if err := daemon.Run(daemon.Config{
 		DataDir:          dataDir,
 		ProjectsDir:      projectsDir,
@@ -271,7 +291,7 @@ func runDaemon() {
 		CapsDir:          appCfg.CapsDir,
 		TerminalsSave: func() {
 			if err := terminals.Save(dataDir); err != nil {
-				log.Printf("[terminals] periodic save: %v", err)
+				log.Printf("[terminals] periodic save: %s", textutil.ErrorLine(err))
 			}
 		},
 		LiveWindows: func() ([]daemon.LiveWindow, error) {
@@ -293,7 +313,21 @@ func runDaemon() {
 func yesmemDataDir() string {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".claude", "yesmem")
-	os.MkdirAll(dir, 0755)
+	// ~/.claude itself can be 0777 (measured 18.10.2026; Claude Code creates it and
+	// yesmem does not own it). The data directory inside it is 0700, so the
+	// knowledge base is not reachable through the parent's mode. Documented only:
+	// changing Claude Code's directory is not this tool's decision (YM-338).
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("yesmem data dir %q: %s", dir, textutil.ErrorLine(err))
+	}
+	// MkdirAll leaves the mode of a directory it did not create, so an existing
+	// installation keeps its 0755 until this runs. The directory holds the
+	// database, config.yaml with the API keys and auth_token (audit 16.10.2026,
+	// YM-328). A mode it cannot set is reported, not fatal: unlike the database
+	// and socket hardening, this path runs on every CLI call.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		log.Printf("yesmem data dir %q: chmod: %s", dir, textutil.ErrorLine(err))
+	}
 	return dir
 }
 
@@ -314,12 +348,16 @@ func printUsage() {
 	fmt.Println("  synthesize-persona    Force re-synthesis of persona directive (uses Opus)")
 	fmt.Println("  reextract       Re-run extraction on existing sessions [--project P] [--last N] [--dry-run]")
 	fmt.Println("  resolve-stale   List/resolve stale unfinished items [--dry-run]")
+	fmt.Println("  restore-short-session-learnings  List/restore learnings wrongly superseded by a cleanup (session too short, junk) [--apply] [--ids 1,2,3]")
+	fmt.Println("  restore-rulebased-learnings  List/restore user-owned learnings displaced by the rule-based dedup [--apply] [--ids 1,2,3] [--apply-no-displacer] [--no-displacer-ids 1,2,3] [--limit N]")
+	fmt.Println("  pending-confirmation  List learnings from the retired pending_confirmation status [--project P] [--limit N] [--json]")
 	fmt.Println("  resolve-check   Check commit message against open tasks (for git hooks)")
 	fmt.Println("  backfill-flavor Backfill session_flavor for sessions without one [--last N] [--dry-run]")
 	fmt.Println("  embed-learnings Bulk-embed learnings into vector store [--force] [--all] [--batch-size N]")
 	fmt.Println("  proxy           Start infinite-thread proxy [--port N] [--threshold N] [--target URL]")
 	fmt.Println("  stop [target]   Stop daemon/proxy/all (default: all)")
 	fmt.Println("  restart         Stop all, clean up, start daemon fresh")
+	fmt.Println("  reap-stale-mcp  Kill yesmem-mcp helpers that still map a replaced binary [--dry-run]")
 	fmt.Println("  hook-check      PreToolUse hook: warn about known gotchas")
 	fmt.Println("  hook-guard      PreToolUse hook: evaluate tool calls against RULES.md via LLM")
 	fmt.Println("  hook-failure    PostToolUseFailure hook: learn gotcha + deep search (combined)")
@@ -327,12 +365,15 @@ func printUsage() {
 	fmt.Println("  hook-assist     Deep search on Bash failures (legacy, use hook-failure)")
 	fmt.Println("  claudemd        Regenerate CLAUDE.md ops files [--all] [--dry-run]")
 	fmt.Println("  add-docs        Ingest documentation [--name N --path P|--file F] [--project P] [--dry-run]")
-	fmt.Println("  sync-docs       Re-sync registered doc sources [--name N|--project P|--all]")
+	fmt.Println("  sync-docs       Re-sync registered doc sources [--name N|--project P|--all] [--prune]")
 	fmt.Println("  list-docs       List registered documentation sources [--project P]")
 	fmt.Println("  remove-docs     Remove a doc source and its chunks [--name N] [--project P]")
 	fmt.Println("  export [path]   Export learnings + persona to JSON (default: yesmem-export.json)")
-	fmt.Println("  import <file>   Import learnings from JSON export file")
+	fmt.Println("  import <file> [--distrust-file-sources]  Import learnings from JSON export file")
 	fmt.Println("  backup [path]   Back up database to timestamped file (default: backups/)")
+	fmt.Println("  archive-sessions  Write archive documents for indexed sessions without one [--project P] [--dry-run]")
+	fmt.Println("  repair-attribution  Repair learnings attributed to the wrong session [--apply] [--db F] [--opencode-db F] [--since D]")
+	fmt.Println("  repair-messages-fts  Backfill missing messages_fts rows for message_search [--apply] [--db F] [--examples N]")
 	fmt.Println("  migrate-project <from> <to>  Rename project across all tables [--no-backup]")
 	fmt.Println("  migrate-messages            Move messages to separate messages.db + FTS5")
 	fmt.Println("  cost            Show API cost summary")
@@ -351,6 +392,7 @@ func printUsage() {
 	fmt.Println("  spawn-terminal [dir]  Start a new terminal session as a managed (relayable) agent; default: current dir")
 	fmt.Println("  version         Show version")
 	fmt.Println("  cbm-gc [--dry-run]  Delete CBM index DBs of removed worktrees [--dry-run]")
+	fmt.Println("  clusters-gc [--apply]  Delete learning clusters no live project maps to, clear dangling supersede edges (default: list)")
 	fmt.Println()
 	fmt.Println("Hooks (called by Claude Code, not directly):")
 	fmt.Println("  briefing-hook   SessionStart hook (briefing generation)")
@@ -364,7 +406,7 @@ func runConsolidate() {
 	dataDir := yesmemDataDir()
 	store, err := storage.Open(filepath.Join(dataDir, "yesmem.db"))
 	if err != nil {
-		log.Fatalf("open store: %v", err)
+		log.Fatalf("open store: %s", textutil.ErrorLine(err))
 	}
 	defer store.Close()
 
@@ -392,10 +434,10 @@ func runConsolidate() {
 		}
 		client, err := extraction.NewLLMClient(cfg.LLM.Provider, apiKey, cfg.ModelID(), cfg.LLM.ClaudeBinary, cfg.ResolvedOpenAIBaseURL())
 		if err != nil {
-			log.Printf("warn: no LLM client — falling back to rule-based only: %v", err)
+			log.Printf("warn: no LLM client — falling back to rule-based only: %s", textutil.ErrorLine(err))
 			ruleOnly = true
 		} else {
-			ext = extraction.NewExtractor(client, store)
+			ext = extraction.NewExtractor(redacted(cfg, client), store)
 		}
 	}
 

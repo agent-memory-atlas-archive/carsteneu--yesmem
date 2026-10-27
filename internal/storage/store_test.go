@@ -1167,7 +1167,7 @@ func TestCountPendingExtractions(t *testing.T) {
 		}
 	}
 
-	count, err := s.CountPendingExtractions(5)
+	count, err := s.CountPendingExtractions(ShortSessionMaxMessages)
 	if err != nil {
 		t.Fatalf("count pending: %v", err)
 	}

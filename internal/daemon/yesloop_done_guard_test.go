@@ -13,6 +13,11 @@ import (
 // makeDoneGuardAgent creates a yesloop agent with a given scratchpad content.
 func makeDoneGuardAgent(t *testing.T, h *Handler, s *storage.Store, id, sessionID, content string) {
 	t.Helper()
+	// The fixture's PID is this test process. C3 gates the paused-agent path on
+	// isAgentProcess, so the fixture declares itself an opencode process and
+	// reports the matching /proc cmdline (a test binary has no opencode cmdline
+	// of its own).
+	stubProcCmdline(t, agentProcCmdlineStub)
 	agent := storage.Agent{
 		ID:            id,
 		Project:       "testproj",
@@ -20,6 +25,7 @@ func makeDoneGuardAgent(t *testing.T, h *Handler, s *storage.Store, id, sessionI
 		SessionID:     sessionID,
 		PID:           testPID,
 		Status:        "running",
+		Backend:       "opencode",
 		SockPath:      "/nonexistent/" + id + ".sock",
 		CallerSession: "caller-" + id,
 	}
@@ -192,7 +198,7 @@ func TestDoneGuard_Pauses_After_Max_Refires(t *testing.T) {
 	}
 
 	// L5/I1: DEAD_AGENT message to orchestrator must include the pause hint.
-	msgs, err := s.GetChannelMessages("caller-dg-3")
+	msgs, err := s.GetChannelMessages([]string{"caller-dg-3"})
 	if err != nil {
 		t.Fatalf("GetChannelMessages: %v", err)
 	}
@@ -293,5 +299,36 @@ func TestDoneGuard_DoesNot_Revalidate_Idle_Paused_Agent(t *testing.T) {
 	agent, _ := s.AgentGet("dg-recv-2")
 	if agent.Status != "paused" {
 		t.Errorf("agent paused by Idle must NOT be revalidated by DoneGuard, got status=%q", agent.Status)
+	}
+}
+
+// TestDoneGuard_BindsUnboundAgentBeforeEvidenceCheck: the Phase 5 evidence check
+// verifies subagent session ids against opencode's session DB, and it needs the
+// agent's own session id to do so. For an unbound agent the check was skipped
+// silently — the guard then accepted unverified review evidence from exactly the
+// agents whose bind had failed. The guard binds on demand before verifying.
+func TestDoneGuard_BindsUnboundAgentBeforeEvidenceCheck(t *testing.T) {
+	resetDoneGuardState()
+	h, s := mustHandler(t)
+	stubOpencodeFind(t, "ses_guard")
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "dg-unbound", Project: "testproj", Section: "yesloop-dg-unbound",
+		SessionID: "sess-dg-unbound", PID: testPID, Status: "running",
+		Backend: "opencode", SockPath: "/nonexistent/dg-unbound.sock",
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	agent, _ := s.AgentGet("dg-unbound")
+
+	h.checkOneDoneGuardAgent(*agent, ValidationResult{
+		Compliant:      true,
+		PhaseCount:     6,
+		Phase5Evidence: map[string]string{"cold-review": "ses_reviewer"},
+	})
+
+	stored, _ := s.AgentGet("dg-unbound")
+	if stored.OpencodeSessionID != "ses_guard" {
+		t.Errorf("OpencodeSessionID = %q, want the session bound before the evidence check", stored.OpencodeSessionID)
 	}
 }

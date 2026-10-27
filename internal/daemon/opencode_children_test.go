@@ -42,6 +42,7 @@ func TestOpencodeChildSessionActive(t *testing.T) {
 	if opencodeChildSessionActive(dbPath, "") {
 		t.Errorf("empty parent id must read as inactive without touching the db")
 	}
+	restoreRealOpencodeChildActive(t)
 	if opencodeChildActiveFn("") {
 		t.Errorf("injectable default: empty parent id must read as inactive")
 	}

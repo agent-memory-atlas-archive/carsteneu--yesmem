@@ -1,7 +1,7 @@
 ---
 name: changelog_check
 description: "Fetch Claude Code changelog from GitHub raw CHANGELOG.md, extract entries from a given version number onwards. Returns clean markdown with version headers and bullet points. Use when checking CC updates, new features, or breaking changes."
-version: 62
+version: 517
 tags: [web, changelog, claude-code, fetch]
 scope: user
 tested: true
@@ -16,6 +16,8 @@ Fetch Claude Code changelog from GitHub raw CHANGELOG.md, extract entries from a
 
 ### changelog_check
 kind: tool
+sandbox: standard
+allowed_hosts: raw.githubusercontent.com
 
 ```javascript
 async ({ from_version = 100 } = {}) => {

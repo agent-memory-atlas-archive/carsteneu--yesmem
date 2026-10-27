@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -71,9 +72,87 @@ func New(handler RPCHandler, listen, authToken string, logger *log.Logger) *Serv
 	return s
 }
 
-// handleRPC is a generic pass-through for existing daemon RPC methods.
+// httpRPCMethods is the allowlist of daemon methods POST /api/rpc/{method}
+// forwards. An open pass-through made the daemon's whole method table reachable
+// over HTTP — including execute_cap (runs code on the host), remove_docs,
+// set_config and send_to (steers another agent). Memory reads plus scratchpad
+// coordination (read, write, append, list) are what this transport exists for;
+// deletion, memory writes, code execution and configuration stay on the local
+// socket. Adding a name here is a deliberate decision.
+// Deliberately excluded, even though they are reads: code navigation
+// (get_code_snippet, get_file_symbols, graph_traverse, search_code_index ...)
+// reads paths the caller names, agent inspection (list_agents, get_agent)
+// exposes process state, and get_config/get_proxy_state expose daemon state.
+// The daemon's handlerAdapter keeps its own httpDeniedMethods deny list as the
+// inner gate (internal/daemon/daemon.go, httpDeniedMethods); this list is the
+// outer one, so a method denied there should never be listed here.
+var httpRPCMethods = map[string]bool{
+	"ping": true,
+
+	// Memory reads.
+	"search":                          true,
+	"hybrid_search":                   true,
+	"deep_search":                     true,
+	"vector_search":                   true,
+	"query_facts":                     true,
+	"related_to_file":                 true,
+	"get_coverage":                    true,
+	"get_learnings":                   true,
+	"get_learnings_since":             true,
+	"get_session":                     true,
+	"get_session_start":               true,
+	"get_session_flavors_since":       true,
+	"get_session_flavors_for_session": true,
+	"get_pulse_learnings_since":       true,
+	"get_compacted_stubs":             true,
+	"expand_context":                  true,
+	"list_projects":                   true,
+	"project_summary":                 true,
+	"get_project_profile":             true,
+	"get_persona":                     true,
+	"get_self_feedback":               true,
+	"get_pins":                        true,
+	"get_plan":                        true,
+	"get_active_gaps":                 true,
+	"get_repl_pattern_suggestion":     true,
+	"get_skill_content":               true,
+	"get_caps":                        true,
+	"get_active_caps":                 true,
+	"list_cap_proposals":              true,
+	"get_rules_block":                 true,
+	"get_docs_hint":                   true,
+	"docs_search":                     true,
+	"list_docs":                       true,
+	"list_trigger_extensions":         true,
+	"contextual_docs":                 true,
+	"index_status":                    true,
+
+	// Memory write is NOT here: remember takes its trust level from the request
+	// and force_supersede retires an existing learning, so over this transport a
+	// token holder could stamp content as user_stated or retire real user
+	// knowledge. That write belongs on the local socket.
+
+	// Scratchpad coordination between agents. Delete is NOT here: it removes
+	// every row of a caller-named project plus its assets, and this list excludes
+	// deletion (remove_docs) for the same reason.
+	"scratchpad_read":   true,
+	"scratchpad_write":  true,
+	"scratchpad_append": true,
+	"scratchpad_list":   true,
+}
+
+// handleRPC is a generic pass-through for the daemon RPC methods listed in
+// httpRPCMethods.
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	method := r.PathValue("method")
+	if !httpRPCMethods[method] {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("rpc method %q is not available over the HTTP API", method),
+		})
+		return
+	}
 
 	var params map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {

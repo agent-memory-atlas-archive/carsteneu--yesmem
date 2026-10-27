@@ -339,6 +339,128 @@ func TestDeleteDocSource(t *testing.T) {
 	}
 }
 
+// YM-231: the deletion removed the docs_extracted learnings before the chunks.
+// A failure in between left the source with its chunks but without the
+// learnings derived from them, and nothing regenerates those learnings. All
+// deletes belong to one transaction.
+func TestDeleteDocSource_IsAtomic(t *testing.T) {
+	s := mustOpen(t)
+
+	srcID, err := s.UpsertDocSource(&DocSource{Name: "atomic", Project: "test", Version: "1"})
+	if err != nil {
+		t.Fatalf("upsert source: %v", err)
+	}
+	chunkID, err := s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "f.md", Content: "chunk body", ContentHash: "ch-atomic"})
+	if err != nil {
+		t.Fatalf("insert chunk: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO learnings (category, content, created_at, model_used, source, doc_chunk_ref)
+		VALUES ('knowledge', 'extracted from the chunk', '2026-10-17T00:00:00Z', 'test-model', 'docs_extracted', ?)`, chunkID); err != nil {
+		t.Fatalf("insert learning: %v", err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER los07b_block_chunks BEFORE DELETE ON doc_chunks BEGIN SELECT RAISE(ABORT, 'blocked for test'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	if _, err := s.DeleteDocSource("atomic", "test"); err == nil {
+		t.Fatal("delete reported success although the chunk delete was aborted")
+	}
+
+	if _, err := s.GetDocSource("atomic", "test"); err != nil {
+		t.Errorf("source row was removed although the delete failed: %v", err)
+	}
+	chunks, err := s.GetDocChunksBySource(srcID)
+	if err != nil {
+		t.Fatalf("chunks: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Errorf("chunks = %d, want 1 — the aborted delete was not rolled back", len(chunks))
+	}
+	var learnings int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM learnings WHERE source = 'docs_extracted' AND doc_chunk_ref = ?`, chunkID).Scan(&learnings); err != nil {
+		t.Fatalf("count learnings: %v", err)
+	}
+	if learnings != 1 {
+		t.Errorf("learnings = %d, want 1 — the learnings were deleted before the chunk delete failed", learnings)
+	}
+}
+
+// YM-231: DeleteDocSource removed the rows but left the process-wide vector
+// snapshot untouched, so a removed source stayed searchable with its full
+// content until the daemon restarted.
+func TestDeleteDocSource_DropsChunksFromVecCache(t *testing.T) {
+	s := mustOpen(t)
+
+	srcID, err := s.UpsertDocSource(&DocSource{Name: "cached", Project: "test", Version: "1"})
+	if err != nil {
+		t.Fatalf("upsert source: %v", err)
+	}
+	chunkID, err := s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "f.md", Content: "goroutine scheduler ghost body", ContentHash: "ch-cache"})
+	if err != nil {
+		t.Fatalf("insert chunk: %v", err)
+	}
+	if err := s.SetDocChunkEmbedding(chunkID, []float32{1, 0, 0, 0}, "ch-cache"); err != nil {
+		t.Fatalf("embed chunk: %v", err)
+	}
+
+	// Warm the snapshot the way a real search does.
+	warm, err := s.SearchDocChunksSemantic([]float32{1, 0, 0, 0}, 10, "", nil, "", "")
+	if err != nil {
+		t.Fatalf("warm search: %v", err)
+	}
+	if len(warm) != 1 {
+		t.Fatalf("fixture precondition: %d hits before delete, want 1", len(warm))
+	}
+
+	if _, err := s.DeleteDocSource("cached", "test"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	after, err := s.SearchDocChunksSemantic([]float32{1, 0, 0, 0}, 10, "", nil, "", "")
+	if err != nil {
+		t.Fatalf("search after delete: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("a removed source is still searchable from the vector cache (%d hit(s), content %q)", len(after), after[0].Content)
+	}
+}
+
+// YM-231: the snapshot is process-wide. A delete made by another process (the
+// CLI's remove-docs or sync-docs --prune) never reaches this process's cache, so
+// the cache has to notice on its own that the rows it was built from changed.
+func TestSearchDocChunksSemantic_NoticesExternalChunkDeletion(t *testing.T) {
+	s := mustOpen(t)
+
+	srcID, err := s.UpsertDocSource(&DocSource{Name: "external", Project: "test", Version: "1"})
+	if err != nil {
+		t.Fatalf("upsert source: %v", err)
+	}
+	chunkID, err := s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "f.md", Content: "ghost body from another process", ContentHash: "ch-ext"})
+	if err != nil {
+		t.Fatalf("insert chunk: %v", err)
+	}
+	if err := s.SetDocChunkEmbedding(chunkID, []float32{1, 0, 0, 0}, "ch-ext"); err != nil {
+		t.Fatalf("embed chunk: %v", err)
+	}
+	if _, err := s.SearchDocChunksSemantic([]float32{1, 0, 0, 0}, 10, "", nil, "", ""); err != nil {
+		t.Fatalf("warm search: %v", err)
+	}
+
+	// Raw SQL: this process's invalidation helpers are not involved, which is
+	// what a delete in another process looks like here.
+	if _, err := s.db.Exec(`DELETE FROM doc_chunks WHERE id = ?`, chunkID); err != nil {
+		t.Fatalf("external delete: %v", err)
+	}
+
+	after, err := s.SearchDocChunksSemantic([]float32{1, 0, 0, 0}, 10, "", nil, "", "")
+	if err != nil {
+		t.Fatalf("search after external delete: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("cache served %d chunk(s) that no longer exist in the database", len(after))
+	}
+}
+
 func TestInsertDocChunk_AndGetBySource(t *testing.T) {
 	s := mustOpen(t)
 
@@ -391,20 +513,31 @@ func TestGetDocChunksByFile(t *testing.T) {
 	s := mustOpen(t)
 
 	srcID, _ := s.UpsertDocSource(&DocSource{Name: "src", Project: "p", Version: "1"})
+	otherID, _ := s.UpsertDocSource(&DocSource{Name: "other", Project: "p", Version: "1"})
 
 	s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "config.md", SourceHash: "s1", Content: "Config section A", ContentHash: "ca"})
 	s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "config.md", SourceHash: "s1", Content: "Config section B", ContentHash: "cb"})
 	s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "install.md", SourceHash: "s2", Content: "Install guide", ContentHash: "ci"})
+	// Same file name in a different source, and the "." path two single-file
+	// sources share (YM-24).
+	s.InsertDocChunk(&DocChunk{SourceID: otherID, SourceFile: "config.md", SourceHash: "o1", Content: "Other config", ContentHash: "oc"})
+	s.InsertDocChunk(&DocChunk{SourceID: otherID, SourceFile: ".", SourceHash: "o2", Content: "Other single file", ContentHash: "os"})
+	s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: ".", SourceHash: "s3", Content: "Own single file", ContentHash: "ss"})
 
-	got, err := s.GetDocChunksByFile("config.md")
+	got, err := s.GetDocChunksByFile("config.md", srcID)
 	if err != nil {
 		t.Fatalf("get by file: %v", err)
 	}
 	if len(got) != 2 {
 		t.Errorf("expected 2 chunks for config.md, got %d", len(got))
 	}
+	for _, c := range got {
+		if c.SourceID != srcID {
+			t.Errorf("chunk %d belongs to source %d, want %d", c.ID, c.SourceID, srcID)
+		}
+	}
 
-	got2, err := s.GetDocChunksByFile("install.md")
+	got2, err := s.GetDocChunksByFile("install.md", srcID)
 	if err != nil {
 		t.Fatalf("get by file install.md: %v", err)
 	}
@@ -412,8 +545,17 @@ func TestGetDocChunksByFile(t *testing.T) {
 		t.Errorf("expected 1 chunk for install.md, got %d", len(got2))
 	}
 
+	// The "." path must never leak across sources
+	dotOwn, err := s.GetDocChunksByFile(".", srcID)
+	if err != nil {
+		t.Fatalf("get by file .: %v", err)
+	}
+	if len(dotOwn) != 1 || dotOwn[0].Content != "Own single file" {
+		t.Errorf("expected only the own .-chunk, got %d chunks", len(dotOwn))
+	}
+
 	// Nonexistent file
-	got3, err := s.GetDocChunksByFile("nope.md")
+	got3, err := s.GetDocChunksByFile("nope.md", srcID)
 	if err != nil {
 		t.Fatalf("get by file nope.md: %v", err)
 	}
@@ -445,28 +587,6 @@ func TestDeleteDocChunksBySource(t *testing.T) {
 	}
 	if len(results) != 0 {
 		t.Errorf("expected 0 FTS results after delete, got %d", len(results))
-	}
-}
-
-func TestDeleteDocChunksByFile(t *testing.T) {
-	s := mustOpen(t)
-
-	srcID, _ := s.UpsertDocSource(&DocSource{Name: "src", Project: "p", Version: "1"})
-	s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "keep.md", SourceHash: "s1", Content: "keep this", ContentHash: "ck"})
-	s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "remove.md", SourceHash: "s2", Content: "remove this", ContentHash: "cr"})
-
-	if err := s.DeleteDocChunksByFile("remove.md"); err != nil {
-		t.Fatalf("delete by file: %v", err)
-	}
-
-	kept, _ := s.GetDocChunksByFile("keep.md")
-	if len(kept) != 1 {
-		t.Errorf("expected 1 kept chunk, got %d", len(kept))
-	}
-
-	removed, _ := s.GetDocChunksByFile("remove.md")
-	if len(removed) != 0 {
-		t.Errorf("expected 0 removed chunks, got %d", len(removed))
 	}
 }
 
@@ -1238,5 +1358,101 @@ func TestGetReferenceSources_ProjectScoped(t *testing.T) {
 	}
 	if names["foreign-ref"] {
 		t.Error("foreign reference doc must not leak")
+	}
+}
+
+// YM-25: ingest.Run upserts every source without content (it has none), and the
+// update wrote full_content unconditionally — so a doc-sync run blanked the
+// condensed rules block of the is_rules source. A content-less upsert must
+// preserve what is stored.
+func TestUpsertDocSource_PreservesFullContentOnUpdate(t *testing.T) {
+	s := mustOpen(t)
+
+	id, err := s.UpsertDocSource(&DocSource{Name: "rules", Project: "p", Version: "h1", Path: "/repo/CLAUDE.md"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := s.SaveRulesContent(id, "Never commit secrets.", "h1"); err != nil {
+		t.Fatalf("save rules content: %v", err)
+	}
+
+	// Same upsert shape ingest.Run uses: no FullContent field set.
+	if _, err := s.UpsertDocSource(&DocSource{Name: "rules", Project: "p", Version: "h1", Path: "/repo/CLAUDE.md"}); err != nil {
+		t.Fatalf("content-less update: %v", err)
+	}
+	if got := s.GetRulesContent("p"); got != "Never commit secrets." {
+		t.Fatalf("full_content wiped by a content-less upsert: %q", got)
+	}
+
+	// An explicit content value still overwrites.
+	if _, err := s.UpsertDocSource(&DocSource{Name: "rules", Project: "p", Version: "h2", FullContent: "Updated rules."}); err != nil {
+		t.Fatalf("update with content: %v", err)
+	}
+	if got := s.GetRulesContent("p"); got != "Updated rules." {
+		t.Errorf("full_content = %q, want the explicit update", got)
+	}
+}
+
+// Skill content (is_skill=1) travels the same full_content column and must
+// survive a content-less upsert too.
+func TestUpsertDocSource_PreservesSkillContentOnUpdate(t *testing.T) {
+	s := mustOpen(t)
+
+	if _, err := s.UpsertDocSource(&DocSource{Name: "skill-a", Project: "p", IsSkill: true, FullContent: "Skill body."}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := s.UpsertDocSource(&DocSource{Name: "skill-a", Project: "p", IsSkill: true}); err != nil {
+		t.Fatalf("content-less update: %v", err)
+	}
+	got, err := s.GetSkillContent("skill-a", "p")
+	if err != nil {
+		t.Fatalf("get skill content: %v", err)
+	}
+	if got != "Skill body." {
+		t.Errorf("skill content = %q, want it preserved", got)
+	}
+}
+
+// YM-294 [DEV-DT46]: the snapshot signature counted rows and their highest id.
+// A rewrite of an existing chunk's vector changes neither, so the search kept
+// answering with the old embedding until the process restarted. Re-embedding is
+// exactly this case: same chunk, new vector.
+func TestSearchDocChunksSemantic_NoticesExternalVectorRewrite(t *testing.T) {
+	s := mustOpen(t)
+
+	srcID, err := s.UpsertDocSource(&DocSource{Name: "rewritten", Project: "test", Version: "1"})
+	if err != nil {
+		t.Fatalf("upsert source: %v", err)
+	}
+	chunkID, err := s.InsertDocChunk(&DocChunk{SourceID: srcID, SourceFile: "f.md", Content: "vector moved under the cache", ContentHash: "ch-rw"})
+	if err != nil {
+		t.Fatalf("insert chunk: %v", err)
+	}
+	if err := s.SetDocChunkEmbedding(chunkID, []float32{1, 0, 0, 0}, "ch-rw"); err != nil {
+		t.Fatalf("embed chunk: %v", err)
+	}
+
+	warm, err := s.SearchDocChunksSemantic([]float32{1, 0, 0, 0}, 10, "", nil, "", "")
+	if err != nil {
+		t.Fatalf("warm search: %v", err)
+	}
+	if len(warm) != 1 {
+		t.Fatalf("fixture precondition: %d hits before rewrite, want 1", len(warm))
+	}
+
+	// Raw SQL with a fresh timestamp: this is the state another process's
+	// writer leaves behind, and this process's invalidation never runs.
+	if _, err := s.db.Exec(`UPDATE doc_chunks SET embedding_vector = ?, updated_at = '2099-01-01 00:00:00.000' WHERE id = ?`, float32ToBytes([]float32{-1, 0, 0, 0}), chunkID); err != nil {
+		t.Fatalf("external rewrite: %v", err)
+	}
+
+	// The rewritten vector points the other way, so the old snapshot would still
+	// report a hit while the database holds none.
+	after, err := s.SearchDocChunksSemantic([]float32{1, 0, 0, 0}, 10, "", nil, "", "")
+	if err != nil {
+		t.Fatalf("search after external rewrite: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("cache served the pre-rewrite vector (%d hit(s), score %v)", len(after), after[0].Score)
 	}
 }

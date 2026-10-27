@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"log"
+	"os"
 	"strings"
 	"testing"
 )
@@ -56,7 +57,9 @@ func TestRoutingFallbackNoWarningForCoveredModel(t *testing.T) {
 func TestRoutingFallbackWarningLogLine(t *testing.T) {
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
-	defer log.SetOutput(nil)
+	// Restore the default sink, not nil: a nil output makes every later
+	// log.Printf in this package panic on the next test run.
+	defer log.SetOutput(os.Stderr)
 
 	s := &Server{
 		cfg: Config{

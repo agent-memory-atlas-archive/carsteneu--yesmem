@@ -5,8 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
-	"math/rand"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +27,7 @@ func createTarGz(t *testing.T, name string, content []byte) []byte {
 }
 
 func TestDownloadAndReplace_LargeArchive(t *testing.T) {
+	allowLocalDownloads(t)
 	// Real goreleaser archives are ~120 MiB; the old 100 MiB download cap
 	// truncated them, producing a checksum mismatch on every update.
 	const payloadSize = 110 << 20 // above old 100 MiB cap, below new 200 MiB
@@ -68,6 +69,7 @@ func TestDownloadAndReplace_LargeArchive(t *testing.T) {
 }
 
 func TestDownloadAndReplace_Success(t *testing.T) {
+	allowLocalDownloads(t)
 	binaryContent := []byte("fake-yesmem-binary-content")
 	archive := createTarGz(t, "yesmem", binaryContent)
 	hash := sha256.Sum256(archive)
@@ -101,6 +103,7 @@ func TestDownloadAndReplace_Success(t *testing.T) {
 }
 
 func TestDownloadAndReplace_ChecksumMismatch(t *testing.T) {
+	allowLocalDownloads(t)
 	binaryContent := []byte("fake-binary")
 	archive := createTarGz(t, "yesmem", binaryContent)
 	checksumLine := "0000000000000000000000000000000000000000000000000000000000000000  yesmem_linux_amd64.tar.gz\n"
@@ -121,6 +124,55 @@ func TestDownloadAndReplace_ChecksumMismatch(t *testing.T) {
 	err := DownloadAndReplace(srv.URL+"/binary", srv.URL+"/checksums", "yesmem_linux_amd64.tar.gz", dest)
 	if err == nil {
 		t.Fatal("should fail on checksum mismatch")
+	}
+}
+
+// The old binary is the only rollback the updater has, so a replacement that
+// cannot complete must leave dest exactly as it was. A directory at dest makes
+// the final rename fail without any permission setup.
+func TestAtomicReplace_FailedReplaceKeepsDestination(t *testing.T) {
+	tmpDir := t.TempDir()
+	dest := filepath.Join(tmpDir, "yesmem")
+	if err := os.Mkdir(dest, 0755); err != nil {
+		t.Fatalf("seed dest dir: %v", err)
+	}
+
+	_ = atomicReplace(dest, []byte("new"))
+
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("dest disappeared after a failed replace: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("dest was replaced although the replace could not complete")
+	}
+	if _, err := os.Stat(dest + ".bak"); err == nil {
+		t.Error("dest was moved aside before the new binary was in place")
+	}
+}
+
+// An interrupted run leaves .bak.tmp behind. The next run must clean it up
+// instead of failing the link with EEXIST and silently keeping an ancient .bak.
+func TestAtomicReplace_RecoversFromLeftoverTempBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	dest := filepath.Join(tmpDir, "yesmem")
+	os.WriteFile(dest, []byte("old"), 0755)
+	os.WriteFile(dest+".bak.tmp", []byte("leftover"), 0755)
+	os.WriteFile(dest+".bak", []byte("ancient"), 0755)
+
+	if err := atomicReplace(dest, []byte("new")); err != nil {
+		t.Fatalf("atomicReplace failed: %v", err)
+	}
+
+	backup, err := os.ReadFile(dest + ".bak")
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(backup) != "old" {
+		t.Errorf("backup = %q, want the previous binary \"old\"", backup)
+	}
+	if _, err := os.Stat(dest + ".bak.tmp"); err == nil {
+		t.Error("leftover .bak.tmp must be removed")
 	}
 }
 

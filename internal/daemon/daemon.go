@@ -31,6 +31,7 @@ import (
 	"github.com/carsteneu/yesmem/internal/ingest"
 	"github.com/carsteneu/yesmem/internal/ivf"
 	"github.com/carsteneu/yesmem/internal/logrotate"
+	"github.com/carsteneu/yesmem/internal/repo"
 	"github.com/carsteneu/yesmem/internal/sanitize"
 	"github.com/carsteneu/yesmem/internal/storage"
 	"github.com/carsteneu/yesmem/internal/update"
@@ -40,6 +41,18 @@ type briefingRefreshTarget struct {
 	Project     storage.ProjectSummary
 	Raw         string
 	Fingerprint string
+}
+
+// excludeProjectsFor returns the config's project exclusion list and is the only
+// place the daemon start reads that field. config.Load falls back to defaults on
+// every error path and never returns nil today, so the nil branch is defensive:
+// it keeps the read in one guarded place instead of guarding it at each of the
+// two call sites, only one of which had a check.
+func excludeProjectsFor(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.ExcludeProjects
 }
 
 func embeddingCacheModelKey(cfg *config.Config) string {
@@ -63,9 +76,15 @@ func wrapWithSanitizationIfEnabled(c extraction.LLMClient, cfg *config.Config, r
 }
 
 // ReadClaudeCodeAPIKey reads the API key from Claude Code's config.json.
+//
+// The file holds a live provider key, and this read is the daemon's one contact
+// with it, so it also takes the key out of reach of other local users: Claude Code
+// has been observed leaving the file at mode 0777 (YM-303).
 func ReadClaudeCodeAPIKey() string {
 	home, _ := os.UserHomeDir()
-	data, err := os.ReadFile(filepath.Join(home, ".claude", "config.json"))
+	path := filepath.Join(home, ".claude", "config.json")
+	hardenSecretFileMode(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -77,6 +96,44 @@ func ReadClaudeCodeAPIKey() string {
 		return key
 	}
 	return ""
+}
+
+// hardenSecretFileMode narrows a file that carries a key to 0600 when it is group
+// or world readable. Best effort: a file owned by another user, or one on a
+// read-only mount, keeps its mode — that must not stop the read that follows.
+//
+// Only the file itself is narrowed, never a path that merely leads to one: a run
+// can write ~/.claude, so a symlink or a hard link placed at this path would aim
+// the chmod at an inode of its choosing (a directory loses its x bit and everything
+// below becomes unreachable). The mode is changed on the file descriptor, not on
+// the path, so a swap between the check and the chmod cannot retarget it.
+func hardenSecretFileMode(path string) {
+	// A FIFO or a directory is not this file; opening a FIFO would block.
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			log.Printf("[sandbox] not narrowing %s: it is not a regular file", path)
+		}
+		return
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil || !stat.Mode().IsRegular() || stat.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	if sys, ok := stat.Sys().(*syscall.Stat_t); ok && sys.Nlink > 1 {
+		log.Printf("[sandbox] not narrowing %s: it has %d hard links", path, sys.Nlink)
+		return
+	}
+	if err := file.Chmod(0o600); err != nil {
+		log.Printf("[sandbox] WARNING: %s is readable by other users and could not be narrowed to 0600: %v", path, err)
+		return
+	}
+	log.Printf("[sandbox] narrowed %s to 0600 (it carries a provider key)", path)
 }
 
 // Config holds daemon configuration.
@@ -129,6 +186,17 @@ func Run(cfg Config) error {
 	log.Printf("  Log: %s", logPath)
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+	// Databases that never pass through openSQLite (guard_state.db, caps.db) and
+	// the legacy stubs of older installations keep the umask mode until a sweep
+	// restricts them (audit 16.10.2026, YM-338). After the log is attached, so the
+	// result is visible in daemon.log. Best effort: a file on a foreign mount must
+	// not keep the daemon from starting.
+	if hardened, err := storage.HardenDBFilesInDir(cfg.DataDir); err != nil {
+		log.Printf("[warn] database mode sweep: %d file(s) restricted, %v", hardened, err)
+	} else if hardened > 0 {
+		log.Printf("Restricted %d database files to owner-only", hardened)
+	}
+
 	// Open storage (has data from previous runs — MCP can serve immediately)
 	store, err := storage.Open(filepath.Join(cfg.DataDir, "yesmem.db"))
 	if err != nil {
@@ -164,13 +232,16 @@ func Run(cfg Config) error {
 	ac, _ := config.Load(filepath.Join(cfg.DataDir, "config.yaml"))
 
 	// Archiver + Indexer
-	arch := archive.New(filepath.Join(cfg.DataDir, "archive"))
-	var idx *indexer.Indexer
-	if ac != nil {
-		idx = indexer.New(store, bloomMgr, arch, ac.ExcludeProjects)
-	} else {
-		idx = indexer.New(store, bloomMgr, arch, nil)
+	archDir := ac.ArchiveDir(cfg.DataDir)
+	// A configured paths.archive is used unchecked otherwise, and a failure is
+	// only logged per session, where the watermark then keeps it from being
+	// retried. Say it once at startup instead.
+	if err := archive.EnsureBaseDir(archDir); err != nil {
+		log.Printf("[archive] %v: archiving will fail until it is writable", err)
 	}
+	arch := archive.New(archDir)
+	excludeProjects := excludeProjectsFor(ac)
+	idx := indexer.New(store, bloomMgr, arch, excludeProjects)
 
 	// Index progress tracking (atomics — safe for concurrent reads)
 	var indexTotal, indexDone, indexSkipped int64
@@ -179,7 +250,7 @@ func Run(cfg Config) error {
 	batchExtractNotify := make(chan struct{}, 1) // non-blocking signal for batch trigger
 
 	// ━━━ Socket server FIRST — MCP available immediately ━━━
-	handler := NewHandler(store, bloomMgr)
+	handler := newProductionHandler(store, bloomMgr, ac.ClaudeProjectsDir())
 	handler.dataDir = cfg.DataDir
 	handler.RebuildFromPIDFiles()
 	handler.liveWindows = cfg.LiveWindows
@@ -216,8 +287,17 @@ func Run(cfg Config) error {
 		if ac.DefaultSandboxProfile != "" {
 			if p, err := ParseSandboxProfile(ac.DefaultSandboxProfile); err == nil {
 				handler.defaultSandboxProfile = p
+				handler.sandboxDefaultSet = true
+				if p == ProfileNone {
+					log.Printf("[scheduler] default_sandbox_profile=none: scheduled jobs run unsandboxed")
+				}
+			} else {
+				log.Printf("[scheduler] invalid default_sandbox_profile %q, jobs get standard: %v", ac.DefaultSandboxProfile, err)
 			}
 		}
+		// Sandboxed agent runs reach the LLM through the proxy on the host
+		// loopback; ai-jail 2.x needs that port relayed into the sandbox.
+		handler.proxyForwardPort = proxyForwardPort(ac.Proxy.Listen)
 		if ac.SecretsSanitization.Enabled {
 			handler.redactor = sanitize.NewSecretRedactor(ac.SecretsSanitization.AllowedExceptions)
 		}
@@ -234,7 +314,7 @@ func Run(cfg Config) error {
 	}
 	handler.SetOpencodeDBPath(ocDBPath)
 	if _, err := os.Stat(ocDBPath); err == nil {
-		ocScanner := indexer.NewOpencodeScanner(ocDBPath, store, log.Default(), batchExtractNotify, ac.ExcludeProjects)
+		ocScanner := indexer.NewOpencodeScanner(ocDBPath, store, log.Default(), batchExtractNotify, excludeProjects, arch)
 		handler.SetOpencodeScanner(ocScanner)
 		log.Printf("opencode scanner: watching %s", ocDBPath)
 
@@ -249,12 +329,14 @@ func Run(cfg Config) error {
 		}()
 	}
 
-	// Recover agents from before daemon restart — keep living, delete dead
-	reconnected, deleted, err := store.AgentRecoverOrphaned(func(pid int) bool {
-		return syscall.Kill(pid, 0) == nil
-	})
-	if err == nil && (reconnected > 0 || deleted > 0) {
-		log.Printf("Agent recovery: %d reconnected, %d deleted (daemon restart)", reconnected, deleted)
+	// Recover agents from before daemon restart — keep living, keep resumable
+	// opencode sessions, delete only what has neither.
+	reconnected, reattachable, deleted, err := store.AgentRecoverOrphaned(
+		func(pid int) bool { return syscall.Kill(pid, 0) == nil },
+		opencodeSessionResumableFn,
+	)
+	if err == nil && (reconnected > 0 || reattachable > 0 || deleted > 0) {
+		log.Printf("Agent recovery: %d reconnected, %d kept (resumable or unverified), %d deleted (daemon restart)", reconnected, reattachable, deleted)
 	}
 
 	handler.IndexProgress = func() (total, done, skipped int, running bool) {
@@ -271,12 +353,58 @@ func Run(cfg Config) error {
 	defer socketSrv.Close()
 	log.Println("Socket ready for MCP connections.")
 
-	// Sync CAP.md files from disk into DB (user-scoped caps)
-	userCapsDir := cfg.CapsDir
-	if userCapsDir == "" {
-		userCapsDir = filepath.Join(filepath.Dir(cfg.DataDir), "caps")
+	// Proof of life for systemd (Type=notify). The watchdog pings only while a
+	// probe confirms the socket answers: a daemon that lives on with a dead socket
+	// is the state Restart=always cannot see. Without a notify socket nobody is
+	// listening, so the daemon runs without the extra probe. The address is read
+	// once and then removed from the environment, so it does not reach the agents
+	// and sandbox jobs this daemon spawns.
+	if addr, supervised := notifyAddr(); supervised {
+		// The interval comes from the unit's WatchdogSec before the variables are
+		// stripped, so a hand-tuned deadline is honoured instead of outrun.
+		interval := watchdogInterval()
+		_ = sendNotifyTo(addr, "READY=1")
+		watchdogCtx, watchdogCancel := context.WithCancel(context.Background())
+		defer watchdogCancel()
+		startDaemonWatchdog(watchdogCtx, SocketPath(cfg.DataDir), interval, func(state string) error {
+			return sendNotifyTo(addr, state)
+		})
+		stripNotifyVars()
 	}
+
+	// Restricted socket for sandboxed runs (YM-267). A job gets this one mounted
+	// instead of the full socket, so it can reach its cap store and the LLM
+	// bridge but cannot start anything the sandbox would not have started
+	// itself. It lives in the runtime dir beside the data dir, which the sandbox
+	// masks as a whole (YM-276). A failure here costs jobs their socket, not the
+	// daemon its own.
+	// The job socket lived inside the data dir before YM-276. A leftover there
+	// would still look like a socket to external checks while nothing serves it.
+	legacyJobSock := filepath.Join(cfg.DataDir, "job.sock")
+	if _, statErr := os.Lstat(legacyJobSock); statErr == nil {
+		os.Remove(legacyJobSock)
+	}
+
+	if _, dirErr := EnsureRuntimeDir(cfg.DataDir); dirErr != nil {
+		log.Printf("warn: job runtime dir: %v (sandboxed caps cannot reach the daemon)", dirErr)
+	} else if jobSrv, jobErr := NewSocketServerAt(JobSocketPath(cfg.DataDir), handler.handleJobSocket); jobErr != nil {
+		log.Printf("warn: restricted job socket: %v (sandboxed caps cannot reach the daemon)", jobErr)
+	} else {
+		go jobSrv.Serve()
+		defer jobSrv.Close()
+	}
+
+	// Sync CAP.md files from disk into DB (user-scoped caps)
+	userCapsDir := config.CapsDirPath(cfg.CapsDir, cfg.DataDir)
+	// The sandbox masks this very directory (newSandbox): a run that can write a
+	// CAP.md here reaches past the sandbox, because the watcher below re-imports it
+	// and later runs the edited script. The handler needs the configured value,
+	// not just the default derived from the data dir.
+	handler.capsDir = userCapsDir
 	go func() {
+		// YM-230: report what the stored caps inherit before the import below adds
+		// rows that never ran unsandboxed.
+		logSandboxProfilesOnLoad(handler)
 		SyncCapsFromDisk(handler, userCapsDir, "")
 		ExportAllCaps(handler, userCapsDir)
 	}()
@@ -290,9 +418,13 @@ func Run(cfg Config) error {
 			changed := watcher.ScanChanged(userCapsDir)
 			for _, cf := range changed {
 				params := CapFileToParams(cf)
-				resp := handler.handleSaveCap(params)
+				resp := handler.handleSaveCapFrom(params, cf.SourcePath)
 				if resp.Error != "" {
 					log.Printf("[cap-watch] save %s: %s", cf.Name, resp.Error)
+				} else if unchangedResponse(resp) {
+					// The mtime moved, the content did not: reporting an import here
+					// claims a change that never happened.
+					log.Printf("[cap-watch] %s unchanged (disk v%d: %s)", cf.Name, cf.Version, unchangedReason(resp))
 				} else {
 					log.Printf("[cap-watch] imported %s from disk", cf.Name)
 				}
@@ -316,23 +448,40 @@ func Run(cfg Config) error {
 
 	// ━━━ Scheduler ━━━
 	var sched *Scheduler
-	sched = NewScheduler(func(job ScheduledJob) {
+	sched = newScheduler(handler.store, func(job ScheduledJob) {
 		log.Printf("[scheduler] firing job %s: %s", job.Name, job.Prompt)
 		defer sched.JobDone(job.ID)
 		handler.executeScheduledPrompt(job)
+		if !job.Recurring {
+			// The row is already gone (Tick removed it), so there is nothing to stamp.
+			// The log directory stays: it is the only file-level record of the run.
+			return
+		}
 		_ = handler.store.UpdateJobLastRun(job.ID, time.Now())
 	})
 	handler.scheduler = sched
 
+	// A one-shot row that fired before the persistence hook existed is still in the
+	// table; loading it would fire it a second time right after the upgrade.
+	if removed, err := handler.store.DeleteFiredOneShotJobs(); err != nil {
+		log.Printf("[scheduler] cleanup fired one-shot jobs: %v", err)
+	} else if removed > 0 {
+		log.Printf("[scheduler] removed %d already fired one-shot jobs", removed)
+	}
+
 	// Load persisted jobs from DB
-	if dbJobs, err := handler.store.ListScheduledJobs(); err == nil {
+	if dbJobs, err := handler.store.ListScheduledJobs(); err != nil {
+		// Without a log line a broken query leaves the daemon running with no jobs
+		// at all, and nothing says so.
+		log.Printf("[scheduler] load persisted jobs: %v", err)
+	} else {
 		for _, dj := range dbJobs {
-			sbProfile, _ := ParseSandboxProfile(dj.Sandbox)
 			sched.AddJob(ScheduledJob{
 				ID: dj.ID, Name: dj.Name, Cron: dj.Cron,
 				Prompt: dj.Prompt, Enabled: dj.Enabled, Recurring: dj.Recurring, Mode: dj.Mode,
-				CapName: dj.CapName, ScriptName: dj.ScriptName, AutoCorrect: dj.AutoCorrect, AllowedPorts: dj.AllowedPorts,
-				Sandbox: sbProfile, IntervalSeconds: dj.IntervalSeconds, Backend: dj.Backend, Model: dj.Model, LastRun: dj.LastRun,
+				CapName: dj.CapName, ScriptName: dj.ScriptName, Project: dj.Project, AutoCorrect: dj.AutoCorrect, AllowedPorts: dj.AllowedPorts,
+				AllowedHosts: validatedHosts(dj.AllowedHosts),
+				Sandbox:      jobSandboxProfile(dj.Sandbox), IntervalSeconds: dj.IntervalSeconds, Backend: dj.Backend, Model: dj.Model, LastRun: dj.LastRun,
 			})
 		}
 		if len(dbJobs) > 0 {
@@ -411,11 +560,17 @@ func Run(cfg Config) error {
 			)
 			if err != nil {
 				log.Printf("[scheduler] bash run cleanup failed: %v", err)
-				return
-			}
-			if deleted > 0 {
+			} else if deleted > 0 {
 				log.Printf("[scheduler] purged %d expired bash job runs (retention: %s non-error, %s processed-error)",
 					deleted, nonErrorRetention, processedErrorRetention)
+			}
+			// Closed agent rows are the other table that only grew: every probe,
+			// crash and finished loop left one behind (YM-312).
+			pruned, pruneErr := store.PruneStoppedAgents(now.Add(-storage.AgentPruneRetention))
+			if pruneErr != nil {
+				log.Printf("[agents] prune failed: %v", pruneErr)
+			} else if pruned > 0 {
+				log.Printf("[agents] pruned %d closed agent row(s) older than %s", pruned, storage.AgentPruneRetention)
 			}
 		}
 
@@ -435,11 +590,21 @@ func Run(cfg Config) error {
 	// FTS5 background sync — replaces triggers to avoid write contention on BM25 reads
 	store.StartFTSSync(daemonCtx, 10*time.Second)
 
+	// WAL guard — heals SQLite log files that an external writer truncated or
+	// unlinked while this process held them open (YM-352)
+	store.StartWALGuard(daemonCtx, time.Minute)
+
 	// Agent heartbeat — polls for messages targeting running agents, relays via inject socket
 	go handler.startAgentHeartbeat(daemonCtx)
 
 	// Wiki render ticker — rebuilds wiki for all active projects every 5min
 	startWikiTicker(daemonCtx, store)
+
+	// Scan bookkeeping prune — drops rows for projects that no longer exist
+	startScanPruneTicker(daemonCtx, store)
+
+	// Session pin sweep — bounds pins of sessions whose end no hook reports
+	go startSessionPinSweep(daemonCtx, store, storage.SessionPinMaxAge)
 
 	// CBM daemon keeper — attach CLI calls to one permanent CBM daemon
 	startCBMDaemonKeeper(daemonCtx, store)
@@ -449,13 +614,14 @@ func Run(cfg Config) error {
 
 	// Extractor holder — set asynchronously after config is loaded
 	var (
-		extMu        sync.Mutex
-		extractor    extraction.SessionExtractor
-		evoExtractor *extraction.Extractor
-		llmClient    extraction.LLMClient
-		qualityLLM   extraction.LLMClient
-		appCfg       *config.Config
-		apiGateRef   *extraction.APIGate
+		extMu          sync.Mutex
+		extractor      extraction.SessionExtractor
+		evoExtractor   *extraction.Extractor
+		llmClient      extraction.LLMClient
+		qualityLLM     extraction.LLMClient
+		appCfg         *config.Config
+		apiGateRef     *extraction.APIGate
+		extractTracker *extraction.BudgetTracker
 	)
 
 	sessionRoots := cfg.SessionSources
@@ -579,91 +745,40 @@ func Run(cfg Config) error {
 		ac.API.APIKey = apiKey
 		baseURL := ac.ResolvedOpenAIBaseURL()
 
-		// Set up LLM clients
-		// Extraction client (Sonnet default) — for learnings extraction
-		client, clientErr := extraction.NewLLMClient(ac.LLM.Provider, apiKey, ac.ModelID(), ac.LLM.ClaudeBinary, baseURL)
-		if clientErr != nil {
-			log.Printf("LLM client error: %v", clientErr)
-		}
-		// Wrap with daily budget enforcement
+		// Set up LLM clients.
+		//
+		// The trackers, the api gate and the per-call cap are shared by every
+		// daemon LLM path, so they are built before the clients:
+		// newDaemonLLMClient applies the whole decoration in one step and no
+		// handle can end up outside the budget/gate/redaction chain.
 		spendAdapter := &storage.SpendAdapter{Store: store}
 
-		// Always create a lightweight summarize client (Haiku) for on-demand tasks
-		// (rules condensation, doc destillation) — independent of extraction cycle
-		if apiKey != "" {
-			summarizeModel := ac.SummarizeModelID()
-			sc, scErr := extraction.NewLLMClient(ac.LLM.Provider, apiKey, summarizeModel, ac.LLM.ClaudeBinary, baseURL)
-			if scErr == nil && sc != nil {
-				handler.SummarizeClient = wrapWithSanitizationIfEnabled(sc, ac, sanitize.NewSecretRedactor(ac.SecretsSanitization.AllowedExceptions))
-				log.Printf("Summarize client ready: %s (for rules/destillation)", summarizeModel)
-			}
-		}
-
-		// Shared extraction budget tracker (used by summarize + extract clients)
-		var extractTracker *extraction.BudgetTracker
+		// Shared extraction budget tracker (used by summarize + extract clients,
+		// and read by the gap review so it meters against the same counter)
 		if ac.LLM.DailyBudgetExtractUSD > 0 {
-			extractTracker = extraction.NewPersistentBudgetTracker(ac.LLM.DailyBudgetExtractUSD, "extract", spendAdapter)
+			tracker := extraction.NewPersistentBudgetTracker(ac.LLM.DailyBudgetExtractUSD, "extract", spendAdapter)
+			extMu.Lock()
+			extractTracker = tracker
+			extMu.Unlock()
 			log.Printf("Daily extraction budget: $%.2f", ac.LLM.DailyBudgetExtractUSD)
 		}
 		// Throttle function: blocks LLM calls when API utilization exceeds 50%
 		throttleFn := func() bool {
-			rlJSON, err := store.GetProxyState("rate_limits")
-			if err != nil || rlJSON == "" {
-				return false
-			}
-			var rl struct {
-				Unified5hUtilization float64 `json:"unified_5h_utilization"`
-				TokensLimit          int     `json:"tokens_limit"`
-				TokensRemaining      int     `json:"tokens_remaining"`
-				IsSubscription       bool    `json:"is_subscription"`
-			}
-			if json.Unmarshal([]byte(rlJSON), &rl) != nil {
-				return false
-			}
-			var utilization float64
-			if rl.IsSubscription {
-				utilization = rl.Unified5hUtilization
-			} else if rl.TokensLimit > 0 {
-				utilization = 1.0 - float64(rl.TokensRemaining)/float64(rl.TokensLimit)
-			}
-			return utilization > 0.5
+			return proxyRateLimitThrottled(store, 0.5)
 		}
-		if client != nil && extractTracker != nil {
-			bc := extraction.NewBudgetClient(client, extractTracker)
-			bc.ThrottleFn = throttleFn
-			client = bc
-		}
-		// Quality client (Opus default) — for narratives, profiles, persona synthesis
-		var qualityClient extraction.LLMClient
+
+		// The narrative/quality path is a separate handle only when it uses a
+		// different model; its budget bucket exists under the same condition.
+		separateQualityModel := ac.NarrativeModelID() != ac.ModelID()
 		var qualityTracker *extraction.BudgetTracker
-		if ac.NarrativeModelID() != ac.ModelID() {
-			qc, qcErr := extraction.NewLLMClient(ac.LLM.Provider, apiKey, ac.NarrativeModelID(), ac.LLM.ClaudeBinary, baseURL)
-			if qcErr != nil {
-				log.Printf("Quality LLM client error (falling back to extraction model): %v", qcErr)
-				qualityClient = client
-			} else {
-				if ac.LLM.DailyBudgetQualityUSD > 0 {
-					qualityTracker = extraction.NewPersistentBudgetTracker(ac.LLM.DailyBudgetQualityUSD, "quality", spendAdapter)
-					qbc := extraction.NewBudgetClient(qc, qualityTracker)
-					qbc.ThrottleFn = throttleFn
-					qc = qbc
-					log.Printf("Daily quality budget: $%.2f", ac.LLM.DailyBudgetQualityUSD)
-				}
-				qualityClient = qc
-			}
-		} else {
-			qualityClient = client
+		if separateQualityModel && ac.LLM.DailyBudgetQualityUSD > 0 {
+			qualityTracker = extraction.NewPersistentBudgetTracker(ac.LLM.DailyBudgetQualityUSD, "quality", spendAdapter)
+			log.Printf("Daily quality budget: $%.2f", ac.LLM.DailyBudgetQualityUSD)
 		}
 
 		// ━━━ Global API Health Gate ━━━
 		apiGate := extraction.NewAPIGate(extractTracker, qualityTracker, 5, 0.50)
 		apiGateRef = apiGate
-		if client != nil {
-			client = extraction.NewGatedClient(client, apiGate, "extract")
-		}
-		if qualityClient != nil && qualityClient != client {
-			qualityClient = extraction.NewGatedClient(qualityClient, apiGate, "quality")
-		}
 		// Feed actual token usage from API responses into budget tracking
 		extraction.OnUsage = func(model string, inputTokens, outputTokens int) {
 			inputPerM, outputPerM := ac.PricingForModel(model)
@@ -674,9 +789,74 @@ func Run(cfg Config) error {
 		log.Printf("[api-gate] Global health gate active (threshold=5, reserve=$0.50)")
 
 		// Set per-call budget limit on CLI clients (safety net via --max-budget-usd)
-		if ac.LLM.MaxBudgetPerCallUSD > 0 {
-			extraction.SetMaxBudgetPerCall(client, ac.LLM.MaxBudgetPerCallUSD)
-			extraction.SetMaxBudgetPerCall(qualityClient, ac.LLM.MaxBudgetPerCallUSD)
+		env := daemonLLMEnv(apiKey, ac.LLM.ClaudeBinary, baseURL, extractTracker, apiGate, throttleFn, ac.LLM.MaxBudgetPerCallUSD)
+
+		// Extraction client (Sonnet default) — extraction, evolution, cluster
+		// distillation, recurrence detection, persona signals
+		client, clientErr := newDaemonLLMClient(ac, meteredOpts(env, ac.ModelID(), "extract"))
+		if clientErr != nil {
+			log.Printf("LLM client error: %v", clientErr)
+		}
+
+		// Quality client (Opus default) — narratives, profiles, persona synthesis.
+		// Without a separate narrative model the handle shares the extraction
+		// tracker: there is no quality budget to meter against, and the gate's
+		// quality bucket stays budget-neutral, exactly as before.
+		qualityOpts := meteredOpts(env, ac.ModelID(), "quality")
+		if separateQualityModel {
+			qualityOpts.model = ac.NarrativeModelID()
+			qualityOpts.tracker = qualityTracker
+		}
+		qualityClient, qcErr := newDaemonLLMClient(ac, qualityOpts)
+		if qcErr != nil {
+			log.Printf("Quality LLM client error (falling back to extraction model): %v", qcErr)
+			qualityClient = client
+		}
+
+		// New briefing keys reach an existing installation only through setup, and
+		// LoadStrings then fills them with English defaults. The backfill translates
+		// the missing keys into the language the file already uses. Off the start
+		// path: a slow or failing model must not delay the daemon (YM-338). The
+		// directory follows the configured DB path, the same one the briefing
+		// renderer reads (regenerateBriefingsForTargets).
+		stringsDir := cfg.DataDir
+		if ac.Paths.DB != "" {
+			stringsDir = filepath.Dir(ac.Paths.DB)
+		}
+		go func() {
+			if err := backfillStringsOnStartup(stringsDir, client); err != nil {
+				log.Printf("[i18n] strings.yaml backfill: %v", err)
+			}
+		}()
+
+		// Auto-correct client — the bash-job repair pass asks the model to repair
+		// a failing cap script. Same decoration as the other metered paths: the
+		// prompt carries the failure excerpt and the cap metadata, never the
+		// script body, so it goes through the redactor like every other prompt
+		// (see autoCorrectPrompt).
+		autoCorrectOpts := meteredOpts(env, ac.ModelID(), "extract")
+		if acClient, acErr := newDaemonLLMClient(ac, autoCorrectOpts); acErr != nil {
+			log.Printf("Auto-correct LLM client error: %v", acErr)
+		} else if acClient == nil {
+			log.Printf("Auto-correct LLM client unavailable (no provider/API key): failed bash jobs stay queued without a diagnosis")
+		} else {
+			handler.SetAutoCorrectClient(acClient)
+		}
+
+		// Always create a lightweight summarize client (Haiku) for on-demand tasks
+		// (rules condensation, doc destillation) — independent of extraction cycle
+		if apiKey != "" {
+			summarizeModel := ac.SummarizeModelID()
+			sc, scErr := newDaemonLLMClient(ac, llmClientOpts{
+				apiKey:       apiKey,
+				model:        summarizeModel,
+				claudeBinary: ac.LLM.ClaudeBinary,
+				baseURL:      baseURL,
+			})
+			if scErr == nil && sc != nil {
+				handler.SetSummarizeClient(sc)
+				log.Printf("Summarize client ready: %s (for rules/destillation)", summarizeModel)
+			}
 		}
 
 		// ━━━ Embedding: Initialize provider synchronously (needed for clustering) ━━━
@@ -768,7 +948,7 @@ func Run(cfg Config) error {
 
 			embedIndexer := embedding.NewIndexer(embedProv, vecStore)
 			handler.SetEmbedding(embedIndexer, vecStore, embedProv)
-			handler.ivfPath = filepath.Join(cfg.DataDir, "yesmem.ivf")
+			handler.SetIVFPath(filepath.Join(cfg.DataDir, "yesmem.ivf"))
 			handler.StartEmbedWorker(daemonCtx)
 			log.Printf("Embedding enabled: %s (%dd vectors, %d docs in vec_learnings)", ac.Embedding.Provider, embedProv.Dimensions(), vecStore.Count())
 
@@ -783,12 +963,10 @@ func Run(cfg Config) error {
 		if client != nil && ac.Extraction.AutoExtract {
 			log.Printf("LLM backend: %s (model: %s)", client.Name(), ac.Extraction.Model)
 
-			// Always create single-pass extractor for evolution
-			evoClient := client
-			if ac.SecretsSanitization.Enabled && handler.redactor != nil {
-				evoClient = extraction.NewSanitizingClient(client, handler.redactor)
-			}
-			evoExt := extraction.NewExtractor(evoClient, store)
+			// Always create single-pass extractor for evolution. The extraction
+			// client already carries the redactor (newDaemonLLMClient), so it is
+			// used as-is — a second layer would only duplicate the redaction.
+			evoExt := extraction.NewExtractor(client, store)
 
 			// Create session extractor based on mode
 			var ext extraction.SessionExtractor
@@ -800,39 +978,38 @@ func Run(cfg Config) error {
 					// Same model — reuse client (already budget-wrapped)
 					summarizeClient = client
 				} else {
-					sc, scErr := extraction.NewLLMClient(ac.LLM.Provider, apiKey, summarizeModel, ac.LLM.ClaudeBinary, baseURL)
+					sc, scErr := newDaemonLLMClient(ac, llmClientOpts{
+						apiKey:       apiKey,
+						model:        summarizeModel,
+						claudeBinary: ac.LLM.ClaudeBinary,
+						baseURL:      baseURL,
+						tracker:      extractTracker,
+						throttle:     throttleFn,
+					})
 					if scErr != nil || sc == nil {
 						log.Printf("Summarize client unavailable, using extraction model: %v", scErr)
 						summarizeClient = client
 					} else {
-						if extractTracker != nil {
-							sbc := extraction.NewBudgetClient(sc, extractTracker)
-							sbc.ThrottleFn = throttleFn
-							sc = sbc
-						}
 						summarizeClient = sc
 					}
 				}
 
 				// Pass 2: Extract client — uses QualityModelID
 				extractModel := ac.QualityModelID()
-				extractClient, extractErr := extraction.NewLLMClient(ac.LLM.Provider, apiKey, extractModel, ac.LLM.ClaudeBinary, baseURL)
+				extractClient, extractErr := newDaemonLLMClient(ac, llmClientOpts{
+					apiKey:       apiKey,
+					model:        extractModel,
+					claudeBinary: ac.LLM.ClaudeBinary,
+					baseURL:      baseURL,
+					tracker:      extractTracker,
+					throttle:     throttleFn,
+				})
 				if extractErr == nil && extractClient != nil {
-					if extractTracker != nil {
-						ebc := extraction.NewBudgetClient(extractClient, extractTracker)
-						ebc.ThrottleFn = throttleFn
-						extractClient = ebc
-					}
-					{
-						summarizeClient, extractClient := summarizeClient, extractClient
-						summarizeClient = wrapWithSanitizationIfEnabled(summarizeClient, ac, handler.redactor)
-						extractClient = wrapWithSanitizationIfEnabled(extractClient, ac, handler.redactor)
-						ext = extraction.NewTwoPassExtractor(summarizeClient, extractClient, store)
-					}
+					ext = extraction.NewTwoPassExtractor(summarizeClient, extractClient, store)
 					log.Printf("Extraction mode: two-pass (summarize=%s, extract=%s)", summarizeClient.Model(), extractClient.Model())
 					// Make summarize client available for doc destillation
-					handler.SummarizeClient = summarizeClient
-					handler.CommitEvalClient = extractClient
+					handler.SetSummarizeClient(summarizeClient)
+					handler.SetCommitEvalClient(extractClient)
 				} else {
 					ext = evoExt
 					log.Printf("Extraction mode: single-pass fallback (quality client unavailable)")
@@ -841,17 +1018,24 @@ func Run(cfg Config) error {
 				ext = evoExt
 				log.Printf("Extraction mode: single-pass (%s)", client.Model())
 			}
+			ext.SetChunkSize(ac.Extraction.ChunkSize)
 
 			// Always wire handler LLM fields for llm_complete RPC,
 			// regardless of extraction mode.
-			handler.QualityClient = qualityClient
-			handler.LLMProvider = ac.LLM.Provider
-			handler.LLMCompleteProvider = ac.LLM.CompleteProvider
-			handler.LLMAPIKey = apiKey
-			handler.LLMBaseURL = baseURL
+			handler.SetQualityClient(qualityClient)
+			wiringBaseURL := baseURL
 			if ac.LLM.OpenAIBaseURL != "" {
-				handler.LLMBaseURL = ac.LLM.OpenAIBaseURL
+				wiringBaseURL = ac.LLM.OpenAIBaseURL
 			}
+			// An llm_complete call that overrides model or provider gets a client
+			// with the same metering, api gate, per-call cap and redactor as the
+			// daemon's own paths — not a bare client outside the budget.
+			handler.SetLLMRouting(ac.LLM.Provider, ac.LLM.CompleteProvider, wiringBaseURL, func(provider, model string) (extraction.LLMClient, error) {
+				o := meteredOpts(env, model, "extract")
+				o.provider = provider
+				o.baseURL = wiringBaseURL
+				return newDaemonLLMClient(ac, o)
+			})
 
 			extMu.Lock()
 			extractor = ext
@@ -860,8 +1044,6 @@ func Run(cfg Config) error {
 			qualityLLM = qualityClient
 			appCfg = ac
 			extMu.Unlock()
-
-			handler.BriefingUserProfile = ac.Briefing.UserProfile
 
 			log.Printf("Quality model: %s", qualityClient.Model())
 			runInitialExtraction(ext, evoExt, store, ac, client, qualityClient, handler)
@@ -937,9 +1119,9 @@ func Run(cfg Config) error {
 	go func() {
 		// Wait for summarize client (set at daemon startup)
 		time.Sleep(3 * time.Second)
-		rulesClient := handler.QualityClient
+		rulesClient := handler.qualityLLMClient()
 		if rulesClient == nil {
-			rulesClient = handler.SummarizeClient
+			rulesClient = handler.summarizeLLM()
 		}
 		RunRulesRefresh(store, rulesClient)
 		startRulesWatch(daemonCtx, store, rulesClient)
@@ -951,7 +1133,7 @@ func Run(cfg Config) error {
 		// Give up after 2 minutes if the client never materializes (e.g. LLM disabled).
 		const stalenessStartupTimeout = 2 * time.Minute
 		deadline := time.After(stalenessStartupTimeout)
-		for handler.CommitEvalClient == nil {
+		for handler.commitEvalLLM() == nil {
 			select {
 			case <-daemonCtx.Done():
 				return
@@ -989,22 +1171,24 @@ func Run(cfg Config) error {
 		log.Printf("Briefing refinement: model=%s, interval=24h", model)
 
 		// Build a gated client for briefing refinement
-		briefingClient, _ := extraction.NewLLMClient(ac.LLM.Provider, apiKey, model, ac.LLM.ClaudeBinary, ac.ResolvedOpenAIBaseURL())
-		if briefingClient != nil {
-			extMu.Lock()
-			gate := apiGateRef
-			extMu.Unlock()
-			if gate != nil {
-				briefingClient = extraction.NewGatedClient(briefingClient, gate, "quality")
-			}
-			if ac.SecretsSanitization.Enabled {
-				briefingClient = extraction.NewSanitizingClient(briefingClient,
-					sanitize.NewSecretRedactor(ac.SecretsSanitization.AllowedExceptions))
-			}
-		}
+		extMu.Lock()
+		gate := apiGateRef
+		extMu.Unlock()
+		briefingClient, _ := newDaemonLLMClient(ac, llmClientOpts{
+			apiKey:       apiKey,
+			model:        model,
+			claudeBinary: ac.LLM.ClaudeBinary,
+			gate:         gate,
+			gateBucket:   "quality",
+		})
 
 		// Initial generation on daemon start only for projects with missing or changed cache entries.
-		if targets, err := listProjectsNeedingBriefingRefresh(store, ac); err == nil && len(targets) > 0 {
+		if targets, err := listProjectsNeedingBriefingRefresh(store, ac); err != nil {
+			// Its own branch: without it a failed scan reaches the else below and
+			// reports "cache present", which is the opposite of what happened now
+			// that the fingerprint and hash reads surface their errors.
+			log.Printf("[briefing] refine: startup scan failed: %v", err)
+		} else if len(targets) > 0 {
 			log.Printf("Briefing refinement: %d projects missing/changed — generating", len(targets))
 			regenerateBriefingsForTargets(store, ac, briefingClient, targets)
 		} else {
@@ -1043,10 +1227,9 @@ func Run(cfg Config) error {
 	}()
 
 	// Batch extraction cycle — replaces immediate settled-trigger extraction.
-	// Runs every 2h OR when ≥5 sessions are pending (whichever comes first).
+	// Runs every 2h or when the watcher reports a settled session.
 	// Back-to-back processing enables Anthropic Prompt Cache reuse (5min TTL).
 	go func() {
-		const batchPendingThreshold = 5
 		ticker := time.NewTicker(2 * time.Hour)
 		defer ticker.Stop()
 		for {
@@ -1056,35 +1239,27 @@ func Run(cfg Config) error {
 			case <-ticker.C:
 			case <-batchExtractNotify:
 			}
-			// Check pending count — only run if enough sessions or timer fired
-			pending, _ := store.CountPendingExtractions(5)
-			isTick := true // simplification: always check, ticker resets on select
-			if !isTick && pending < batchPendingThreshold {
-				continue
+			// Check pending count — the ticker fires unconditionally, and a notify
+			// arrives per settled session, so there is no threshold to apply here.
+			pending, err := store.CountPendingExtractions(storage.ShortSessionMaxMessages)
+			if err != nil {
+				log.Printf("warn: pending extraction count: %v", err)
 			}
 			if pending == 0 {
-				continue
+				// A session that a fork marked as extracted can still carry an
+				// uncovered tail; it has no extracted_at gap to make it pending.
+				tails, err := store.CountUncoveredTails(forkCoverageSlack)
+				if err != nil {
+					log.Printf("warn: uncovered-tail count: %v", err)
+				}
+				if tails == 0 && err == nil {
+					continue
+				}
 			}
 			// Throttle extraction when API utilization is high
-			if rlJSON, err := store.GetProxyState("rate_limits"); err == nil && rlJSON != "" {
-				var rl struct {
-					Unified5hUtilization float64 `json:"unified_5h_utilization"`
-					TokensLimit          int     `json:"tokens_limit"`
-					TokensRemaining      int     `json:"tokens_remaining"`
-					IsSubscription       bool    `json:"is_subscription"`
-				}
-				if json.Unmarshal([]byte(rlJSON), &rl) == nil {
-					var utilization float64
-					if rl.IsSubscription {
-						utilization = rl.Unified5hUtilization
-					} else if rl.TokensLimit > 0 {
-						utilization = 1.0 - float64(rl.TokensRemaining)/float64(rl.TokensLimit)
-					}
-					if utilization > 0.5 {
-						log.Printf("━━━ Extraction deferred: utilization %.0f%% (threshold 50%%) ━━━", utilization*100)
-						continue
-					}
-				}
+			if rl := readRateLimits(store); rl != nil && rl.ShouldThrottle(0.5) {
+				log.Printf("━━━ Extraction deferred: utilization %.0f%% (threshold 50%%) ━━━", rl.Utilization()*100)
+				continue
 			}
 			extMu.Lock()
 			ext := extractor
@@ -1151,22 +1326,51 @@ func Run(cfg Config) error {
 		}
 	}()
 
-	// Recurrence detection — every 2h, but only if ≥50 new learnings since last run.
-	// Finds clusters with recurring patterns and generates alerts.
+	// Orphaned proxy rows — a thread that neither invalidates its frozen prefix
+	// nor comes back for it leaves the row (several megabytes) in proxy_state
+	// forever: the proxy eviction is deliberately in-memory only and never
+	// rewrites a row from the request path.
+	//
+	// The age is far above the prefix RAM TTL (65 minutes for a 1h cache TTL)
+	// because a long-lived thread keeps a byte-identical prefix and only rewrites
+	// the row when its bytes change, so an old updated_at does not prove the
+	// thread is gone. Such a thread pays for the deletion in two ways: a restart
+	// inside the gap rebuilds the prefix from scratch, and so does a live process
+	// after Evict drops loadedFromDB. Both are one cache miss, not a state loss;
+	// ensureFrozenPersisted re-persists the row on the next restore turn. Rows
+	// older than a day cannot carry a warm upstream cache anyway: keepalive pings
+	// stop after about 22 minutes.
 	go func() {
-		ticker := time.NewTicker(2 * time.Hour)
+		const frozenRowMaxAge = 24 * time.Hour
+		ticker := time.NewTicker(30 * time.Minute)
 		defer ticker.Stop()
-		lastRun := time.Now()
 		for {
 			select {
 			case <-daemonCtx.Done():
 				return
 			case <-ticker.C:
-				newCount := store.CountLearningSince(lastRun)
-				if newCount < 50 {
-					log.Printf("[recurrence] skipped: only %d new learnings (need 50)", newCount)
-					continue
+				for _, prefix := range []string{"frozen:", frozenMarkersKeyPrefix} {
+					n, err := store.DeleteProxyStatePrefixOlderThan(prefix, frozenRowMaxAge)
+					if err != nil {
+						log.Printf("[janitor] reclaim %s*: %v", prefix, err)
+					} else if n > 0 {
+						log.Printf("[janitor] reclaimed %d orphaned %s* rows", n, prefix)
+					}
 				}
+			}
+		}
+	}()
+
+	// Recurrence detection — every 2h. The new-learning gate lives inside
+	// DetectRecurrence (persisted cursor), so both callers share one rule.
+	go func() {
+		ticker := time.NewTicker(2 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-daemonCtx.Done():
+				return
+			case <-ticker.C:
 				extMu.Lock()
 				cl := llmClient
 				extMu.Unlock()
@@ -1174,8 +1378,9 @@ func Run(cfg Config) error {
 					continue
 				}
 				alerts := DetectRecurrence(store, cl)
-				log.Printf("[recurrence] done: %d alerts from %d new learnings", alerts, newCount)
-				lastRun = time.Now()
+				if alerts > 0 {
+					log.Printf("[recurrence] done: %d alerts", alerts)
+				}
 			}
 		}
 	}()
@@ -1204,6 +1409,15 @@ func Run(cfg Config) error {
 
 	// Gap review — daily LLM review of unreviewed knowledge gaps.
 	// Deletes noise (context-loss artifacts), keeps real knowledge gaps.
+	// gapReviewTracker reads the shared tracker under the same lock the config
+	// holder uses: it is written by the async setup goroutine, so an unguarded
+	// read here would race with that write.
+	gapReviewTracker := func() *extraction.BudgetTracker {
+		extMu.Lock()
+		defer extMu.Unlock()
+		return extractTracker
+	}
+
 	// Prefers 06:00 when budget is fresh, but catches up on startup if >24h since last review.
 	go func() {
 		// Catch-up: if last review was >24h ago, run now (after 5min delay)
@@ -1214,7 +1428,7 @@ func Run(cfg Config) error {
 				return
 			case <-time.After(5 * time.Minute):
 			}
-			runGapReviewDaemon(store, &extMu, &appCfg)
+			runGapReviewDaemon(store, &extMu, &appCfg, gapReviewTracker())
 		}
 
 		// Then schedule daily at 06:00
@@ -1229,20 +1443,16 @@ func Run(cfg Config) error {
 				return
 			case <-time.After(time.Until(next)):
 			}
-			runGapReviewDaemon(store, &extMu, &appCfg)
+			runGapReviewDaemon(store, &extMu, &appCfg, gapReviewTracker())
 		}
 	}()
 
 	// Auto-update check
 	go func() {
-		extMu.Lock()
-		ac := appCfg
-		extMu.Unlock()
-		if ac == nil || !ac.Update.AutoUpdate {
+		interval, enabled := updateTickerDecision(daemonCtx, &extMu, &appCfg)
+		if !enabled {
 			return
 		}
-		interval := update.ParseCheckInterval(ac.Update.CheckInterval)
-		log.Printf("[update] auto-update enabled, checking every %v", interval)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -1263,12 +1473,21 @@ func Run(cfg Config) error {
 				}
 				newVersion, err := update.RunUpdate(buildinfo.Version, log.Default())
 				if err != nil {
-					log.Printf("[update] check failed: %v", err)
+					// Not only a failed release check lands here: a refused lock and
+					// a rolled-back migration do too.
+					log.Printf("[update] failed: %v", err)
 					continue
 				}
 				if newVersion != "" {
-					log.Printf("[update] updated to %s, restarting...", newVersion)
-					update.RunRestart(log.Default())
+					log.Printf("[update] updated to %q, restarting...", newVersion)
+					// The restart takes the update lock now, so it can be refused
+					// while a deploy or a second updater holds it: the new binary
+					// is installed but not active. This goroutine ends here, so the
+					// process makes no further automatic attempt; %q because the
+					// version comes from the release JSON.
+					if err := update.RunRestart(log.Default()); err != nil {
+						log.Printf("[update] restart failed, %q is installed but not active: %v", newVersion, err)
+					}
 					return
 				}
 			}
@@ -1287,9 +1506,46 @@ func Run(cfg Config) error {
 	return nil
 }
 
+// backfillStringsOnStartup adds the briefing keys a new version introduced to an
+// existing strings.yaml, translated into the language the file already uses.
+//
+// Setup owns a missing file: without one there is no language to match, and
+// writing English defaults would cement the exact half-translated state this
+// backfill removes. The model is required; without a client the daemon starts
+// unchanged.
+func backfillStringsOnStartup(dataDir string, client extraction.LLMClient) error {
+	if client == nil {
+		return nil
+	}
+	path := filepath.Join(dataDir, "strings.yaml")
+	missing, err := briefing.MissingStringKeys(path)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	prompt, err := briefing.BuildMissingStringsPrompt(path, missing)
+	if err != nil {
+		return err
+	}
+	response, err := client.Complete("You are a translator. Return ONLY valid YAML, no explanation.", prompt)
+	if err != nil {
+		return err
+	}
+	merged, err := briefing.MergeStringKeys(path, response, missing)
+	if err != nil {
+		return err
+	}
+	if merged > 0 {
+		log.Printf("[i18n] strings.yaml: %d missing keys translated into the file's language", merged)
+	}
+	return nil
+}
+
 // regenerateAllBriefings generates refined briefings for all known projects.
 func regenerateAllBriefings(store *storage.Store, cfg *config.Config, llmClient extraction.LLMClient) {
-	projects, err := store.ListProjects()
+	projects, err := store.ListProjectsWithRepositoryRoots()
 	if err != nil {
 		log.Printf("[briefing] refine: list projects failed: %v", err)
 		return
@@ -1310,9 +1566,7 @@ func regenerateBriefingsForTargets(store *storage.Store, cfg *config.Config, llm
 		briefing.SetStringsPath(filepath.Join(filepath.Dir(cfg.Paths.DB), "strings.yaml"))
 		raw := target.Raw
 		if raw == "" {
-			gen := briefing.New(store, 0)
-			gen.SetUserProfile(cfg.Briefing.UserProfile)
-			raw = gen.Generate(p.Project)
+			raw = briefing.NewFromConfig(store, cfg).GenerateForKey(p.ProjectShort)
 		}
 		if raw == "" {
 			continue
@@ -1329,8 +1583,25 @@ func regenerateBriefingsForTargets(store *storage.Store, cfg *config.Config, llm
 // refinement calls on long-dormant projects.
 const briefingInactivityThreshold = 30 * 24 * time.Hour
 
+// briefingLastActiveAt is the activity timestamp the refresh loop ranks by. A
+// synthetic repository-root row owns no session, so the exact-match lookup in the
+// sessions table returns zero for it; its worktree copies are what moved, and the
+// row's aggregated last_active is the only source. Zero stays "unknown" and fails
+// open, as before.
+func briefingLastActiveAt(store *storage.Store, project storage.ProjectSummary) time.Time {
+	if last := projectLastActiveAt(context.Background(), store, project.ProjectShort); !last.IsZero() {
+		return last
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, project.LastActive); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 func listProjectsNeedingBriefingRefresh(store *storage.Store, cfg *config.Config) ([]briefingRefreshTarget, error) {
-	projects, err := store.ListProjects()
+	projects, err := store.ListProjectsWithRepositoryRoots()
 	if err != nil {
 		return nil, err
 	}
@@ -1349,13 +1620,19 @@ func listProjectsNeedingBriefingRefresh(store *storage.Store, cfg *config.Config
 		// Inactivity filter: skip projects dormant longer than the threshold.
 		// Uses the sessions table's MAX(started_at); falls back to "include"
 		// when the timestamp can't be parsed so we fail open.
-		if last := projectLastActiveAt(context.Background(), store, project.ProjectShort); !last.IsZero() &&
+		if last := briefingLastActiveAt(store, project); !last.IsZero() &&
 			time.Since(last) > briefingInactivityThreshold {
 			continue
 		}
 		// Lightweight change detection: compare DB fingerprint instead of
 		// generating the full raw briefing (which contains volatile timestamps).
-		fingerprint := store.ProjectChangeFingerprint(project.ProjectShort)
+		fingerprint, err := store.ProjectChangeFingerprint(project.ProjectShort)
+		if err != nil {
+			// One unreadable project must not cost the whole scan: the other
+			// projects are healthy and the next attempt is 24h away.
+			log.Printf("[briefing] refine: fingerprint for %q failed: %v", project.ProjectShort, err)
+			continue
+		}
 		cachedHash, err := store.GetRefinedBriefingHash(project.ProjectShort)
 		if err != nil {
 			return nil, err
@@ -1375,6 +1652,15 @@ func listProjectsNeedingBriefingRefresh(store *storage.Store, cfg *config.Config
 // runDocSync checks all registered doc sources for updates.
 // If a source is inside a git repo, pulls first. Then re-imports changed files.
 func runDocSync(store *storage.Store, cfg *config.Config) {
+	// Read the chunk watermark before listing the sources: the sweep for a
+	// source without a path leaves every row above it alone, because a
+	// concurrent pass may have written them after this snapshot (same rule as
+	// ingest.Run). 0 disables that sweep.
+	sweepWatermark, watermarkErr := store.MaxDocChunkID()
+	if watermarkErr != nil {
+		log.Printf("[doc-sync] chunk watermark: %q; sources without a path will not be swept", watermarkErr)
+		sweepWatermark = 0
+	}
 	sources, err := store.ListDocSources("")
 	if err != nil {
 		log.Printf("[doc-sync] list sources: %v", err)
@@ -1388,15 +1674,64 @@ func runDocSync(store *storage.Store, cfg *config.Config) {
 	log.Printf("[doc-sync] Checking %d doc sources for updates...", len(sources))
 
 	for _, src := range sources {
+		// Rules and skill sources hold their body in full_content, not chunks —
+		// re-ingesting them would index the source file as documentation and clear
+		// the flag that makes the content reachable. Rules are refreshed by
+		// RunRulesRefresh, not by doc-sync.
+		if src.IsRules || src.IsSkill {
+			continue
+		}
 		if src.Path == "" {
+			// The list is a snapshot, and the loop that follows takes real time
+			// (git pulls, full walks). Another pass may have re-registered this
+			// source with a path and re-indexed it meanwhile; a content match
+			// then writes no row the watermark could spare, so judge the current
+			// row rather than the snapshot.
+			current, readErr := store.GetDocSource(src.Name, src.Project)
+			if readErr != nil {
+				log.Printf("[doc-sync] %q: re-read source before the sweep: %q", src.Name, readErr)
+				continue
+			}
+			if current == nil || current.Path != "" {
+				continue
+			}
+			if sweepWatermark == 0 {
+				log.Printf("[doc-sync] %q: skipped the sweep of a source without a path (no chunk watermark)", src.Name)
+				continue
+			}
+			// Without a path there is no tree to compare against, so ingest.Run
+			// never sees this source and its documents stay indexed although
+			// nothing can ever refresh them. That is the same loss the sweep in
+			// Run handles for a deleted document, only the whole source is gone.
+			swept, sweepErr := ingest.SweepUnreachableSource(store, src.ID, sweepWatermark)
+			if sweepErr != nil {
+				log.Printf("[doc-sync] %q: sweep chunks of a source without a path: %q", src.Name, sweepErr)
+			}
+			if swept.FilesRemoved > 0 {
+				log.Printf("[doc-sync] %q: removed %d document(s) and retired %d learning(s) of a source without a path",
+					src.Name, swept.FilesRemoved, swept.LearningsSuperseded)
+				if countErr := store.UpdateDocSourceChunkCount(src.ID); countErr != nil {
+					log.Printf("[doc-sync] %q: refresh chunk count: %q", src.Name, countErr)
+				}
+			}
+			continue
+		}
+		// A relative path was registered against a working directory nobody
+		// recorded; re-reading it from the daemon's cwd indexes whatever sits
+		// at that name now, under the source's name.
+		if !filepath.IsAbs(src.Path) {
+			log.Printf("[doc-sync] %q: skipped relative path %q (re-register it with an absolute path)", src.Name, src.Path)
 			continue
 		}
 
+		// The name and the path come from the caller, so both are quoted: a
+		// newline in either would split one log line into two, the second
+		// reading like a line this daemon never wrote.
 		if _, err := os.Stat(src.Path); err != nil {
 			if os.IsNotExist(err) {
-				log.Printf("[doc-sync] %s: skipped missing path %s", src.Name, src.Path)
+				log.Printf("[doc-sync] %q: skipped missing path %q", src.Name, src.Path)
 			} else {
-				log.Printf("[doc-sync] %s: skipped unreadable path %s: %v", src.Name, src.Path, err)
+				log.Printf("[doc-sync] %q: skipped unreadable path %q: %q", src.Name, src.Path, err)
 			}
 			continue
 		}
@@ -1413,20 +1748,25 @@ func runDocSync(store *storage.Store, cfg *config.Config) {
 
 		result, runErr := ingest.Run(icfg, []string{src.Path}, store)
 		if runErr != nil {
-			log.Printf("[doc-sync] %s: error: %v", src.Name, runErr)
+			// The error text repeats the path, so quoting it here is what keeps
+			// the newline out: the message carries the raw path from the OS
+			// error even though Run formats its own copy with %q.
+			log.Printf("[doc-sync] %q: error: %q", src.Name, runErr)
 			continue
 		}
 
-		if result.FilesProcessed > 0 || gitUpdated {
-			log.Printf("[doc-sync] %s: %d files updated, %d chunks created",
-				src.Name, result.FilesProcessed, result.ChunksCreated)
+		if result.FilesProcessed > 0 || result.UnreadableEntries > 0 || gitUpdated {
+			log.Printf("[doc-sync] %q: %d files updated, %d chunks created, %d unreadable entries skipped",
+				src.Name, result.FilesProcessed, result.ChunksCreated, result.UnreadableEntries)
 		}
 	}
 }
 
-// tryGitPull checks if the path is inside a git repo and pulls if so.
+// tryGitPull updates a doc source from its upstream, but only when the source
+// path is itself a repository root (a docs clone). It never walks up to an
+// enclosing repository — see repo.CloneRoot.
 func tryGitPull(path string) bool {
-	gitRoot := findGitRoot(path)
+	gitRoot := repo.CloneRoot(path)
 	if gitRoot == "" {
 		return false
 	}
@@ -1434,34 +1774,15 @@ func tryGitPull(path string) bool {
 	cmd := exec.Command("git", "-C", gitRoot, "pull", "--quiet")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[doc-sync] git pull %s: %v: %s", gitRoot, err, output)
+		// gitRoot derives from the registered source path and git's own output
+		// repeats it, so every part of this line can carry a caller-chosen
+		// newline.
+		log.Printf("[doc-sync] git pull %q: %q: %q", gitRoot, err, output)
 		return false
 	}
 
 	// "Already up to date." means no changes
 	return !strings.Contains(string(output), "Already up to date")
-}
-
-// findGitRoot walks up from path to find the nearest .git directory.
-func findGitRoot(path string) string {
-	absPath, _ := filepath.Abs(path)
-	info, err := os.Stat(absPath)
-	if err != nil {
-		return ""
-	}
-	if !info.IsDir() {
-		absPath = filepath.Dir(absPath)
-	}
-	for {
-		if _, err := os.Stat(filepath.Join(absPath, ".git")); err == nil {
-			return absPath
-		}
-		parent := filepath.Dir(absPath)
-		if parent == absPath {
-			return ""
-		}
-		absPath = parent
-	}
 }
 
 // handlerAdapter bridges daemon.Handler to httpapi.RPCHandler interface,
@@ -1470,7 +1791,39 @@ type handlerAdapter struct {
 	h *Handler
 }
 
+// httpDeniedMethods are the daemon methods the HTTP RPC pass-through must not
+// serve. They read and consume a session's channel inbox and identify their
+// caller by the peer of its unix-socket connection (channelInboxSession); an
+// HTTP request carries no peer, so on that transport the guard has nothing to
+// hold a caller to and any bearer-token holder could name any inbox. The proxy
+// reaches them over the socket, which is where they belong.
+//
+// broadcast is denied for the same reason on the write side: its sender label is
+// resolved from the caller's proven identity, and the proof lives on the socket
+// (peer pid, PID/workdir mapping). A transport that carries no peer would leave
+// the label caller-chosen again — and a broadcast is read by every agent in the
+// project (YM-271).
+var httpDeniedMethods = map[string]bool{
+	"check_channel":     true,
+	"mark_channel_read": true,
+	"check_broadcasts":  true,
+	"broadcast":         true,
+	// The proxy_state and config_runtime methods ask "is this caller the proxy,
+	// or the session it names" and answer it from the peer the kernel reports
+	// (proxyStateForeignPeer, sessionOverrideWriteAllowed). A transport without a
+	// peer makes those guards abstain, so the methods belong to the socket no
+	// matter what a future entry in httpRPCMethods says (YM-427).
+	"set_proxy_state":           true,
+	"get_proxy_state":           true,
+	"delete_proxy_state_prefix": true,
+	"set_config":                true,
+	"get_config":                true,
+}
+
 func (a *handlerAdapter) Handle(req httpapi.RPCRequest) httpapi.RPCResponse {
+	if httpDeniedMethods[req.Method] {
+		return httpapi.RPCResponse{Error: "method is not available over the HTTP API"}
+	}
 	resp := a.h.Handle(Request{
 		Method: req.Method,
 		Params: req.Params,

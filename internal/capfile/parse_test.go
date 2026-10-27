@@ -716,6 +716,86 @@ kind: handler
 
 // --- scope=project + sandbox=none guard ---
 
+// An omitted scope field must land on the shareable default rather than on the
+// project-bound one, so a scope-less CAP.md is not tied to whichever project
+// happened to import it. The flip is inert on today's call graph — the only
+// ScanAll caller passes no project dir — but it is what a future project-dir
+// caller would inherit.
+func TestParse_NoScopeDefaultsToUser(t *testing.T) {
+	src := `---
+name: x
+description: "x"
+---
+
+## Purpose
+x
+
+## Scripts
+
+### x
+kind: handler
+
+` + "```bash\necho hi\n```" + `
+`
+	cf, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cf.Scope != "user" {
+		t.Errorf("Scope = %q, want user", cf.Scope)
+	}
+}
+
+// The default is the scanner's answer to a missing scope field. An unknown
+// value would slip past the project-dir lock exactly like a missing one, so it
+// is refused instead of stored.
+func TestParseWithDefaultScope_RejectsUnknownDefault(t *testing.T) {
+	src := `---
+name: x
+description: "x"
+---
+
+## Purpose
+x
+
+## Scripts
+
+### x
+kind: handler
+
+` + "```bash\necho hi\n```" + `
+`
+	if _, err := ParseWithDefaultScope([]byte(src), "global"); err == nil {
+		t.Error("an unknown default scope must be refused")
+	}
+}
+
+// An explicit scope is validated too: a typo such as "projct" would otherwise
+// bypass the project-dir default and load the cap project-agnostic, with
+// sandbox=none left standing.
+func TestParse_RejectsUnknownExplicitScope(t *testing.T) {
+	src := `---
+name: x
+description: "x"
+scope: projct
+---
+
+## Purpose
+x
+
+## Scripts
+
+### x
+kind: handler
+sandbox: none
+
+` + "```bash\necho hi\n```" + `
+`
+	if _, err := Parse([]byte(src)); err == nil {
+		t.Error("an unknown scope value must be refused")
+	}
+}
+
 func TestParse_ProjectScopeRejectsSandboxNone(t *testing.T) {
 	src := `---
 name: x
@@ -770,12 +850,10 @@ sandbox: none
 }
 
 func TestParse_NoScopeAllowsSandboxNone(t *testing.T) {
-	// No scope in frontmatter — historically defaults to "project" internally,
-	// but the T4 guard applies only when scope is explicitly "project".
-	// The test documents the expected behaviour: omitting scope is allowed.
-	// NOTE: parse.go currently defaults empty scope to "project", which means
-	// this test will pass only if the guard is restricted to explicit "project".
-	// If the guard fires on the default, update this test and the guard together.
+	// No scope in frontmatter — that is the shareable default ("user"), and the
+	// T4 guard applies only to an explicitly project-scoped file.
+	// If the guard is ever widened to the effective scope, update this test and
+	// the guard together.
 	src := `---
 name: x
 description: "x"

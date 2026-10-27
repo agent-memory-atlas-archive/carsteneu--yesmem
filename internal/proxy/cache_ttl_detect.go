@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -18,10 +19,22 @@ type CacheTTLDetector struct {
 	mu             sync.Mutex
 	supported      *bool                // nil = unknown, true/false = detected
 	testedAt       time.Time            // when supported was last determined
-	threadRequests map[string]time.Time // per-thread last request time for gap measurement
-	currentThread  string               // thread whose gap should be checked in RecordResponse
+	threadRequests map[string]time.Time // per-thread last response time for gap measurement
+	lastEvict      time.Time            // last sweep of threadRequests
 	dataDir        string               // for persisting state across restarts
 }
+
+const (
+	// ttlThreadEvictionAge bounds how long a gap timeline is worth keeping. The
+	// evidence lives between 5 minutes and the 1h lifetime; an older timeline
+	// can no longer prove anything and only costs memory.
+	ttlThreadEvictionAge = 2 * time.Hour
+	// ttlMaxTrackedThreads is the hard cap on tracked timelines. The thread ID
+	// comes from a client header, so the age rule alone leaves the map open to
+	// unbounded growth by a caller that invents one ID per request.
+	ttlMaxTrackedThreads = 1024
+	ttlEvictInterval     = 10 * time.Minute
+)
 
 func NewCacheTTLDetector() *CacheTTLDetector {
 	return &CacheTTLDetector{
@@ -39,35 +52,38 @@ func NewCacheTTLDetectorWithPersist(dataDir string) *CacheTTLDetector {
 	return d
 }
 
-// RecordRequest tracks per-thread request timing for gap measurement.
-func (d *CacheTTLDetector) RecordRequest(threadID string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.currentThread = threadID
-	// Don't update threadRequests yet — the gap is measured from the
-	// PREVIOUS request time for THIS thread to now.
+// RecordResponse checks one thread's response fields to determine 1h TTL support.
+// The thread ID is passed explicitly: a single "current" thread attributed each
+// response to whichever request started last, so interleaved threads measured
+// the wrong timeline.
+func (d *CacheTTLDetector) RecordResponse(threadID string, cacheRead, cacheWrite, ephemeral1h int) {
+	d.RecordResponseAndReportChange(threadID, cacheRead, cacheWrite, ephemeral1h)
 }
 
-// RecordResponse checks response fields to determine 1h TTL support.
-func (d *CacheTTLDetector) RecordResponse(cacheRead, cacheWrite, ephemeral1h int) {
+// RecordResponseAndReportChange records a response and reports the resulting
+// detection state plus whether it differs from the previous one. Both happen
+// under one lock: two concurrent responses must not both apply the same
+// transition (double propagation, double keepalive retrigger).
+func (d *CacheTTLDetector) RecordResponseAndReportChange(threadID string, cacheRead, cacheWrite, ephemeral1h int) (*bool, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	total := cacheRead + cacheWrite
 	if total == 0 {
-		return
+		return d.supported, false
 	}
 
 	prevSupported := d.supported
 
-	// Gap measurement: time since THIS thread's previous request
+	// Gap measurement: time since THIS thread's previous response
 	now := time.Now()
-	prevTime, hasPrev := d.threadRequests[d.currentThread]
+	prevTime, hasPrev := d.threadRequests[threadID]
 	gap := now.Sub(prevTime)
 	hasGap := hasPrev && gap > 301*time.Second
 
 	// Update this thread's timestamp after measuring gap
-	d.threadRequests[d.currentThread] = now
+	d.threadRequests[threadID] = now
+	d.evictThreadRequestsLocked(now, threadID)
 
 	// Positive: after >5:01 gap, cache still warm (>80% read) → 1h confirmed
 	if hasGap && total > 0 && cacheRead*100/total > 80 {
@@ -75,7 +91,7 @@ func (d *CacheTTLDetector) RecordResponse(cacheRead, cacheWrite, ephemeral1h int
 		d.supported = &t
 		d.testedAt = time.Now()
 		d.saveStateIfChanged(prevSupported)
-		return
+		return d.supported, !boolPtrEqual(prevSupported, d.supported)
 	}
 
 	// Negative: substantial write (not delta) with ephemeral_1h=0 → 5min
@@ -85,6 +101,50 @@ func (d *CacheTTLDetector) RecordResponse(cacheRead, cacheWrite, ephemeral1h int
 		d.supported = &f
 		d.testedAt = time.Now()
 		d.saveStateIfChanged(prevSupported)
+	}
+	return d.supported, !boolPtrEqual(prevSupported, d.supported)
+}
+
+// boolPtrEqual compares two optional detection results; nil never equals a value.
+func boolPtrEqual(a, b *bool) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// evictThreadRequestsLocked bounds the per-thread gap timelines. Two rules: drop
+// expired timelines, then enforce a hard cap oldest first. keep is the thread of
+// the response being recorded and is never dropped. Caller holds mu. The sweep
+// runs at most once per ttlEvictInterval unless the map is over the cap.
+func (d *CacheTTLDetector) evictThreadRequestsLocked(now time.Time, keep string) {
+	if len(d.threadRequests) > ttlMaxTrackedThreads || now.Sub(d.lastEvict) >= ttlEvictInterval {
+		cutoff := now.Add(-ttlThreadEvictionAge)
+		for tid, seen := range d.threadRequests {
+			if tid != keep && seen.Before(cutoff) {
+				delete(d.threadRequests, tid)
+			}
+		}
+		d.lastEvict = now
+	}
+	if len(d.threadRequests) <= ttlMaxTrackedThreads {
+		return
+	}
+	type entry struct {
+		tid  string
+		seen time.Time
+	}
+	entries := make([]entry, 0, len(d.threadRequests))
+	for tid, seen := range d.threadRequests {
+		entries = append(entries, entry{tid, seen})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].seen.Before(entries[j].seen) })
+	// Oldest first: a timeline that is closer to the age limit is the least
+	// likely to still serve as gap evidence for a live session.
+	for _, e := range entries[:len(entries)-ttlMaxTrackedThreads] {
+		if e.tid != keep {
+			delete(d.threadRequests, e.tid)
+		}
 	}
 }
 

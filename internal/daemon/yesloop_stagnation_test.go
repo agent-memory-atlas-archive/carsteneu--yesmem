@@ -36,6 +36,10 @@ func TestBuildStagnationRelayMessage(t *testing.T) {
 
 func makeStagnationAgent(t *testing.T, h *Handler, s *storage.Store, id string, content string) {
 	t.Helper()
+	// The fixture's PID is this test process, so the row declares the backend
+	// whose cmdline it reports: the guard gates on isAgentProcess (a test binary
+	// has no opencode cmdline of its own).
+	stubProcCmdline(t, agentProcCmdlineStub)
 	agent := storage.Agent{
 		ID:            id,
 		Project:       "testproj",
@@ -43,6 +47,7 @@ func makeStagnationAgent(t *testing.T, h *Handler, s *storage.Store, id string, 
 		SessionID:     "sess-" + id,
 		PID:           testPID,
 		Status:        "running",
+		Backend:       "opencode",
 		SockPath:      "/nonexistent/" + id + ".sock",
 		CallerSession: "caller-" + id,
 		Progress:      "Phase 1/6 ANALYZE",
@@ -74,11 +79,15 @@ func TestStagnation_TracksAndEscalates(t *testing.T) {
 	// Simulate 3h without change.
 	yesloopStagnationAgentsMu.Lock()
 	st := yesloopStagnationAgents["stag-1"]
+	if st != nil {
+		st.lastChangedAt = time.Now().Add(-3 * time.Hour)
+	}
+	yesloopStagnationAgentsMu.Unlock()
+	// The failure must not happen under the lock: t.Fatalf runs Goexit, so a
+	// leaked mutex would deadlock every later test in the package.
 	if st == nil {
 		t.Fatalf("agent not tracked")
 	}
-	st.lastChangedAt = time.Now().Add(-3 * time.Hour)
-	yesloopStagnationAgentsMu.Unlock()
 
 	// Tick 2: threshold exceeded — initial relay fires (socket is a dead
 	// path in tests, but the state machine must advance).
@@ -214,7 +223,7 @@ func TestStagnation_EscalatesAfterRefires(t *testing.T) {
 		t.Errorf("expected terminal paused state, got state=%d", state)
 	}
 
-	msgs, err := s.GetChannelMessages("caller-stag-esc")
+	msgs, err := s.GetChannelMessages([]string{"caller-stag-esc"})
 	if err != nil {
 		t.Fatalf("GetChannelMessages: %v", err)
 	}
@@ -268,5 +277,73 @@ func TestStagnation_SkipsNonRunningNonYesloopEmpty(t *testing.T) {
 
 	if len(yesloopStagnationAgents) != 0 {
 		t.Errorf("non-running/non-yesloop/empty-scratchpad agents must not be tracked, got %d", len(yesloopStagnationAgents))
+	}
+}
+
+// A recycled PID must not enter the stagnation protocol. The guard's action is a
+// relay into the agent's socket, which belongs to the agent's own process
+// (Learning #101907); the row's own scratchpad content is not evidence that its
+// process is still the one the row names.
+func TestStagnation_RecycledPIDNotTracked(t *testing.T) {
+	h, s := mustHandler(t)
+	pinProcessTable(t)
+	bystander, _ := startBystander(t)
+	// The row declares an opencode process; the PID holds a live bystander with a
+	// foreign cmdline — a recycled number, not this agent's process.
+	stubProcCmdline(t, "/usr/bin/sleep\x00--recycled-stagnation")
+	agent := storage.Agent{
+		ID: "stag-recycled", Project: "testproj", Section: "yesloop-stag-recycled",
+		SessionID: "sess-stag-recycled", PID: bystander.Process.Pid,
+		Status: "running", Backend: "opencode", Progress: "Phase 1/6 ANALYZE",
+	}
+	if err := s.AgentCreate(agent); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	if err := s.ScratchpadWrite("testproj", "yesloop-stag-recycled", "### Phase 1: ANALYZE\n**Status:** IN PROGRESS\n", "test"); err != nil {
+		t.Fatalf("ScratchpadWrite: %v", err)
+	}
+	streamStatesMu.Lock()
+	streamStates["sess-stag-recycled"] = &StreamState{Active: true, StartedAt: time.Now()}
+	streamStatesMu.Unlock()
+	sessionToThreadMu.Lock()
+	sessionToThread["sess-stag-recycled"] = "sess-stag-recycled"
+	sessionToThreadMu.Unlock()
+
+	h.checkYesloopStagnation()
+
+	if _, tracked := yesloopStagnationAgents["stag-recycled"]; tracked {
+		t.Error("the PID is held by another process — this agent is gone, so the stagnation guard must not track it")
+	}
+}
+
+// Without a readable process table (macOS) the stagnation guard keeps tracking a
+// live agent instead of going dark.
+func TestStagnation_WithoutProcessTableStillTracks(t *testing.T) {
+	h, s := mustHandler(t)
+	prev := procTableReadable
+	procTableReadable = false
+	t.Cleanup(func() { procTableReadable = prev })
+	agent := storage.Agent{
+		ID: "stag-no-proc", Project: "testproj", Section: "yesloop-stag-no-proc",
+		SessionID: "sess-stag-no-proc", PID: testPID,
+		Status: "running", Backend: "opencode", Progress: "Phase 1/6 ANALYZE",
+	}
+	if err := s.AgentCreate(agent); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	if err := s.ScratchpadWrite("testproj", "yesloop-stag-no-proc", "### Phase 1: ANALYZE\n**Status:** IN PROGRESS\n", "test"); err != nil {
+		t.Fatalf("ScratchpadWrite: %v", err)
+	}
+	streamStatesMu.Lock()
+	streamStates["sess-stag-no-proc"] = &StreamState{Active: true, StartedAt: time.Now()}
+	streamStatesMu.Unlock()
+	sessionToThreadMu.Lock()
+	sessionToThread["sess-stag-no-proc"] = "sess-stag-no-proc"
+	sessionToThreadMu.Unlock()
+
+	h.checkYesloopStagnation()
+
+	if _, tracked := yesloopStagnationAgents["stag-no-proc"]; !tracked {
+		t.Error("without a process table the stagnation guard went dark for a live agent")
 	}
 }

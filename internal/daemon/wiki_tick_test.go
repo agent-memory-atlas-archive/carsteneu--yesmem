@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/storage"
+	"github.com/carsteneu/yesmem/internal/wikidir"
 )
 
 func newWikiTickTestStore(t *testing.T) *storage.Store {
@@ -41,6 +42,21 @@ func insertSessionForProject(t *testing.T, s *storage.Store, projectShort, start
 	)
 	if err != nil {
 		t.Fatalf("insert session for %s @ %s: %v", projectShort, startedAt, err)
+	}
+}
+
+// insertLos40bLearningForSession seeds one learning that references the given
+// session, the only shape the wiki renderer can see: render.go collects its
+// session ids from the project's learnings (YM-266).
+func insertLos40bLearningForSession(t *testing.T, s *storage.Store, project, sessionID string) {
+	t.Helper()
+	_, err := s.DB().Exec(
+		`INSERT INTO learnings (session_id, project, category, content, confidence, created_at, model_used, source)
+		 VALUES (?, ?, 'gotcha', 'x', 1.0, ?, 'test', 'llm_extracted')`,
+		sessionID, project, time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		t.Fatalf("insert learning for session %s: %v", sessionID, err)
 	}
 }
 
@@ -187,5 +203,150 @@ func TestColdTierDueForRender_StaleSnapshot(t *testing.T) {
 	}
 	if !coldTierDueForRender(outDir) {
 		t.Errorf("expected coldTierDueForRender=true (25h-old snapshot is due)")
+	}
+}
+
+// --- wikiNeedsRender: session change signal (YM-198) ---
+
+func renderTestWikiDir(t *testing.T, project string) string {
+	t.Helper()
+	out := t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "index.md"), []byte("# wiki\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wikidir.WriteMarker(out, project); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestWikiNeedsRender_ExistingSessionChange(t *testing.T) {
+	s := newWikiTickTestStore(t)
+	project := "proj"
+	// The session has to own a learning, otherwise the renderer never shows it
+	// and its changes are not part of the signal (YM-266).
+	const sessID = "sess-proj-2026-10-01T10:00:00Z"
+	insertSessionRow(t, s, sessID, project, "2026-10-01T10:00:00Z")
+	insertLos40bLearningForSession(t, s, project, sessID)
+	out := renderTestWikiDir(t, project)
+
+	ctx := context.Background()
+	writeWikiSnapshot(ctx, s, project, out)
+	if wikiNeedsRender(ctx, s, project, out) {
+		t.Fatalf("expected no render right after writing the snapshot")
+	}
+
+	// The session grows after the session is finished: message_count and
+	// ended_at move, started_at stays. The wiki renders both fields.
+	if _, err := s.DB().Exec(
+		`UPDATE sessions SET message_count = 42, ended_at = '2026-10-01T12:00:00Z' WHERE project_short = ?`, project,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !wikiNeedsRender(ctx, s, project, out) {
+		t.Error("expected render after an existing session changed (message_count/ended_at)")
+	}
+}
+
+func TestWikiNeedsRender_StableAfterSessionChange(t *testing.T) {
+	s := newWikiTickTestStore(t)
+	project := "proj"
+	const sessID = "sess-proj-2026-10-01T10:00:00Z"
+	insertSessionRow(t, s, sessID, project, "2026-10-01T10:00:00Z")
+	insertLos40bLearningForSession(t, s, project, sessID)
+	out := renderTestWikiDir(t, project)
+
+	ctx := context.Background()
+	writeWikiSnapshot(ctx, s, project, out)
+	if _, err := s.DB().Exec(`UPDATE sessions SET message_count = 42 WHERE project_short = ?`, project); err != nil {
+		t.Fatal(err)
+	}
+	writeWikiSnapshot(ctx, s, project, out)
+	if wikiNeedsRender(ctx, s, project, out) {
+		t.Error("snapshot written after the change must be stable")
+	}
+}
+
+// A session that owns no learning is on no wiki page, so its counters must not
+// trigger a render. The signal used to aggregate every session of the project
+// (a superset of the rendered set), which re-rendered every hot project on
+// every tick (YM-266 / DEV-DT43).
+func TestWikiNeedsRender_IgnoresSessionsWithoutLearnings(t *testing.T) {
+	s := newWikiTickTestStore(t)
+	project := "proj"
+	// Two real sessions: one grows without ever owning a learning, the other owns
+	// one and keeps the project active. Only the second one is rendered.
+	const unlinked = "sess-unlinked"
+	const rendered = "sess-rendered"
+	insertSessionRow(t, s, unlinked, project, "2026-10-01T10:00:00Z")
+	insertSessionRow(t, s, rendered, project, "2026-10-02T10:00:00Z")
+	insertLos40bLearningForSession(t, s, project, rendered)
+	out := renderTestWikiDir(t, project)
+
+	ctx := context.Background()
+	writeWikiSnapshot(ctx, s, project, out)
+	if _, err := s.DB().Exec(`UPDATE sessions SET message_count = 42 WHERE id = ?`, unlinked); err != nil {
+		t.Fatal(err)
+	}
+	if wikiNeedsRender(ctx, s, project, out) {
+		t.Error("a session without learnings is not rendered, its change must not force a render")
+	}
+}
+
+// The signal must not be capped at the session page's 200-row window: the file
+// pages list start times and message counts of the project's learning-linked
+// sessions beyond it (wikirender.loadFileSessions, top 10 per path). A change to
+// the oldest session is therefore still rendered content and has to move the
+// signal (YM-266 review finding).
+func TestWikiNeedsRender_DetectsSessionBeyondThePageWindow(t *testing.T) {
+	s := newWikiTickTestStore(t)
+	project := "proj"
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	var oldest string
+	for i := 0; i < 201; i++ {
+		started := base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		id := "sess-" + started
+		insertSessionRow(t, s, id, project, started)
+		insertLos40bLearningForSession(t, s, project, id)
+		if i == 0 {
+			oldest = id
+		}
+	}
+	out := renderTestWikiDir(t, project)
+
+	ctx := context.Background()
+	writeWikiSnapshot(ctx, s, project, out)
+	if _, err := s.DB().Exec(`UPDATE sessions SET message_count = 42 WHERE id = ?`, oldest); err != nil {
+		t.Fatal(err)
+	}
+	if !wikiNeedsRender(ctx, s, project, out) {
+		t.Error("session number 201 is rendered on the file pages, its change must force a render")
+	}
+}
+
+// The file list renders session_count and last_touched from file_coverage, which
+// the indexer fills from every indexed session. That content has no learning
+// behind it, so the snapshot needs its own component for it (YM-266).
+func TestWikiNeedsRender_DetectsFileCoverageChange(t *testing.T) {
+	s := newWikiTickTestStore(t)
+	project := "proj"
+	insertLearningForProject(t, s, project)
+	if _, err := s.DB().Exec(
+		`INSERT INTO file_coverage (project, file_path, directory, session_count, last_touched)
+		 VALUES (?, 'internal/x.go', 'internal', 3, '2026-10-01T10:00:00Z')`, project,
+	); err != nil {
+		t.Fatal(err)
+	}
+	out := renderTestWikiDir(t, project)
+
+	ctx := context.Background()
+	writeWikiSnapshot(ctx, s, project, out)
+	if _, err := s.DB().Exec(
+		`UPDATE file_coverage SET session_count = 9, last_touched = '2026-10-02T10:00:00Z' WHERE project = ?`, project,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !wikiNeedsRender(ctx, s, project, out) {
+		t.Error("the file list renders file_coverage, its change must force a render")
 	}
 }

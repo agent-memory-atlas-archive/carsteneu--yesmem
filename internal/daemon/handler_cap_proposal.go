@@ -182,29 +182,18 @@ func toInt64(v any) int64 {
 // acceptCapProposal loads the active cap with the given name, splices the
 // proposed bash body into its existing scripts (preserving project, tags,
 // auto_active, and any extra non-bash scripts in a bundle), and re-saves the
-// cap through the standard save_cap pipeline. project must match the
-// proposal's project so the 3-way project filter in GetActiveLearnings
-// (project = ? OR project IS NULL OR project = ”) resolves the correct row.
+// cap through the standard save_cap pipeline.
+//
+// The row is resolved by capRowFor, the same rule the catalog, execute_cap and the
+// scheduler use: the caller's own binding wins over a global row of the same name.
+// A name can be live twice — a project copy shadows the global cap instead of
+// ending it (YM-402) — so picking the first row in list order patched the wrong
+// body: the caller worked in a project whose cap shadows the global one, and the
+// accept rewrote the global cap every other project runs.
 func (h *Handler) acceptCapProposal(capName, project, scriptName, newBody string) (Response, error) {
-	activeCaps, err := h.store.GetActiveLearnings("cap", project, "", "", 0)
+	active, activeMeta, err := h.capRowFor(capName, project)
 	if err != nil {
-		return Response{}, fmt.Errorf("cap_proposal_decide: load active caps: %w", err)
-	}
-	activeIdx := -1
-	wantTrigger := "cap:" + capName
-	for i := range activeCaps {
-		if activeCaps[i].TriggerRule == wantTrigger {
-			activeIdx = i
-			break
-		}
-	}
-	if activeIdx < 0 {
-		return Response{}, fmt.Errorf("cap_proposal_decide: no active cap %q to update", capName)
-	}
-	active := &activeCaps[activeIdx]
-	activeMeta, err := ParseCapMeta(active.Context)
-	if err != nil {
-		return Response{}, fmt.Errorf("cap_proposal_decide: parse active CapMeta: %w", err)
+		return Response{}, fmt.Errorf("cap_proposal_decide: no active cap %q to update: %w", capName, err)
 	}
 	swapped := false
 	for i := range activeMeta.Scripts {
@@ -245,8 +234,20 @@ func (h *Handler) acceptCapProposal(capName, project, scriptName, newBody string
 		}
 		saveParams["tags"] = tagsAny
 	}
-	if activeMeta.Scope != "" {
+	if len(activeMeta.Scope) > 0 {
 		saveParams["scope"] = activeMeta.Scope
+	}
+	if len(activeMeta.Actions) > 0 {
+		// save_cap only takes actions from the params; omitting them emptied the
+		// cap's actions on every accepted proposal.
+		if actionsJSON, aErr := json.Marshal(activeMeta.Actions); aErr == nil {
+			saveParams["actions"] = string(actionsJSON)
+		}
+	}
+	if len(activeMeta.Requires) > 0 {
+		// Same class as actions: a declared list wins over detection, so omitting
+		// it replaced the cap's declaration with a scan of the proposed body.
+		saveParams["requires"] = strings.Join(activeMeta.Requires, ",")
 	}
 
 	return h.Handle(Request{Method: "save_cap", Params: saveParams}), nil

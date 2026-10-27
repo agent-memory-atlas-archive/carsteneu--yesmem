@@ -19,6 +19,10 @@ type OpenAIMessage struct {
 	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
 	Name             string           `json:"name,omitempty"`
+	// IsError is not part of the OpenAI chat format, but transports in front of
+	// the proxy do send it on a tool message. Reading it keeps a flag the caller
+	// set from being dropped on the way to the tool_result block.
+	IsError bool `json:"is_error,omitempty"`
 }
 
 type OpenAIToolCall struct {
@@ -80,9 +84,9 @@ type OpenAIChoice struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens         int `json:"prompt_tokens"`
-	CompletionTokens     int `json:"completion_tokens"`
-	TotalTokens          int `json:"total_tokens"`
+	PromptTokens          int `json:"prompt_tokens"`
+	CompletionTokens      int `json:"completion_tokens"`
+	TotalTokens           int `json:"total_tokens"`
 	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
 }

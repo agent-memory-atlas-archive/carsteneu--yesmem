@@ -42,11 +42,11 @@ func hasErrorToolResult(msg map[string]any) bool {
 		if b["type"] != "tool_result" {
 			continue
 		}
-		if isErr, ok := b["is_error"].(bool); ok && isErr {
+		if toolResultIsError(b) {
 			return true
 		}
 		if content, ok := b["content"].(string); ok {
-			if strings.Contains(content, "exit code") && !strings.Contains(content, "exit code 0") {
+			if toolResultExitCodeFailure(content) {
 				return true
 			}
 		}

@@ -1,7 +1,7 @@
 ---
 name: cap_collect
 description: "Generic collect-and-prep over any cap_store table for analysis. Default mode 'data' pulls all matching rows (auto-paginated). Mode 'analyze' delegates synthesis to a fast model. Mode 'instruction' builds a prompt without sending."
-version: 96
+version: 551
 tags: [cap_store, collect, analyze]
 requires: [store]
 scope: user
@@ -18,6 +18,7 @@ Generic collect-and-prep over any cap_store table for analysis. Default mode 'da
 ### cap_collect
 kind: tool
 schema: {"type":"object","properties":{"cap":{"type":"string"},"table":{"type":"string"},"where":{"type":"string"},"args":{},"instruction":{"type":"string"},"mode":{"type":"string","enum":["data","instruction","analyze"]},"model":{"type":"string"},"max_tokens":{"type":"number"},"max_rows":{"type":"number"}},"required":["cap","table"]}
+sandbox: standard
 
 ```javascript
 async ({cap, table, where, args, instruction, mode, model, max_tokens, max_rows}) => {

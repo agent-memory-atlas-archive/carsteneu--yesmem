@@ -299,3 +299,109 @@ func TestSkillCheck_WrongRoundMarker_DoesNotConfirm(t *testing.T) {
 		t.Errorf("round-less or wrong-round marker must not confirm the window")
 	}
 }
+// A fresh window must not reuse a token that already appears in the section: the
+// counter is in-memory (it resets on daemon restart and whenever the row leaves
+// "running"), so a reused low token let a marker from an earlier window confirm
+// the new one without any reload.
+func TestSkillCheck_WindowTokenAvoidsMarkersAlreadyPresent(t *testing.T) {
+	h, s := mustHandler(t)
+	makeSkillCheckAgent(t, h, s, "sc-seed", "sess-sc-seed", "**SKILL-RELOAD-7:** yes\nsome work\n")
+
+	h.checkYesloopSkillCheck() // TRACKING
+	jumpSkillCheckCounters(t, s, "sc-seed", skillCheckOutputTokenThreshold, 0)
+	h.checkYesloopSkillCheck() // -> REMIND with a token above the markers present
+
+	yesloopSkillCheckAgentsMu.Lock()
+	round := yesloopSkillCheckAgents["sc-seed"].round
+	yesloopSkillCheckAgentsMu.Unlock()
+	if round <= 7 {
+		t.Errorf("window token = %d, want > 7 — a token already present in the section can be confirmed by a stale marker", round)
+	}
+	if hasSkillReloadMarker("**SKILL-RELOAD-7:** yes", round) {
+		t.Errorf("round %d still matches the stale marker already in the section", round)
+	}
+}	
+
+// A later round's marker must be recognized even when an earlier round's marker
+// sits above it. hasSkillReloadMarker used FindStringSubmatch — the FIRST match
+// only — so after round 1 was confirmed, every later round looked unconfirmed
+// and the agent was escalated to DEAD_AGENT although it had reloaded the skill
+// and said so. Live: this agent's own row was paused with a yesloop-skillcheck
+// escalation while its scratchpad carried SKILL-RELOAD-2.
+func TestSkillCheck_LaterRoundMarker_ConfirmsAfterEarlierRound(t *testing.T) {
+	content := "**SKILL-RELOAD-1:** yes\n\nsome work\n\n**SKILL-RELOAD-2:** yes"
+
+	if !hasSkillReloadMarker(content, 2) {
+		t.Error("hasSkillReloadMarker(content, 2) = false, want true — the current round is marked, just not first")
+	}
+	if !hasSkillReloadMarker(content, 1) {
+		t.Error("hasSkillReloadMarker(content, 1) = false, want true")
+	}
+
+	// Only earlier rounds are marked: a later round must not be confirmed.
+	older := "**SKILL-RELOAD-7:** yes\n**SKILL-RELOAD-8:** yes"
+	if hasSkillReloadMarker(older, 9) {
+		t.Error("hasSkillReloadMarker(older, 9) = true, want false — only earlier rounds are marked")
+	}
+
+	// The daemon's line-anchored contract must survive the fix: a marker pasted
+	// mid-paragraph is not a confirmation, and round 12 is not round 2.
+	if hasSkillReloadMarker("the relay said: SKILL-RELOAD-2: yes", 2) {
+		t.Error("a marker pasted mid-paragraph confirmed the round")
+	}
+	if hasSkillReloadMarker("**SKILL-RELOAD-12:** yes", 2) {
+		t.Error("round 12 confirmed round 2")
+	}
+	if !hasSkillReloadMarker("  **SKILL-RELOAD-3:**  yes", 3) {
+		t.Error("whitespace and asterisk tolerance lost")
+	}
+}
+
+// A recycled PID must not enter the skill-check protocol: the guard relays into
+// the agent's socket and can escalate to a pause, both of which belong to the
+// agent's own process (Learning #101907).
+func TestSkillCheck_RecycledPIDNotTracked(t *testing.T) {
+	resetYesloopSkillCheckState()
+	h, s := mustHandler(t)
+	pinProcessTable(t)
+	bystander, _ := startBystander(t)
+	// The row declares an opencode process; the PID holds a live bystander with a
+	// foreign cmdline — a recycled number, not this agent's process.
+	stubProcCmdline(t, "/usr/bin/sleep\x00--recycled-skillcheck")
+	if err := s.AgentCreate(storage.Agent{
+		ID: "recycled-skillcheck", Project: "testproj", Section: "yesloop-recycled-skillcheck",
+		SessionID: "sess-recycled-skillcheck", PID: bystander.Process.Pid,
+		Status: "running", Backend: "opencode",
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	h.checkYesloopSkillCheck()
+
+	if hasSkillCheckState("recycled-skillcheck", yesloopSkillCheckStateTracking) {
+		t.Error("the PID is held by another process — this agent is gone, so the skill check must not track it")
+	}
+}
+
+// Without a readable process table (macOS) the skill check keeps tracking a live
+// agent instead of going dark: it only relays into the agent's own inject socket.
+func TestSkillCheck_WithoutProcessTableStillTracks(t *testing.T) {
+	resetYesloopSkillCheckState()
+	h, s := mustHandler(t)
+	prev := procTableReadable
+	procTableReadable = false
+	t.Cleanup(func() { procTableReadable = prev })
+	if err := s.AgentCreate(storage.Agent{
+		ID: "no-proc-skillcheck", Project: "testproj", Section: "yesloop-no-proc-skillcheck",
+		SessionID: "sess-no-proc-skillcheck", PID: testPID,
+		Status: "running", Backend: "opencode",
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	h.checkYesloopSkillCheck()
+
+	if !hasSkillCheckState("no-proc-skillcheck", yesloopSkillCheckStateTracking) {
+		t.Error("without a process table the skill check went dark for a live agent")
+	}
+}

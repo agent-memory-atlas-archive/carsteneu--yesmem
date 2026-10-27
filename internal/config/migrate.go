@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 type configMigration struct {
@@ -59,7 +61,7 @@ const modelFeaturesBlock = `
   #   rules_reminder           = Periodic reminder of project rules/guidelines
   #   plan_checkpoint          = Inject plan checkpoint reminders
   #   think_reminder           = Inject hybrid_search() hint (check memory before assuming)
-  #   think_reminder_min_chars = Min user text length to trigger reminder (0=always)
+  #   think_reminder_min_chars = Min user text length for the reminder; 0 = inherit from feature_defaults (0 there = always)
   #   timestamps               = Inject [HH:MM:SS] [msg:N] [+Δ] markers
   #   assoc_context            = Inject [assoc-context] from hybrid_search (frozen per msg:N)
   #   loop_warning             = Inject [loop-warning] when loop detection fires
@@ -117,8 +119,9 @@ const modelFeaturesBlock = `
 
   feature_defaults:
     # Fallback for models not listed above.
-    # Most features on; assoc_context off by default (injection quality varies per model).
-    assoc_context: false
+    # Most features on; assoc_context stays on so an unlisted model does not lose
+    # the associative context that every listed model has.
+    assoc_context: true
     briefing: true
     loop_warning: true
     plan_checkpoint: true
@@ -138,6 +141,13 @@ const deepseekPricingSnippet = `
 // proxy-section fields, paths fields, and model_features section.
 // Returns the number of fields/sections added.
 func MigrateConfig(path string) (int, error) {
+	// The read-modify-write runs under the write lock, like the other
+	// incremental writers: an update racing a "config set" would otherwise drop
+	// one of the two changes (YM-392). The installer's full rewrite does not take
+	// it; it replaces the document on purpose.
+	unlock := lockConfigWrite(path)
+	defer unlock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, fmt.Errorf("read config: %w", err)
@@ -331,7 +341,10 @@ http:
 	if err := backupFile(path); err != nil {
 		return 0, fmt.Errorf("backup config: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// Same writer as every other config path: an atomic replace with mode 0600.
+	// os.WriteFile wrote through a symlink and kept a world-readable mode on a
+	// file that carries the API keys (YM-392).
+	if err := writeConfigFile(path, []byte(content)); err != nil {
 		return 0, fmt.Errorf("write config: %w", err)
 	}
 
@@ -430,19 +443,48 @@ func injectThinkReminderMinChars(content, targetSection, value string) string {
 
 // gateDefaults defines the value injected for each missing gate key during
 // per-key migration of existing model_features entries and feature_defaults.
-// loop_warning=true is the single exception: loop detection ran ungated before
-// the gate existed, so false would regress effective behavior. All other gates
-// default to false (the plain-bool zero value, made explicit).
+// The values follow feature_defaults in config.Default() and the fresh template
+// in insertFeatureDefaultsSection: a missing key means the user never stated an
+// opinion, so the migration has to write what a fresh install gets. The earlier
+// false values (briefing, plan_checkpoint, rules_reminder, think_reminder,
+// timestamps) silently switched those blocks off on an upgrade while a fresh
+// install had them on (YM-349). loop_warning and skill_eval are true for the
+// same reason: both ran ungated before the gate existed.
 var gateDefaults = map[string]string{
-	"assoc_context":            "false",
-	"briefing":                 "false",
+	"assoc_context":            "true",
+	"briefing":                 "true",
 	"loop_warning":             "true",
-	"plan_checkpoint":          "false",
-	"rules_reminder":           "false",
-	"skill_eval":               "false",
-	"think_reminder":           "false",
+	"plan_checkpoint":          "true",
+	"rules_reminder":           "true",
+	"skill_eval":               "true",
+	"think_reminder":           "true",
 	"think_reminder_min_chars": "0",
-	"timestamps":               "false",
+	"timestamps":               "true",
+}
+
+// modelGateDefaults holds the value a gate receives in a NAMED model block that
+// does not name it. It mirrors feature_defaults of config.Default() and the
+// fresh template block by block: a block is a complete statement, so a missing
+// key has to inherit what that model gets on a fresh install, not what the
+// fallback says (YM-349, cold review MEDIUM-3). A block this map does not list
+// (a custom model name) falls back to gateDefaults.
+var modelGateDefaults = map[string]map[string]string{
+	"claude":   {"timestamps": "false"},
+	"deepseek": {"plan_checkpoint": "false"},
+	"gpt":      {"plan_checkpoint": "false", "think_reminder": "false", "timestamps": "false"},
+	"openai":   {"plan_checkpoint": "false", "think_reminder": "false", "timestamps": "false"},
+	"glm":      {"plan_checkpoint": "false"},
+}
+
+// gateValueFor returns the value to inject for key inside the block named
+// section (the header without its colon).
+func gateValueFor(section, key string) string {
+	if overrides, ok := modelGateDefaults[section]; ok {
+		if v, ok := overrides[key]; ok {
+			return v
+		}
+	}
+	return gateDefaults[key]
 }
 
 // canonicalGateOrder is the insertion order for missing gate keys (alphabetical).
@@ -512,10 +554,11 @@ func injectMissingGates(content, sectionHeader string) (string, int) {
 		keyIndent = strings.Repeat(" ", sectionIndent+2)
 	}
 
+	section := strings.TrimSuffix(sectionHeader, ":")
 	var toInsert []string
 	for _, key := range canonicalGateOrder {
 		if !existing[key] {
-			toInsert = append(toInsert, keyIndent+key+": "+gateDefaults[key])
+			toInsert = append(toInsert, keyIndent+key+": "+gateValueFor(section, key))
 		}
 	}
 	if len(toInsert) == 0 {
@@ -623,11 +666,266 @@ func sectionExists(content, sectionHeader string) bool {
 	return false
 }
 
+// MoveMisplacedProxyKeys moves known proxy keys that sit on the top level of
+// config.yaml into the proxy: section, where Load reads them, and returns the
+// moved key names. It works on lines, so comments and the file's own
+// indentation survive; a re-marshalled document would lose both. A missing file
+// or an already clean file yields no moves.
+func MoveMisplacedProxyKeys(path string) ([]string, error) {
+	unlock := lockConfigWrite(path)
+	defer unlock()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	content, moved := moveMisplacedProxyKeys(string(data))
+	if len(moved) == 0 {
+		return nil, nil
+	}
+
+	// Never write a document this code cannot read back. A broken file is left
+	// as it is; CheckKeys keeps reporting it.
+	var check map[string]any
+	if err := yaml.Unmarshal([]byte(content), &check); err != nil {
+		return nil, fmt.Errorf("moved keys would leave config.yaml unparsable, leaving the file untouched: %w", err)
+	}
+
+	if err := backupFile(path); err != nil {
+		return nil, fmt.Errorf("backup config: %w", err)
+	}
+	if err := writeConfigFile(path, []byte(content)); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	return moved, nil
+}
+
+func moveMisplacedProxyKeys(content string) (string, []string) {
+	lines := strings.Split(content, "\n")
+
+	hasProxySection := false
+	for _, line := range lines {
+		if key, ok := topLevelKeyName(line); ok && key == "proxy" {
+			hasProxySection = true
+			break
+		}
+	}
+	proxyIdx := proxySectionLine(lines)
+	if hasProxySection && proxyIdx < 0 {
+		// Inline value ("proxy: {}"): indented children below it would be
+		// invalid YAML, so the file is left alone.
+		return content, nil
+	}
+
+	var blocks [][]string
+	var moved []string
+	removed := make([]bool, len(lines))
+	proxyKeys := proxyChildKeys(lines, proxyIdx)
+	for i := 0; i < len(lines); i++ {
+		key, ok := topLevelKeyName(lines[i])
+		if !ok || key == "proxy" || !isMisplacedProxyKey(key) {
+			continue
+		}
+		// The proxy value is the one in effect. Moving the inert top-level value
+		// over it would change live behavior during a maintenance command, and
+		// keeping both would make the document invalid YAML; the key stays where
+		// it is and CheckKeys keeps reporting it.
+		if proxyKeys[key] {
+			continue
+		}
+		end := blockEnd(lines, i)
+		// Trailing blank lines and comments belong to whatever follows.
+		for end > i+1 && isBlankOrComment(lines[end-1]) {
+			end--
+		}
+		for j := i; j < end; j++ {
+			removed[j] = true
+		}
+		blocks = append(blocks, lines[i:end])
+		moved = append(moved, key)
+		i = end - 1
+	}
+	if len(blocks) == 0 {
+		return content, nil
+	}
+
+	kept := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if !removed[i] {
+			kept = append(kept, line)
+		}
+	}
+
+	if proxyIdx < 0 {
+		// No proxy section at all: create one at the end, so the keys become
+		// readable instead of staying inert.
+		out := kept
+		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+			out = out[:len(out)-1]
+		}
+		out = append(out, "", "proxy:")
+		return strings.Join(append(out, indentBlock(blocks, 2)...), "\n"), moved
+	}
+
+	proxyIdx = proxySectionLine(kept)
+	if proxyIdx < 0 {
+		return content, nil
+	}
+
+	// Insert at the end of the proxy section, indented like its existing
+	// children (yaml.Marshal writes four spaces, the setup template two).
+	childIndent := 2
+	indentSeen := false
+	insertAt := proxyIdx + 1
+	for i := proxyIdx + 1; i < len(kept); i++ {
+		if _, ok := topLevelKeyName(kept[i]); ok {
+			break
+		}
+		insertAt = i + 1
+		if !indentSeen && !isBlankOrComment(kept[i]) && lineIndent(kept[i]) > 0 {
+			childIndent = lineIndent(kept[i])
+			indentSeen = true
+		}
+	}
+	// Blank lines and a top-level banner comment below the section belong to
+	// whatever follows, so the new keys go in front of them.
+	for insertAt > proxyIdx+1 && isBlankOrTopLevelComment(kept[insertAt-1]) {
+		insertAt--
+	}
+
+	out := make([]string, 0, len(kept)+len(blocks))
+	out = append(out, kept[:insertAt]...)
+	out = append(out, indentBlock(blocks, childIndent)...)
+	out = append(out, kept[insertAt:]...)
+	return strings.Join(out, "\n"), moved
+}
+
+func indentBlock(blocks [][]string, indent int) []string {
+	prefix := strings.Repeat(" ", indent)
+	var out []string
+	for _, block := range blocks {
+		for _, line := range block {
+			if strings.TrimSpace(line) == "" {
+				out = append(out, "")
+				continue
+			}
+			out = append(out, prefix+line)
+		}
+	}
+	return out
+}
+
+// isBlankOrTopLevelComment reports lines that separate sections: blank lines and
+// comments at indent 0 (banners like "# --- Signals ---").
+func isBlankOrTopLevelComment(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return true
+	}
+	return lineIndent(line) == 0 && strings.HasPrefix(trimmed, "#")
+}
+
+// proxySectionLine returns the index of a block-form "proxy:" header. A header
+// carrying an inline value ("proxy: {}") is not a block: appending indented
+// children below it would produce invalid YAML, so nothing is moved.
+func proxySectionLine(lines []string) int {
+	for i, line := range lines {
+		key, ok := topLevelKeyName(line)
+		if !ok || key != "proxy" {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "proxy:"))
+		if rest == "" || strings.HasPrefix(rest, "#") {
+			return i
+		}
+		return -1
+	}
+	return -1
+}
+
+// proxyChildKeys collects the keys already defined inside the proxy section.
+func proxyChildKeys(lines []string, proxyIdx int) map[string]bool {
+	keys := map[string]bool{}
+	for i := proxyIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		if _, ok := topLevelKeyName(line); ok {
+			break
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if colon := strings.Index(trimmed, ":"); colon > 0 {
+			keys[trimmed[:colon]] = true
+		}
+	}
+	return keys
+}
+
+// topLevelKeyName returns the key of a line that starts a top-level YAML key.
+func topLevelKeyName(line string) (string, bool) {
+	if line == "" || line[0] == ' ' || line[0] == '\t' || line[0] == '#' {
+		return "", false
+	}
+	i := strings.Index(line, ":")
+	if i <= 0 {
+		return "", false
+	}
+	key := line[:i]
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return "", false
+		}
+	}
+	return key, true
+}
+
+// blockEnd returns the index one past the last line belonging to the top-level
+// block that starts at start.
+func blockEnd(lines []string, start int) int {
+	for i := start + 1; i < len(lines); i++ {
+		if _, ok := topLevelKeyName(lines[i]); ok {
+			return i
+		}
+	}
+	return len(lines)
+}
+
+func isBlankOrComment(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "" || strings.HasPrefix(trimmed, "#")
+}
+
+func lineIndent(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " "))
+}
+
+// isMisplacedProxyKey reports whether key is a proxy field that is not also a
+// top-level Config field, so finding it at the top level means Load ignores it.
+func isMisplacedProxyKey(key string) bool {
+	if _, isSection := yamlField(configType, key); isSection {
+		return false
+	}
+	_, isProxyKey := yamlField(proxyType, key)
+	return isProxyKey
+}
+
 // insertFeatureDefaultsSection inserts a full feature_defaults block with
-// documented template values (NOT gateDefaults-false values) immediately after
-// the model_features section ends. Indent mirrors the model_features header.
-// If model_features is absent, the block is appended at content end as a
-// sibling of the proxy section.
+// documented template values immediately after the model_features section ends.
+// Indent mirrors the model_features header. If model_features is absent, the
+// block is appended at content end as a sibling of the proxy section.
+//
+// The migration only fills keys a block does not name. An existing explicit
+// value stays untouched, including an assoc_context: false that an older
+// template wrote: flipping a value the user has on disk would be a silent
+// behavior change, so a config that predates the true default keeps it off until
+// an operator changes it.
 func insertFeatureDefaultsSection(content string) string {
 	lines := strings.Split(content, "\n")
 	mfLine := -1
@@ -646,7 +944,7 @@ func insertFeatureDefaultsSection(content string) string {
 	}
 
 	block := strings.Repeat(" ", mfIndent) + "feature_defaults:\n" +
-		strings.Repeat(" ", mfIndent+2) + "assoc_context: false\n" +
+		strings.Repeat(" ", mfIndent+2) + "assoc_context: true\n" +
 		strings.Repeat(" ", mfIndent+2) + "briefing: true\n" +
 		strings.Repeat(" ", mfIndent+2) + "loop_warning: true\n" +
 		strings.Repeat(" ", mfIndent+2) + "plan_checkpoint: true\n" +

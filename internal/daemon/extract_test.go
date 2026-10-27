@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"database/sql"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
+	"github.com/carsteneu/yesmem/internal/storage"
 )
 
 // --- truncID ---
@@ -525,29 +528,18 @@ func TestExtract_BuildNarrativeUserMessageWithContext_NilContext(t *testing.T) {
 
 func TestExtract_CountPendingNarratives(t *testing.T) {
 	_, s := mustHandler(t)
-	count, err := countPendingNarratives(s)
+	pending, err := pendingNarrativeSessions(s)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if count != 0 {
-		t.Errorf("expected 0 on fresh DB, got %d", count)
+	if len(pending) != 0 {
+		t.Errorf("expected no pending narratives on a fresh DB, got %d", len(pending))
 	}
 }
 
 func TestExtract_CountPendingProfiles(t *testing.T) {
 	_, s := mustHandler(t)
 	count, err := countPendingProfiles(s)
-	if err != nil {
-		t.Fatalf("error: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("expected 0 on fresh DB, got %d", count)
-	}
-}
-
-func TestExtract_CountPendingRefinedBriefings(t *testing.T) {
-	_, s := mustHandler(t)
-	count, err := countPendingRefinedBriefings(s)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -632,13 +624,145 @@ func TestExtract_IsLikelyGitRepo_NonRepo(t *testing.T) {
 	}
 }
 
-func TestExtract_ListProjectsMissingRefinedBriefings(t *testing.T) {
-	_, s := mustHandler(t)
-	missing, err := listProjectsMissingRefinedBriefings(s)
+// --- cleanupFinishedShortSessionLearnings ---
+
+// The startup cleanup runs once per run. When it fails, the run must say so:
+// a swallowed error hides a broken cleanup for the whole extraction pass.
+func TestCleanupFinishedShortSessionLearnings_LogsError(t *testing.T) {
+	s, err := storage.Open(":memory:")
 	if err != nil {
-		t.Fatalf("error: %v", err)
+		t.Fatalf("open store: %v", err)
 	}
-	if len(missing) != 0 {
-		t.Errorf("expected 0 missing on fresh DB, got %d", len(missing))
+	s.Close()
+
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	if n := cleanupFinishedShortSessionLearnings(s); n != 0 {
+		t.Errorf("cleaned %d learnings from a broken store, want 0", n)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "warn: clean up finished short sessions") {
+		t.Errorf("cleanup error was not logged, log output: %q", out)
+	}
+	if !strings.Contains(out, "database is closed") {
+		t.Errorf("log line does not name the cause, log output: %q", out)
+	}
+}
+
+func TestCleanupFinishedShortSessionLearnings_SupersedesFinishedShortSession(t *testing.T) {
+	_, s := mustHandler(t)
+	ended := time.Now().Add(-72 * time.Hour)
+	if err := s.UpsertSession(&models.Session{
+		ID: "sess-cleanup", Project: "/test", MessageCount: 3,
+		StartedAt: ended.Add(-time.Minute), EndedAt: ended,
+		JSONLPath: "/sess-cleanup.jsonl", IndexedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	id, err := s.InsertLearning(&models.Learning{
+		Category: "gotcha", Content: "Learning from an abandoned short session",
+		SessionID: "sess-cleanup", Source: "llm_extracted",
+		Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "self",
+	})
+	if err != nil {
+		t.Fatalf("insert learning: %v", err)
+	}
+
+	n := cleanupFinishedShortSessionLearnings(s)
+	if n != 1 {
+		t.Errorf("cleaned %d learnings, want 1", n)
+	}
+	var superseded sql.NullInt64
+	if err := s.DB().QueryRow(`SELECT superseded_by FROM learnings WHERE id = ?`, id).Scan(&superseded); err != nil {
+		t.Fatalf("read learning: %v", err)
+	}
+	if !superseded.Valid {
+		t.Error("learning of a finished short session must be superseded")
+	}
+}
+
+// --- markSessionsExtracted ---
+
+// The mark pass runs on every extraction run. A failed mark must be logged: the
+// same sessions then resurface as pending on every cycle and nobody sees why.
+func TestMarkSessionsExtracted_LogsBothErrors(t *testing.T) {
+	s, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	s.Close()
+
+	var buf strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	markSessionsExtracted(s)
+
+	out := buf.String()
+	for _, want := range []string{
+		"warn: mark extraction-internal sessions as extracted",
+		"warn: mark short sessions as extracted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing log line %q, log output: %q", want, out)
+		}
+	}
+	if !strings.Contains(out, "database is closed") {
+		t.Errorf("log line does not name the cause, log output: %q", out)
+	}
+}
+
+// The cleanup supersedes narrative rows of a short session as well, so it also
+// owns the marker: a marker left behind keeps that session unnarrated once it
+// grows, which is the very leak this cleanup has to close.
+func TestCleanupFinishedShortSessionLearnings_ClearsStaleNarrativeMarker(t *testing.T) {
+	s, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	ended := time.Now().Add(-72 * time.Hour)
+	if err := s.UpsertSession(&models.Session{
+		ID: "sess-short-narrative", Project: "/test", ProjectShort: "test",
+		MessageCount: 2, StartedAt: ended.Add(-time.Minute), EndedAt: ended,
+		JSONLPath: "/sess-short-narrative.jsonl", IndexedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	if err := s.MarkSessionNarrative("sess-short-narrative"); err != nil {
+		t.Fatalf("mark session narrative: %v", err)
+	}
+	narrativeID, err := s.InsertLearning(&models.Learning{
+		Category: "narrative", Content: "Narrative of an abandoned short session",
+		SessionID: "sess-short-narrative", Source: "llm_extracted",
+		Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "self",
+	})
+	if err != nil {
+		t.Fatalf("insert narrative: %v", err)
+	}
+
+	if n := cleanupFinishedShortSessionLearnings(s); n != 1 {
+		t.Errorf("cleaned %d learnings, want 1 (the narrative of the short session)", n)
+	}
+
+	var superseded sql.NullInt64
+	if err := s.DB().QueryRow(`SELECT superseded_by FROM learnings WHERE id = ?`, narrativeID).Scan(&superseded); err != nil {
+		t.Fatalf("read narrative: %v", err)
+	}
+	if !superseded.Valid {
+		t.Error("narrative of a finished short session must be superseded")
+	}
+
+	var marker sql.NullString
+	if err := s.DB().QueryRow(`SELECT narrative_at FROM sessions WHERE id = ?`, "sess-short-narrative").Scan(&marker); err != nil {
+		t.Fatalf("read narrative_at: %v", err)
+	}
+	if marker.Valid {
+		t.Errorf("narrative_at of a session whose narrative the cleanup removed must be cleared, got %q", marker.String)
 	}
 }

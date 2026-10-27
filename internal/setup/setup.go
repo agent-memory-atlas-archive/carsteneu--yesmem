@@ -1,10 +1,15 @@
 package setup
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,23 +19,29 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/caps"
-	yesmemPlugins "github.com/carsteneu/yesmem/plugins"
 	"github.com/carsteneu/yesmem/skills"
 	"gopkg.in/yaml.v3"
 
+	"github.com/carsteneu/yesmem/internal/capfile"
+
 	"github.com/carsteneu/yesmem/internal/orchestrator"
 
-	"github.com/carsteneu/yesmem/internal/buildinfo"
 	"github.com/carsteneu/yesmem/internal/briefing"
+	"github.com/carsteneu/yesmem/internal/buildinfo"
 	"github.com/carsteneu/yesmem/internal/config"
 	"github.com/carsteneu/yesmem/internal/daemon"
 	"github.com/carsteneu/yesmem/internal/extraction"
+	"github.com/carsteneu/yesmem/internal/sanitize"
+	"github.com/carsteneu/yesmem/internal/textutil"
 )
 
 // Run executes the install. Non-interactive by default (uses sensible defaults).
 // Pass interactive=true for the classic wizard with model/provider prompts.
 func Run(interactive bool) error {
-	home, _ := os.UserHomeDir()
+	home, err := UserHome()
+	if err != nil {
+		return err
+	}
 	binaryPath, _ := os.Executable()
 	dataDir := filepath.Join(home, ".claude", "yesmem")
 
@@ -333,7 +344,7 @@ func runInteractive(home, dataDir, binaryPath string) error {
 	fmt.Println("[1/3] LLM Model for knowledge extraction:")
 	fmt.Println()
 
-	projectsDir := filepath.Join(home, ".claude", "projects")
+	projectsDir := claudeProjectsDirFromConfig(dataDir)
 	costs, sessions, _ := daemon.EstimateMonthlyFromDir(projectsDir)
 
 	var options []string
@@ -544,27 +555,31 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 
 	// 1. Create directories
 	withSpinner("Creating directories", func() (string, error) {
-		for _, d := range []string{dataDir, filepath.Join(dataDir, "archive"), hookDir} {
-			os.MkdirAll(d, 0755)
+		// dataDir and its archive subdirectory hold the database, config.yaml
+		// with the API keys and auth_token: owner-only, and hardened for an
+		// existing installation too, because MkdirAll leaves the mode of a
+		// directory it did not create (audit 16.10.2026, YM-328).
+		archiveDir := filepath.Join(dataDir, "archive")
+		for _, d := range []string{dataDir, archiveDir} {
+			os.MkdirAll(d, 0o700)
+			if err := os.Chmod(d, 0o700); err != nil {
+				log.Printf("setup: chmod %s: %v", d, err)
+			}
 		}
+		os.MkdirAll(hookDir, 0755)
 		return "", nil
 	})
 
-	// 2. Write config.yaml
+	// 2. Check and write config.yaml. The order lives in writeConfigForInstall: the check must read the
+	// file this run replaces, not the template it writes (YM-463). Its lines are buffered because the
+	// spinner prints its label without a newline, and a report inside it would read as part of the label.
+	var checkOut, checkWarn bytes.Buffer
 	withSpinner("Writing config.yaml", func() (string, error) {
-		// Backup existing config.yaml before overwriting
-		cfgPath := filepath.Join(dataDir, "config.yaml")
-		if _, err := os.Stat(cfgPath); err == nil {
-			backupDir := filepath.Join(dataDir, "backup")
-			os.MkdirAll(backupDir, 0755)
-			backupPath := filepath.Join(backupDir, "config.yaml.bak."+time.Now().Format("20060102T150405"))
-			if data, err := os.ReadFile(cfgPath); err == nil {
-				os.WriteFile(backupPath, data, 0644)
-			}
-		}
 		cfgContent := generateConfig(model, autoExtract, apiKey, openaiKey, openaiBaseURL, provider, terminal, narrativeModel, qualityModel, summarizeModel)
-		return model, os.WriteFile(cfgPath, []byte(cfgContent), 0644)
+		return model, writeConfigForInstall(dataDir, cfgContent, &checkOut, &checkWarn)
 	})
+	fmt.Print(checkOut.String())
+	fmt.Fprint(os.Stderr, checkWarn.String())
 
 	// 2b. Bootstrap SYSTEM.md (if not present)
 	withSpinner("Writing system prompt template", func() (string, error) {
@@ -633,7 +648,7 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 
 	// 7. Install bundled commands
 	withSpinner("Installing commands", func() (string, error) {
-		installed, err := installBundledCommands(home, lang, apiKey, model, provider)
+		installed, err := installBundledCommands(home, dataDir, lang, apiKey, model, provider)
 		if err != nil {
 			return "", err
 		}
@@ -667,9 +682,13 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 		return "up to date", nil
 	})
 
-	// 7c. Install bundled capabilities
+	// 7c. Install bundled capabilities. A cap the bundle was not derived from is
+	// kept and its conflict printed after the step: the spinner owns its own line,
+	// and a skip nobody sees is what this path exists to end (YM-450).
+	var capConflicts []CapConflict
 	withSpinner("Installing capabilities", func() (string, error) {
-		installed, err := InstallBundledCaps(home)
+		installed, conflicts, err := InstallBundledCaps(los35eCapsDirForSetup(dataDir))
+		capConflicts = conflicts
 		if err != nil {
 			return "", err
 		}
@@ -678,6 +697,7 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 		}
 		return "up to date", nil
 	})
+	PrintCapConflicts(os.Stdout, capConflicts)
 
 	// 7d. Install opencode plugin (only if opencode is installed).
 	// Threads primaryModel/smallModel through so the user's wizard choice is
@@ -698,7 +718,7 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 		})
 
 		withSpinner("Installing opencode plugin", func() (string, error) {
-			return "", installOpencodePlugin(home, binaryPath, primaryModel, smallModel)
+			return installOpencodePlugin(home, binaryPath, primaryModel, smallModel)
 		})
 	}
 
@@ -767,7 +787,7 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 	if autoStart {
 		withSpinner("Setting up auto-start", func() (string, error) {
 			if runtime.GOOS == "linux" {
-				return "systemd", setupSystemd(home, binaryPath)
+				return "systemd", setupSystemd(home, binaryPath, dataDir)
 			} else if runtime.GOOS == "darwin" {
 				return "launchd", setupLaunchd(home, binaryPath)
 			}
@@ -826,7 +846,7 @@ func executeSetup(home, dataDir, binaryPath, model, apiKey, provider, terminal s
 		fmt.Println()
 		fmt.Printf("  ✓ %d sessions imported (search ready)\n", imported)
 		withSpinner("Verifying LLM connection", func() (string, error) {
-			return "", verifyLLMConnection(apiKey, model, provider, openaiBaseURL)
+			return "", verifyLLMConnection(dataDir, apiKey, model, provider, openaiBaseURL)
 		})
 	}
 
@@ -889,7 +909,7 @@ func writeAuthJSON(home string, providerKeys map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(authPath, append(out, '\n'), 0644)
+	return writeSecretFile(authPath, append(out, '\n'))
 }
 
 // modelToProviderID maps an extraction model to its provider ID for auth.json.
@@ -1004,6 +1024,56 @@ func startProxyDirect(binaryPath string) {
 		proxyCmd.Process.Release()
 		fmt.Println("✓ (running in background, restart manually after reboot)")
 	}
+}
+
+// backupAndWriteConfigFile keeps a copy of an existing config.yaml and writes
+// the fresh template. setup rewrites the file wholesale, so a copy is the only
+// way back to the previous keys. Both writes go through config.WriteFile: the
+// file and its copy carry the API keys, so both are owner-only and atomic, the
+// same rule the runtime writer follows (YM-268).
+func backupAndWriteConfigFile(dataDir, content string) error {
+	cfgPath := filepath.Join(dataDir, "config.yaml")
+	backupDir := filepath.Join(dataDir, "backup")
+	// A Stat error other than "does not exist" means the question cannot be
+	// answered, and the template write below would then replace a file nobody
+	// backed up (EACCES, ENOTDIR, a dangling link).
+	_, statErr := os.Stat(cfgPath)
+	cfgExists := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return fmt.Errorf("stat config.yaml before writing it: %w", statErr)
+	}
+	if cfgExists {
+		// Copies of the key file go into their own directory, owner-only like the
+		// file itself (the parent data dir is 0700).
+		if err := os.MkdirAll(backupDir, 0o700); err != nil {
+			return fmt.Errorf("create config backup dir: %w", err)
+		}
+		// MkdirAll leaves an existing directory as it is, so an install created
+		// before this mode was set keeps a 0755 backup dir holding key copies.
+		if err := os.Chmod(backupDir, 0o700); err != nil {
+			log.Printf("setup: config backup dir mode: %v", err)
+		}
+		// A second setup run in the same second must not overwrite the first
+		// copy: the timestamp alone collides, so the name carries a counter.
+		backupPath, err := config.NextBackupPath(filepath.Join(backupDir, "config.yaml"))
+		if err != nil {
+			return fmt.Errorf("config backup: %w", err)
+		}
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("read config for the backup: %w", err)
+		}
+		// No copy, no overwrite: the template write below would replace the only
+		// copy of the API keys. Skipping the copy quietly was a silent loss.
+		if err := config.WriteFile(backupPath, data); err != nil {
+			return fmt.Errorf("write config backup: %w", err)
+		}
+	}
+	// The installer keeps its copies in a directory of their own, where the
+	// runtime prune never looks. Without this the pile of key copies grows with
+	// every setup and update run.
+	config.PruneBackups(backupDir, "config.yaml")
+	return config.WriteFile(cfgPath, []byte(content))
 }
 
 func generateConfig(model string, autoExtract bool, apiKey, openaiKey, openaiBaseURL, provider, terminal, narrativeModel, qualityModel, summarizeModel string) string {
@@ -1268,7 +1338,6 @@ proxy:
   effort_floor: ""
   skill_eval_inject: "silent"
   code_nav_mode: "block"
-  code_nav_dismiss_count: 5
 
   # --- Prompt Profile Flags ---
   # Profile-aware prompt injection layers. shared_prompt is the base for ALL
@@ -1309,7 +1378,7 @@ proxy:
 
   # --- Per-Model Feature Gates ---
   feature_defaults:
-    assoc_context: false
+    assoc_context: true
     briefing: true
     loop_warning: true
     plan_checkpoint: true
@@ -1530,7 +1599,6 @@ diagnostics:
 # Only set these if you need a custom location.
 paths:
   db: ~/.claude/yesmem/yesmem.db
-  bleve_index: ~/.claude/yesmem/bleve-index
   archive: ~/.claude/yesmem/archive
   claude_projects: ~/.claude/projects
   opencode_db: ~/.local/share/opencode/opencode.db
@@ -1558,6 +1626,9 @@ agents:
   max_runtime: ""
   max_turns: 0
   max_depth: 0
+  # Max output tokens per agent. The unit is output tokens, not input: input is
+  # cumulative and includes cache reads, so a budget in that unit would end an
+  # agent after a few turns. 0 = no limit (nothing applies a default).
   token_budget: 0
 
   # TUI theme per agent type (section prefix). The yesmem theme family is
@@ -1596,6 +1667,39 @@ func testAPIKeyForSonnet(apiKey string) bool {
 	client := extraction.NewClient(apiKey, "claude-sonnet-4-6")
 	_, err := client.Complete("Reply with OK.", "test")
 	return err == nil
+}
+
+// redactedForDataDir wraps c in the secret redactor when the user enabled
+// secrets_sanitization. Setup builds its own clients outside the daemon factory
+// (internal/daemon/llm_client_factory.go), so the switch has to be applied here
+// too. dataDir is the yesmem data directory that holds config.yaml.
+//
+// A missing or unreadable config.yaml leaves the client unwrapped, same as
+// redacted() in package main: config.Load falls back to its defaults there, and
+// the default has the switch off.
+func redactedForDataDir(dataDir string, c extraction.LLMClient) extraction.LLMClient {
+	if c == nil {
+		return nil
+	}
+	cfg, err := config.Load(filepath.Join(dataDir, "config.yaml"))
+	if err != nil || cfg == nil || !cfg.SecretsSanitization.Enabled {
+		return c
+	}
+	return extraction.NewSanitizingClient(c, sanitize.NewSecretRedactor(cfg.SecretsSanitization.AllowedExceptions))
+}
+
+// claudeProjectsDirFromConfig is the directory Claude Code names its project
+// folders in. Setup and uninstall used to build ~/.claude/projects themselves,
+// so a configured paths.claude_projects was ignored on both paths. A missing
+// config.yaml yields the home default, same as the daemon.
+func claudeProjectsDirFromConfig(dataDir string) string {
+	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
+	if cfg == nil {
+		// Load's contract allows a nil config with an error. Uninstall deletes
+		// files, so a panic here would land in the middle of a removal.
+		return ""
+	}
+	return cfg.ClaudeProjectsDir()
 }
 
 func readExistingConfigKey(dataDir string) string {
@@ -1640,6 +1744,7 @@ func translateStrings(dataDir, langCode, apiKey, model, provider string) error {
 	if err != nil {
 		return fmt.Errorf("llm client: %w", err)
 	}
+	client = redactedForDataDir(dataDir, client)
 
 	prompt := briefing.BuildTranslationPrompt(langCode)
 
@@ -1662,22 +1767,74 @@ func translateStrings(dataDir, langCode, apiKey, model, provider string) error {
 // buildDaemonUnit renders the systemd user unit for the daemon. Both services
 // are local-first (Unix socket, SQLite, index) and must not be delayed by
 // network-online.target — net-dependent work happens asynchronously after start.
-func buildDaemonUnit(binaryPath, display, xauth, dbus string) string {
+//
+// Type=notify plus WatchdogSec=90: the daemon reports READY once its socket
+// serves and then pings every 30s, but only after a probe confirmed the socket
+// still answers. Restart=always alone never fires for a process that lives on with
+// a dead socket. TimeoutStartSec carries slack for a cold start (schema open,
+// index, agent recovery) — it must not be the same 90s the watchdog uses, or a
+// slow start looks like a hang. A binary that predates the notify protocol never
+// sends READY and will not start under this unit: unit and binary move together
+// (the post-update migration runs the new binary).
+func buildDaemonUnit(binaryPath, display, xauth, dbus, proxyURL string) string {
 	return fmt.Sprintf(`[Unit]
 Description=YesMem — Long-term memory for coding agents
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
+TimeoutStartSec=300
 ExecStart=%s daemon --replace
 Restart=always
 RestartSec=10
 Environment="DISPLAY=%s"
 Environment="XAUTHORITY=%s"
 Environment="DBUS_SESSION_BUS_ADDRESS=%s"
+Environment="ANTHROPIC_BASE_URL=%s"
 
 [Install]
 WantedBy=default.target
-`, binaryPath, display, xauth, dbus)
+`, binaryPath, display, xauth, dbus, proxyURL)
+}
+
+// proxyBaseURL turns the proxy's listen address into the URL an agent tool has to
+// dial. The unit declares it because a systemd daemon only inherits what the unit
+// names: the value otherwise comes from the login session's manager environment
+// and disappears after a reboot. A sandboxed claude without it talks straight to
+// Anthropic, so memory injection, ledger and cost accounting stop silently.
+func proxyBaseURL(listen string) string {
+	listen = strings.TrimSpace(listen)
+	if listen == "" {
+		listen = config.DefaultProxyListen
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil || port == "" {
+		host, port = "", strings.TrimPrefix(listen, ":")
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// migrateDaemonProxyEnv adds the proxy URL to an installed unit that predates it.
+// Additive only: an explicit value stays, because someone chose it.
+func migrateDaemonProxyEnv(content, proxyURL string) string {
+	if proxyURL == "" || indexOfDirective(content, `Environment="ANTHROPIC_BASE_URL=`) >= 0 {
+		return content
+	}
+	if indexOfDirective(content, "ANTHROPIC_BASE_URL=") >= 0 {
+		return content
+	}
+	anchor := indexOfDirective(content, `Environment="DBUS_SESSION_BUS_ADDRESS=`)
+	if anchor < 0 {
+		anchor = indexOfDirective(content, "[Service]")
+	}
+	if anchor < 0 {
+		return content
+	}
+	return insertUnitLines(strings.Split(content, "\n"), anchor, `Environment="ANTHROPIC_BASE_URL=`+proxyURL+`"`)
 }
 
 // buildProxyUnit renders the systemd user unit for the proxy. It only listens
@@ -1698,11 +1855,14 @@ WantedBy=default.target
 }
 
 // MigrateSystemdUnits removes After/Wants=network-online.target from already
-// installed unit files (both services are local-first). Idempotent — only
-// rewrites files that still carry the obsolete network dependency. Called from
-// the post-update migration so existing installs heal on the next `yesmem update`.
-func MigrateSystemdUnits(home string) (int, error) {
+// installed unit files (both services are local-first) and upgrades the daemon
+// unit to the notify type. Idempotent — only rewrites files that still carry the
+// obsolete network dependency or the old type. Called from the post-update
+// migration so existing installs heal on the next `yesmem update`.
+func MigrateSystemdUnits(home, dataDir string) (int, error) {
 	serviceDir := filepath.Join(home, ".config", "systemd", "user")
+	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
+	proxyURL := proxyBaseURL(cfg.Proxy.Listen)
 	changed := 0
 	for _, name := range []string{"yesmem.service", "yesmem-proxy.service"} {
 		path := filepath.Join(serviceDir, name)
@@ -1714,19 +1874,209 @@ func MigrateSystemdUnits(home string) (int, error) {
 			return changed, err
 		}
 		content := string(data)
-		if !strings.Contains(content, "network-online.target") {
+		updated := content
+		if strings.Contains(updated, "network-online.target") {
+			updated = stripNetworkOneline(updated)
+		}
+		if name == "yesmem.service" {
+			notifyUnit := migrateDaemonUnitWatchdog(updated)
+			if notifyUnit != updated {
+				// Type=notify is a one-way door: a downgraded binary never sends
+				// READY, so the unit blocks the start for TimeoutStartSec and then
+				// fails, and the binary that could undo it is the one that cannot
+				// start. Keep the unit as it was, once, before the rewrite.
+				if err := keepUnitBackup(path, content); err != nil {
+					return changed, err
+				}
+			}
+			updated = notifyUnit
+			if unitRunsThisBinary(updated) {
+				updated = migrateDaemonProxyEnv(updated, proxyURL)
+			}
+		}
+		if updated == content {
 			continue
 		}
-		cleaned := stripNetworkOneline(content)
-		if cleaned == content {
-			continue
-		}
-		if err := os.WriteFile(path, []byte(cleaned), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(updated), 0644); err != nil {
 			return changed, err
 		}
 		changed++
 	}
 	return changed, nil
+}
+
+// UnitBackupSuffix marks the copy a migration keeps of a unit it changes in a way
+// it cannot undo. systemd only reads files ending in .service, so the copy is
+// inert where it lies.
+const UnitBackupSuffix = ".pre-migrate.bak"
+
+// UnitBackupPath is where the pre-migration copy of a unit lives.
+func UnitBackupPath(unitPath string) string { return unitPath + UnitBackupSuffix }
+
+// keepUnitBackup writes the unit as it was before the migration, and never
+// overwrites an existing copy: a second run must keep the original, not the state
+// of the run before. Lstat and O_EXCL are deliberate: a symlink at the backup path
+// is not a copy (following it would write to whatever it points at), and the
+// mode comes from the unit itself, so a hardened unit does not become a readable
+// copy just because it was backed up.
+func keepUnitBackup(unitPath, content string) error {
+	backup := UnitBackupPath(unitPath)
+	if info, err := os.Lstat(backup); err == nil {
+		if info.Mode().IsRegular() {
+			return nil
+		}
+		return fmt.Errorf("pre-migration copy %s exists but is not a regular file — move it away and run the migration again", backup)
+	}
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(unitPath); err == nil {
+		mode = info.Mode().Perm()
+	}
+	f, err := os.OpenFile(backup, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return fmt.Errorf("keep pre-migration copy of %s (a notify unit cannot be started by an older binary, so the migration is not written without one): %w", filepath.Base(unitPath), err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		return fmt.Errorf("write pre-migration copy %s: %w", backup, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close pre-migration copy %s: %w", backup, err)
+	}
+	return nil
+}
+
+// systemdReloadTimeout bounds one systemctl invocation. `systemctl --user` talks to
+// the user manager over D-Bus; when that manager is wedged the call never returns,
+// and a migration without a deadline would sit there with no output forever.
+const systemdReloadTimeout = 20 * time.Second
+
+// systemctlRun runs one systemctl command under a context. Seamed so a test can
+// assert the deadline without a user manager.
+var systemctlRun = func(ctx context.Context, args ...string) error {
+	return exec.CommandContext(ctx, "systemctl", args...).Run()
+}
+
+// ReloadSystemdUnits makes systemd re-read the unit files a migration rewrote. It
+// is best effort for the caller: a reload that fails leaves the old definition in
+// memory, not a broken unit on disk.
+func ReloadSystemdUnits() error {
+	ctx, cancel := context.WithTimeout(context.Background(), systemdReloadTimeout)
+	defer cancel()
+	if err := systemctlRun(ctx, "--user", "daemon-reload"); err != nil {
+		return fmt.Errorf("systemctl --user daemon-reload: %w", err)
+	}
+	return nil
+}
+
+// migrationSelfPath is the binary that is running the migration. A unit whose
+// ExecStart names a different binary is left alone: Type=notify only works with a
+// daemon that sends READY, and the only binary we can vouch for is ourselves.
+var migrationSelfPath = func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		return resolved
+	}
+	return filepath.Clean(exe)
+}()
+
+// unitExecStart returns the program a unit starts, or "" when the unit names none.
+func unitExecStart(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		value, found := strings.CutPrefix(strings.TrimSpace(line), "ExecStart=")
+		if !found {
+			continue
+		}
+		fields := strings.Fields(value)
+		if len(fields) == 0 {
+			return ""
+		}
+		return fields[0]
+	}
+	return ""
+}
+
+// unitRunsThisBinary reports whether the unit starts the binary that is running the
+// migration. An unverifiable answer counts as no.
+func unitRunsThisBinary(content string) bool {
+	execStart := unitExecStart(content)
+	if execStart == "" || migrationSelfPath == "" {
+		return false
+	}
+	return filepath.Clean(execStart) == filepath.Clean(migrationSelfPath)
+}
+
+// migrateDaemonUnitWatchdog upgrades an installed daemon unit to the notify type
+// with the watchdog the binary reports since YM-312: READY=1 once the socket
+// serves, WATCHDOG=1 only while it answers. Additive only — a unit that already
+// names a deadline or a type other than the default keeps it, because that value
+// was a decision; it only gains the start deadline it may still be missing.
+func migrateDaemonUnitWatchdog(content string) string {
+	if !unitRunsThisBinary(content) {
+		// Someone else's binary is installed: rewriting the unit would make the
+		// service wait for a READY that never comes.
+		return content
+	}
+	if watchdogAt := indexOfDirective(content, "WatchdogSec="); watchdogAt >= 0 {
+		if indexOfDirective(content, "TimeoutStartSec=") >= 0 {
+			return content
+		}
+		lines := strings.Split(content, "\n")
+		return insertUnitLines(lines, watchdogAt, "TimeoutStartSec=300")
+	}
+	lines := strings.Split(content, "\n")
+	typeIdx, serviceIdx, explicitOther := -1, -1, false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "[Service]":
+			if serviceIdx < 0 {
+				serviceIdx = i
+			}
+		case trimmed == "Type=simple":
+			if typeIdx < 0 {
+				typeIdx = i
+			}
+		case strings.HasPrefix(trimmed, "Type="):
+			explicitOther = true
+		}
+	}
+	if typeIdx >= 0 {
+		lines[typeIdx] = "Type=notify"
+		return insertUnitLines(lines, typeIdx, "NotifyAccess=main", "WatchdogSec=90", "TimeoutStartSec=300", notifyRollbackHint)
+	}
+	if explicitOther || serviceIdx < 0 {
+		return content
+	}
+	// Units written before Type= was explicit rely on systemd's default.
+	return insertUnitLines(lines, serviceIdx, notifyRollbackHint, "Type=notify", "NotifyAccess=main", "WatchdogSec=90", "TimeoutStartSec=300")
+}
+
+// notifyRollbackHint sits in the migrated unit because that is where the person
+// looks when the service will not start after a downgrade. It names the copy the
+// migration kept (UnitBackupSuffix) and the reload that makes systemd read it.
+const notifyRollbackHint = "# yesmem: notify type and watchdog added; to run an older binary put back yesmem.service.pre-migrate.bak and call systemctl --user daemon-reload"
+
+// indexOfDirective returns the index of the first line that sets a directive.
+func indexOfDirective(content, directive string) int {
+	for i, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), directive) {
+			return i
+		}
+	}
+	return -1
+}
+
+// insertUnitLines puts directives directly behind a line, keeping the file's line
+// endings and everything else untouched.
+func insertUnitLines(lines []string, idx int, added ...string) string {
+	out := make([]string, 0, len(lines)+len(added))
+	out = append(out, lines[:idx+1]...)
+	out = append(out, added...)
+	out = append(out, lines[idx+1:]...)
+	return strings.Join(out, "\n")
 }
 
 // stripNetworkOneline removes After=/Wants=network-online.target directives
@@ -1743,7 +2093,7 @@ func stripNetworkOneline(content string) string {
 	return strings.Join(kept, "\n")
 }
 
-func setupSystemd(home, binaryPath string) error {
+func setupSystemd(home, binaryPath, dataDir string) error {
 	serviceDir := filepath.Join(home, ".config", "systemd", "user")
 	os.MkdirAll(serviceDir, 0755)
 
@@ -1762,9 +2112,10 @@ func setupSystemd(home, binaryPath string) error {
 	if dbus == "" {
 		dbus = fmt.Sprintf("unix:path=/run/user/%d/bus", os.Getuid())
 	}
+	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
 
 	// Daemon unit
-	daemonUnit := buildDaemonUnit(binaryPath, display, xauth, dbus)
+	daemonUnit := buildDaemonUnit(binaryPath, display, xauth, dbus, proxyBaseURL(cfg.Proxy.Listen))
 	if err := os.WriteFile(filepath.Join(serviceDir, "yesmem.service"), []byte(daemonUnit), 0644); err != nil {
 		return err
 	}
@@ -1891,12 +2242,13 @@ func discoverSkills(dataDir, apiKey, model string) int {
 // Returns nil on success, error with diagnostic message on failure.
 // baseURL is threaded through so openai_compatible providers (DeepSeek, GLM, etc.)
 // route to their real upstream instead of defaulting to api.openai.com.
-func verifyLLMConnection(apiKey, model, provider, baseURL string) error {
+func verifyLLMConnection(dataDir, apiKey, model, provider, baseURL string) error {
 	modelID := resolveLLMModelIDForVerify(provider, model)
 	client, err := extraction.NewLLMClient(provider, apiKey, modelID, "", baseURL)
 	if err != nil {
 		return fmt.Errorf("could not create LLM client: %w", err)
 	}
+	client = redactedForDataDir(dataDir, client)
 	// opencode CLI subprocess needs a real system prompt to produce text output
 	// (without it, the opencode binary often returns empty "no text events")
 	systemMsg := "Reply with OK."
@@ -1913,10 +2265,9 @@ func verifyLLMConnection(apiKey, model, provider, baseURL string) error {
 // installBundledCommands copies embedded skill files to ~/.claude/commands/.
 // Uses SHA-256 hash to skip unchanged files. If lang != "de" and apiKey is set,
 // translates content via LLM before installing. Returns number of installed/updated commands.
-func installBundledCommands(home, lang, apiKey, model, provider string) (int, error) {
+func installBundledCommands(home, dataDir, lang, apiKey, model, provider string) (int, error) {
 	cmdDir := filepath.Join(home, ".claude", "commands")
 	os.MkdirAll(cmdDir, 0755)
-
 	entries, err := skills.BundledCommands.ReadDir(".")
 	if err != nil {
 		return 0, fmt.Errorf("read bundled commands: %w", err)
@@ -1935,7 +2286,7 @@ func installBundledCommands(home, lang, apiKey, model, provider string) (int, er
 		if lang != "de" && lang != "" && apiKey != "" {
 			done := make(chan string, 1)
 			go func() {
-				if translated, err := translateCommand(string(data), lang, apiKey, model, provider); err == nil {
+				if translated, err := translateCommand(dataDir, string(data), lang, apiKey, model, provider); err == nil {
 					done <- translated
 				} else {
 					done <- ""
@@ -2016,24 +2367,41 @@ func InstallBundledSkills(home string) (int, error) {
 // InstallOpencodeCommands copies embedded command files to ~/.config/opencode/commands/.
 // Uses SHA-256 hash to skip unchanged files. Returns number of installed/updated files.
 func InstallOpencodeCommands(home string) (int, error) {
-	cmdsDir := filepath.Join(home, ".config", "opencode", "commands")
+	cmdsDir := filepath.Join(home, opencodeCommandsRelDir)
 	installed := 0
 
-	entries, err := skills.BundledOpencodeCommands.ReadDir("bundled-commands/opencode")
-	if err != nil {
-		return 0, fmt.Errorf("read bundled opencode commands: %w", err)
+	// A commands directory that is itself a symlink carries every write into the
+	// link target. os.MkdirAll would accept it, and the uninstall sweep refuses
+	// the same shape.
+	if fi, err := os.Lstat(cmdsDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return 0, fmt.Errorf("opencode commands dir %s is a symlink, refusing to install into it", cmdsDir)
+	}
+	if err := os.MkdirAll(cmdsDir, 0755); err != nil {
+		return 0, fmt.Errorf("create opencode commands dir: %w", err)
 	}
 
-	os.MkdirAll(cmdsDir, 0755)
-	for _, f := range entries {
-		if f.IsDir() {
-			continue
-		}
-		data, err := skills.BundledOpencodeCommands.ReadFile(filepath.Join("bundled-commands", "opencode", f.Name()))
+	// The name list is the same one the uninstall sweep uses, so it is also
+	// filtered for plain entry names: a bundle entry carrying a path separator
+	// must never reach filepath.Join (YM-386).
+	names, err := bundledOpencodeCommandNames()
+	if err != nil {
+		return 0, err
+	}
+	var errs []error
+	for _, name := range names {
+		data, err := skills.BundledOpencodeCommands.ReadFile(filepath.Join("bundled-commands", "opencode", name))
 		if err != nil {
 			continue
 		}
-		dst := filepath.Join(cmdsDir, f.Name())
+		dst := filepath.Join(cmdsDir, name)
+		// os.WriteFile follows a symlink at the destination, so a link planted at
+		// a command name would carry the content into its target. One such file
+		// must not stop the others: dotfile setups link single commands on
+		// purpose, and the run reports what it skipped.
+		if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			errs = append(errs, fmt.Errorf("opencode command %s is a symlink, refusing to overwrite its target", dst))
+			continue
+		}
 		newHash := fmt.Sprintf("%x", sha256.Sum256(data))
 		if existing, err := os.ReadFile(dst); err == nil {
 			oldHash := fmt.Sprintf("%x", sha256.Sum256(existing))
@@ -2042,20 +2410,75 @@ func InstallOpencodeCommands(home string) (int, error) {
 			}
 		}
 		if err := os.WriteFile(dst, data, 0644); err != nil {
-			return installed, fmt.Errorf("write opencode command %s: %w", f.Name(), err)
+			errs = append(errs, fmt.Errorf("write opencode command %s: %w", name, err))
+			continue
 		}
 		installed++
 	}
-	return installed, nil
+	return installed, errors.Join(errs...)
 }
 
-func InstallBundledCaps(home string) (int, error) {
-	capsDir := filepath.Join(home, ".claude", "caps")
+// los35eCapsDirForSetup resolves the CAP.md directory for the install at dataDir.
+// The configured caps_dir is deliberately not read here: step 2 of this same run
+// rewrites config.yaml from the template (caps_dir: ""), so the file on disk at
+// this point is the one this run just wrote. yesmem update resolves it from the
+// live config instead.
+//
+// The data dir case the YM-353 commit named, a data dir outside ~/.claude moving
+// the installer's default, cannot occur on this path: Run pins dataDir to
+// ~/.claude/yesmem. The derivation is shared with the daemon and the update path
+// because those do run against a configured data dir, and because two derivations
+// of the same path drift apart silently, which they had (YM-359).
+func los35eCapsDirForSetup(dataDir string) string {
+	return config.CapsDirPath("", dataDir)
+}
+
+// InstallBundledCaps installs the embedded CAP.md files into capsDir and returns
+// how many it wrote and which caps it refused to write. The error concerns the caps
+// dir itself only; a cap that cannot be reconciled is a conflict, not a failure.
+//
+// capsDir must be absolute: a relative path lands under the caller's working
+// directory, where nothing imports it, and the export path refuses the same case
+// (daemon.cap_sync.WriteCapToDisk).
+func InstallBundledCaps(capsDir string) (int, []CapConflict, error) {
+	manifest, err := loadBundledCapManifest()
+	if err != nil {
+		return 0, nil, err
+	}
+	return installBundledCaps(capsDir, manifest)
+}
+
+// installBundledCaps is the installer with the bundled provenance passed in, so a
+// test can describe a bundle that lists some caps and not others.
+//
+// A bundled body replaces the installed one only on evidence that the bundle is its
+// successor: the provenance file of the installation (or, for an install that has
+// none yet, the bundled file) must name the hash of the body sitting there.
+// Everything else is kept and reported. The frontmatter version is no part of that
+// decision any more: it counts local revisions, drifted far ahead of the bundles,
+// and every setup run reported success while six caps stayed inert (YM-450, YM-446).
+func installBundledCaps(capsDir string, bundled capManifest) (int, []CapConflict, error) {
+	if !filepath.IsAbs(capsDir) {
+		return 0, nil, fmt.Errorf("caps dir %q is not absolute", capsDir)
+	}
+	// The root directory carries the same mode as the cap directories inside it and
+	// is repaired here: an install created before YM-353 has it 0755, and the
+	// listing alone names every installed cap.
+	if err := capfile.EnsureDirOwnerOnly(capsDir); err != nil {
+		return 0, nil, fmt.Errorf("create caps dir: %w", err)
+	}
+
 	entries, err := caps.BundledCaps.ReadDir("bundled-caps")
 	if err != nil {
-		return 0, fmt.Errorf("read bundled caps: %w", err)
+		return 0, nil, fmt.Errorf("read bundled caps: %w", err)
 	}
+
+	manifestPath := filepath.Join(capsDir, capManifestName)
+	state, stateUsable := loadInstalledCapManifest(manifestPath)
+	tracked := false
 	installed := 0
+	var conflicts []CapConflict
+
 	for _, capDir := range entries {
 		if !capDir.IsDir() {
 			continue
@@ -2067,28 +2490,121 @@ func InstallBundledCaps(home string) (int, error) {
 		}
 		targetDir := filepath.Join(capsDir, name)
 		targetPath := filepath.Join(targetDir, "CAP.md")
-		if existing, err := os.ReadFile(targetPath); err == nil {
-			if fmt.Sprintf("%x", sha256.Sum256(existing)) == fmt.Sprintf("%x", sha256.Sum256(data)) {
-				continue
+		// Owner-only, like the file inside it: the listing names every installed cap.
+		// The helper refuses a symlink, because os.Chmod would follow it (YM-353).
+		if err := capfile.EnsureDirOwnerOnly(targetDir); err != nil {
+			log.Printf("setup: cap dir %s: %v", targetDir, err)
+			continue
+		}
+
+		bundledHash := textutil.BodyDigest(data)
+		// The installation's own entry wins: it records what this installation
+		// actually took. The bundled entry is the only evidence a bundle can carry
+		// for an installation that predates the manifest, and it is a claim only when
+		// it names a body other than the bundle itself. A self-hash says nothing
+		// (that case is decided by the content comparison below), so presenting it as
+		// a derivation would tell the operator the bundle descends from a body it was
+		// never cut from.
+		claim := state.Find(name)
+		if claim == nil {
+			claim = bundled.Find(name)
+			if claim != nil && claim.DerivedFromHash == bundledHash {
+				claim = nil
 			}
 		}
-		os.MkdirAll(targetDir, 0755)
-		if err := os.WriteFile(targetPath, data, 0644); err != nil {
+		// Neither the hash nor the mode repair may follow a link: a link planted at
+		// this path would feed the decision foreign content and hand the repair to a
+		// foreign file (YM-359). A read that fails for any other reason (a link, a
+		// hard-linked body, an unreadable file) is no evidence that the bundle is the
+		// successor, and such a file must not be written over either.
+		existing, readErr := capfile.ReadNoFollow(targetPath)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			log.Printf("setup: cap %s: %v (not installed)", name, readErr)
+			continue
+		}
+		haveInstalled := readErr == nil
+
+		switch {
+		case !haveInstalled:
+			// Nothing on disk: fresh install, and the bundled body is tracked from
+			// here on.
+		case textutil.BodyDigest(existing) == bundledHash:
+			// Same body, at most a different line-ending style: the digest ignores line
+			// endings and trailing newlines, so a CRLF checkout or a newline an editor
+			// added is not news. It keeps everything else, case and indentation
+			// included: inside a bash or python body those are the program. Nothing is
+			// written, but the mode may need repairing (a CAP.md exported before
+			// YM-346 carries 0644) and a cap installed before this manifest existed
+			// is tracked from here on.
+			if chmodErr := capfile.RepairFileOwnerOnly(targetPath); chmodErr != nil {
+				log.Printf("setup: mode %s: %v", targetPath, chmodErr)
+			}
+			if state.Record(name, bundledHash) {
+				tracked = true
+			}
+			continue
+		case claim != nil && claim.DerivedFromHash == textutil.BodyDigest(existing):
+			// The bundle is the successor of exactly this body. This is the update
+			// path and it ignores the version: a live body at revision 603 is replaced
+			// by a bundle carrying 195 when the bundle descends from it.
+		default:
+			// Either the installation holds a body the bundle does not descend from,
+			// or nothing vouches for the bundle at all (a cap added to the bundle
+			// under a name this installation already uses). Both are the same
+			// situation: no evidence that writing would keep the local work. Writing
+			// would roll back every change made after the bundle was cut, and skipping
+			// it without a word is what kept six caps inert for months. So: keep the
+			// body, repair its mode, report the hash pair.
+			_, parseErr := capfile.Parse(existing)
+			conflict := CapConflict{
+				Name:          name,
+				InstalledHash: textutil.BodyDigest(existing),
+				Unparseable:   parseErr != nil,
+			}
+			if claim != nil {
+				conflict.ManifestHash = claim.DerivedFromHash
+			} else {
+				conflict.Untracked = true
+			}
+			conflicts = append(conflicts, conflict)
+			if chmodErr := capfile.RepairFileOwnerOnly(targetPath); chmodErr != nil {
+				log.Printf("setup: mode %s: %v", targetPath, chmodErr)
+			}
+			continue
+		}
+
+		// Owner-only: a cap body names endpoints, paths and command lines, and the
+		// daemon imports scripts from this directory (YM-346). The write refuses a
+		// linked target, so the bundled body never lands outside the caps tree.
+		if err := capfile.WriteOwnerOnly(targetPath, data); err != nil {
+			log.Printf("setup: write %s: %v", targetPath, err)
 			continue
 		}
 		installed++
+		if state.Record(name, bundledHash) {
+			tracked = true
+		}
 	}
-	return installed, nil
+
+	// A file that exists but did not parse is left untouched: it may hold a
+	// reconciliation someone typed by hand.
+	if tracked && stateUsable {
+		if err := saveInstalledCapManifest(manifestPath, state); err != nil {
+			log.Printf("setup: %v", err)
+		}
+	}
+	return installed, conflicts, nil
 }
 
 // translateCommand translates a skill document to the target language via LLM.
-func translateCommand(content, langCode, apiKey, model, provider string) (string, error) {
+func translateCommand(dataDir, content, langCode, apiKey, model, provider string) (string, error) {
 	modelID := config.ResolveModelIDForProvider(provider, "haiku", "claude-haiku-4-5-20251001", "gpt-5-mini")
 
 	client, err := extraction.NewLLMClient(provider, apiKey, modelID, "", "")
 	if err != nil {
 		return "", fmt.Errorf("llm client: %w", err)
 	}
+	client = redactedForDataDir(dataDir, client)
 
 	prompt := fmt.Sprintf(`Translate the following skill document to %s.
 
@@ -2219,7 +2735,13 @@ func detectOpencodeBinary() string {
 	if path, err := exec.LookPath("opencode"); err == nil {
 		return path
 	}
-	home, _ := os.UserHomeDir()
+	// The fallback needs a home directory. Without one there is no candidate
+	// path: probing a relative ".opencode/bin/opencode" would look in the working
+	// directory (YM-350).
+	home, err := UserHome()
+	if err != nil {
+		return ""
+	}
 	fb := filepath.Join(home, ".opencode", "bin", "opencode")
 	if _, err := os.Stat(fb); err == nil {
 		return fb
@@ -2227,43 +2749,22 @@ func detectOpencodeBinary() string {
 	return ""
 }
 
-// detectOpencodeConfigDir returns the opencode config directory.
-func detectOpencodeConfigDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "opencode")
-}
-
-// installOpencodePlugin symlinks the yesmem plugin into opencode's plugins directory
-// and registers it in opencode.json. Even if the plugin source files aren't available,
+// installOpencodePlugin prepares the plugin artifacts and the config for the
+// user's opencode major version. Even when the plugin sources are unavailable,
 // the provider/mcp/compaction settings are still merged.
 //
 // primaryModel/smallModel are threaded through to mergeOpencodeSettingsWith so the
 // user's wizard choice is written in the same pass. Without this, step 7d would
 // write hardcoded deepseek-reasoner defaults that step 7d2 cannot overwrite
 // (deepMergeJSON preserves existing scalars).
-func installOpencodePlugin(home, binaryPath, primaryModel, smallModel string) error {
-	if err := installOpencodePluginSource(home); err != nil {
-		return err
-	}
+func installOpencodePlugin(home, binaryPath, primaryModel, smallModel string) (string, error) {
+	major := opencodeVersionFn()
+	_, detail, installErr := installOpencodePluginFor(home, major)
+	cfgErr := mergeOpencodeSettingsWith(home, primaryModel, smallModel, binaryPath)
 
-	pluginSource := resolvePluginSource(home, binaryPath)
-
-	if pluginSource != "" {
-		pluginsDir := filepath.Join(detectOpencodeConfigDir(), "plugins")
-		os.MkdirAll(pluginsDir, 0755)
-
-		symlinkPath := filepath.Join(pluginsDir, "yesmem.ts")
-		os.Remove(symlinkPath) // remove old symlink if exists
-		if err := os.Symlink(pluginSource, symlinkPath); err != nil {
-			return fmt.Errorf("symlink plugin: %w", err)
-		}
-	}
-
-	if err := mergeOpencodeJSON(home, pluginSource, primaryModel, smallModel); err != nil {
-		return err
-	}
 	// Window plugin: registers which session a terminal window shows so
-	// spawned agents open on the caller's desktop.
+	// spawned agents open on the caller's desktop. It and the themes are
+	// independent of the config merge, so a failed merge must not skip them.
 	if _, err := InstallWindowPlugin(home); err != nil {
 		fmt.Fprintf(os.Stderr, "  opencode window plugin not installed: %v\n", err)
 	}
@@ -2271,110 +2772,14 @@ func installOpencodePlugin(home, binaryPath, primaryModel, smallModel string) er
 	if _, err := InstallThemes(home); err != nil {
 		fmt.Fprintf(os.Stderr, "  opencode agent themes not installed: %v\n", err)
 	}
-	return nil
+	return detail, errors.Join(installErr, cfgErr)
 }
 
-// installOpencodePluginSource copies the bundled opencode plugin source files
-// from the embedded FS into ~/.local/share/yesmem/plugins/opencode-yesmem/.
-// The symlink target (resolvePluginSource) points to this directory.
-func installOpencodePluginSource(home string) error {
-	_, err := InstallOpencodePlugin(home)
-	return err
-}
-
-// InstallOpencodePlugin extracts bundled plugin source files to
-// ~/.local/share/yesmem/plugins/opencode-yesmem/ if they are missing
-// or outdated (SHA256 comparison). Returns the number of files updated.
-func InstallOpencodePlugin(home string) (int, error) {
-	dstDir := filepath.Join(home, ".local", "share", "yesmem", "plugins", "opencode-yesmem")
-	os.MkdirAll(dstDir, 0755)
-
-	entries, err := yesmemPlugins.BundledOpencodePlugin.ReadDir("opencode-yesmem")
-	if err != nil {
-		return 0, fmt.Errorf("read embedded plugin: %w", err)
-	}
-
-	installed := 0
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		data, err := yesmemPlugins.BundledOpencodePlugin.ReadFile("opencode-yesmem/" + e.Name())
-		if err != nil {
-			continue
-		}
-		dstPath := filepath.Join(dstDir, e.Name())
-		if existing, err := os.ReadFile(dstPath); err == nil {
-			if fmt.Sprintf("%x", sha256.Sum256(existing)) == fmt.Sprintf("%x", sha256.Sum256(data)) {
-				continue
-			}
-		}
-		if err := os.WriteFile(dstPath, data, 0644); err != nil {
-			return installed, fmt.Errorf("write plugin %s: %w", e.Name(), err)
-		}
-		installed++
-	}
-	return installed, nil
-}
-
-// resolvePluginSource returns the path to the plugin index.ts for symlinking.
-// Priority: ~/.local/share/yesmem/plugins/ > ../plugins/ relative to binary.
-func resolvePluginSource(home, binaryPath string) string {
-	// Check persistent install location first
-	persistent := filepath.Join(home, ".local", "share", "yesmem", "plugins", "opencode-yesmem", "index.ts")
-	if _, err := os.Stat(persistent); err == nil {
-		return persistent
-	}
-
-	// Fallback: relative to binary (development)
-	dev := filepath.Join(filepath.Dir(binaryPath), "..", "plugins", "opencode-yesmem", "index.ts")
-	if _, err := os.Stat(dev); err == nil {
-		return dev
-	}
-
-	return ""
-}
-
-// mergeOpencodeJSON adds both the plugin entry and the provider/MCP/compaction
-// settings to opencode.json. Preserves existing configuration. Idempotent.
-// primaryModel/smallModel are forwarded to mergeOpencodeSettingsWith so the
-// user's wizard choice is applied atomically — without them, the hardcoded
-// deepseek defaults from defaultOpencodeSettings() would win and step 7d2's
-// mergeOpencodeSettingsWith call could not overwrite them.
-func mergeOpencodeJSON(home, pluginPath, primaryModel, smallModel string) error {
-	if err := mergeOpencodeSettingsWith(home, primaryModel, smallModel, ""); err != nil {
-		return err
-	}
-
-	cfgPath := opencodeConfigPath(home)
-	os.MkdirAll(filepath.Dir(cfgPath), 0755)
-
-	var cfg map[string]any
-	data, err := os.ReadFile(cfgPath)
-	if err == nil {
-		json.Unmarshal(data, &cfg)
-	}
-	if cfg == nil {
-		cfg = map[string]any{}
-	}
-
-	plugins, _ := cfg["plugin"].([]any)
-	for _, p := range plugins {
-		if s, ok := p.(string); ok && s == pluginPath {
-			return nil
-		}
-	}
-
-	if pluginPath != "" {
-		cfg["plugin"] = append(plugins, pluginPath)
-	}
-	cfg["$schema"] = "https://opencode.ai/config.json"
-
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(cfgPath, append(out, '\n'), 0644)
+// InstallOpencodePlugin installs the bundled plugin for the user's opencode
+// major version and returns the number of files updated. Where the install was
+// skipped by design, the reason is returned instead of a count.
+func InstallOpencodePlugin(home string) (int, string, error) {
+	return installOpencodePluginFor(home, opencodeVersionFn())
 }
 
 // readAuthJSONKey reads a provider API key from opencode's auth.json.

@@ -35,35 +35,6 @@ func TestRenderDocIndex_WithSources(t *testing.T) {
 	}
 }
 
-func TestRenderKnowledgeTopology_Empty(t *testing.T) {
-	result := renderKnowledgeTopology(nil, nil, defaultStrings())
-	if result != "" {
-		t.Errorf("empty clusters should produce empty string, got: %q", result)
-	}
-}
-
-func TestRenderKnowledgeTopology_DepthLabels(t *testing.T) {
-	strong := []ClusterSummary{
-		{Label: "proxy architecture", Count: 45},
-		{Label: "extraction pipeline", Count: 30},
-	}
-	weak := []ClusterSummary{
-		{Label: "config loading", Count: 3},
-	}
-	result := renderKnowledgeTopology(strong, weak, defaultStrings())
-
-	if !strings.Contains(result, "proxy architecture") {
-		t.Error("should contain strong cluster label")
-	}
-	if !strings.Contains(result, "config loading") {
-		t.Error("should contain weak cluster label")
-	}
-	// Strong clusters should have depth indicator
-	if !strings.Contains(result, "45") {
-		t.Error("should show learning count for strong clusters")
-	}
-}
-
 func TestRenderHealth_AllZero(t *testing.T) {
 	h := HealthData{
 		Contradictions: 0,

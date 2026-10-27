@@ -32,12 +32,12 @@ func RestoreLegacyGitSwap(rootDir string) bool {
 	}
 	_ = os.Remove(dotGit)
 	if err := os.WriteFile(dotGit, data, 0o644); err != nil {
-		log.Printf("cbm: git swap recovery: restore %s: %v", dotGit, err)
+		log.Printf("cbm: git swap recovery: restore %q: %v", dotGit, err)
 		return false
 	}
 	if err := os.Remove(bak); err != nil {
-		log.Printf("cbm: git swap recovery: remove backup: %v", err)
+		log.Printf("cbm: git swap recovery: remove backup %q: %v", bak, err)
 	}
-	log.Printf("cbm: git swap recovery: restored %s", dotGit)
+	log.Printf("cbm: git swap recovery: restored %q", dotGit)
 	return true
 }

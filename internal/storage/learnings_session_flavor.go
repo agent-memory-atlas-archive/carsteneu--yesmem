@@ -12,7 +12,7 @@ func (s *Store) GetSessionFlavorsForSession(sessionID string) ([]map[string]any,
 	query := `SELECT session_flavor, MIN(created_at) as first_seen
 		FROM learnings
 		WHERE superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
 		AND session_id = ?
 		AND length(session_flavor) > 0
 		GROUP BY session_flavor

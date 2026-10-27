@@ -11,8 +11,9 @@ import (
 // the WAL is recycled in place after a checkpoint and stays at its peak
 // physical size, which has been observed to grow into hundreds of MB on
 // long-running daemons and slows every external sqlite3-reader by ~8s per
-// open. The fix sets journal_size_limit so SQLite truncates the WAL file
-// down to that limit after each checkpoint.
+// open. The fix sets journal_size_limit so SQLite truncates the WAL file down
+// to that limit when a connection carrying the setting restarts the log, which
+// is the next write after a fully checkpointed WAL.
 func TestJournalSizeLimit_TruncatesWalAfterCheckpoint(t *testing.T) {
 	const walLimit = 10 * 1024 * 1024 // 10 MB, must match openSQLite() value
 

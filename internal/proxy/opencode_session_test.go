@@ -80,7 +80,7 @@ func TestOpencodeSessionID_ProviderShapes(t *testing.T) {
 func TestAnthropicThreadID_ForkSessionIDHeader(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-opencode-session-id", "ses_child")
-	if got := anthropicThreadID(opencodeLikeRequest(), h); got != "opencode:ses_child" {
+	if got, _ := anthropicThread(opencodeLikeRequest(), h); got != "opencode:ses_child" {
 		t.Fatalf("expected opencode:ses_child, got %q", got)
 	}
 }
@@ -88,7 +88,7 @@ func TestAnthropicThreadID_ForkSessionIDHeader(t *testing.T) {
 func TestAnthropicThreadID_OpencodeAffinityHeader(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-session-affinity", "ses_abc")
-	if got := anthropicThreadID(opencodeLikeRequest(), h); got != "opencode:ses_abc" {
+	if got, _ := anthropicThread(opencodeLikeRequest(), h); got != "opencode:ses_abc" {
 		t.Fatalf("expected opencode:ses_abc, got %q", got)
 	}
 }
@@ -100,8 +100,8 @@ func TestAnthropicThreadID_DistinctPerOpencodeSession(t *testing.T) {
 	h1.Set("x-session-affinity", "ses_one")
 	h2 := http.Header{}
 	h2.Set("x-session-affinity", "ses_two")
-	a := anthropicThreadID(opencodeLikeRequest(), h1)
-	b := anthropicThreadID(opencodeLikeRequest(), h2)
+	a, _ := anthropicThread(opencodeLikeRequest(), h1)
+	b, _ := anthropicThread(opencodeLikeRequest(), h2)
 	if a == b {
 		t.Fatalf("expected distinct thread IDs per opencode session, both = %q", a)
 	}
@@ -111,7 +111,7 @@ func TestAnthropicThreadID_ClaudeCodeHeaderWins(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Claude-Code-Session-Id", "cc-123")
 	h.Set("x-session-affinity", "ses_abc")
-	if got := anthropicThreadID(opencodeLikeRequest(), h); got != "cc-123" {
+	if got, _ := anthropicThread(opencodeLikeRequest(), h); got != "cc-123" {
 		t.Fatalf("expected cc-123, got %q", got)
 	}
 }
@@ -125,7 +125,7 @@ func TestAnthropicThreadID_OpencodeHeaderBeatsBodyMetadata(t *testing.T) {
 	req["metadata"] = map[string]any{"user_id": string(userID)}
 	h := http.Header{}
 	h.Set("x-session-affinity", "ses_abc")
-	if got := anthropicThreadID(req, h); got != "opencode:ses_abc" {
+	if got, _ := anthropicThread(req, h); got != "opencode:ses_abc" {
 		t.Fatalf("expected opencode:ses_abc, got %q", got)
 	}
 }
@@ -135,7 +135,7 @@ func TestAnthropicThreadID_ClaudeCodeBodyMetadataWithoutHeaders(t *testing.T) {
 	userID, _ := json.Marshal(map[string]string{"session_id": "cc-body"})
 	req := opencodeLikeRequest()
 	req["metadata"] = map[string]any{"user_id": string(userID)}
-	if got := anthropicThreadID(req, http.Header{}); got != "cc-body" {
+	if got, _ := anthropicThread(req, http.Header{}); got != "cc-body" {
 		t.Fatalf("expected cc-body, got %q", got)
 	}
 }
@@ -143,7 +143,7 @@ func TestAnthropicThreadID_ClaudeCodeBodyMetadataWithoutHeaders(t *testing.T) {
 func TestAnthropicThreadID_FallbackToDerived(t *testing.T) {
 	req := opencodeLikeRequest()
 	want := DeriveThreadID(req)
-	if got := anthropicThreadID(req, http.Header{}); got != want {
+	if got, _ := anthropicThread(req, http.Header{}); got != want {
 		t.Fatalf("expected derived %q, got %q", want, got)
 	}
 }

@@ -2,8 +2,12 @@ package daemon
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/carsteneu/yesmem/internal/httpapi"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -21,7 +25,7 @@ func TestHandleSendTo_WithMsgType(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatal(resp.Error)
 	}
-	msgs, err := s.GetChannelMessages("target-session-1")
+	msgs, err := s.GetChannelMessages([]string{"target-session-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +50,7 @@ func TestHandleSendTo_DefaultMsgType(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatal(resp.Error)
 	}
-	msgs, err := s.GetChannelMessages("target-session-2")
+	msgs, err := s.GetChannelMessages([]string{"target-session-2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +128,54 @@ func TestResolveSessionID_ActiveSessionFallback(t *testing.T) {
 	got := h.resolveSessionID(map[string]any{}, "missing")
 	if got != "active-fallback" {
 		t.Errorf("got %q, want active-fallback", got)
+	}
+}
+
+// --- resolveSessionID: ambiguous PIDs ---
+//
+// The opencode plugin registers the PID that hosts a session. When one PID is
+// registered for several sessions (shared service process, PID-file rebuild),
+// returning whichever session the map yields first misattributes the call, so
+// the resolver must refuse and let the caller-cwd path decide instead.
+
+func TestResolveSessionID_AmbiguousPIDResolvesNothing(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	h.pidMapMu.Lock()
+	h.pidMap["opencode:ses_amb_a"] = 4242
+	h.pidMap["opencode:ses_amb_b"] = 4242
+	h.pidMapMu.Unlock()
+
+	got := h.resolveSessionID(map[string]any{"_caller_pid": float64(4242)}, "missing")
+	if got != "" {
+		t.Fatalf("got %q, want no resolution for a PID mapping to two sessions", got)
+	}
+}
+
+func TestResolveSessionIDFromPID_AmbiguousPIDResolvesNothing(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	h.pidMapMu.Lock()
+	h.pidMap["opencode:ses_amb_c"] = 4243
+	h.pidMap["opencode:ses_amb_d"] = 4243
+	h.pidMapMu.Unlock()
+
+	if got := h.resolveSessionIDFromPID(4243); got != "" {
+		t.Fatalf("got %q, want no resolution for a PID mapping to two sessions", got)
+	}
+}
+
+// A PID with exactly one session keeps resolving — the rejection is about
+// ambiguity, not about PID lookups in general.
+func TestResolveSessionID_UnambiguousPIDStillResolves(t *testing.T) {
+	h, _ := mustHandler(t)
+	h.pidMapMu.Lock()
+	h.pidMap["opencode:ses_only"] = 4244
+	h.pidMapMu.Unlock()
+
+	got := h.resolveSessionID(map[string]any{"_caller_pid": float64(4244)}, "missing")
+	if got != "opencode:ses_only" {
+		t.Fatalf("got %q, want opencode:ses_only", got)
 	}
 }
 
@@ -290,22 +342,28 @@ func TestHandleSendTo_MissingParams(t *testing.T) {
 	}
 }
 
-func TestHandleSendTo_SenderFallbackToResolve(t *testing.T) {
+// A caller that proves no identity must not be labelled with the
+// last-writer-wins active session: that is whichever session wrote last, so the
+// replies to the label reached a foreign session (YM-60).
+func TestHandleSendTo_UnidentifiedSenderIsNotTheActiveSession(t *testing.T) {
 	h, s := mustHandler(t)
 	h.activeSessionMu.Lock()
-	h.activeSessionID = "resolved-sender"
+	h.activeSessionID = "foreign-session"
 	h.activeSessionMu.Unlock()
 
 	resp := h.Handle(Request{Method: "send_to", Params: map[string]any{"target": "tgt-1", "content": "hello"}})
 	if resp.Error != "" {
 		t.Fatal(resp.Error)
 	}
-	msgs, _ := s.GetChannelMessages("tgt-1")
+	msgs, _ := s.GetChannelMessages([]string{"tgt-1"})
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 msg, got %d", len(msgs))
 	}
-	if msgs[0].Sender != "resolved-sender" {
-		t.Errorf("sender=%q, want resolved-sender", msgs[0].Sender)
+	if msgs[0].Sender == "foreign-session" {
+		t.Errorf("sender=%q — a caller that proved nothing was labelled with the last active session", msgs[0].Sender)
+	}
+	if msgs[0].Sender != "unknown" {
+		t.Errorf("sender=%q, want unknown", msgs[0].Sender)
 	}
 }
 
@@ -323,7 +381,7 @@ func TestHandleSendTo_ImplicitAck(t *testing.T) {
 	}
 
 	// The message targeted at sender-X should now be delivered/read
-	msgs, _ := s.GetChannelMessages("sender-X")
+	msgs, _ := s.GetChannelMessages([]string{"sender-X"})
 	if len(msgs) != 0 {
 		t.Errorf("expected 0 undelivered messages after implicit ack, got %d", len(msgs))
 	}
@@ -390,7 +448,7 @@ func TestHandleMarkChannelRead_OK(t *testing.T) {
 		t.Errorf("status=%v, want ok", m["status"])
 	}
 	// Verify messages are now read
-	msgs, _ := s.GetChannelMessages("sess-mark-1")
+	msgs, _ := s.GetChannelMessages([]string{"sess-mark-1"})
 	if len(msgs) != 0 {
 		t.Errorf("expected 0 undelivered after mark_channel_read, got %d", len(msgs))
 	}
@@ -542,13 +600,22 @@ func TestHandleRegisterWindow_MissingParams(t *testing.T) {
 // --- handleBroadcast ---
 
 func TestHandleBroadcast_OK(t *testing.T) {
-	h, _ := mustHandler(t)
-	h.activeSessionMu.Lock()
-	h.activeSessionID = "bc-sender"
-	h.activeSessionMu.Unlock()
+	h, s := mustHandler(t)
+
+	// The label is resolved from the kernel-reported peer, so the caller needs a row
+	// whose pid the daemon can find (YM-271). The active-session fallback is gone on
+	// this path, and a session id the caller sends is not evidence.
+	peer := os.Getpid()
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-20261020-80", Project: "test-proj", Section: "bc",
+		SessionID: "bc-sender", Status: "running", PID: peer,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
 
 	resp := h.Handle(Request{Method: "broadcast", Params: map[string]any{
 		"project": "test-proj", "content": "hello everyone",
+		"_cwd": "/srv/test-proj", "_peer_pid": peer,
 	}})
 	if resp.Error != "" {
 		t.Fatal(resp.Error)
@@ -591,10 +658,10 @@ func TestHandleBroadcast_MissingSender(t *testing.T) {
 
 func TestHandleCheckBroadcasts_OK(t *testing.T) {
 	h, s := mustHandler(t)
-	s.SendBroadcast("sender-bc", "proj-1", "broadcast msg")
+	s.SendBroadcast("sender-bc", "/srv/proj-1", "broadcast msg")
 
 	resp := h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{
-		"session_id": "reader-1", "project": "proj-1",
+		"session_id": "reader-1", "project": "proj-1", "_cwd": "/srv/proj-1",
 	}})
 	if resp.Error != "" {
 		t.Fatal(resp.Error)
@@ -613,7 +680,7 @@ func TestHandleCheckBroadcasts_OK(t *testing.T) {
 func TestHandleCheckBroadcasts_Empty(t *testing.T) {
 	h, _ := mustHandler(t)
 	resp := h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{
-		"session_id": "reader-2", "project": "proj-2",
+		"session_id": "reader-2", "project": "proj-2", "_cwd": "/srv/proj-2",
 	}})
 	if resp.Error != "" {
 		t.Fatal(resp.Error)
@@ -627,24 +694,30 @@ func TestHandleCheckBroadcasts_Empty(t *testing.T) {
 
 func TestHandleCheckBroadcasts_MissingParams(t *testing.T) {
 	h, _ := mustHandler(t)
+	// A broadcast read identifies its reader by the session id it names, so a
+	// caller that names none cannot be served at all (YM-235, same form as the
+	// endpoints YM-204 closed). The empty-project case stays a no-op.
 	resp := h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{}})
+	if resp.Error == "" {
+		t.Error("expected an error for a broadcast read without a session id")
+	}
+	resp = h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{"session_id": "reader-x"}})
 	if resp.Error != "" {
-		t.Error("expected graceful empty response, not error")
+		t.Fatalf("a missing project must stay a no-op: %s", resp.Error)
 	}
 	m := resultMap(t, resp)
-	msgs := m["messages"].([]any)
-	if len(msgs) != 0 {
+	if msgs := m["messages"].([]any); len(msgs) != 0 {
 		t.Errorf("expected empty, got %d", len(msgs))
 	}
 }
 
 func TestHandleCheckBroadcasts_MarksRead(t *testing.T) {
 	h, s := mustHandler(t)
-	s.SendBroadcast("sender-x", "proj-r", "first read")
+	s.SendBroadcast("sender-x", "/srv/proj-r", "first read")
 
 	// First check: should see the broadcast
 	resp := h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{
-		"session_id": "reader-r", "project": "proj-r",
+		"session_id": "reader-r", "project": "proj-r", "_cwd": "/srv/proj-r",
 	}})
 	m := resultMap(t, resp)
 	if len(m["messages"].([]any)) != 1 {
@@ -653,11 +726,83 @@ func TestHandleCheckBroadcasts_MarksRead(t *testing.T) {
 
 	// Second check: should be empty (already read)
 	resp = h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{
-		"session_id": "reader-r", "project": "proj-r",
+		"session_id": "reader-r", "project": "proj-r", "_cwd": "/srv/proj-r",
 	}})
 	m = resultMap(t, resp)
 	if len(m["messages"].([]any)) != 0 {
 		t.Error("expected 0 broadcasts after re-read")
+	}
+}
+
+// A broadcast read names its reader and then marks what it showed as read, so
+// it carried the same ownership hole the channel inbox had before YM-204: any
+// socket client could name another session and consume its broadcasts. The peer
+// guard closes it (YM-235).
+func TestCheckBroadcasts_ForeignCallerStaysClosed(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendBroadcast("orchestrator-b", "proj-b", "broadcast for the victim"); err != nil {
+		t.Fatal(err)
+	}
+	stubProcCmdline(t, "/usr/bin/opencode\x00serve\x00")
+
+	for name, extra := range map[string]map[string]any{
+		"an identity it asserts itself": {"_session_id": "opencode:ses_VICTIM_BC"},
+		"its own unrelated identity":    {"_session_id": "caller-session"},
+		"nothing at all":                {},
+	} {
+		params := map[string]any{
+			"session_id": "opencode:ses_VICTIM_BC",
+			"project":    "proj-b",
+			"_peer_pid":  4321,
+		}
+		for k, v := range extra {
+			params[k] = v
+		}
+		resp := h.Handle(Request{Method: "check_broadcasts", Params: params})
+		if resp.Error == "" {
+			t.Errorf("%s read a foreign broadcast inbox: %s", name, resp.Result)
+		}
+		if strings.Contains(string(resp.Result), "broadcast for the victim") {
+			t.Errorf("%s received the victim's broadcast: %s", name, resp.Result)
+		}
+	}
+
+	left, err := s.GetUnreadBroadcasts("opencode:ses_VICTIM_BC", "proj-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Errorf("a foreign caller consumed the victim's broadcast: %d left", len(left))
+	}
+}
+
+// The guard must not close the proxy out: it is the only reader of these
+// endpoints, and a proxy binary whose argv no longer matches would stop channel
+// delivery entirely (the failure is logged, not silent).
+func TestCheckBroadcasts_ProxyCallerIsServed(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendBroadcast("orchestrator-c", "/srv/proj-c", "broadcast for the reader"); err != nil {
+		t.Fatal(err)
+	}
+	stubProcCmdline(t, "/home/u/.local/bin/yesmem\x00proxy\x00")
+
+	resp := h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{
+		"session_id": "opencode:ses_READER_C", "project": "/srv/proj-c", "_peer_pid": 4321,
+	}})
+	if resp.Error != "" {
+		t.Fatalf("the proxy was refused its own consumer path: %s", resp.Error)
+	}
+	if !strings.Contains(string(resp.Result), "broadcast for the reader") {
+		t.Errorf("the proxy did not receive the broadcast: %s", resp.Result)
+	}
+
+	// The identity is still required: absence of the session id is refused for
+	// that reason, not because of the peer.
+	resp = h.Handle(Request{Method: "check_broadcasts", Params: map[string]any{
+		"project": "/srv/proj-c", "_peer_pid": 4321,
+	}})
+	if !strings.Contains(resp.Error, "session_id") {
+		t.Errorf("a proxy call without a session id failed for the wrong reason: %q", resp.Error)
 	}
 }
 
@@ -927,6 +1072,29 @@ func TestFormatCheckMessagesResult_WithMessages(t *testing.T) {
 	}
 }
 
+// The sender label is truncated with a literal [:8]; a sender shorter than that
+// panicked the whole formatter (YM-73).
+func TestFormatCheckMessagesResult_ShortSender(t *testing.T) {
+	raw := json.RawMessage(`{"has_dialog":true,"topic":"t","messages":[{"sender":"ab","content":"hi"}]}`)
+	got := formatCheckMessagesResult(raw)
+	if got != "\U0001f4e8 DIALOG [t] ab: hi\n" {
+		t.Errorf("unexpected format: %q", got)
+	}
+}
+
+// The sender label is truncated to 8 characters; counting bytes cut a multi-byte
+// label apart and produced invalid UTF-8 in the text an agent reads.
+func TestFormatCheckMessagesResult_MultiByteSenderKeepsWholeCharacters(t *testing.T) {
+	raw := json.RawMessage(`{"has_dialog":true,"topic":"t","messages":[{"sender":"äöüßéèàçx","content":"hi"}]}`)
+	got := formatCheckMessagesResult(raw)
+	if !utf8.ValidString(got) {
+		t.Errorf("invalid UTF-8 in %q", got)
+	}
+	if !strings.Contains(got, "äöüßéèàç") {
+		t.Errorf("the label was cut mid-character: %q", got)
+	}
+}
+
 func TestFormatCheckMessagesResult_NoDialog(t *testing.T) {
 	raw := json.RawMessage(`{"has_dialog":false,"messages":[]}`)
 	got := formatCheckMessagesResult(raw)
@@ -948,6 +1116,168 @@ func TestFormatCheckMessagesResult_InvalidJSON(t *testing.T) {
 	got := formatCheckMessagesResult(raw)
 	if got != "" {
 		t.Errorf("expected empty for invalid JSON, got %q", got)
+	}
+}
+
+// --- channel inbox ownership (YM-204) ---
+
+// The proxy is the installation's channel consumer: it reads and marks for the
+// session whose request it is serving and has no session of its own. Its
+// connection is the peer the socket layer reports, so the named inbox stays open
+// for it.
+func TestCheckChannel_ProxyPeerReadsTheNamedSession(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendChannelMessage("opencode:ses_TARGET", "someone", "for the target", "command"); err != nil {
+		t.Fatal(err)
+	}
+	stubProcCmdline(t, "/home/tester/.local/bin/yesmem\x00proxy\x00")
+
+	resp := h.Handle(Request{Method: "check_channel", Params: map[string]any{
+		"session_id": "opencode:ses_TARGET", "_peer_pid": 4242,
+	}})
+	if resp.Error != "" {
+		t.Fatalf("the proxy was refused its own consumer path: %s", resp.Error)
+	}
+	if !strings.Contains(string(resp.Result), "for the target") {
+		t.Errorf("proxy did not receive the message: %s", resp.Result)
+	}
+}
+
+// A session_id is not an ownership proof. A caller that arrives on a connection
+// and is not the proxy must not read a foreign inbox — and it must not be able to
+// talk its way in either: naming the victim as its own identity used to be
+// enough, because that value is one the caller chooses (review finding on
+// YM-204).
+func TestCheckChannel_ForeignInboxStaysClosed(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendChannelMessage("opencode:ses_VICTIM", "someone", "for the victim", "command"); err != nil {
+		t.Fatal(err)
+	}
+	// The peer of this connection is not the proxy.
+	stubProcCmdline(t, "/usr/bin/opencode\x00serve\x00")
+
+	for name, extra := range map[string]map[string]any{
+		"an identity it asserts itself":               {"_session_id": "opencode:ses_VICTIM"},
+		"the source marker that makes itself trusted": {"_session_id": "opencode:ses_VICTIM", "_session_id_source": "env"},
+		"its own unrelated identity":                  {"_session_id": "caller-session"},
+		"nothing at all":                              {},
+	} {
+		params := map[string]any{"session_id": "opencode:ses_VICTIM", "_peer_pid": 4321}
+		for k, v := range extra {
+			params[k] = v
+		}
+		resp := h.Handle(Request{Method: "check_channel", Params: params})
+		if resp.Error == "" {
+			t.Errorf("%s read a foreign inbox: %s", name, resp.Result)
+		}
+		if strings.Contains(string(resp.Result), "for the victim") {
+			t.Errorf("%s received the victim's message: %s", name, resp.Result)
+		}
+	}
+
+	// A pid the caller sends itself is not a peer: JSON decoding makes every
+	// number a float64, and only the int the socket layer writes counts.
+	resp := h.Handle(Request{Method: "check_channel", Params: map[string]any{
+		"session_id": "opencode:ses_VICTIM", "_peer_pid": float64(4321),
+	}})
+	if resp.Error != "" {
+		t.Errorf("a caller-supplied pid must not count as a peer at all, and with no peer the in-process path stands: %s", resp.Error)
+	}
+}
+
+// The peer pid has to be the transport's own value, not one a caller can send:
+// the socket layer writes an int, while anything arriving through JSON decoding
+// is a float64 and is ignored. A caller that names a pid of its choosing must
+// not reach the peer branch in either direction.
+func TestPeerPIDParam_OnlyTheSocketsIntCounts(t *testing.T) {
+	if got := peerPIDParam(map[string]any{"_peer_pid": float64(4321)}); got != 0 {
+		t.Errorf("a JSON number was read as a peer pid: %d", got)
+	}
+	if got := peerPIDParam(map[string]any{"_peer_pid": "4321"}); got != 0 {
+		t.Errorf("a string was read as a peer pid: %d", got)
+	}
+	if got := peerPIDParam(map[string]any{"_peer_pid": 4321}); got != 4321 {
+		t.Errorf("the socket layer's int form was not read: %d", got)
+	}
+	if got := peerPIDParam(map[string]any{}); got != 0 {
+		t.Errorf("a request without a peer must read 0: %d", got)
+	}
+}
+
+// The HTTP RPC pass-through carries no peer, so the channel endpoints cannot be
+// held to a caller there. They exist for the proxy's socket calls; an HTTP
+// bearer-token holder must not get a session's inbox through the public API
+// (review finding on YM-204).
+func TestHTTPAdapter_DoesNotServeTheChannelEndpoints(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendChannelMessage("opencode:ses_VICTIM", "someone", "for the victim", "command"); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &handlerAdapter{h: h}
+
+	for _, method := range []string{"check_channel", "mark_channel_read", "check_broadcasts"} {
+		resp := adapter.Handle(httpapi.RPCRequest{Method: method, Params: map[string]any{"session_id": "opencode:ses_VICTIM"}})
+		if resp.Error == "" {
+			t.Errorf("%s is served over HTTP and read a foreign inbox: %s", method, resp.Result)
+		}
+	}
+	// broadcast writes, but its label is resolved from the caller's proven
+	// identity — and that proof lives on the socket (YM-271).
+	if resp := adapter.Handle(httpapi.RPCRequest{Method: "broadcast", Params: map[string]any{
+		"project": "http-proj", "content": "forged", "sender": "opencode:ses_VICTIM",
+	}}); resp.Error == "" {
+		t.Errorf("broadcast is served over HTTP, where no peer can vouch for the sender: %s", resp.Result)
+	}
+	left, err := s.GetChannelMessages(s.ChannelAddresses("opencode:ses_VICTIM"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Errorf("the victim's message was consumed over HTTP: %d left", len(left))
+	}
+}
+
+// The daemon's own callers pass no peer, and a platform without peer credentials
+// never has one. That path keeps the old behaviour, which is deliberate: the
+// guard closes the socket, not the daemon's internal calls.
+func TestCheckChannel_InProcessCallerKeepsTheNamedSession(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendChannelMessage("opencode:ses_INTERNAL", "someone", "internal read", "command"); err != nil {
+		t.Fatal(err)
+	}
+	resp := h.Handle(Request{Method: "check_channel", Params: map[string]any{
+		"session_id": "opencode:ses_INTERNAL",
+	}})
+	if resp.Error != "" {
+		t.Fatalf("an in-process caller was refused: %s", resp.Error)
+	}
+	if !strings.Contains(string(resp.Result), "internal read") {
+		t.Errorf("an in-process caller lost its inbox: %s", resp.Result)
+	}
+}
+
+// mark_channel_read consumes the mail it names, so the same guard has to hold
+// there: otherwise a foreign caller can silently swallow another session's
+// messages.
+func TestMarkChannelRead_ForeignInboxStaysClosed(t *testing.T) {
+	h, s := mustHandler(t)
+	if _, err := s.SendChannelMessage("opencode:ses_VICTIM", "someone", "for the victim", "command"); err != nil {
+		t.Fatal(err)
+	}
+	stubProcCmdline(t, "/usr/bin/opencode\x00serve\x00")
+
+	resp := h.Handle(Request{Method: "mark_channel_read", Params: map[string]any{
+		"session_id": "opencode:ses_VICTIM", "_peer_pid": 4321, "_session_id": "caller-session",
+	}})
+	if resp.Error == "" {
+		t.Error("a foreign caller marked another session's inbox read")
+	}
+	left, err := s.GetChannelMessages(s.ChannelAddresses("opencode:ses_VICTIM"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Errorf("the victim's message was consumed: %d left", len(left))
 	}
 }
 

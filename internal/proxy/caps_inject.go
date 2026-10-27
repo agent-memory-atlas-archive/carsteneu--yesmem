@@ -6,13 +6,15 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/carsteneu/yesmem/internal/capfile"
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // ScriptInjection carries one script entry inside a cap — Cap-Spec v1.1
 // allows multiple scripts per cap (bundle caps), each with its own kind,
-// runtime and schema. Only kind="tool" scripts become registerTool() calls.
+// runtime and schema. Only kind="tool" scripts are callable through
+// execute_cap, so the catalog names those.
 type ScriptInjection struct {
 	Name    string
 	Kind    string
@@ -21,10 +23,10 @@ type ScriptInjection struct {
 	Schema  string
 }
 
-// CapInjection carries the fields the proxy needs to render the
-// registerTool(...) snippets for one active cap. Cap-level metadata
-// (Name/Description/Tags) plus a slice of Scripts — each tool-script
-// produces one registerTool call in renderCapabilitiesBlock.
+// CapInjection carries the fields the proxy needs to render the catalog row of
+// one active cap. Cap-level metadata (Name/Description/Tags) plus a slice of
+// Scripts; the registerTool(...) snippets are the daemon's business
+// (handler_caps.go), the proxy only names what execute_cap can call.
 type CapInjection struct {
 	Name        string
 	Description string
@@ -81,11 +83,12 @@ func decodeCapsResponse(raw json.RawMessage) ([]CapInjection, error) {
 	return caps, nil
 }
 
-// renderCapabilitiesBlock produces the <system-reminder>-wrapped
-// renderCapabilitiesCatalog builds a short catalog listing available caps
-// without embedding full handler code. Each cap is listed with name,
-// description, and schema summary. A small activate_cap bootstrapper is
-// included so Claude can load the full handler on demand via MCP.
+// renderCapabilitiesCatalog builds the <system-reminder>-wrapped catalog listing
+// available caps without embedding full handler code. Each cap is listed with
+// name and description; a small activate_cap bootstrapper is included so Claude
+// can load the full handler on demand via MCP. The <caps-active> registerTool
+// block it used to render is gone: the daemon generates those snippets
+// (activate_cap) and the proxy copy was never called.
 func renderCapabilitiesCatalog(caps []CapInjection) string {
 	if len(caps) == 0 {
 		return ""
@@ -102,101 +105,11 @@ func renderCapabilitiesCatalog(caps []CapInjection) string {
 
 	b.WriteString("| Capability | Description |\n|---|---|\n")
 	for _, cap := range sorted {
-		desc := cap.Description
-		if len(desc) > 120 {
-			desc = desc[:117] + "..."
-		}
-		b.WriteString(fmt.Sprintf("| %s | %s |\n", cap.Name, desc))
+		b.WriteString(fmt.Sprintf("| %s | %s |\n", capTableCell(cap.Name), capTableCell(cap.Description)))
 	}
 
 	b.WriteString("</caps-available>\n</system-reminder>")
 	return b.String()
-}
-
-// <caps-active> body containing one registerTool() snippet per cap.
-// Returns empty string if caps is empty.
-func renderCapabilitiesBlock(caps []CapInjection) string {
-	if len(caps) == 0 {
-		return ""
-	}
-	sorted := make([]CapInjection, len(caps))
-	copy(sorted, caps)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Name < sorted[j].Name
-	})
-	var sb strings.Builder
-	sb.WriteString("<system-reminder>\n")
-	sb.WriteString("<caps-active>\n")
-	sb.WriteString("# MANDATORY: Active Capabilities\n\n")
-	sb.WriteString("Match user requests to the `description` of each cap below and **call the matching tool** (e.g. `await reddit_fetch({...})`) — do **NOT** use raw `Bash(curl)`, `WebFetch`, or manual pipelines when a matching cap exists. Register ALL tools below in ONE `REPL()` call at session start (idempotent, safe to repeat). Fall back to generic tools only if a cap's handler fails at runtime — and report the cap error first.\n\n")
-	needsAdapter := false
-	for _, c := range sorted {
-		for _, sc := range c.Scripts {
-			if sc.Runtime == "repl" && capfile.UsesGenericAdapters(sc.Body) {
-				needsAdapter = true
-				break
-			}
-		}
-		if needsAdapter {
-			break
-		}
-	}
-	if needsAdapter {
-		sharedJS := capfile.GenerateAdapterJS(capfile.DefaultAdapters(), true)
-		if sharedJS != "" {
-			sb.WriteString("## Adapter Aliases\n\n```js\n")
-			sb.WriteString(sharedJS)
-			sb.WriteString("```\n\n")
-		}
-	}
-	sb.WriteString("## Registered Tools\n\n")
-	for _, c := range sorted {
-		for _, line := range renderRegisterTools(c) {
-			sb.WriteString(line)
-			sb.WriteString("\n")
-		}
-	}
-	sb.WriteString("</caps-active>\n")
-	sb.WriteString("</system-reminder>")
-	return sb.String()
-}
-
-// renderRegisterTools emits one registerTool(...) line per kind="tool"
-// script in the cap. Bundle caps (Cap-Spec v1.1) may contain multiple
-// tool-scripts plus internal handler-scripts; only tool-scripts become
-// registerTool calls. Each tool-script's body is wrapped depending on
-// runtime: repl bodies inline as the function expression, bash bodies
-// wrap into `async () => sh(...)`. Repl bodies that use the store()
-// adapter get a capability-bound store closure via WrapToolWithStore.
-func renderRegisterTools(c CapInjection) []string {
-	lines := make([]string, 0, len(c.Scripts))
-	for _, sc := range c.Scripts {
-		if sc.Kind != "tool" {
-			continue
-		}
-		var fn string
-		switch sc.Runtime {
-		case "repl":
-			fn = sc.Body
-			if capfile.UsesStoreAdapter(fn) {
-				fn = capfile.ProviderToGeneric(fn, capfile.DefaultAdapters())
-				fn = capfile.WrapToolWithStore(fn, c.Name)
-			}
-		case "bash":
-			fn = fmt.Sprintf("async () => sh(%q)", sc.Body)
-		default:
-			continue
-		}
-		if fn == "" {
-			fn = "async () => null"
-		}
-		schema := sc.Schema
-		if schema == "" {
-			schema = "{}"
-		}
-		lines = append(lines, fmt.Sprintf("registerTool(%q, %q, %s, %s);", sc.Name, c.Description, schema, fn))
-	}
-	return lines
 }
 
 // injectCapabilitiesTurnImpl is the testable core of the proxy stage. It
@@ -230,10 +143,15 @@ func renderRegisterTools(c CapInjection) []string {
 // that happened to mention "<caps-active>" in plain text (e.g.,
 // gotcha notes referencing this injector), silently suppressing every
 // subsequent injection once such a stub entered session history.
+//
+// Dialect — the block body follows the client profile, not the wire: opencode
+// speaks /v1/messages too and its Code Mode has no eval, so it gets the
+// execute_cap catalog instead of the activate_cap bootstrap.
 func injectCapabilitiesTurnImpl(
 	req map[string]any,
 	threadID string,
 	parentThreadID string,
+	profile models.PromptProfile,
 	queryFn func(method string, params map[string]any) (json.RawMessage, error),
 	capsCache *CapsCache,
 	logger *log.Logger,
@@ -259,7 +177,7 @@ func injectCapabilitiesTurnImpl(
 			if cached, ok := capsCache.Get(threadID); ok {
 				if fallback, ferr := decodeCapsResponse(cached); ferr == nil && len(fallback) > 0 {
 					if logger != nil {
-						logger.Printf("[caps-inject] fallback to cache for tid=%s: daemon err=%v decode err=%v cached=%d caps", threadID, err, decodeErr, len(fallback))
+						logger.Printf("[caps-inject] fallback to cache for tid=%s: daemon err=%v decode err=%v cached=%d caps", journalToken(threadID), err, decodeErr, len(fallback))
 					}
 					caps = fallback
 				}
@@ -267,7 +185,7 @@ func injectCapabilitiesTurnImpl(
 		}
 		if len(caps) == 0 {
 			if logger != nil && (err != nil || decodeErr != nil) {
-				logger.Printf("[caps-inject] skip for tid=%s: daemon err=%v decode err=%v cache empty", threadID, err, decodeErr)
+				logger.Printf("[caps-inject] skip for tid=%s: daemon err=%v decode err=%v cache empty", journalToken(threadID), err, decodeErr)
 			}
 			return false
 		}
@@ -314,6 +232,9 @@ func injectCapabilitiesTurnImpl(
 	}
 
 	block := renderCapabilitiesCatalog(caps)
+	if profile != models.ProfileClaude {
+		block = renderOpencodeCapabilitiesCatalog(caps)
+	}
 	capsUser := map[string]any{"role": "user", "content": block}
 	capsAssistant := map[string]any{"role": "assistant", "content": "Understood. I've read the active caps."}
 
@@ -323,7 +244,14 @@ func injectCapabilitiesTurnImpl(
 	newMsgs = append(newMsgs, msgs[insertAt:]...)
 	req["messages"] = newMsgs
 
-	injectReplPatternSuggestionIfReady(req, caps, queryFn)
+	// The REPL-pattern hint is a Claude Code construct: it names a cap function the
+	// REPL can call directly plus the MCP tools around it. opencode has no REPL and
+	// no bare cap function (it reaches a cap through execute_cap with fn), and the
+	// recorded shapes come from Claude's bash/REPL pipelines, so the hint only
+	// sends the other profiles after something that does not exist for them.
+	if profile == models.ProfileClaude {
+		injectReplPatternSuggestionIfReady(req, caps, queryFn)
+	}
 
 	return true
 }
@@ -386,8 +314,9 @@ func injectReplPatternSuggestionIfReady(
 
 // injectCapabilitiesTurn is the production entry point wired into the proxy
 // pipeline. A thin wrapper over injectCapabilitiesTurnImpl that binds the
-// queryFn to s.queryDaemon for live daemon RPC.
-func (s *Server) injectCapabilitiesTurn(req map[string]any, threadID string) bool {
+// queryFn to s.queryDaemon for live daemon RPC and passes the client's prompt
+// profile, which selects the catalog dialect.
+func (s *Server) injectCapabilitiesTurn(req map[string]any, threadID string, profile models.PromptProfile) bool {
 	tidPreview := threadID
 	if len(tidPreview) > 12 {
 		tidPreview = tidPreview[:12]
@@ -396,8 +325,10 @@ func (s *Server) injectCapabilitiesTurn(req map[string]any, threadID string) boo
 		log.Printf("[caps-inject] skip: empty threadID")
 		return false
 	}
-	injected := injectCapabilitiesTurnImpl(req, threadID, s.getParentThread(threadID), s.queryDaemon, s.capsCache, s.logger)
-	log.Printf("[caps-inject] threadID=%s injected=%v", tidPreview, injected)
+	injected := injectCapabilitiesTurnImpl(req, threadID, s.getParentThread(threadID), profile, s.queryDaemon, s.capsCache, s.logger)
+	// The preview is a slice of client text; without journalToken a newline inside
+	// the first 12 bytes still forges a journal line.
+	log.Printf("[caps-inject] threadID=%s injected=%v", journalToken(tidPreview), injected)
 	return injected
 }
 
@@ -405,8 +336,61 @@ func (s *Server) getParentThread(threadID string) string {
 	return ""
 }
 
+// capCallableNames lists the script names a caller may pass as fn to
+// execute_cap. Tool scripts are the intended surface; a cap that carries no
+// tool script stays reachable by naming its internal scripts.
+func capCallableNames(c CapInjection) []string {
+	tools := make([]string, 0, len(c.Scripts))
+	for _, sc := range c.Scripts {
+		if sc.Kind == "tool" {
+			tools = append(tools, sc.Name)
+		}
+	}
+	if len(tools) > 0 {
+		return tools
+	}
+	names := make([]string, 0, len(c.Scripts))
+	for _, sc := range c.Scripts {
+		names = append(names, sc.Name)
+	}
+	return names
+}
+
+// capTableCell renders one caller-defined text into a single cell of the catalog
+// table. Script names and descriptions both come from save_cap without further
+// filtering, so characters that would end the table row or the surrounding
+// <caps-available> block are neutralized and the cell is bounded. One function for
+// both cells on purpose: a later hardening must not reach one and miss the other.
+func capTableCell(text string) string {
+	cell := strings.NewReplacer(
+		"|", "/", "<", "(", ">", ")", "\n", " ", "\r", " ", "\t", " ",
+		// Unicode line separators: a renderer may break the row on them even though
+		// they are not \n.
+		"\u2028", " ", "\u2029", " ", "\u0085", " ",
+	).Replace(text)
+	cell = strings.TrimSpace(cell)
+	// Truncate on a rune boundary: a byte cut through an umlaut yields invalid
+	// UTF-8 in the injected block. Cutting at a rune start keeps the prefix as it
+	// was — a cell that already carried a broken byte is shortened, not emptied.
+	if len(cell) > 120 {
+		cut := 117
+		for cut > 0 && !utf8.RuneStart(cell[cut]) {
+			cut--
+		}
+		cell = cell[:cut] + "..."
+	}
+	return cell
+}
+
+// capFunctionCell renders the Functions cell.
+func capFunctionCell(c CapInjection) string {
+	return capTableCell(strings.Join(capCallableNames(c), ", "))
+}
+
 // renderOpencodeCapabilitiesCatalog builds a catalog listing available caps
-// for opencode sessions. Uses mcp__yesmem__execute_cap instead of REPL activation.
+// for opencode sessions. opencode Code Mode has neither eval nor the Function
+// constructor (measured 2026-10-17), so activate_cap cannot register a tool
+// there: the catalog names execute_cap and the script each cap offers.
 func renderOpencodeCapabilitiesCatalog(caps []CapInjection) string {
 	if len(caps) == 0 {
 		return ""
@@ -418,14 +402,13 @@ func renderOpencodeCapabilitiesCatalog(caps []CapInjection) string {
 	var b strings.Builder
 	b.WriteString("<system-reminder>\n<caps-available>\n")
 	b.WriteString("# Available Capabilities\n\n")
-	b.WriteString("To execute: `mcp__yesmem__execute_cap({name: \"<name>\", fn: \"<function>\", args: '{\"key\":\"value\"}'})` — the daemon runs the handler sandboxed and returns the result.\n\n")
-	b.WriteString("| Capability | Description |\n|---|---|\n")
+	b.WriteString("To execute: in Code Mode `await tools.yesmem.execute_cap({name: \"<name>\", fn: \"<function>\", args: '{\"key\":\"value\"}'})`, as a direct MCP tool `yesmem_execute_cap(...)`. The daemon runs the script sandboxed: a script that names no sandbox profile inherits the daemon default (standard unless configured otherwise), and `none` applies only when the script writes it out. The result comes back as the return value.\n\n")
+	b.WriteString("`fn` is one of the names in the Functions column; omit it only when the cap has a single tool script.\n\n")
+	b.WriteString("When a capability script errors: diagnose the root cause, fix the script, save the corrected version via `save_cap` (`tools.yesmem.save_cap` in Code Mode), then retry.\n\n")
+	b.WriteString("| Capability | Functions | Description |\n|---|---|---|\n")
 	for _, cap := range sorted {
-		desc := cap.Description
-		if len(desc) > 120 {
-			desc = desc[:117] + "..."
-		}
-		b.WriteString(fmt.Sprintf("| %s | %s |\n", cap.Name, desc))
+		fns := capFunctionCell(cap)
+		b.WriteString(fmt.Sprintf("| %s | %s | %s |\n", capTableCell(cap.Name), fns, capTableCell(cap.Description)))
 	}
 	b.WriteString("</caps-available>\n</system-reminder>")
 	return b.String()

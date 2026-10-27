@@ -3,6 +3,7 @@ package capfile
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -142,5 +143,101 @@ func TestScanAll_MergesBothDirs(t *testing.T) {
 	}
 	if len(caps) != 2 {
 		t.Fatalf("want 2 caps, got %d", len(caps))
+	}
+}
+
+// YM-174/OPS-20: the scan took every CAP.md it found, whatever the directory
+// was called. A stray copy like "telegram (Kopie)" therefore imported the
+// original cap's name and bumped its version on every daemon restart.
+func TestScanDirectory_RejectsDirectoryNameMismatch(t *testing.T) {
+	dir := t.TempDir()
+
+	cf := makeBashHandlerCap("telegram", "Telegram")
+	if err := WriteFile(cf, filepath.Join(dir, "telegram")); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFile(cf, filepath.Join(dir, "telegram (Kopie)")); err != nil {
+		t.Fatal(err)
+	}
+
+	caps, errs := ScanDirectory(dir)
+	if len(caps) != 1 || caps[0].SourcePath != filepath.Join(dir, "telegram", "CAP.md") {
+		t.Fatalf("want only the directory that matches the frontmatter name, got %d caps", len(caps))
+	}
+	if len(errs) != 1 {
+		t.Fatalf("want 1 error for the mismatched directory, got %d: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "telegram (Kopie)") {
+		t.Errorf("error must name the offending directory, got %q", errs[0])
+	}
+}
+
+// YM-210/OPS-43 (latent case from E8): a scope-less CAP.md below the project
+// directory was read with the parser's user default, so the cap landed
+// project-agnostic instead of project-bound.
+func TestScanAll_ProjectDirScopeLessCapIsProjectScoped(t *testing.T) {
+	userDir := t.TempDir()
+	projDir := t.TempDir()
+
+	cf := makeBashHandlerCap("proj_cap", "Project")
+	cf.Scope = ""
+	if err := WriteFile(cf, filepath.Join(projDir, "proj_cap")); err != nil {
+		t.Fatal(err)
+	}
+
+	caps, errs := ScanAll(userDir, projDir)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(caps) != 1 {
+		t.Fatalf("want 1 cap, got %d", len(caps))
+	}
+	if caps[0].Scope != "project" {
+		t.Errorf("Scope = %q, want project — a scope-less CAP.md in the project dir is project-bound", caps[0].Scope)
+	}
+}
+
+// The same scope-less file with sandbox=none must be refused: loading it as a
+// project-agnostic, unsandboxed cap is exactly the gap E8 reported.
+func TestScanAll_ProjectDirScopeLessSandboxNoneIsRefused(t *testing.T) {
+	userDir := t.TempDir()
+	projDir := t.TempDir()
+
+	cf := makeBashHandlerCap("unsandboxed", "Runs unsandboxed")
+	cf.Scope = ""
+	cf.Scripts[0].Sandbox = "none"
+	if err := WriteFile(cf, filepath.Join(projDir, "unsandboxed")); err != nil {
+		t.Fatal(err)
+	}
+
+	caps, errs := ScanAll(userDir, projDir)
+	if len(caps) != 0 {
+		t.Fatalf("a scope-less project-dir cap with sandbox=none must not load, got %d caps", len(caps))
+	}
+	if len(errs) != 1 {
+		t.Fatalf("want 1 error, got %d: %v", len(errs), errs)
+	}
+}
+
+// A scope-less CAP.md below the user directory keeps the shareable default.
+func TestScanAll_UserDirScopeLessCapStaysUserScoped(t *testing.T) {
+	userDir := t.TempDir()
+	projDir := t.TempDir()
+
+	cf := makeBashHandlerCap("user_cap", "User")
+	cf.Scope = ""
+	if err := WriteFile(cf, filepath.Join(userDir, "user_cap")); err != nil {
+		t.Fatal(err)
+	}
+
+	caps, errs := ScanAll(userDir, projDir)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(caps) != 1 {
+		t.Fatalf("want 1 cap, got %d", len(caps))
+	}
+	if caps[0].Scope != "user" {
+		t.Errorf("Scope = %q, want user", caps[0].Scope)
 	}
 }

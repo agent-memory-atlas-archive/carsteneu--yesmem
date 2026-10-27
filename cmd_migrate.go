@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/carsteneu/yesmem/internal/archive"
+	"github.com/carsteneu/yesmem/internal/config"
 	"github.com/carsteneu/yesmem/internal/storage"
 
 	_ "modernc.org/sqlite"
@@ -134,6 +136,39 @@ func runMigrateProject() {
 	}
 
 	printMigrateResult("Migrated:", res, fromShort, toShort)
+
+	// The database is renamed, the archive is not: session documents archived
+	// under the old encoded project name would be written a second time under the
+	// new one by the next archiving pass (YM-320). Both key spaces are moved —
+	// ProjectDirName of the full path, and of the short name that legacy rows
+	// carry as a project.
+	// The archive lives where the daemon writes it, not necessarily beside the
+	// database: a configured paths.archive points elsewhere, and a hardcoded
+	// dataDir/archive would make this whole step a silent no-op (YM-320, review).
+	cfg, _ := config.Load(filepath.Join(dataDir, "config.yaml"))
+	arch := archive.New(cfg.ArchiveDir(dataDir))
+	// Named once, unconditionally: the base comes from the configuration, and an
+	// operator who pointed paths.archive at the wrong directory sees it here
+	// instead of after folders were renamed there.
+	fmt.Fprintf(os.Stderr, "Archive base: %s\n", arch.BaseDir())
+	for _, pair := range [][2]string{
+		{archive.ProjectDirName(fromPath), archive.ProjectDirName(toPath)},
+		{archive.ProjectDirName(fromShort), archive.ProjectDirName(toShort)},
+	} {
+		if pair[0] == pair[1] {
+			continue
+		}
+		moved, kept, err := arch.MoveProjectDir(pair[0], pair[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: archive folder %s -> %s not moved: %v\n", pair[0], pair[1], err)
+			fmt.Fprintf(os.Stderr, "  The database rename is already committed. Move %s to %s by hand before the next archiving run, or those session documents are written twice.\n",
+				filepath.Join(arch.BaseDir(), pair[0]), filepath.Join(arch.BaseDir(), pair[1]))
+			continue
+		}
+		if moved > 0 || kept > 0 {
+			fmt.Fprintf(os.Stderr, "Archive: %d document(s) moved, %d kept (%s -> %s)\n", moved, kept, pair[0], pair[1])
+		}
+	}
 }
 
 func printMigrateResult(header string, res *storage.MigrateResult, fromShort, toShort string) {

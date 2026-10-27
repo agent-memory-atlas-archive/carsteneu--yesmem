@@ -145,3 +145,63 @@ func TestLoadTopPivotMomentsEmpty(t *testing.T) {
 		t.Errorf("expected nil for empty store, got %d pivots", len(pivots))
 	}
 }
+
+// YM-227 (5): legacy traits with the fallback dimension "general" must not
+// reach the directive prompt. autoDetectDimension can no longer produce it for
+// user writes, but old rows and imports carry it.
+func TestSynthesizePersonaDirectiveSkipsLegacyGeneralDimension(t *testing.T) {
+	s, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "de", Confidence: 0.9, Source: "auto_extracted", EvidenceCount: 5,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "general", TraitKey: "legacy_note",
+		TraitValue: "stale", Confidence: 0.9, Source: "bootstrapped", EvidenceCount: 5,
+	})
+
+	mock := &capturingMockClient{completeResp: "directive"}
+	synthesizePersonaDirective(s, mock)
+
+	if mock.lastUserMessage == "" {
+		t.Fatal("mock should have received a user message")
+	}
+	if strings.Contains(mock.lastUserMessage, "general.") {
+		t.Errorf("directive prompt contains the legacy general dimension:\n%s", mock.lastUserMessage)
+	}
+	if !strings.Contains(mock.lastUserMessage, "communication.language") {
+		t.Errorf("directive prompt lost the valid trait:\n%s", mock.lastUserMessage)
+	}
+}
+
+// YM-227: the dimension filter drops legacy stock, not the user's own rule. A
+// user_override keeps its place even when its dimension label is not one of the
+// six structured ones (the live DB carries several such rows).
+func TestSynthesizePersonaDirectiveKeepsUserOverrideWithLegacyDimension(t *testing.T) {
+	s, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "de", Confidence: 0.9, Source: "auto_extracted", EvidenceCount: 5,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "technical_preference", TraitKey: "external_font_policy",
+		TraitValue: "no external font CDNs", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+
+	mock := &capturingMockClient{completeResp: "directive"}
+	synthesizePersonaDirective(s, mock)
+
+	if !strings.Contains(mock.lastUserMessage, "technical_preference.external_font_policy") {
+		t.Errorf("explicit user override missing from the directive prompt:\n%s", mock.lastUserMessage)
+	}
+}

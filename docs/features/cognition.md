@@ -15,7 +15,7 @@ Sessions aren't all equal — a frustrating debugging marathon that ends with a 
 
 Builds a persistent identity profile from session history.
 
-### Dimensions (6)
+### Dimensions (6 allowed)
 1. **Communication** — humor, language, verbosity
 2. **Workflow** — speed preferences, debug approach, iterative vs. comprehensive
 3. **Expertise** — languages, frameworks, domain strengths
@@ -23,10 +23,12 @@ Builds a persistent identity profile from session history.
 5. **Boundaries** — what not to do
 6. **Learning Style** — examples, visual, documentation
 
+`validDimensions` (`internal/daemon/persona.go`) accepts exactly these six. Live rows additionally carry labels outside that set (`general`, `decision_style`, `technical_preference`), written by paths that do not validate against it, so treat the list as the write contract, not as a closed description of the table.
+
 ### Pipeline
 1. **Bootstrap** (`yesmem bootstrap-persona`) — analyzes session history, extracts traits
 2. **Synthesis** (`yesmem synthesize-persona`) — converts traits → structured directive (uses Opus)
-3. **Injection** — directive appears BEFORE all other briefing sections
+3. **Injection** — the directive renders after the awakening narrative, the state-brief line and the user profile, ahead of the learnings blocks. It is not "before all sections" and it does not disappear when a profile exists: with a profile it is cut to 5 rules, without one it keeps 10 rules and the preference learnings render as well (D8)
 4. **Trait storage:** `persona_traits` table (dimension, trait_key, value, confidence, source)
 5. **Trait normalization:** Prefix stripping on save — `expertise.go` → `go`, `communication.language` → `language`. Prevents dimension prefix leaking into trait keys.
 6. **Hash tracking:** Regenerate directive only if traits changed
@@ -55,8 +57,8 @@ Pin important instructions, rules, or context that must survive every compressio
 - **`unpin(id, scope?)`** — remove a pin by ID
 - **`get_pins(project?)`** — list all active pins
 - **Two scopes:**
-  - `session` (default) — survives until `/clear`, lives in proxy memory
-  - `permanent` — survives everything, stored in DB across sessions
+  - `session` (default) — survives until `/clear`; stored in `runtime.db` (`pinned_learnings`, per session and project, purged by `PurgeSessionPinsBefore`), not in proxy memory
+  - `permanent` — survives everything; stored in `yesmem.db` across sessions
 - **Injection:** pins are rendered via `FormatPinnedBlock()` in the briefing system block (message index 0) — never collapsed, never stubbed
 - **Format:** `- [pin:42] The instruction...` / `- [pin:17 permanent] Permanent instruction...`
 - **Use cases:** temporary coding rules, debug reminders, project constraints, anything that must not be lost mid-session
@@ -65,46 +67,54 @@ Pin important instructions, rules, or context that must survive every compressio
 
 ## 4. Skill Evaluation
 
-The proxy detects when skill evaluation is relevant and injects a `[skill-eval]` block into the conversation:
+The proxy injects a `[skill-eval]` block into the conversation when skill evaluation is relevant:
 
 - **`isUserInputTurn()` guard** — skill-eval only injected on real user input messages, not on continuation requests (tool results)
-- **`buildSkillEvalBlock()`** — assembles available skills from Claude Code settings into a compact evaluation prompt
-- **Collapse-protected** — old skill-eval blocks stripped before collapse via `stripSkillHints()`, always re-injected fresh
+- **`buildSkillEvalBlock(mode)`** — returns one of three **static** constants (`skillEvalBlock`, `silentSkillEvalBlock`, or `""`); it does not assemble the skill list. The skill catalogue itself is a separate injection, so the block is a fixed instruction, not a generated prompt
+- **Collapse-protected** — `stripSkillHints()` removes `[skill-hint]…[/skill-hint]` blocks from all older user messages and leaves the last user message untouched; the `[skill-eval]` block is not touched by it
 
 ---
 
 ## 5. Cognitive Signals & Reflection
 
-An async feedback loop that lets the system evaluate its own context injections.
+A feedback loop that lets the system evaluate its own context injections. It is **inline**: there are no signal tools and no second LLM call.
 
-### Signal Tools
+### Inline Reflection
 
-`_signal_*` prefixed tools injected into Claude's tool list (never exposed to user):
+Every learning injection point appends `InlineReflectionHint`, which asks the model to annotate its answer:
 
-| Signal Tool | Purpose |
-|---|---|
-| `_signal_learning_used` | Report which injected learnings were useful vs. noise |
-| `_signal_knowledge_gap` | Report missing information, resolve known gaps |
-| `_signal_contradiction` | Flag conflicting learnings for review |
-| `_signal_self_prime` | Capture cognitive state shifts |
+```
+<!-- [IDs: 123, 456] -->              learnings actually used
+<!-- [gap: topic] -->                 missing domain knowledge
+<!-- [contradiction: 12 vs 34: …] --> conflicting learnings
+```
 
-### Reflection Call
+`[ID:123]` references in thinking or text blocks count as a use signal as well.
 
-After each response, the proxy fires an async LLM-based reflection (default: Haiku):
-1. Builds compact request: user query + assistant response + injected learnings + open gaps
-2. LLM analyzes which signals to fire
-3. Signal handlers route to daemon: `increment_use`, `increment_noise`, `track_gap`, `resolve_gap`, `flag_contradiction`
+### Scanning
 
-Zero latency impact — reflection runs in background after the response is already streaming.
+On the next request, `scanInlineSignals` walks back over the message history to the previous assistant response and parses those annotations. It only runs when the previous turn actually injected learnings, on a fresh (non-retry) request, and only while `signals.enabled` is true.
+
+| Signal | Effect | Guard |
+|---|---|---|
+| Used ID | `increment_use` | only IDs that were injected on this thread |
+| Unused injection | `increment_noise` | only `associative` and `fresh` sources; never `briefing`. Requires a scanned answer and a trailing non-tool-result user message, so an intermediate step never counts as noise |
+| Tool error after use | `increment_fail` | only when the last `tool_result` carries `is_error` |
+| Gap | `track_gap` | project-scoped |
+| Contradiction | `flag_contradiction` | project and thread scoped |
+
+Zero latency and zero token cost: this is regex scanning, not a model call.
 
 ### Configuration
 ```yaml
 signals:
-  enabled: true
-  mode: reflection
-  model: haiku
-  every_n_turns: 1
+  enabled: true      # only this key is read
+  mode: reflection   # inert, kept for old config files
+  model: haiku       # inert
+  every_n_turns: 1   # inert
 ```
+
+`mode`, `model` and `every_n_turns` configured the async reflection call that no longer exists; they stay accepted so existing config files keep parsing.
 
 ---
 
@@ -115,7 +125,7 @@ Periodically clusters semantically similar learnings using agglomerative cluster
 - Cosine similarity with 0.85 threshold, minimum 2 documents per cluster
 - Results feed into narrative generation, pattern synthesis, sleep consolidation, and recurrence detection
 - Cluster labels generated via quality model (default: Sonnet, pre-computed during daemon run, not on-the-fly)
-- **Cluster Score Propagation:** 3 real columns (inject_count, use_count, noise_count); match/save/fail collapse into inject_count. Propagates to cluster scores via `IncrementClusterScore()`. Enables cluster-level affinity: `1.0 + useRate - noiseRate*0.5`.
+- **Cluster Score Propagation (query clusters):** applies to **query** clusters (`query_clusters`, `learning_cluster_scores`), not to the learning clusters above. Three columns exist per learning×cluster pair (`inject_count`, `use_count`, `noise_count`); `match`, `save` and `fail` are ignored outright by `IncrementClusterScore`, they are not folded into `inject_count`. Cluster affinity is `1.0 + useRate - noiseRate*0.5`, applied when ranking results for a clustered query.
 
 ### 15b. Sleep Consolidation (Schlaf-Konsolidierung)
 
@@ -125,11 +135,12 @@ Automatic knowledge consolidation inspired by biological sleep — runs without 
 
 | Stage | Method | Trigger | LLM? |
 |---|---|---|---|
-| **Rule-based Dedup** | BigramJaccard (>0.85) + Embedding Cosine (>0.92) | Daemon startup + settled idle (1h cooldown) | No |
-| **LLM Cluster Distillation** | Learning clusters → LLM destills to single consolidated learning | After rule-based pass, if budget available | Haiku/Sonnet |
+| **Rule-based Dedup** | BigramJaccard (>0.85) + Embedding Cosine (>0.92) | Daemon startup after the initial extraction, and after every batch extraction cycle | No |
+| **LLM Cluster Distillation** | Learning clusters → LLM destills to single consolidated learning | Startup (after the rule-based pass) and every 2h ticker | Haiku/Sonnet |
 
 **Rule-based Consolidation (`RunConsolidation`):**
-- Iterative rounds until convergence (<5% supersede rate)
+- Iterative rounds until convergence (<5% supersede rate), `MaxRounds = 2` in the daemon runner
+- Incremental: a durable high-watermark (`consolidation:rule_based_state`) limits each run to project/category scopes touched by newer inserts, so unchanged calls are free
 - Finds near-duplicate learnings, supersedes the weaker one
 - Zero cost — pure algorithm, no API calls
 - First run: 5360 checked, 176 superseded (3.3% rate, 42s)
@@ -137,17 +148,19 @@ Automatic knowledge consolidation inspired by biological sleep — runs without 
 **LLM Cluster Distillation (`RunClusterDistillation`):**
 - Loads learning clusters from Phase 4.5 (agglomerative, 0.85 threshold)
 - For each cluster (≥3 learnings): sends to LLM in **batches of 30** (avoids timeout on large clusters)
+- A cluster containing any user-owned source is skipped as a whole — distillation may add knowledge but must not replace the user's wording
 - LLM returns distilled text + category + which source IDs to supersede
 - Creates new learning with `source='consolidated'`, supersedes originals
 - Validation: LLM can only supersede IDs within the cluster (no cross-cluster)
 - If learnings don't belong together: LLM returns empty actions (skip)
-- Graceful budget handling: skips silently when budget exhausted
+- No budget check: the daemon caller passes no budget limit, so a distillation run is not suppressed by cost state
 
 **Triggers:**
 - **Startup:** Goroutine after LLM client init — rule-based first, then distillation
 - **Periodic (2h ticker):** Cluster distillation runs every 2 hours in daemon background
 - **Batch cycle (2h):** Extraction runs every 2h or when ≥5 sessions pending — back-to-back processing enables Anthropic Prompt Cache reuse
-- **Post-batch:** Rule-based consolidation after each batch (1h cooldown)
+- **Post-batch:** Rule-based consolidation runs after each batch cycle
+- There is no idle-triggered consolidation and no 1h cooldown
 
 ### 15c. Recurrence Detection (B0 — "Feeling of Knowing")
 

@@ -13,11 +13,11 @@ func TestParseUsageFromSSE(t *testing.T) {
 		wantFound  bool
 	}{
 		{
-			name:      "message_start with usage",
-			line:      `data: {"type":"message_start","message":{"usage":{"input_tokens":150,"output_tokens":0}}}`,
-			wantInput: 150,
+			name:       "message_start with usage",
+			line:       `data: {"type":"message_start","message":{"usage":{"input_tokens":150,"output_tokens":0}}}`,
+			wantInput:  150,
 			wantOutput: 0,
-			wantFound: true,
+			wantFound:  true,
 		},
 		{
 			name:       "message_delta with output",

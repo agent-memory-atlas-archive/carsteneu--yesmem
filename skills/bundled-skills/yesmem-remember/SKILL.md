@@ -13,6 +13,13 @@ Store learnings with structured metadata for better retrieval.
 3. For completed tasks: `resolve_by_text(text)` or `resolve(learning_id, reason)`
 4. For connected insights: `relate_learnings(id_a, id_b, relation_type)`
 
+## Open Tasks
+
+A commit closes an open task only when its subject names the task, by ticket key
+(`YM-123`) or learning id (`#12345`). An id anchor is weaker: the subject must
+also share two words with the task text. Write that key into the task text
+itself when you save it, otherwise no commit can ever close it.
+
 ## remember() Parameters
 
 | Parameter | Purpose | Example |
@@ -26,6 +33,7 @@ Store learnings with structured metadata for better retrieval.
 | `anticipated_queries` | 3-5 search phrases | ["CGO disabled", "cross compile yesmem"] |
 | `source` | user_stated, agreed_upon, claude_suggested | "agreed_upon" |
 | `project` | Project scope | "yesmem" |
+| `task_type` | Only for open tasks: `task`, `idea`, `blocked`, `stale` | "task" |
 | `supersedes` | ID of learning this replaces | 12345 |
 
 ## relate_learnings()
