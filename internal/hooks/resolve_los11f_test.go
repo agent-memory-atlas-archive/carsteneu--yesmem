@@ -21,7 +21,14 @@ import (
 // los11fRepo creates a git repository with one commit and returns its path.
 func los11fRepo(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	// The hook resolves the repository through `git rev-parse --show-toplevel`,
+	// which on macOS answers /private/var/... for a temp dir handed out as
+	// /var/...; a task stored under the unresolved path would never be found.
+	raw := t.TempDir()
+	dir, err := filepath.EvalSymlinks(raw)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", raw, err)
+	}
 	los11fGit(t, dir, "init", "-q")
 	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("content\n"), 0o644); err != nil {
 		t.Fatalf("seed file: %v", err)

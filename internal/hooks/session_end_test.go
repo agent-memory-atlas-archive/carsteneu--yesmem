@@ -93,7 +93,13 @@ func TestRunSessionEnd_CallsDaemon(t *testing.T) {
 // never ends the session, so the hook must not report it. The documented
 // SessionEnd reasons are clear, resume, logout, prompt_input_exit and other.
 func TestRunSessionEnd_IgnoresReasonsThatDoNotEndASession(t *testing.T) {
-	dir := t.TempDir()
+	// macOS caps a unix socket path at 104 bytes and t.TempDir() under
+	// /var/folders/... exceeds it once daemon.sock is appended.
+	dir, err := os.MkdirTemp("", "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
 	sockPath := filepath.Join(dir, "daemon.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {

@@ -9,14 +9,14 @@ import (
 	"testing"
 )
 
-// fakeDaemon starts a unix-socket daemon stub in t.TempDir() and returns a
+// fakeDaemon starts a unix-socket daemon stub in a short temp dir and returns a
 // Server wired to it, so tests can exercise queryDaemon callers hermetically.
 // handler maps method+params to the raw result JSON ("null" for an empty
 // result). The stub outlives the test only until t.Cleanup closes the listener.
 func fakeDaemon(t *testing.T, handler func(method string, params map[string]any) string) *Server {
 	t.Helper()
 
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	ln, err := net.Listen("unix", filepath.Join(dir, "daemon.sock"))
 	if err != nil {
 		t.Fatalf("listen: %v", err)

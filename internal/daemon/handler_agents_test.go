@@ -619,6 +619,11 @@ func TestHandleStopAgent_DormantAgentDoesNotSignalStalePID(t *testing.T) {
 // otherwise a row bound this way is unverifiable and every guard reads a live
 // agent as gone (the F1 failure mode, reached through a second writer).
 func TestHandleRegisterAgent_WritesSpawnMarker(t *testing.T) {
+	// The identity check reads the process table via /proc, which darwin does not
+	// expose; isAgentProcess abstains there by design.
+	if !procTableReadable {
+		t.Skip("the agent identity check needs the process table")
+	}
 	h, s := mustHandler(t)
 	stubProcCmdline(t, agentProcCmdlineStub)
 
@@ -709,6 +714,11 @@ func stubRestartSpawn(t *testing.T) func() int {
 // terminal emulator's PID as the agent's. The row now has to hold the process the
 // bridge created — the same invariant bindAgentProcess writes everywhere else.
 func TestAttemptRestart_BindsTheBackendProcess(t *testing.T) {
+	// The identity check reads the process table via /proc, which darwin does not
+	// expose; isAgentProcess abstains there by design.
+	if !procTableReadable {
+		t.Skip("the agent identity check needs the process table")
+	}
 	h, s := mustHandler(t)
 	h.disableAgentProcesses = false
 	bridgePid := stubRestartSpawn(t)

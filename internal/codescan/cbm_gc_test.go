@@ -12,11 +12,14 @@ import (
 // dashes in its path (keeps slug reconstruction unambiguous).
 func gcFixture(t *testing.T) (cacheDir, baseDir string) {
 	t.Helper()
-	cacheDir = t.TempDir()
+	cacheDir = realPath(t, t.TempDir())
 	baseDir = filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The DB names carry the base dir as a slug, so it has to be the form the
+	// scanner reconstructs: resolved.
+	baseDir = realPath(t, baseDir)
 	t.Setenv("FAKE_CBM_LOG", filepath.Join(cacheDir, "fake-calls.log"))
 	return cacheDir, baseDir
 }

@@ -55,7 +55,7 @@ func los26cFakeDaemon(t *testing.T, dir string) *int32 {
 // round trip per request (two, when the id carries a backend prefix) and never
 // waited. The window alone bounds nothing; the process needs a budget.
 func TestLos26c_SessionOverrideRefreshHasGlobalBudget(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	count := los26cFakeDaemon(t, dir)
 
 	s := &Server{

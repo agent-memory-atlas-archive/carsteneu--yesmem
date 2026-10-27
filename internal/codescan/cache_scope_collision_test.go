@@ -56,7 +56,7 @@ func los04eRepoAt(t *testing.T, parent, name, head string) string {
 // first repository's file list, and whichever scans last overwrites the other's
 // index (YM-277 / DEV-DT45).
 func TestScanCache_SameNamedReposDoNotShareTheirScanRow(t *testing.T) {
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 	a := los04eRepoAt(t, filepath.Join(root, "work"), "yesmem", "samehead")
 	b := los04eRepoAt(t, filepath.Join(root, "home"), "yesmem", "samehead")
 
@@ -91,7 +91,7 @@ func TestScanCache_SameNamedReposDoNotShareTheirScanRow(t *testing.T) {
 // keeps the repository name, the storage key carries the checkout path. A linked
 // worktree is a checkout of its own and keeps its path as its key (YM-453).
 func TestScanCacheKey_DisplayNameStaysBasename(t *testing.T) {
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 	repo := los04eRepoAt(t, root, "yesmem", "head1")
 	sub := filepath.Join(repo, "internal", "proxy")
 	if err := os.MkdirAll(sub, 0o755); err != nil {

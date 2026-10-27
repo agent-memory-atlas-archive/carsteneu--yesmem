@@ -41,7 +41,7 @@ func moduleGitDir(super, sub string) string {
 // both repositories share one project_scan row, so whichever scans last
 // overwrites the other's file list (YM-311, escaped from YM-277).
 func TestScanCacheKey_SubmoduleKeepsItsOwnRepository(t *testing.T) {
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 	super := los04eRepoAt(t, root, "super", "head-super")
 
 	nested := filepath.Join(super, "libs", "inner")
@@ -65,7 +65,7 @@ func TestScanCacheKey_SubmoduleKeepsItsOwnRepository(t *testing.T) {
 // carries both scopes in its gitdir (<super>/.git/worktrees/<wt>/modules/<sub>).
 // It must not fall back onto the superproject, or both share one row again.
 func TestScanCacheKey_SubmoduleInLinkedWorktreeOfSuperproject(t *testing.T) {
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 	super := los04eRepoAt(t, root, "super", "head-super")
 
 	wtGitDir := filepath.Join(super, ".git", "worktrees", "wt")
@@ -99,7 +99,7 @@ func TestScanCacheKey_SubmoduleInLinkedWorktreeOfSuperproject(t *testing.T) {
 // submodule scope: the worktree keeps its own checkout as its key (YM-453), so
 // no name can fold it onto another repository.
 func TestScanCacheKey_WorktreeNamedModules(t *testing.T) {
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 	super := los04eRepoAt(t, root, "super", "head-super")
 
 	wtGitDir := filepath.Join(super, ".git", "worktrees", "modules")
@@ -128,7 +128,7 @@ func TestScanCacheKey_WorktreeNamedModules(t *testing.T) {
 // otherwise the key collapses back onto the superproject (or onto a directory
 // that is no repository at all).
 func TestScanCacheKey_SubmoduleNamedModules(t *testing.T) {
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 	super := los04eRepoAt(t, root, "super", "head-super")
 
 	cases := []string{

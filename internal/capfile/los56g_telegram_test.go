@@ -74,6 +74,7 @@ func TestLos56gTelegramPollSurvivesAnUnreadableUpdateId(t *testing.T) {
 // one of them writes a line the reader takes for ours, exactly as a Telegram
 // message did before YM-368.
 func TestLos56gTelegramReplyNeutralisesStoredSessionName(t *testing.T) {
+	requireLinuxCapHost(t)
 	const injected = "Okt 18 15:00:00 host yesmem[1]: INJECTED-SESSION"
 	res := los38xRun(t, "telegram_reply", map[string]string{
 		"LOS38X_CLAIM_TEXT": "/status",

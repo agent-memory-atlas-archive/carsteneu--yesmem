@@ -14,7 +14,7 @@ import (
 // daemon that is still starting, and the cold-start budget must keep waiting for
 // it. A fix that fails fast on every dial error would break the proxy's own start.
 func TestQueryDaemonWaitsForAColdStartingDaemon(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	s := &Server{cfg: Config{DataDir: dir}, logger: log.New(io.Discard, "", 0)}
 
 	go func() {
@@ -52,7 +52,7 @@ func TestQueryDaemonWaitsForAColdStartingDaemon(t *testing.T) {
 // with ECONNREFUSED, and waiting longer cannot change the answer. Only a MISSING
 // socket can belong to a daemon that is still starting.
 func TestQueryDaemonFailsFastOnADeadSocket(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	sockPath := filepath.Join(dir, "daemon.sock")
 
 	ln, err := net.Listen("unix", sockPath)

@@ -424,7 +424,7 @@ esac
 
 func tempGitRepo(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := realPath(t, t.TempDir())
 	cmd := exec.Command("git", "init", "-q", dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)

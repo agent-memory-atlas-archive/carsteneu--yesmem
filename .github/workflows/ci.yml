@@ -55,6 +55,10 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: "0"
+          # macOS caps a unix socket path at 104 bytes and t.TempDir() under
+          # /var/folders/... exceeds it, so every socket test failed with
+          # "bind: invalid argument". A short TMPDIR fixes the whole class.
+          TMPDIR: /tmp
         # 120s was set when the suite was smaller; the YM campaign grew the daemon
         # package past it, and the timeout surfaced as a cascade of unrelated
         # failures next to the panic. Measured locally before raising it.

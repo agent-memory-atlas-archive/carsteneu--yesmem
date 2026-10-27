@@ -148,12 +148,16 @@ func TestYm297SystemctlBinaryRefusesWritableCandidate(t *testing.T) {
 		t.Fatalf("write candidate: %v", err)
 	}
 	t.Setenv("PATH", dir)
+	want, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		t.Fatalf("resolve candidate: %v", err)
+	}
 
 	got, err := systemctlBinary()
 	if err != nil {
 		t.Fatalf("clean 0755 candidate refused: %v", err)
 	}
-	if got != bin {
+	if got != want {
 		t.Errorf("systemctlBinary = %q, want %q", got, bin)
 	}
 

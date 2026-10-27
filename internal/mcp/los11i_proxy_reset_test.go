@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,7 +18,14 @@ import (
 // A reply of this kind means the daemon is alive and the connection is fine.
 func fakeDaemonError(t *testing.T, errText string) string {
 	t.Helper()
-	sockPath := filepath.Join(t.TempDir(), "daemon.sock")
+	// macOS caps a unix socket path at 104 bytes; t.TempDir() under
+	// /var/folders/... exceeds it with daemon.sock appended.
+	short, err := os.MkdirTemp("", "ym")
+	if err != nil {
+		t.Fatalf("short temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(short) })
+	sockPath := filepath.Join(short, "daemon.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen fake daemon: %v", err)

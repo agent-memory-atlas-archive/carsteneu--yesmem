@@ -38,7 +38,7 @@ func los33Upstream(t *testing.T) (string, func() string) {
 // reusing serveFakeDaemonConn from fake_daemon_test.go.
 func los33DaemonSocket(t *testing.T, s *Server, handler func(method string, params map[string]any) string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	ln, err := net.Listen("unix", filepath.Join(dir, "daemon.sock"))
 	if err != nil {
 		t.Fatalf("listen: %v", err)

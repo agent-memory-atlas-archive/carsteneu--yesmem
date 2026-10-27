@@ -100,6 +100,8 @@ func TestResolveScanRoot_IsIdempotent(t *testing.T) {
 	if err := os.MkdirAll(project, 0755); err != nil {
 		t.Fatal(err)
 	}
+	// ResolveScanRoot canonicalises, so the oracle has to be the resolved form.
+	project = realPath(t, project)
 	link := filepath.Join(parent, "link")
 	if err := os.Symlink(project, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)

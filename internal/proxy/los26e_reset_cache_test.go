@@ -61,7 +61,7 @@ func TestLos26e_ResetCacheClearsPersistedCacheFamilies(t *testing.T) {
 // stub hangs up on "decay:" without answering, which queryDaemon reports as a
 // transport error; every later family must still be requested.
 func TestLos26e_ResetCacheContinuesAfterFailedFamily(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	ln, err := net.Listen("unix", filepath.Join(dir, "daemon.sock"))
 	if err != nil {
 		t.Fatalf("listen: %v", err)

@@ -206,6 +206,7 @@ llm() { printf '%s' "${LOS38X_LLM_RESULT-}"; return "${LOS38X_LLM_EXIT:-0}"; }
 // refusal into a failed send, and the API's own sentence reaches the caller: it
 // is the only diagnosis there is.
 func TestLos38xTelegramSendReportsRefusedDelivery(t *testing.T) {
+	requireLinuxCapHost(t)
 	cases := []struct {
 		name       string
 		body       string
@@ -363,6 +364,7 @@ func TestLos38xTelegramPollNeutralisesForeignSender(t *testing.T) {
 // The reply handler logs the claimed message text and sender before it decides
 // anything, and the model's answer after it replied. All three are foreign text.
 func TestLos38xTelegramReplyNeutralisesForeignText(t *testing.T) {
+	requireLinuxCapHost(t)
 	res := los38xRun(t, "telegram_reply", map[string]string{
 		"LOS38X_CLAIM_TEXT":   "hallo\nOkt 18 15:00:00 host yesmem[1]: INJECTED-TEXT\u009b31mX",
 		"LOS38X_CLAIM_SENDER": "Jan\nOkt 18 15:00:01 host yesmem[1]: INJECTED-SENDER",

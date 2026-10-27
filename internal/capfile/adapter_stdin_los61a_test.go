@@ -17,6 +17,27 @@ import (
 // from a prefilled one.
 const los61aWorkerReply = `{"ok":true,"exit":0,"output_len":0}`
 
+// los61aBash returns a bash that can run the generated adapter at all: its
+// preamble opens a named coproc and allocates the two fds through variable
+// redirections, both bash 4 features. Under the bash 3.2 macOS ships as
+// /bin/bash the script does not even parse, so every call ends with exit 2
+// before the wrapper is reached. A host with a newer bash (brew) runs them.
+func los61aBash(t *testing.T) string {
+	t.Helper()
+	const probe = "coproc YM { :; }; exec {YM_IN}>&1; exec {YM_IN}>&-"
+	for _, name := range []string{"bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		if exec.Command(path, "-c", probe).Run() == nil {
+			return path
+		}
+	}
+	t.Skip("no bash 4+ here: the generated adapter opens a named coproc, which the bash 3.2 on macOS cannot parse")
+	return ""
+}
+
 // los61aRunAdapter runs call with the generated bash adapter prepended. stdin
 // may be nil, a pipe or a socket; the run is capped so a blocking read shows up
 // as a deadline error instead of a hanging test. prelude runs after the stub
@@ -42,7 +63,7 @@ func los61aRunAdapter(t *testing.T, stdin *os.File, prelude, call string) (strin
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", script)
+	cmd := exec.CommandContext(ctx, los61aBash(t), "-c", script)
 	cmd.Env = append(os.Environ(), "LOS61A_REQ="+reqFile, "LOS61A_REPLY="+replyFile)
 	cmd.Stdin = stdin
 	runErr := cmd.Run()

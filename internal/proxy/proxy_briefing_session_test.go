@@ -66,7 +66,7 @@ func waitBriefingParams(t *testing.T, captured <-chan map[string]any) map[string
 // could never fire. The session id sent to generate_briefing must be the same
 // key the proxy registers in register_pid / anthropicThreadID.
 func TestLoadBriefingSendsSessionID(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	captured := fakeBriefingDaemon(t, dir)
 
 	s := &Server{cfg: Config{DataDir: dir}, logger: log.New(io.Discard, "", 0)}
@@ -83,7 +83,7 @@ func TestLoadBriefingSendsSessionID(t *testing.T) {
 // The messages path has no register_pid call, so the agent kind must travel with
 // the briefing request; otherwise an opencode session keeps Claude wording.
 func TestLoadBriefingSendsSourceAgentForOpenCode(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	captured := fakeBriefingDaemon(t, dir)
 
 	s := &Server{cfg: Config{DataDir: dir}, logger: log.New(io.Discard, "", 0)}
@@ -98,7 +98,7 @@ func TestLoadBriefingSendsSourceAgentForOpenCode(t *testing.T) {
 // Claude Code thread ids are bare session ids: no source_agent, the daemon keeps
 // the Claude profile.
 func TestLoadBriefingOmitsSourceAgentForClaudeCode(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	captured := fakeBriefingDaemon(t, dir)
 
 	s := &Server{cfg: Config{DataDir: dir}, logger: log.New(io.Discard, "", 0)}

@@ -3,6 +3,7 @@ package hooks
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -10,7 +11,12 @@ import (
 )
 
 func TestDaemonCall_Success(t *testing.T) {
-	dir := t.TempDir()
+	// Short temp dir: macOS limits a unix socket path to 104 bytes.
+	dir, err := os.MkdirTemp("", "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
 	sockPath := filepath.Join(dir, "daemon.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {

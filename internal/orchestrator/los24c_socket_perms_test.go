@@ -22,7 +22,13 @@ func TestNewAgentBridge_RejectsEmptySocketPath(t *testing.T) {
 // (audit 16.10.2026, YM-328). They must be owner-only, like daemon.sock since
 // YM-250, and every client runs as the same user.
 func TestNewAgentBridge_SocketsAreOwnerOnly(t *testing.T) {
-	dir := t.TempDir()
+	// macOS caps a unix socket path at 104 bytes, and the agent socket name is
+	// long; t.TempDir() under /var/folders/... would not leave room.
+	dir, err := os.MkdirTemp("", "ym")
+	if err != nil {
+		t.Fatalf("short temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "agent-20261018-01.sock")
 
 	b, err := NewAgentBridge("cat", nil, sock, dir)

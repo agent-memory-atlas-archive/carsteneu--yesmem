@@ -11,7 +11,7 @@ import (
 // checkout's git data.
 func los63bWorktree(t *testing.T) (main, worktree string) {
 	t.Helper()
-	main = t.TempDir()
+	main = realPath(t, t.TempDir())
 	steps := [][]string{
 		{"init", "-q"},
 		{"-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"},

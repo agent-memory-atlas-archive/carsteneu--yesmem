@@ -21,7 +21,7 @@ import (
 // state); only the socket is swapped.
 func los56cDaemonSock(t *testing.T) (dataDir string, seen chan string) {
 	t.Helper()
-	dataDir = t.TempDir()
+	dataDir = shortSocketDir(t)
 	ln, err := net.Listen("unix", filepath.Join(dataDir, "daemon.sock"))
 	if err != nil {
 		t.Fatalf("listen: %v", err)

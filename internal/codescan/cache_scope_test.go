@@ -14,7 +14,7 @@ import (
 // repo's code index.
 func mainRepoWithWorktree(t *testing.T) (mainRepo, worktree string) {
 	t.Helper()
-	root := t.TempDir()
+	root := realPath(t, t.TempDir())
 
 	mainRepo = filepath.Join(root, "yesmem")
 	gitDir := filepath.Join(mainRepo, ".git")

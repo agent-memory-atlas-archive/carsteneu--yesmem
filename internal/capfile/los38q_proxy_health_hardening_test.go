@@ -387,11 +387,14 @@ func los38qAssertPrefixedLines(t *testing.T, stderr string) {
 }
 
 // requireLinuxCapHost skips a test that executes a cap body on a machine the
-// bodies do not target: they are bash for the daemon host and use GNU coreutils
-// (`date -I`), which BSD date rejects.
+// bodies do not target: they are bash for the Linux daemon host. The darwin run
+// showed both symptoms at once — GNU date rejects `date -I<s>` (BSD date takes
+// no suffix), and the `${s//[$'\001'-...]/ }` neutralisation left the newline in
+// place, so foreign text kept writing its own log line. Either one makes a
+// log-line assertion meaningless there.
 func requireLinuxCapHost(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "darwin" {
-		t.Skip("the cap body is written for the Linux daemon host and uses GNU date")
+		t.Skip("the cap body is written for the Linux daemon host: it uses GNU date and the host's bash")
 	}
 }

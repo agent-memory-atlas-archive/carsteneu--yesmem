@@ -729,7 +729,7 @@ func TestContradictionWarning_Empty(t *testing.T) {
 // fakeDaemonDir serves the daemon JSON-RPC protocol on <dir>/daemon.sock.
 func fakeDaemonDir(t *testing.T, responses map[string]json.RawMessage) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	ln, err := net.Listen("unix", filepath.Join(dir, "daemon.sock"))
 	if err != nil {
 		t.Fatalf("listen on fake daemon socket: %v", err)
