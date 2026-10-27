@@ -82,6 +82,12 @@ func TestCBMScanner_Scan(t *testing.T) {
 }
 
 func TestCBMProjectName(t *testing.T) {
+	// cbmProjectName encodes the resolved path, and macOS resolves /tmp to
+	// /private/tmp and /home through autofs, so these Linux fixtures do not name
+	// the same directories there.
+	if runtime.GOOS == "darwin" {
+		t.Skip("the fixture paths resolve through macOS autofs and /private/tmp")
+	}
 	tests := []struct {
 		input string
 		want  string

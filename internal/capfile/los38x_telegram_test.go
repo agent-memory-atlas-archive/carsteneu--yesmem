@@ -331,6 +331,7 @@ func TestLos38xTelegramPollSurvivesATransportFailure(t *testing.T) {
 // A sender name comes from Telegram, so it is foreign text. Written into the job
 // log as it is, a newline in it adds a line the reader takes for ours.
 func TestLos38xTelegramPollNeutralisesForeignSender(t *testing.T) {
+	requireLinuxCapHost(t)
 	const injected = "Okt 18 15:00:00 host yesmem[1]: INJECTED-POLL"
 	res := los38xRun(t, "telegram_poll", map[string]string{
 		"LOS38X_COUNT":     "1",

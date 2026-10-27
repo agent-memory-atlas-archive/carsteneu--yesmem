@@ -414,7 +414,14 @@ func los38wFTSRowCount(t *testing.T, path string) int64 {
 // los38wMessageRows messages.
 func los38wInstallation(t *testing.T) (home, dataDir string) {
 	t.Helper()
-	home = t.TempDir()
+	// macOS caps a unix socket path at 104 bytes, and t.TempDir() under
+	// /var/folders/... plus .claude/yesmem/daemon.sock exceeds it, so the bind
+	// fails with "invalid argument" before the test can prove anything.
+	home, err := os.MkdirTemp("", "ym38w")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
 	dataDir = filepath.Join(home, ".claude", "yesmem")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		t.Fatalf("mkdir data dir: %v", err)

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -308,6 +309,7 @@ func TestLos38qProxyHealthNcGetsTheSocketAfterDoubleDash(t *testing.T) {
 // A newline in either used to split the message into a forged second line in
 // the job output.
 func TestLos38qProxyHealthStderrStaysOneLinePerMessage(t *testing.T) {
+	requireLinuxCapHost(t)
 	res := los38qRunHandler(t, map[string]string{
 		"YESMEM_PROJECT":  "/tmp/los38q-project",
 		"ALERT":           "true",
@@ -330,6 +332,7 @@ func TestLos38qProxyHealthStderrStaysOneLinePerMessage(t *testing.T) {
 // restart, ECONNREFUSED against a dying socket) and leaves a refused write in
 // the old wording.
 func TestLos38qProxyHealthNamesASocketOutage(t *testing.T) {
+	requireLinuxCapHost(t)
 	cases := []struct {
 		name string
 		err  string
@@ -380,5 +383,15 @@ func los38qAssertPrefixedLines(t *testing.T, stderr string) {
 		if !strings.HasPrefix(line, "proxy_health: ") {
 			t.Errorf("stderr line %q does not carry the proxy_health prefix", line)
 		}
+	}
+}
+
+// requireLinuxCapHost skips a test that executes a cap body on a machine the
+// bodies do not target: they are bash for the daemon host and use GNU coreutils
+// (`date -I`), which BSD date rejects.
+func requireLinuxCapHost(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("the cap body is written for the Linux daemon host and uses GNU date")
 	}
 }
