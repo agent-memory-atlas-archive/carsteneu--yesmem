@@ -16,7 +16,7 @@ import (
 // exists for.
 func TestStopRoleFallsBackToTheListingWhenLaunchdRefuses(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -52,7 +52,7 @@ func TestStopRoleFallsBackToTheListingWhenLaunchdRefuses(t *testing.T) {
 // swallowed when the listing found nothing either.
 func TestStopRoleReportsTheLaunchdRefusalWhenNothingElseMatched(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -72,7 +72,7 @@ func TestStopRoleReportsTheLaunchdRefusalWhenNothingElseMatched(t *testing.T) {
 // instance of the same binary must survive.
 func TestStopRolePrefersThePidFileIdentity(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -147,7 +147,7 @@ func TestPlistProgramFollowsLaunchdsPrecedence(t *testing.T) {
 // rule as the stop path.
 func TestStartRoleRefusesAPlistOfAnotherBinary(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })

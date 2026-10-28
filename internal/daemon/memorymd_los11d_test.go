@@ -19,7 +19,7 @@ import (
 // which tests use) so this test drives that seam with a redirected HOME.
 func TestWireMutationHook_Los11d_RegeneratesMemoryMD(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	store, err := storage.Open(":memory:")
 	if err != nil {

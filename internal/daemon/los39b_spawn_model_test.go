@@ -24,7 +24,7 @@ func los39bWriteHome(t *testing.T, models, opencodeConfig, auth string) string {
 	if auth != "" {
 		write(filepath.Join(".local", "share", "opencode", "auth.json"), auth)
 	}
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	return home
 }
 

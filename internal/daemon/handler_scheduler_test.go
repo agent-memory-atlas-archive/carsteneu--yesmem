@@ -687,7 +687,7 @@ func TestExecuteHeadless_TimeoutIsMarkedInTheSection(t *testing.T) {
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	// executeHeadless builds a sandbox, and that materialises mask placeholders in
 	// the home (YM-291). A fake home keeps the test off the developer's own.
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 
 	h, _ := mustHandler(t)
 	job := ScheduledJob{ID: "red-timeout", Name: "timeout-job", Prompt: "hello", Mode: "headless"}

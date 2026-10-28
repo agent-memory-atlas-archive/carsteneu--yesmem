@@ -3075,7 +3075,7 @@ func TestFindCodexSessionID_Success(t *testing.T) {
 	// Copy the test session file to the fake codex dir
 	src, _ := os.ReadFile(jsonl)
 	os.WriteFile(filepath.Join(codexDir, "session-abc.jsonl"), src, 0644)
-	t.Setenv("HOME", homeDir)
+	isolateHomeAt(t, homeDir)
 
 	sid, err := findCodexSessionID(workDir)
 	if err != nil {
@@ -3093,7 +3093,7 @@ func TestFindCodexSessionID_NoMatch(t *testing.T) {
 	os.WriteFile(filepath.Join(codexDir, "session-abc.jsonl"), []byte(
 		`{"type":"session_meta","payload":{"id":"abc-123","cwd":"/other/dir"}}`+"\n",
 	), 0644)
-	t.Setenv("HOME", homeDir)
+	isolateHomeAt(t, homeDir)
 
 	_, err := findCodexSessionID("/no/match")
 	if err == nil {
@@ -3107,7 +3107,7 @@ func TestFindCodexSessionID_NoMatch(t *testing.T) {
 func TestFindCodexSessionID_EmptyDir(t *testing.T) {
 	homeDir := t.TempDir()
 	os.MkdirAll(filepath.Join(homeDir, ".codex", "sessions"), 0755)
-	t.Setenv("HOME", homeDir)
+	isolateHomeAt(t, homeDir)
 
 	_, err := findCodexSessionID("/tmp/work")
 	if err == nil {
@@ -3128,7 +3128,7 @@ func TestFindCodexSessionID_PicksMostRecent(t *testing.T) {
 	os.WriteFile(filepath.Join(codexDir, "newer.jsonl"), []byte(
 		`{"type":"session_meta","payload":{"id":"new-789","cwd":"/tmp/work"}}`+"\n",
 	), 0644)
-	t.Setenv("HOME", homeDir)
+	isolateHomeAt(t, homeDir)
 
 	sid, err := findCodexSessionID("/tmp/work")
 	if err != nil {
@@ -3149,7 +3149,7 @@ func TestFindCodexSessionID_SkipsNonMatchingSessionMeta(t *testing.T) {
 		`{"type":"session_meta","payload":{"id":"wrong-1","cwd":"/other"}}`+"\n"+
 			`{"type":"session_meta","payload":{"id":"right-2","cwd":"/tmp/work"}}`+"\n",
 	), 0644)
-	t.Setenv("HOME", homeDir)
+	isolateHomeAt(t, homeDir)
 
 	sid, err := findCodexSessionID("/tmp/work")
 	if err != nil {

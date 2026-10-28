@@ -166,7 +166,7 @@ func TestLos34hExecuteCapMaskRefusalHidesHostPaths(t *testing.T) {
 	los34cPinAiJail(t, 0)
 	// A temporary HOME keeps the default masks out of the real home; the failing
 	// placeholder is the caps dir below, which lives under procfs.
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	h.capsDir = "/proc/self/los34h-caps"
 	los35bInsertCap(t, h, "los34h_mask_probe", "", "echo ok", "standard")
 
@@ -191,7 +191,7 @@ func TestLos34hExecuteCapRefusesProjectBoundWithoutProfile(t *testing.T) {
 		t.Skip("needs bash on PATH")
 	}
 	h, _ := mustHandler(t)
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	los35bUnsandboxed(t, h)
 	// The caller states its project the way a real call does (session or cwd); a
 	// project-bound cap is not reachable without one (YM-359).
@@ -213,7 +213,7 @@ func TestLos34hExecuteCapAllowsUserScopedWithoutProfile(t *testing.T) {
 		t.Skip("needs bash on PATH")
 	}
 	h, _ := mustHandler(t)
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	los35bUnsandboxed(t, h)
 	los34hInsertUserCap(t, h, "los34h_user_probe", "echo ok")
 
@@ -249,7 +249,7 @@ func TestLos34hExecuteCapBindingShapes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h, _ := mustHandler(t)
-			t.Setenv("HOME", t.TempDir())
+			isolateHomeAt(t, t.TempDir())
 			los35bUnsandboxed(t, h)
 			insertCapRow(t, h, "los34h_shape", tc.project, "echo ok", "", tc.scope)
 
@@ -276,7 +276,7 @@ func TestLos34hJobSandboxRefusesLostSocketMount(t *testing.T) {
 		t.Skip("needs bash on PATH")
 	}
 	h, _ := mustHandler(t)
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	los34cPinAiJail(t, 0)
 	base := t.TempDir()
 	h.dataDir = filepath.Join(base, "data")

@@ -51,7 +51,7 @@ func TestDownloadAiJail_InstallsThePinnedArchive(t *testing.T) {
 	requireAiJailPlatform(t)
 	archive := buildTarGz(t, []tarEntry{{name: "ai-jail", mode: 0o755, body: []byte("#!/bin/sh\necho pinned\n")}}).Bytes()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	restoreAPI, restoreAssets := withFakeAiJailRelease(t, archive, digestOf(archive))
 	defer restoreAPI()
 	defer restoreAssets()
@@ -73,7 +73,7 @@ func TestDownloadAiJail_InstallsThePinnedArchive(t *testing.T) {
 func TestDownloadAiJail_RejectsArchiveThatFailsItsChecksum(t *testing.T) {
 	archive := buildTarGz(t, []tarEntry{{name: "ai-jail", mode: 0o755, body: []byte("#!/bin/sh\necho tampered\n")}}).Bytes()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	restoreAPI, restoreAssets := withFakeAiJailRelease(t, archive, "0000000000000000000000000000000000000000000000000000000000000000")
 	defer restoreAPI()
 	defer restoreAssets()
@@ -94,7 +94,7 @@ func TestDownloadAiJail_RejectsArchiveThatFailsItsChecksum(t *testing.T) {
 // missing entry is a refusal, not a fall-through to "latest".
 func TestDownloadAiJail_RefusesPlatformWithoutPinnedChecksum(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	restore := swapAiJailDigests(t, map[string]string{})
 	defer restore()
 
