@@ -461,7 +461,7 @@ func TestLos32dJobProjectIsRefusedWhenTheHomeIsASymlink(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatalf("symlink home: %v", err)
 	}
-	t.Setenv("HOME", link)
+	isolateHomeAt(t, link)
 
 	if jobProjectUsable(real) {
 		t.Fatalf("jobProjectUsable(%q) = true while $HOME is the symlink %q to it", real, link)

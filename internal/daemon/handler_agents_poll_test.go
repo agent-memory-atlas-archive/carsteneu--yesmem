@@ -23,7 +23,7 @@ func captureLog(t *testing.T) *bytes.Buffer {
 }
 
 func TestPollOpencodeSessionID_LogsWhenDBMissing(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	buf := captureLog(t)
 
 	if got := pollOpencodeSessionID("/some/workdir", time.Time{}, time.Time{}, 10*time.Millisecond); got != "" {
@@ -44,7 +44,7 @@ func TestPollOpencodeSessionID_LogsTimeoutWithCandidates(t *testing.T) {
 		t.Skip("sqlite3 CLI not available")
 	}
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	dbDir := home + "/.local/share/opencode"
 	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestPollOpencodeSessionID_RespectsTimeBound(t *testing.T) {
 	home := seedSessionDB(t, "CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER, parent_id TEXT);"+
 		"INSERT INTO session VALUES ('ses_old', '/wd/loop', "+fmt.Sprint(old)+", '');"+
 		"INSERT INTO session VALUES ('ses_fresh', '/wd/loop', "+fmt.Sprint(fresh)+", '');")
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	if got := pollOpencodeSessionID("/wd/loop", now, time.Time{}, time.Second); got != "ses_fresh" {
 		t.Fatalf("expected the session created after the bound, got %q", got)
@@ -135,7 +135,7 @@ func TestPollOpencodeSessionID_DeclinesAnAmbiguousDirectory(t *testing.T) {
 		fmt.Sprintf("INSERT INTO session VALUES ('ses_other_run', '/wd/loop', %d, '');", now.UnixMilli()-1000)+
 		fmt.Sprintf("INSERT INTO session_v2 VALUES ('ses_other_run', '/wd/loop', %d, '');", now.UnixMilli()-1000)+
 		fmt.Sprintf("INSERT INTO session_v2 VALUES ('ses_mine', '/wd/loop', %d, '');", now.UnixMilli()))
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	buf := captureLog(t)
 
 	if got := pollOpencodeSessionID("/wd/loop", now.Add(-markerSinceSlack), now.Add(markerWindowAfter), 600*time.Millisecond); got != "" {
@@ -160,7 +160,7 @@ func TestPollOpencodeAnyDirSessionID_BindsOnlyAUniqueMatch(t *testing.T) {
 	home := seedSessionDB(t, fmt.Sprintf(
 		"CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER, parent_id TEXT);"+
 			"INSERT INTO session_v2 VALUES ('ses_only', '/repo/proj/.worktrees/a', %d, '');", created))
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	until := now.Add(markerWindowAfter)
 
 	if got := pollOpencodeAnyDirSessionID("/repo/proj", now.Add(-markerSinceSlack), until, time.Second); got != "ses_only" {
@@ -188,7 +188,7 @@ func TestPollOpencodeAnyDirSessionID_RejectsAnotherProjectsSession(t *testing.T)
 	home := seedSessionDB(t, fmt.Sprintf(
 		"CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER, parent_id TEXT);"+
 			"INSERT INTO session_v2 VALUES ('ses_foreign_repo', '/other/repo/.worktrees/x', %d, '');", now.UnixMilli()))
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	if got := pollOpencodeAnyDirSessionID("/repo/proj", now.Add(-markerSinceSlack), now.Add(markerWindowAfter), 600*time.Millisecond); got != "" {
 		t.Fatalf("a session from another project must not be bound, got %q", got)
@@ -208,7 +208,7 @@ func TestPollOpencodeAnyDirSessionID_DeduplicatesAcrossTables(t *testing.T) {
 			"CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER, parent_id TEXT);"+
 			"INSERT INTO session VALUES ('ses_migrated', '/repo/proj/wt', %d, '');"+
 			"INSERT INTO session_v2 VALUES ('ses_migrated', '/repo/proj/wt', %d, '');", now.UnixMilli(), now.UnixMilli()))
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	if got := pollOpencodeAnyDirSessionID("/repo/proj", now.Add(-markerSinceSlack), now.Add(markerWindowAfter), time.Second); got != "ses_migrated" {
 		t.Fatalf("the same session in both tables is one candidate, got %q", got)
@@ -228,7 +228,7 @@ func TestPollOpencodeAnyDirSessionID_RejectsTheProjectRoot(t *testing.T) {
 	home := seedSessionDB(t, fmt.Sprintf(
 		"CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER, parent_id TEXT);"+
 			"INSERT INTO session_v2 VALUES ('ses_orchestrator', '/repo/proj', %d, '');", now.UnixMilli()))
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	if got := pollOpencodeAnyDirSessionID("/repo/proj", now.Add(-markerSinceSlack), now.Add(markerWindowAfter), time.Second); got != "" {
 		t.Fatalf("the project root's own session must not be bound, got %q", got)
@@ -246,7 +246,7 @@ func TestPollOpencodeAnyDirSessionID_StillBindsAWorktreeSession(t *testing.T) {
 	home := seedSessionDB(t, fmt.Sprintf(
 		"CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER, parent_id TEXT);"+
 			"INSERT INTO session_v2 VALUES ('ses_worktree', '/repo/proj/.worktrees/loop', %d, '');", now.UnixMilli()))
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	if got := pollOpencodeAnyDirSessionID("/repo/proj", now.Add(-markerSinceSlack), now.Add(markerWindowAfter), time.Second); got != "ses_worktree" {
 		t.Fatalf("a worktree session must still be bound, got %q", got)
@@ -254,7 +254,7 @@ func TestPollOpencodeAnyDirSessionID_StillBindsAWorktreeSession(t *testing.T) {
 }
 
 func TestPollCodexSessionID_LogsTimeout(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	buf := captureLog(t)
 
 	if got := pollCodexSessionID("/some/workdir", 10*time.Millisecond); got != "" {

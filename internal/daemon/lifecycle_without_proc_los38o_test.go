@@ -82,7 +82,7 @@ func writeDaemonPlist(t *testing.T, home, role, program string) string {
 // the service has to leave the launchd domain.
 func TestStopRoleStopsTheLaunchdServiceThatOwnsThisInstallation(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -110,7 +110,7 @@ func TestStopRoleStopsTheLaunchdServiceThatOwnsThisInstallation(t *testing.T) {
 // platform: a value another installation wrote is not this installation's service.
 func TestStopRoleRefusesAPlistThatStartsAnotherBinary(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -133,7 +133,7 @@ func TestStopRoleRefusesAPlistThatStartsAnotherBinary(t *testing.T) {
 // absolute path plus the role, which is exactly what the PID-file path checks.
 func TestStopRoleFindsTheDaemonInTheProcessListingWithoutAPlist(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -197,7 +197,7 @@ func TestStopRoleKeepsTheProcessTablePathOnLinux(t *testing.T) {
 // child process spawned by the CLI.
 func TestStartRoleBootstrapsTheServiceAgain(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -222,7 +222,7 @@ func TestStartRoleBootstrapsTheServiceAgain(t *testing.T) {
 // system answers with an error, and the install still has to come back up.
 func TestStartRoleFallsBackToLoad(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	prevExe := selfBinaryPath
 	selfBinaryPath = "/opt/yesmem/yesmem"
 	t.Cleanup(func() { selfBinaryPath = prevExe })
@@ -243,7 +243,7 @@ func TestStartRoleFallsBackToLoad(t *testing.T) {
 // the daemon itself, exactly as before.
 func TestStartRoleDoesNothingWithoutAPlist(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	stubServicePlatform(t, "darwin")
 	calls := stubLaunchctl(t, nil)
 

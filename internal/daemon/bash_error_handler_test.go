@@ -17,7 +17,7 @@ import (
 // to assert that auto-correct fails closed when the sandbox isn't available.
 func disableSandbox(t *testing.T) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	t.Setenv("YESMEM_DISABLE_AIJAIL_DOWNLOAD", "1")
 }
 

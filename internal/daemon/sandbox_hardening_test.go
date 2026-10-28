@@ -98,7 +98,7 @@ func TestWrapExecArgs_NoneIsPassThrough(t *testing.T) {
 // what is missing instead of dropping it (YM-291). HOME is pinned because that
 // call now creates the paths it lists.
 func TestDefaultSecretMasksOnlyReturnsExistingAbsolutePaths(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	for _, mask := range defaultSecretMasks() {
 		if _, err := os.Stat(mask); err != nil {
 			t.Errorf("mask %q does not exist, ai-jail would ignore it", mask)
@@ -201,7 +201,7 @@ func realAiJailSandbox(t *testing.T, cfg SandboxConfig) *Sandbox {
 func TestRunWithProfile_StandardLaunchesUnderRealAiJail(t *testing.T) {
 	// defaultSecretMasks materialises missing placeholders (YM-291); a fake home
 	// keeps this test off the developer's own.
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	s := realAiJailSandbox(t, SandboxConfig{
 		Enabled:             true,
 		FallbackUnsandboxed: false,

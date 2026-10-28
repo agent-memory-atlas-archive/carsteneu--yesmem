@@ -92,7 +92,7 @@ func withV2Stub(t *testing.T, srv *httptest.Server) string {
 func withoutV2Service(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	orig := opencodeV2Service
 	opencodeV2Service = func() *opencode.Client { return nil }
 	t.Cleanup(func() { opencodeV2Service = orig })
@@ -129,7 +129,7 @@ func seedSessionDB(t *testing.T, sql string) string {
 		t.Skip("sqlite3 CLI not available")
 	}
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	dir := filepath.Join(home, ".local", "share", "opencode")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -199,7 +199,7 @@ func TestCaptureOpencodeSessionID_DoesNotBindThePreviousRun(t *testing.T) {
 func withoutV2Fallback(t *testing.T, srv *httptest.Server) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	stubV2Service(t, srv)
 	return home
 }
@@ -280,7 +280,7 @@ func TestCaptureOpencodeSessionID_EmptyWhenNothingMatches(t *testing.T) {
 // unreachable service must not block capture.
 func TestCaptureOpencodeSessionID_DeadServiceFallsThroughToV1(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	orig := opencodeV2Service
 	opencodeV2Service = func() *opencode.Client {
 		return opencode.NewClient(opencode.Service{ID: "dead", URL: "http://127.0.0.1:1", Password: "x"})
@@ -410,7 +410,7 @@ func TestQuerySessionTables_KeepsRowsFromTheHealthyTable(t *testing.T) {
 		"CREATE TABLE session (id TEXT, directory TEXT);"+
 			"INSERT INTO session VALUES ('ses_v1_row', '/wd/x');"+
 			"CREATE TABLE session_v2 (id TEXT, other TEXT);")
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	dbPath := filepath.Join(home, ".local", "share", "opencode", "opencode.db")
 	query := func(table string) string {

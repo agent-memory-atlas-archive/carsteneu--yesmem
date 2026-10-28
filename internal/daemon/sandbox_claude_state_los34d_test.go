@@ -68,7 +68,7 @@ func TestJobSandboxMasksClaudeControlPaths(t *testing.T) {
 			h, _ := mustHandler(t)
 			// os.UserHomeDir reads HOME, so the default list resolves against the
 			// decoy tree. Set after mustHandler, which does not depend on it.
-			t.Setenv("HOME", home)
+			isolateHomeAt(t, home)
 
 			sb := h.newSandbox(SandboxConfig{Enabled: true})
 
@@ -244,7 +244,7 @@ func TestJobSandboxKeepsTheDefaultMasksWhenTheCallerBringsOne(t *testing.T) {
 	los34dWriteDecoyTree(t, home)
 	los34cPinAiJail(t, 2)
 	h, _ := mustHandler(t)
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	callerMask := filepath.Join(t.TempDir(), "caller-only")
 	if err := os.WriteFile(callerMask, []byte("x"), 0o600); err != nil {
@@ -298,7 +298,7 @@ func TestJobSandboxMasksTheConfiguredCapsDir(t *testing.T) {
 	}
 	h.capsDir = configured
 
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	sb := h.newSandbox(SandboxConfig{Enabled: true})
 
 	found := false
@@ -323,7 +323,7 @@ func TestJobSandboxMasksTheCapsDirBesideTheDataDir(t *testing.T) {
 		t.Fatalf("mkdir caps dir: %v", err)
 	}
 
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	sb := h.newSandbox(SandboxConfig{Enabled: true})
 
 	found := false
@@ -348,7 +348,7 @@ func TestJobSandboxForwardsTheProxyURL(t *testing.T) {
 	h, _ := mustHandler(t)
 	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9099")
 
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 	sb := h.newSandbox(SandboxConfig{Enabled: true})
 
 	found := false

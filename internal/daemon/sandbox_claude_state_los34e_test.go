@@ -135,7 +135,7 @@ func TestJobSandboxMasksAgentStatePaths(t *testing.T) {
 			h, _ := mustHandler(t)
 			// os.UserHomeDir reads HOME, so the default list resolves against the
 			// decoy tree.
-			t.Setenv("HOME", home)
+			isolateHomeAt(t, home)
 
 			sb := h.newSandbox(SandboxConfig{Enabled: true})
 
@@ -167,7 +167,7 @@ func TestDefaultSecretMasksMaterialiseMissingAgentStatePaths(t *testing.T) {
 	// A fresh temporary home holds none of the paths, which is the fresh-host case
 	// the finding describes.
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	masks := defaultSecretMasks()
 	if len(masks) == 0 {
@@ -260,7 +260,7 @@ func TestJobSandboxHidesTheClaudeGlobalConfigByRunCwd(t *testing.T) {
 			h, _ := mustHandler(t)
 			home := t.TempDir()
 			los34eWriteAgentStateTree(t, home)
-			t.Setenv("HOME", home)
+			isolateHomeAt(t, home)
 
 			sb := h.newSandbox(SandboxConfig{Enabled: true})
 			globalConfig := claudeGlobalConfig(home)
@@ -305,7 +305,7 @@ func TestJobSandboxMaterialisesTheClaudeGlobalConfig(t *testing.T) {
 	los34cPinAiJail(t, 0)
 	h, _ := mustHandler(t)
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	sb := h.newSandbox(SandboxConfig{Enabled: true})
 
@@ -330,7 +330,7 @@ func TestMaterialiseMaskPathsKeepsEntriesItCannotCreate(t *testing.T) {
 		t.Skip("root ignores directory permissions, placeholder creation cannot be made to fail")
 	}
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 	claude := filepath.Join(home, ".claude")
 	if err := os.Mkdir(claude, 0o500); err != nil {
 		t.Fatalf("mkdir %s: %v", claude, err)
@@ -367,7 +367,7 @@ func TestRunUsesTheWorkDirOnBothAiJailMajors(t *testing.T) {
 		t.Run(fmt.Sprintf("ai-jail-%dx", major), func(t *testing.T) {
 			los34cPinAiJail(t, major)
 			h, _ := mustHandler(t)
-			t.Setenv("HOME", t.TempDir())
+			isolateHomeAt(t, t.TempDir())
 			workDir := t.TempDir()
 
 			sb := h.newSandbox(SandboxConfig{Enabled: true, FallbackUnsandboxed: false, WorkDir: workDir})
@@ -420,7 +420,7 @@ func TestRunWithProfile_ClaudeGlobalConfigHidesTheWriteForReal(t *testing.T) {
 	if err := os.WriteFile(globalConfig, body, 0o600); err != nil {
 		t.Fatalf("write %s: %v", globalConfig, err)
 	}
-	t.Setenv("HOME", decoyHome)
+	isolateHomeAt(t, decoyHome)
 
 	quoted := los34dShellQuote(globalConfig)
 	probe := strings.Join([]string{

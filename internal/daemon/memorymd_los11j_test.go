@@ -120,7 +120,7 @@ func TestGenerateAllMemoryMDs_Los11j_WithoutHomeWritesNothing(t *testing.T) {
 func los11jMemoryStore(t *testing.T) (*storage.Store, string, string) {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHomeAt(t, home)
 
 	store, err := storage.Open(":memory:")
 	if err != nil {

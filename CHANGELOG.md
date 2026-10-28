@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Regenerate CHANGELOG
+
 ### Testing
 
-- Let the real-run tests skip when the host has no bubblewrap
+- Point every test home at its XDG roots, not just HOME
 
-## [2.4.1] - 2026-10-28
-
-## [2.4.0] - 2026-10-28
+## [2.4.2] - 2026-10-28
 
 ### Added
 
@@ -1283,6 +1285,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Let the real-run tests skip when the host has no bubblewrap
 - Move the handler opener family into the harness
 - Address cold review findings
 - One reader set for setup fixtures
@@ -8577,9 +8580,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add comprehensive tests for generator and storage
 
 
-[Unreleased]: https://github.com/carsteneu/yesmem/compare/v2.4.1...HEAD
-[2.4.1]: https://github.com/carsteneu/yesmem/compare/v2.4.0...v2.4.1
-[2.4.0]: https://github.com/carsteneu/yesmem/compare/v2.3.19...v2.4.0
+[Unreleased]: https://github.com/carsteneu/yesmem/compare/v2.4.2...HEAD
+[2.4.2]: https://github.com/carsteneu/yesmem/compare/v2.3.19...v2.4.2
 [2.3.19]: https://github.com/carsteneu/yesmem/compare/v2.3.18...v2.3.19
 [2.3.18]: https://github.com/carsteneu/yesmem/compare/v2.3.16...v2.3.18
 [2.3.16]: https://github.com/carsteneu/yesmem/compare/v2.3.15...v2.3.16

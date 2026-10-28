@@ -225,7 +225,7 @@ func realAiJail2xSandbox(t *testing.T, cfg SandboxConfig) *Sandbox {
 	// 2.x-removed allow_tcp_ports fails every launch with "--allow-tcp-port is
 	// disabled", so pin HOME and exercise our flags instead of the developer's
 	// ai-jail configuration.
-	t.Setenv("HOME", t.TempDir())
+	isolateHomeAt(t, t.TempDir())
 
 	s := NewSandbox(cfg)
 	if !s.Available() {
