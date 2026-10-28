@@ -202,7 +202,7 @@ func hasErrorInToolResult(msg map[string]any) bool {
 		if !ok {
 			continue
 		}
-		if b["type"] == "tool_result" && b["is_error"] == true {
+		if b["type"] == "tool_result" && toolResultIsError(b) {
 			return true
 		}
 	}
@@ -226,6 +226,8 @@ func isToolResultMsg(msg map[string]any) bool {
 	return false
 }
 
+// isEditToolUse reports whether the message edits a file. The tool name is read
+// as a class: Claude Code sends Edit/Write, opencode edit/write.
 func isEditToolUse(msg map[string]any) bool {
 	content, ok := msg["content"].([]any)
 	if !ok {
@@ -238,7 +240,7 @@ func isEditToolUse(msg map[string]any) bool {
 		}
 		if b["type"] == "tool_use" {
 			name, _ := b["name"].(string)
-			if name == "Edit" || name == "Write" {
+			if classifyLoopTool(name) == loopToolFileEdit {
 				return true
 			}
 		}
@@ -246,6 +248,8 @@ func isEditToolUse(msg map[string]any) bool {
 	return false
 }
 
+// isBuildToolUse reports whether the message runs a build or test command.
+// opencode names its shell "shell", Claude Code "Bash".
 func isBuildToolUse(msg map[string]any) bool {
 	content, ok := msg["content"].([]any)
 	if !ok {
@@ -258,12 +262,12 @@ func isBuildToolUse(msg map[string]any) bool {
 		}
 		if b["type"] == "tool_use" {
 			name, _ := b["name"].(string)
-			if name == "Bash" {
-				input, _ := b["input"].(map[string]any)
-				cmd, _ := input["command"].(string)
-				if isBuildCommand(cmd) {
-					return true
-				}
+			if classifyLoopTool(name) != loopToolShell {
+				continue
+			}
+			input, _ := b["input"].(map[string]any)
+			if isBuildCommand(loopToolCommand(input)) {
+				return true
 			}
 		}
 	}
@@ -287,6 +291,8 @@ func isBuildCommand(cmd string) bool {
 		first == "g++"
 }
 
+// extractEditFilePath returns the file an edit tool call touches. The path key
+// differs per client: Claude Code sends file_path, opencode path.
 func extractEditFilePath(msg map[string]any) string {
 	content, ok := msg["content"].([]any)
 	if !ok {
@@ -299,11 +305,11 @@ func extractEditFilePath(msg map[string]any) string {
 		}
 		if b["type"] == "tool_use" {
 			name, _ := b["name"].(string)
-			if name == "Edit" || name == "Write" {
-				input, _ := b["input"].(map[string]any)
-				fp, _ := input["file_path"].(string)
-				return fp
+			if classifyLoopTool(name) != loopToolFileEdit {
+				continue
 			}
+			input, _ := b["input"].(map[string]any)
+			return toolFilePath(input)
 		}
 	}
 	return ""
@@ -315,10 +321,10 @@ func (s *Server) persistFixationRatio(threadID string, ratio float64) {
 		return
 	}
 	_, err := s.queryDaemon("update_fixation_ratio", map[string]any{
-		"session_id":      threadID,
-		"fixation_ratio":  ratio,
+		"session_id":     threadID,
+		"fixation_ratio": ratio,
 	})
 	if err != nil && s.logger != nil {
-		s.logger.Printf("  fixation: failed to persist ratio for %s: %v", threadID[:8], err)
+		s.logger.Printf("  fixation: failed to persist ratio for %.8s: %v", journalToken(threadID), err)
 	}
 }

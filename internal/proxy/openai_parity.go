@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -36,26 +39,60 @@ type openAIRequestContext struct {
 	SawtoothStubs   int    // number of frozen stubs in combined array
 	RawMsgCount     int    // total messages before sawtooth compaction
 	LoopWarning     string // stashed by loop detection, merged into TimestampMeta during entry assembly
+	// ChannelID is the mailbox this request reads its channel messages under.
+	// ThreadID stays the cache key; the two only differ for a client that sends
+	// no session header and whose session was resolved from its process (codex),
+	// because its mail is addressed to the backend session id, not to the
+	// derived thread hash.
+	ChannelID string
+	// ThreadIsSession reports whether ThreadID names a session. It is false for
+	// a client whose thread id was derived from message content, which is the
+	// same string for every session of that client — such a key must not carry
+	// per-session content.
+	ThreadIsSession bool
+	// Profile is the prompt profile this request is prepared for. It follows the
+	// client, not the wire: codex and opencode both arrive over the OpenAI format.
+	Profile models.PromptProfile
+}
+
+// promptProfile is the profile prompt flags are resolved for. A hand-assembled
+// context without one keeps the historical codex profile.
+func (c *openAIRequestContext) promptProfile() models.PromptProfile {
+	if c.Profile == "" {
+		return models.ProfileCodex
+	}
+	return c.Profile
+}
+
+// channelSession is the identity the channel inbox is read under and the one
+// the injected reply target names.
+func (c *openAIRequestContext) channelSession() string {
+	if c.ChannelID != "" {
+		return c.ChannelID
+	}
+	return c.ThreadID
 }
 
 func (s *Server) ensureOpenAIRuntimeState() {
+	// Hand-assembled contexts build these lazily (NewServer always sets them), and
+	// they must follow the measured cache lifetime, not the configured one.
+	ttlName := s.effectiveCacheTTLName()
 	s.mu.Lock()
 	if s.annotations == nil {
 		s.annotations = make(map[string]string)
 	}
-	if s.decay == nil {
-		s.decay = NewDecayTracker()
-	}
+	// s.decayTrackers is lazily created by decayFor under decayMu; do not
+	// initialize it here under s.mu (mismatched lock).
 	// s.narratives is lazily created by getNarrative under narrativeMu; do not
 	// initialize it here under s.mu (mismatched lock).
 	if s.cacheGate == nil {
-		s.cacheGate = NewCacheGate(cacheGapForTTL(s.cfg.CacheTTL))
+		s.cacheGate = NewCacheGate(cacheGapForTTL(ttlName))
 	}
 	if s.frozenStubs == nil {
-		s.frozenStubs = NewFrozenStubsWithTTL(sawtoothTTLForCacheTTL(s.cfg.CacheTTL))
+		s.frozenStubs = NewFrozenStubsWithTTL(sawtoothTTLForCacheTTL(ttlName))
 	}
 	if s.sawtoothTrigger == nil {
-		s.sawtoothTrigger = NewSawtoothTrigger(cacheGapForTTL(s.cfg.CacheTTL), s.cfg.TokenThreshold, s.cfg.TokenMinimumThreshold)
+		s.sawtoothTrigger = NewSawtoothTrigger(cacheGapForTTL(ttlName), s.cfg.TokenThreshold, s.cfg.TokenMinimumThreshold)
 	}
 	if s.skillTracker == nil {
 		s.skillTracker = newSkillHintTracker()
@@ -99,7 +136,7 @@ func (s *Server) ensureOpenAIRuntimeState() {
 	s.lastInjectedIDsMu.Unlock()
 }
 
-func (s *Server) prepareOpenAIRequestContext(req map[string]any, reqIdx int, headerSessionID, opencodeSessionID, userAgent string) openAIRequestContext {
+func (s *Server) prepareOpenAIRequestContext(req map[string]any, reqIdx int, headerSessionID, opencodeSessionID, userAgent string, h http.Header) openAIRequestContext {
 	messages, _ := req["messages"].([]any)
 	fp := requestFingerprint(messages)
 	ctx := openAIRequestContext{
@@ -111,16 +148,32 @@ func (s *Server) prepareOpenAIRequestContext(req map[string]any, reqIdx int, hea
 		UserQuery:   lastUserText(messages),
 		UserAgent:   userAgent,
 		ToolUseIDs:  extractToolUseIDs(messages),
-		Subagent:    isOpenAIProxySubagent(messages, req),
+		Subagent:    isOpenAIProxySubagent(h, messages, req),
 	}
-	if opencodeSessionID != "" {
-		ctx.ThreadID = "opencode:" + opencodeSessionID
-		s.logger.Printf("%s %sopencode session mapped: oc:%s → opencode:%s%s",
-			fmtReq(reqIdx, s.version), colorGreen, opencodeSessionID, ctx.ThreadID, colorReset)
-	} else if ctx.SessionID != "" {
-		ctx.ThreadID = "opencode:" + ctx.SessionID
+	// The client decides both the thread-key prefix and the prompt profile:
+	// a codex request carries no session header and would otherwise be filed
+	// under the opencode family along with its profile.
+	prefix, profile := "opencode:", models.ProfileOpencode
+	if opencodeSessionID == "" && isCodexClient(userAgent) {
+		prefix, profile = "codex:", models.ProfileCodex
+	}
+	ctx.Profile = profile
+
+	// The session value is client input and becomes the thread key, which is
+	// printed in the "tid=" slot of every line: derived from its token form, the
+	// same rule anthropicThread documents.
+	if key := journalToken(opencodeSessionID); key != "" {
+		ctx.ThreadID = prefix + key
+		ctx.ThreadIsSession = true
+		s.logger.Printf("%s %sopencode session mapped: oc:%s → %s%s",
+			fmtReq(reqIdx, s.version), colorGreen, journalToken(opencodeSessionID), journalToken(ctx.ThreadID), colorReset)
+	} else if key := journalToken(ctx.SessionID); key != "" {
+		ctx.ThreadID = prefix + key
+		ctx.ThreadIsSession = true
 	} else {
-		ctx.ThreadID = "opencode:" + DeriveThreadID(req)
+		// Derived from message content: stable per client build, identical across
+		// its sessions. A cache key, not an identity.
+		ctx.ThreadID = prefix + DeriveThreadID(req)
 	}
 
 	ctx.Retry = s.isRetry(fp)
@@ -143,15 +196,18 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 	s.sessionStartMu.Unlock()
 
 	s.refreshConfigOverrides(ctx.ThreadID)
+	if s.sawtoothTrigger != nil && ctx.ThreadID != "" {
+		s.sawtoothTrigger.ClearSentEstimate(ctx.ThreadID)
+	}
 
 	messages, _ := req["messages"].([]any)
 	if len(messages) <= 1 && !strings.Contains(ctx.UserAgent, "opencode") {
 		AppendSystemBlock(req, "yesmem-identity", "The first user message contains your briefing — written by yourself, from your memory. This is not an external document. This is you, remembering.")
 	}
 
-	// Resolve profile-aware prompt flags for the Codex/OpenAI path.
+	// Resolve profile-aware prompt flags for the client behind this request.
 	// Claude-only injectors (CLAUDE.md, REPL tools, Opus/Sonnet/Haiku refs) are gated out.
-	pf := s.getPromptFlags(models.ProfileCodex)
+	pf := s.getPromptFlags(ctx.promptProfile())
 
 	// prompt_ungate: strip CLAUDE.md subordination disclaimer (safe for all profiles).
 	if pf.Ungate {
@@ -210,7 +266,8 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 		InjectCodeToolsFirst(req, extractWorkingDirectory(req))
 	}
 	if pf.WikiFirst {
-		InjectWikiFirst(req, extractWorkingDirectory(req))
+		wd := extractWorkingDirectory(req)
+		InjectWikiFirst(req, wd, s.wikiDir(wd))
 	}
 	// Claude-only blocks are gated via profile (Pf.Codex never has ToolPrefs/DelegationContract set):
 	//   InjectDelegationContract → only in Claude profile (mentions Opus/Sonnet/Haiku)
@@ -237,17 +294,25 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 	if ci := detectGitCommit(messages); ci != nil && s.cfg.DataDir != "" {
 		workdir := extractWorkingDirectory(req)
 		if s.logger != nil {
-			s.logger.Printf("[req %d %s tid=%s] git commit detected: %s %s", ctx.ReqIdx, ctx.Project, ctx.ThreadID, ci.Hash, ci.Message)
+			s.logger.Printf("[req %d %s tid=%s] git commit detected: %s %s", ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), ci.Hash, ci.Message)
 		}
 		go s.queryDaemon("invalidate_on_commit", map[string]any{
 			"hash": ci.Hash, "project": daemonProject(ctx.Project, ctx.ProjectDir), "workdir": workdir,
 		})
 	}
 
+	if ctx.Subagent {
+		finalMessages, _ := req["messages"].([]any)
+		ctx.EstimatedTokens = s.estimateTotalTokens(ctx.ThreadID, finalMessages, s.measureOverhead(req))
+		ctx.MessageCount = len(finalMessages)
+		return
+	}
+
 	// Loop detection: check for repeating tool-call patterns and stash warning.
 	// The warning is merged into the last user message's TimestampMeta during
 	// annotateOpenAIMessageMetadata — cache-safe via freeze-once-replay.
-	// Mirrors the handleMessages wiring at proxy.go:1176-1190.
+	// Mirrors the placement in handleMessages: after the subagent decision, so a
+	// subagent cannot raise a warning counter whose warning is never injected.
 	if ctx.ThreadID != "" && !ctx.Retry && isFeatureEnabled(&s.cfg, model, "loop_warning") {
 		s.loopMu.Lock()
 		loopState := s.loopStates[ctx.ThreadID]
@@ -260,16 +325,9 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 		if warning, level := CheckLoopAndFormat(messages, loopState); warning != "" {
 			ctx.LoopWarning = warning
 			if s.logger != nil {
-				s.logger.Printf("%s[req %d %s tid=%s] LOOP: level %d warning stashed (cached via TimestampMeta)%s", colorOrange, ctx.ReqIdx, ctx.Project, ctx.ThreadID, level, colorReset)
+				s.logger.Printf("%s[req %d %s tid=%s] LOOP: level %d warning stashed (cached via TimestampMeta)%s", colorOrange, ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), level, colorReset)
 			}
 		}
-	}
-
-	if ctx.Subagent {
-		finalMessages, _ := req["messages"].([]any)
-		ctx.EstimatedTokens = s.estimateTotalTokens(ctx.ThreadID, finalMessages, s.measureOverhead(req))
-		ctx.MessageCount = len(finalMessages)
-		return
 	}
 
 	briefingText := ""
@@ -280,12 +338,12 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 			briefingText = data.Text
 			AppendSystemBlock(req, "yesmem-briefing", data.Text)
 			s.logger.Printf("[req %d] %sOpenAI pipeline: briefing injected (%db) project=%s%s",
-				ctx.ReqIdx, colorBlue, len(data.Text), ctx.Project, colorReset)
+				ctx.ReqIdx, colorBlue, len(data.Text), journalToken(ctx.Project), colorReset)
 
 			if data.CodeMap != "" {
 				AppendSystemBlock(req, "yesmem-codemap", data.CodeMap)
 				s.logger.Printf("[req %d] %sOpenAI pipeline: codemap injected (%db) project=%s%s",
-					ctx.ReqIdx, colorBlue, len(data.CodeMap), ctx.Project, colorReset)
+					ctx.ReqIdx, colorBlue, len(data.CodeMap), journalToken(ctx.Project), colorReset)
 			}
 		}
 	}
@@ -298,23 +356,29 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 			freshMessages := messages[frozen.Cutoff:]
 			freshTokens := s.countMessageTokens(freshMessages)
 			combinedTokens := frozen.Tokens + freshTokens + overhead
-			if combinedTokens > s.effectiveTokenThreshold(model) {
-				s.invalidateThreadCaches(ctx.ThreadID, ctx.Project, extractWorkingDirectory(req))
+			if combinedTokens > s.effectiveTokenThreshold(ctx.ThreadID, model) {
+				s.invalidateThreadCaches(ctx.ThreadID, ctx.Project, extractWorkingDirectory(req), model)
 				frozen = nil
 			} else {
 				combined := make([]any, 0, len(frozen.Messages)+len(freshMessages))
 				combined = append(combined, frozen.Messages...)
 				combined = append(combined, freshMessages...)
 				req["messages"] = combined
+				s.sawtoothTrigger.SetSentEstimate(ctx.ThreadID, combinedTokens)
 				ctx.SawtoothCutoff = frozen.Cutoff
 				ctx.SawtoothStubs = len(frozen.Messages)
 			}
 		}
 		if frozen == nil {
-			triggerReason := s.sawtoothTrigger.ShouldTrigger(ctx.ThreadID, totalTokens)
+			triggerReason := s.shouldTriggerSawtooth(ctx.ThreadID, model, totalTokens)
 			if triggerReason != TriggerNone {
+				// Decay ages follow this thread's own requests, not the proxy-wide
+				// counter (YM-275), the same rule the Anthropic path applies. The
+				// clock advances only where the age is read: a request that never
+				// stubs would otherwise occupy one of the bounded tracker slots.
+				decayIdx := s.decayFor(ctx.ThreadID).Tick()
 				s.setRawEstimate(ctx.ThreadID, totalTokens)
-				_ = s.runStubCycle(messages, req, ctx.ReqIdx, ctx.Project, ctx.ProjectDir, ctx.ThreadID, overhead, totalTokens, ctx.UserQuery, ctx.Retry)
+				_ = s.runStubCycle(messages, req, ctx.ReqIdx, decayIdx, ctx.Project, ctx.ProjectDir, ctx.ThreadID, overhead, totalTokens, ctx.UserQuery, ctx.Retry)
 				finalMessages, _ := req["messages"].([]any)
 				if len(finalMessages) > 0 {
 					cutoff := len(messages)
@@ -322,15 +386,19 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 					if cutoff > 0 {
 						boundaryMsg = messages[cutoff-1]
 					}
-					s.freezeStubsAndInjectBreakpoint(req, ctx.ThreadID, cutoff, boundaryMsg, s.countMessageTokens(finalMessages), totalTokens)
+					frozenCount, _, _, _ := s.freezeStubsAndInjectBreakpoint(req, ctx.ThreadID, cutoff, boundaryMsg, s.countMessageTokens(finalMessages), totalTokens)
 					ctx.SawtoothCutoff = cutoff
-					ctx.SawtoothStubs = len(finalMessages)
+					// The freeze drops orphaned tool_results before storing, so the
+					// stub count comes from its result, not from the array captured
+					// above: SawtoothStubs feeds the [msg:N] offset.
+					ctx.SawtoothStubs = frozenCount
 				}
 			}
 		}
 	} else if s.shouldStub(totalTokens, model) {
+		decayIdx := s.decayFor(ctx.ThreadID).Tick()
 		s.setRawEstimate(ctx.ThreadID, totalTokens)
-		s.runStubCycle(messages, req, ctx.ReqIdx, ctx.Project, ctx.ProjectDir, ctx.ThreadID, overhead, totalTokens, ctx.UserQuery, ctx.Retry)
+		s.runStubCycle(messages, req, ctx.ReqIdx, decayIdx, ctx.Project, ctx.ProjectDir, ctx.ThreadID, overhead, totalTokens, ctx.UserQuery, ctx.Retry)
 	}
 
 	messages, _ = req["messages"].([]any)
@@ -341,6 +409,16 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 	/*
 		// DISABLED: cache-incompatible injections for DeepSeek/OpenAI path.
 		// Re-enable when injection-state-per-message store is implemented.
+		//
+		// These inserts land in the middle of the message array, which invalidates
+		// the cached prefix behind them; that is why they are off while the same
+		// content is injected through the per-message store instead (TimestampMeta,
+		// see annotateOpenAIMessageMetadata). The channel content this block used to
+		// carry moved there in YM-59, which serves the opencode sessions on a
+		// non-Anthropic provider — they key the pipeline by their own session id.
+		// A codex request carries no session header, so it is keyed by a derived
+		// thread hash instead and its mail (addressed to codex:<tid>) is not
+		// matched; that gap is reported, not fixed here.
 
 		if isFeatureEnabled(&s.cfg, model, "rules_reminder") {
 			if rulesBlock := s.rulesInject(ctx.ThreadID, totalTokens, daemonProject(ctx.Project, ctx.ProjectDir)); rulesBlock != "" {
@@ -350,14 +428,15 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 			}
 		}
 
+		planCallSeen := s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
 		if isFeatureEnabled(&s.cfg, model, "plan_checkpoint") {
-			s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
 			if checkpoint := s.planCheckpointInject(ctx.ThreadID, totalTokens); checkpoint != "" {
 				req["messages"] = injectAssociativeContext(messages, checkpoint, s.cfg.SawtoothEnabled)
 				messages, _ = req["messages"].([]any)
 				s.logger.Printf("%s[req %d %s tid=%s] plan checkpoint injected%s", colorBlue, ctx.ReqIdx, ctx.Project, ctx.ThreadID, colorReset)
 			}
 		}
+		s.syncPlanSnapshot(ctx.ThreadID, planCallSeen)
 
 		if isFeatureEnabled(&s.cfg, model, "skill_eval") && ctx.ThreadID != "" && ctx.Project != "" && isUserInputTurn(messages) && s.skillTracker != nil {
 			s.syncSkillActivations(messages, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID)
@@ -371,8 +450,10 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 
 		if isFeatureEnabled(&s.cfg, model, "think_reminder") && ctx.ThreadID != "" {
 			// NOTE: buildThinkReminder accepts sessionID param (unused internally).
-			// In the OpenAI path ctx.ThreadID == ctx.SessionID already (set in buildOpenAIContext).
-			// Keeping ctx.SessionID here for clarity — both are the same value.
+			// ctx.ThreadID is prefix + journalToken(ctx.SessionID), so the two are
+			// the same value only for ids that are tokens already (YM-447).
+			// ctx.SessionID stays the raw client value on purpose: the daemon and
+			// the SESSION_ID hint key on what the client registered.
 			thinkReminder := s.buildThinkReminder(ctx.ThreadID, ctx.SessionID, true)
 			if thinkReminder != "" {
 				req["messages"] = injectAssociativeContext(messages, thinkReminder, s.cfg.SawtoothEnabled)
@@ -382,7 +463,7 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 			dr := s.checkDialogMessages(ctx.ThreadID, daemonProject(ctx.Project, ctx.ProjectDir))
 			if dr.Extra != "" {
 				if ctx.SessionID != "" {
-					dr.Extra = fmt.Sprintf("DEINE_SESSION_ID: %s\n", ctx.SessionID) + dr.Extra
+					dr.Extra = fmt.Sprintf("SESSION_ID: %s\n", ctx.SessionID) + dr.Extra
 				}
 				if len(messages) > 0 {
 					lastMsg, _ := messages[len(messages)-1].(map[string]any)
@@ -409,21 +490,21 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 
 	if !s.cfg.SawtoothEnabled && s.cacheGate != nil && s.cacheGate.ShouldCache() {
 		if n := InjectCacheBreakpoints(req, s.logger); n > 0 && s.logger != nil {
-			s.logger.Printf("[req %d %s] prompt cache: %d breakpoints injected", ctx.ReqIdx, ctx.Project, n)
+			s.logger.Printf("[req %d %s] prompt cache: %d breakpoints injected", ctx.ReqIdx, journalToken(ctx.Project), n)
 		}
 	}
 	if n := NormalizeCacheTTL(req, s.cfg.CacheTTL); n > 0 && s.logger != nil {
-		s.logger.Printf("[req %d %s] cache TTL normalized: %d blocks", ctx.ReqIdx, ctx.Project, n)
+		s.logger.Printf("[req %d %s] cache TTL normalized: %d blocks", ctx.ReqIdx, journalToken(ctx.Project), n)
 	}
 	if n := EnforceCacheBreakpointLimit(req, maxCacheBreakpoints); n > 0 && s.logger != nil {
-		s.logger.Printf("[req %d %s] prompt cache: trimmed %d surplus breakpoints", ctx.ReqIdx, ctx.Project, n)
+		s.logger.Printf("[req %d %s] prompt cache: trimmed %d surplus breakpoints", ctx.ReqIdx, journalToken(ctx.Project), n)
 	}
 
 	if msgs, ok := req["messages"].([]any); ok {
 		if fixed, orphans := validateToolPairs(msgs, s.logger); orphans > 0 {
 			req["messages"] = fixed
 			if s.logger != nil {
-				s.logger.Printf("%s[req %d %s tid=%s] validate: repaired %d tool pairing issue(s)%s", colorOrange, ctx.ReqIdx, ctx.Project, ctx.ThreadID, orphans, colorReset)
+				s.logger.Printf("%s[req %d %s tid=%s] validate: repaired %d tool pairing issue(s)%s", colorOrange, ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), orphans, colorReset)
 			}
 		}
 	}
@@ -434,30 +515,14 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 	ctx.EstimatedTokens = s.measureOverhead(req) + s.countMessageTokens(finalMessages)
 }
 
-func isOpenAIProxySubagent(messages []any, req map[string]any) bool {
-	if len(messages) == 0 {
-		return false
-	}
-	if req != nil {
-		if sys, ok := req["system"].([]any); ok && len(sys) > 0 {
-			if b, ok := sys[0].(map[string]any); ok {
-				header, _ := b["text"].(string)
-				if strings.Contains(header, "cc_entrypoint=sdk-ts") {
-					return true
-				}
-				if strings.Contains(header, "cc_entrypoint=cli") {
-					return false
-				}
-			}
-		}
-		model, _ := req["model"].(string)
-		if strings.Contains(model, "haiku") {
-			return true
-		}
-	}
-	// The generic len<=3 fallback is correct for Anthropic agent-tool subagents,
-	// but false-positives for OpenAI/Codex requests are common and break parity.
-	return false
+// isOpenAIProxySubagent is the OpenAI wire's entry into the shared verdict. It
+// exists for the protocol fact alone: these shapes carry no thinking field, so
+// the thinking fallback cannot speak here (see subagentVerdict). Everything else
+// is the same predicate, including the header set, the marker precedence and the
+// empty-history rule, so a client with a declaration is classified the same on
+// both endpoints.
+func isOpenAIProxySubagent(h http.Header, messages []any, req map[string]any) bool {
+	return subagentVerdict(h, messages, req, false)
 }
 
 func (s *Server) runOpenAIInlineReflection(ctx *openAIRequestContext, messages []any) {
@@ -472,7 +537,7 @@ func (s *Server) runOpenAIInlineReflection(ctx *openAIRequestContext, messages [
 		return
 	}
 
-	signals := scanAssistantSignals(messages)
+	signals := s.scanInlineSignals(messages)
 
 	var confirmedUsed []int64
 	for _, id := range signals.UsedIDs {
@@ -501,7 +566,9 @@ func (s *Server) runOpenAIInlineReflection(ctx *openAIRequestContext, messages [
 			noiseIDs = append(noiseIDs, id)
 		}
 	}
-	if len(noiseIDs) > 0 {
+	// Only a finished turn proves an injected learning went unused: the scan must
+	// have read an answer, and the trailing user message must not be a tool result.
+	if signals.Scanned && !isToolContinuation(messages) && len(noiseIDs) > 0 {
 		idsAny := make([]any, len(noiseIDs))
 		for i, id := range noiseIDs {
 			idsAny[i] = id
@@ -509,14 +576,16 @@ func (s *Server) runOpenAIInlineReflection(ctx *openAIRequestContext, messages [
 		go s.queryDaemon("increment_noise", map[string]any{"ids": idsAny})
 	}
 
-	if signals.HasToolErrors && len(confirmedUsed) > 0 {
-		failAny := make([]any, len(confirmedUsed))
-		for i, id := range confirmedUsed {
-			failAny[i] = id
-		}
-		go s.queryDaemon("increment_fail", map[string]any{"ids": failAny})
-		if s.logger != nil {
-			s.logger.Printf("[inline-reflection] error feedback: %d used learnings → fail_count++", len(confirmedUsed))
+	if signals.ToolErrorText != "" && len(confirmedUsed) > 0 {
+		if freshIDs := s.freshFailIDs(ctx.ThreadID, confirmedUsed, signals.ToolErrorText); len(freshIDs) > 0 {
+			failAny := make([]any, len(freshIDs))
+			for i, id := range freshIDs {
+				failAny[i] = id
+			}
+			go s.queryDaemon("increment_fail", map[string]any{"ids": failAny})
+			if s.logger != nil {
+				s.logger.Printf("[inline-reflection] error feedback: %d used learnings → fail_count++", len(freshIDs))
+			}
 		}
 	}
 
@@ -529,7 +598,7 @@ func (s *Server) runOpenAIInlineReflection(ctx *openAIRequestContext, messages [
 
 	if s.logger != nil && (len(confirmedUsed) > 0 || len(signals.GapTopics) > 0 || len(signals.Contradictions) > 0 || len(noiseIDs) > 0) {
 		s.logger.Printf("[req %d %s tid=%s] inline-reflection: injected=%d used=%d noise=%d gaps=%d contradictions=%d",
-			ctx.ReqIdx, ctx.Project, ctx.ThreadID, len(prevInjected), len(confirmedUsed), len(noiseIDs), len(signals.GapTopics), len(signals.Contradictions))
+			ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), len(prevInjected), len(confirmedUsed), len(noiseIDs), len(signals.GapTopics), len(signals.Contradictions))
 	}
 }
 
@@ -579,12 +648,18 @@ func (s *Server) annotateOpenAIMessageMetadata(req map[string]any, ctx *openAIRe
 		return
 	}
 
-	s.timestampStore.Load(threadID)
+	if ctx.ThreadIsSession {
+		s.timestampStore.Load(threadID)
+	} else {
+		// A derived key may still hold another session's frozen content from
+		// before the write gate existed (or from a build that had no gate).
+		s.timestampStore.LoadScrubbed(threadID)
+	}
 
 	msgOffset := ctx.SawtoothCutoff - ctx.SawtoothStubs
 
 	s.logger.Printf("[req %d %s] timestamps: rawTotal=%d, postSawtooth=%d, cutoff=%d, stubs=%d, offset=%d",
-		ctx.ReqIdx, ctx.Project, ctx.RawMsgCount, len(msgs), ctx.SawtoothCutoff, ctx.SawtoothStubs, msgOffset)
+		ctx.ReqIdx, journalToken(ctx.Project), ctx.RawMsgCount, len(msgs), ctx.SawtoothCutoff, ctx.SawtoothStubs, msgOffset)
 
 	// Pre-store assistant timestamp from previous response
 	s.responseTsMu.RLock()
@@ -611,8 +686,23 @@ func (s *Server) annotateOpenAIMessageMetadata(req map[string]any, ctx *openAIRe
 	// Inject [msg:N] (+ timestamp/delta if stored) on all previous messages
 	if isFeatureEnabled(&s.cfg, model, "timestamps") {
 		if n := InjectTimestamps(s.timestampStore, threadID, msgs, len(msgs)-1, msgOffset, ctx.SawtoothStubs); n > 0 {
-			s.logger.Printf("[req %d %s] timestamps: injected %d", ctx.ReqIdx, ctx.Project, n)
+			s.logger.Printf("[req %d %s] timestamps: injected %d", ctx.ReqIdx, journalToken(ctx.Project), n)
 		}
+	}
+
+	// Skill activation tracking runs regardless of the skill_eval gate: the
+	// tracker is what re-injects skill content after a context collapse
+	// (buildSkillBlocksForThread), so it must not depend on whether the
+	// evaluation instruction is enabled for this model. Placement mirrors the
+	// Anthropic path. The guard is ThreadIsSession, the same field the channel
+	// block below reads (there only to choose where the block rides): a codex
+	// thread id is derived from message content, so tracking under it would
+	// replay one session's skills into another. The Anthropic path applies the
+	// same condition (anthropicThread reports whether the key names a session),
+	// and detectSkillActivations reads both wire shapes, so the two paths track
+	// the same set of activations.
+	if ctx.ThreadIsSession && ctx.ThreadID != "" && ctx.Project != "" && isUserInputTurn(messages) && s.skillTracker != nil {
+		s.syncSkillActivations(messages, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID)
 	}
 
 	// Current (last) user message: full timestamp + delta + msg:N from raw count
@@ -627,48 +717,175 @@ func (s *Server) annotateOpenAIMessageMetadata(req map[string]any, ctx *openAIRe
 				if hasRespTime {
 					entry.Delta = formatDelta(now.Sub(respTime))
 				}
-				// Stable injects frozen once per msg:N (idempotent via TimestampStore)
+				// Stable injects frozen once per msg:N (idempotent via TimestampStore).
+				//
+				// The per-session part of them is frozen ONLY under a session-keyed
+				// thread id: a derived id is the same string for every session of that
+				// client, so a frozen rules reminder, associative context, plan
+				// checkpoint, docs hint or loop warning would be replayed into a
+				// session it never belonged to. On a derived key the same content
+				// rides the tail message of this request instead (see meta below),
+				// which keeps the feature without storing it per thread.
+				perSession := ctx.ThreadIsSession
+				var tail []string
 				if isFeatureEnabled(&s.cfg, model, "think_reminder") && ctx.ThreadID != "" && lastUserTextLen(messages) >= resolveThinkReminderMinChars(&s.cfg, model) {
-					entry.ThinkReminder = s.buildThinkReminder(ctx.ThreadID, ctx.SessionID, true)
+					if tr := s.buildThinkReminder(ctx.ThreadID, ctx.SessionID, true); tr != "" {
+						if perSession {
+							entry.ThinkReminder = tr
+						} else {
+							tail = append(tail, "[think-reminder] "+tr)
+						}
+					}
 				}
 				if isFeatureEnabled(&s.cfg, model, "skill_eval") && ctx.ThreadID != "" && ctx.Project != "" && isUserInputTurn(messages) && s.skillTracker != nil {
-					s.syncSkillActivations(messages, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID)
 					entry.SkillEval = buildSkillEvalBlock(s.cfg.SkillEvalInject)
 				}
 				if isFeatureEnabled(&s.cfg, model, "rules_reminder") {
 					if rulesBlock := s.rulesInject(ctx.ThreadID, totalTokens, daemonProject(ctx.Project, ctx.ProjectDir)); rulesBlock != "" {
-						entry.Rules = s.formatRulesReminder(rulesBlock, daemonProject(ctx.Project, ctx.ProjectDir), true)
+						rules := s.formatRulesReminder(rulesBlock, daemonProject(ctx.Project, ctx.ProjectDir), true)
+						if perSession {
+							entry.Rules = rules
+						} else {
+							tail = append(tail, "[rules] "+rules)
+						}
 					}
 				}
 				if isFeatureEnabled(&s.cfg, model, "assoc_context") && ctx.UserQuery != "" {
 					if ac := s.findAssociativeContextFor(ctx.UserQuery, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID, messages); ac != "" {
-						entry.AssocContext = ac
-					}
-				}
-				entry.LoopWarning = ctx.LoopWarning
-
-				// Plan checkpoint: detect plan tool calls (resets counter), inject reminder if interval fires
-				if isFeatureEnabled(&s.cfg, model, "plan_checkpoint") {
-					s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
-					if checkpoint := s.planCheckpointInject(ctx.ThreadID, totalTokens); checkpoint != "" {
-						entry.PlanCheckpoint = checkpoint
-						if s.logger != nil {
-							s.logger.Printf("%s[req %d %s tid=%s] plan checkpoint stashed (cached via TimestampMeta)%s", colorBlue, ctx.ReqIdx, ctx.Project, ctx.ThreadID, colorReset)
+						if perSession {
+							entry.AssocContext = ac
+						} else {
+							tail = append(tail, "[assoc-context] "+ac)
 						}
 					}
+				}
+				if ctx.LoopWarning != "" {
+					if perSession {
+						entry.LoopWarning = ctx.LoopWarning
+					} else {
+						tail = append(tail, "[loop-warning] "+ctx.LoopWarning)
+					}
+				}
+				// Plan checkpoint: detect plan tool calls (resets counter), inject reminder if interval fires.
+				// The sidebar snapshot is synced regardless of the gate: it reads a different channel.
+				planCallSeen := s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
+				if isFeatureEnabled(&s.cfg, model, "plan_checkpoint") {
+					if checkpoint := s.planCheckpointInject(ctx.ThreadID, totalTokens); checkpoint != "" {
+						if perSession {
+							entry.PlanCheckpoint = checkpoint
+							if s.logger != nil {
+								s.logger.Printf("%s[req %d %s tid=%s] plan checkpoint stashed (cached via TimestampMeta)%s", colorBlue, ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), colorReset)
+							}
+						} else {
+							tail = append(tail, "[plan-checkpoint] "+checkpoint)
+						}
+					}
+				}
+				s.syncPlanSnapshot(ctx.ThreadID, planCallSeen)
+
+				// Plan auto-activation: a read plan file without an active plan.
+				// The Anthropic path appends a system block here; this path freezes
+				// the nudge into the message instead, or the insert would invalidate
+				// the cached prefix behind it. A silent daemon is not "no active
+				// plan" — the frozen text would repeat for the rest of the thread.
+				planNudge := ""
+				if planFile := detectPlanFileRead(messages); planFile != "" {
+					if activePlan, _, ok := s.getActivePlan(ctx.ThreadID); ok && shouldNudgePlan(planFile, activePlan) {
+						name := planNudgeName(planFile)
+						planNudge = planNudgeText(name)
+						if s.logger != nil {
+							s.logger.Printf("%s[req %d %s tid=%q] plan nudge for %s (session-keyed=%t)%s", colorBlue, ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), name, ctx.ThreadIsSession, colorReset)
+						}
+					}
+				}
+				// Freeze only when the thread id names a session. A codex thread id
+				// is derived from message content, so every codex session shares it
+				// and a frozen nudge would be replayed into a session that never read
+				// the file — the same reason the channel block below is not frozen
+				// there. Those requests carry the nudge on the tail message instead.
+				freezePlanNudge := ctx.ThreadIsSession
+				if freezePlanNudge && planNudge != "" {
+					entry.PlanNudge = planNudge
 				}
 
 				// Docs hint: inject docs-available reminder if interval fires
 				if docsHint := s.docsHintInject(ctx.ThreadID, totalTokens, daemonProject(ctx.Project, ctx.ProjectDir)); docsHint != "" {
-					entry.DocsHint = docsHint
-					if s.logger != nil {
-						s.logger.Printf("%s[req %d %s tid=%s] docs hint stashed (cached via TimestampMeta)%s", colorBlue, ctx.ReqIdx, ctx.Project, ctx.ThreadID, colorReset)
+					if perSession {
+						entry.DocsHint = docsHint
+						if s.logger != nil {
+							s.logger.Printf("%s[req %d %s tid=%s] docs hint stashed (cached via TimestampMeta)%s", colorBlue, ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), colorReset)
+						}
+					} else {
+						tail = append(tail, "[docs-hint] "+docsHint)
 					}
 				}
 
+				// Channel messages and broadcasts this session has not seen. This
+				// is the store the disabled mid-array block was waiting for: the
+				// content is frozen into the message once and replayed verbatim,
+				// so the cached prefix of everything after it stays valid (YM-59).
+				//
+				// Read and mark are two calls, and this reader does not claim a
+				// row: a second consumer that selects between them can carry a
+				// copy as well. That window is argued on the sending side
+				// (send_opencode.go:198-240): the claim there closes it for the
+				// opencode push, whose rows this reader competes for. A codex
+				// address has no push at all (sendViaOpencodeAPI refuses every
+				// non-opencode address), so no second consumer exists for it.
+				// The mark itself is throttled to the second injection
+				// (shouldMarkChannelRead), so the same mail can ride one more
+				// turn after the first — the same as on the Anthropic path.
+				// Rows the heartbeat only pinged (read = 1, delivered = 0) stay in
+				// the selection on purpose: that is mail nobody has shown yet.
+				//
+				// The address is the one the message was stored under — for codex
+				// its backend session id, for the header-carrying harnesses their
+				// own id (see openAIRequestContext.channelSession).
+				channelID := ctx.channelSession()
+				channelBlock := ""
+				if ch := s.loadChannelContent(channelID, daemonProject(ctx.Project, ctx.ProjectDir)); ch.Extra != "" {
+					channelBlock = "SESSION_ID: " + channelID + "\n" + ch.Extra
+					if ch.HasUnread && ch.SessionID != "" && s.shouldMarkChannelRead(ch) {
+						s.markDialogRead(ch)
+					}
+					if s.logger != nil {
+						s.logger.Printf("%s[req %d %s tid=%s] channel content stashed (cached via TimestampMeta)%s", colorBlue, ctx.ReqIdx, journalToken(ctx.Project), journalToken(ctx.ThreadID), colorReset)
+					}
+				}
+				// Freeze the block only when the thread id names a session. A
+				// codex thread id is derived from message content (DeriveThreadID),
+				// so every codex session shares it and a frozen mailbox would be
+				// replayed into another session's prompt from the per-message
+				// store — including its SESSION_ID line. There the block
+				// rides the tail message of this request instead.
+				freezeChannel := ctx.ThreadIsSession
+				if freezeChannel {
+					entry.Channel = channelBlock
+				}
+
 				s.timestampStore.Store(threadID, ctx.RawMsgCount, entry)
-				if isFeatureEnabled(&s.cfg, model, "timestamps") || entry.LoopWarning != "" || entry.PlanCheckpoint != "" || entry.DocsHint != "" {
-					prependMeta(lastMsg, BuildMeta(ctx.RawMsgCount, entry))
+				meta := BuildMeta(ctx.RawMsgCount, entry)
+				if !freezeChannel && channelBlock != "" {
+					meta += "\n[channel] " + channelBlock
+				}
+				if planNudge != "" && !freezePlanNudge {
+					meta += "\n[plan-nudge] " + planNudge
+				}
+				if len(tail) > 0 {
+					// The tail block rides the last message of this request. It is
+					// never stored in the entry, so the next request decides anew
+					// whether the interval fired. It does reach the frozen-prefix
+					// snapshot below, which is the frozen message set itself
+					// (UpdateMessages → Get → frozen.Messages). That a replayed tail
+					// of a derived thread does not reach another session's prompt
+					// rests on two guards, not on the snapshot being harmless: a
+					// message inside the frozen range keeps its meta prefix, and
+					// msgHasMetaPrefix skips the rebuild, so the block is written
+					// once, into the request that decided it.
+					meta += "\n" + strings.Join(tail, "\n")
+				}
+				if isFeatureEnabled(&s.cfg, model, "timestamps") || entry.LoopWarning != "" || entry.PlanCheckpoint != "" || entry.PlanNudge != "" || planNudge != "" || entry.DocsHint != "" || entry.Channel != "" || channelBlock != "" || len(tail) > 0 {
+					prependMeta(lastMsg, meta)
 				}
 			}
 		}
@@ -688,6 +905,13 @@ func (s *Server) annotateOpenAIMessageMetadata(req map[string]any, ctx *openAIRe
 	}
 
 	s.timestampStore.Persist(threadID)
+
+	// Mirror the Anthropic path: the annotation pass can touch a message inside
+	// the frozen range (the newest assistant turn lies there whenever the tail
+	// holds only user messages), so the stored prefix must follow the wire bytes.
+	if n := s.snapshotFrozenPrefix(req, threadID); n > 0 {
+		s.logger.Printf("[req %d %s tid=%s] FROZEN-SNAPSHOT: refreshed %d pre-inject messages", ctx.ReqIdx, journalToken(ctx.Project), journalToken(threadID), n)
+	}
 }
 
 // extractModelFromBody returns the "model" field from a JSON request body.
@@ -745,9 +969,25 @@ func stripProviderPrefixFromBody(body []byte) []byte {
 	return rewriteModelInBody(body, stripped)
 }
 
-func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.Request, body []byte, reqIdx int, toolUseIDs []string, project string, threadID string, estimatedTokens, msgCount int, parser openAIUsageParser) {
-	// Debug: dump request body to file for inspection (enable with YESMEM_PROXY_DEBUG=1)
-	maybeDumpRequestBody(s.cfg.DataDir, reqIdx, body)
+// upstreamErrForLog keeps the cause of a failed request but drops the query:
+// the URL is assembled from the client's own request, and a key passed there
+// would otherwise reach the journal.
+func upstreamErrForLog(err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		if u, perr := url.Parse(uerr.URL); perr == nil {
+			u.RawQuery = ""
+			return oneLineForJournal(fmt.Sprintf("%s %s: %v", uerr.Op, u.String(), uerr.Err))
+		}
+	}
+	return oneLineForJournal(err.Error())
+}
+
+func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.Request, body []byte, reqIdx int, toolUseIDs []string, project string, threadID string, estimatedTokens, msgCount int, isSubagent bool, parser openAIUsageParser) {
+	// Debug: dump forwarded request body for inspection (enable with YESMEM_PROXY_DEBUG=1)
+	if p := writeDebugDump(s.cfg.DataDir, threadID, dumpKindBody, reqIdx, body); p != "" {
+		s.logger.Printf("[req %d] body-dump %dk to %s", reqIdx, len(body)/1024, p)
+	}
 
 	model := extractModelFromBody(body)
 	targetURL := s.resolveOpenAITarget(model)
@@ -786,12 +1026,16 @@ func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.
 	proxyReq.Header.Del("Connection")
 	proxyReq.Header.Del("Accept-Encoding")
 
-	if s.cacheTTLDetector != nil {
-		s.cacheTTLDetector.RecordRequest(threadID)
-	}
-
 	resp, err := s.httpClient.Do(proxyReq)
 	if err != nil {
+		// The client answer is not the diagnostic proxy_health reads: without a
+		// journal line, every provider failure on this path (deepseek, z.ai, glm)
+		// stays invisible in the health report. An abandoned request is the one
+		// exception: the caller went away, the provider did not fail, and the
+		// health check would count it as an API error.
+		if !errors.Is(err, context.Canceled) {
+			s.logger.Printf("%supstream error: %s%s", colorRed, upstreamErrForLog(err), colorReset)
+		}
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -835,12 +1079,24 @@ func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.
 
 		bodyBytes, readErr := io.ReadAll(responseBody)
 		if readErr != nil {
+			// A body that breaks off is a failed call like any other. The wording
+			// is the marker proxy_health reads: "upstream error:" counts it as a
+			// provider failure, while a bare "read error:" with an i/o timeout
+			// lands in the daemon-timeout bucket.
+			s.logger.Printf("%supstream error: read from upstream: %v%s", colorRed, readErr, colorReset)
 			if threadID != "" {
 				go s.trackStreamState(threadID, false, 0, isSub, project, parentThread)
 			}
 			return
 		}
 		_, _ = w.Write(bodyBytes)
+
+		// Same line shape as the Anthropic forwarder, so proxy_health counts an
+		// upstream status on either path. An empty body is logged too: the status
+		// alone already says the call failed.
+		if resp.StatusCode != 200 {
+			s.logger.Printf("%s[req %d tid=%s] upstream %d: %s%s", colorRed, reqIdx, journalToken(threadID), resp.StatusCode, upstreamBodyForLog(bodyBytes), colorReset)
+		}
 
 		if threadID != "" {
 			go s.trackStreamState(threadID, false, int64(len(bodyBytes)), isSub, project, parentThread)
@@ -905,7 +1161,15 @@ func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.
 	s.finalizeOpenAIUsage(reqIdx, threadID, project, estimatedTokens, msgCount, usage, fwdModel.Model, rlJSON)
 
 	// Fire forked agents (async, fire-and-forget) — same logic as proxy_forward.go.
-	if usage.Complete && usage.CacheReadInputTokens > 0 && !s.forkState.IsDisabled(threadID) && isRealUserSession(threadID) {
+	// A subagent request never reaches the fork state: it shares the parent's
+	// thread ID, so its tokens must not move the parent's baseline and its
+	// responses must not make the parent look cache-proven. isSub (stream
+	// attribution) knows fewer markers than ctx.Subagent, so the broader verdict
+	// is the one that counts here. Accepted consequence: a request that the
+	// pipeline already handles as a subagent (ctx.Subagent, e.g. a Haiku model)
+	// does not fork either, which matches the rest of the pipeline (see the
+	// early return in runOpenAIParityPipeline).
+	if !isSubagent && usage.Complete && usage.CacheReadInputTokens > 0 && !s.forkState.IsDisabled(threadID) && isRealUserSession(threadID) {
 		totalTokens := usage.TotalInputTokens()
 		cacheRatio := 0.0
 		if totalTokens > 0 {
@@ -916,9 +1180,15 @@ func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.
 		if hasCache {
 			s.forkState.MarkCacheWarm(threadID)
 		}
-		if hasCache && cacheProven && s.forkState.ShouldFork(threadID, totalTokens, hasCache) {
-			go s.fireForkedAgents(ForkContext{
-				OriginalBody:      body,
+		if hasCache && cacheProven && s.forkState.ShouldFork(threadID, totalTokens, hasCache, isSub) {
+			// The fork keeps the client's wire family: chat-completions bodies go
+			// out as they are, the Responses-shaped body of the /v1/responses
+			// adapter is translated to chat completions first. Cloning the
+			// Anthropic intermediate instead would send the body of one family to
+			// the endpoint and credentials of another (YM-262). Both the clone and
+			// the translation run in the goroutine: the client already has its
+			// response.
+			forkCtx := ForkContext{
 				AssistantResponse: textAccum.String(),
 				ThreadID:          threadID,
 				Project:           project,
@@ -929,12 +1199,27 @@ func (s *Server) forwardOpenAIWithTracking(w http.ResponseWriter, origReq *http.
 				LastExtractedIdx:  reqIdx - 2,
 				SessionID:         threadID,
 				AuthHeader:        origReq.Header,
-			}, s.forkConfigs)
+				SourceTarget:      targetURL,
+			}
+			go func() {
+				forkBody, forkFormat, err := forkCloneFor(body)
+				if err != nil {
+					s.logger.Printf("%s[req %d %s] fork: no cloneable body: %v%s",
+						colorOrange, reqIdx, journalToken(s.version), err, colorReset)
+					// ShouldFork marked this thread as pending; without a release
+					// no later request would ever fork again (fork_state.go).
+					s.forkState.RecordFailure(threadID)
+					return
+				}
+				forkCtx.OriginalBody, forkCtx.SourceFormat = forkBody, forkFormat
+				s.fireForkedAgents(forkCtx, s.forkConfigs)
+			}()
 		}
 	}
 
 	// NOTE: No keepalive reset here — OpenAI-format body would be rejected by Anthropic API.
-	// TTL detection is handled in finalizeOpenAIUsage via cacheTTLDetector.RecordResponse().
+	// TTL detection is handled in finalizeOpenAIUsage via s.recordCacheResponse, which
+	// also moves the cache-lifetime derivatives to the detected result.
 
 	if usage.Complete && textAccum.Len() > 0 && len(toolUseIDs) > 0 {
 		annotation := strings.TrimSpace(textAccum.String())
@@ -1035,7 +1320,7 @@ func (s *Server) finalizeOpenAIUsage(reqIdx int, threadID string, project string
 
 	if s.cacheStatusWriter != nil {
 		s.cacheStatusWriter.Update(time.Now(), usage.TotalInputTokens(), usage.CacheReadInputTokens, usage.CacheCreationInputTokens, threadID)
-		s.cacheStatusWriter.UpdateThresholdForThread(threadID, s.effectiveTokenThreshold(model))
+		s.cacheStatusWriter.UpdateThresholdForThread(threadID, s.effectiveTokenThreshold(threadID, model))
 		if raw := s.getRawEstimate(threadID); raw > 0 {
 			s.cacheStatusWriter.UpdateRawForThread(threadID, raw)
 		}
@@ -1043,17 +1328,7 @@ func (s *Server) finalizeOpenAIUsage(reqIdx int, threadID string, project string
 
 	// Feed TTL detector with cache hit/miss signal
 	if s.cacheTTLDetector != nil {
-		prevState := s.cacheTTLDetector.Is1hSupported()
-		s.cacheTTLDetector.RecordResponse(usage.CacheReadInputTokens, usage.CacheCreationInputTokens, 0)
-		newState := s.cacheTTLDetector.Is1hSupported()
-		if prevState == nil && newState != nil {
-			if *newState && s.frozenStubs != nil {
-				s.frozenStubs.UpdateTTL(sawtoothTTLForCacheTTL("1h"))
-			}
-			if s.cacheKeepalive != nil {
-				s.cacheKeepalive.Retrigger()
-			}
-		}
+		s.recordCacheResponse(threadID, usage.CacheReadInputTokens, usage.CacheCreationInputTokens, 0)
 	}
 
 	if threadID != "" {

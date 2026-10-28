@@ -20,7 +20,7 @@ This skill is the **discovery surface**. Side-files in this directory hold the d
 ## External references
 
 - **Cap-Spec (canonical format)**: `https://github.com/carsteneu/cap-spec` — treat as authoritative for CAP.md structure, frontmatter rules, and the v1.1 multi-script format. **Note**: spec.md is at v1.1-draft, but `cap-spec/examples/*/CAP.md` are still v1.0 — see `gotchas.md` "Cap-spec format drift" before copying.
-- **Working caps to copy from**: `caps/bundled-caps/wiki_export/CAP.md` (current, v1.1, ~16 KB embedded base64) and `caps/bundled-caps/reddit_fetch/` are the freshest in-repo references.
+- **Working caps to copy from**: `caps/bundled-caps/cap_collect/CAP.md` (current, v1.1) and `caps/bundled-caps/reddit/CAP.md` are the freshest in-repo references. `wiki_export` and `reddit_fetch` no longer ship as bundled caps, so their paths are dead.
 - **yesmem CLI for caps**: `yesmem query --format objects` (read-only SQL across `yesmem.db`/`messages.db`/`caps.db`/`runtime.db`, projection-wrapped JSON), `yesmem json` (gojq-style filter pipeline, no `--slurpfile`), `yesmem cap-blob-put` (chunked blob ingest, bypasses the 30 KB `sh()` wall). Bash-runtime caps wire these together — see `recipes.md` "Cap that pipes `yesmem query` into `yesmem json`" and `api-reference.md` "yesmem CLI surface for caps".
 
 ## When to build a cap
@@ -273,13 +273,14 @@ After superseding a schema, existing threads must re-`activate_cap` — proxy ca
 
 ## Bundled cap update lifecycle (CRITICAL)
 
-Bundled caps live at `caps/bundled-caps/<name>/CAP.md`. They are also persisted as a learnings row in `caps.db`. The daemon reads from DB at runtime, and **writes DB content back to disk on restart**. So:
+Bundled caps live at `caps/bundled-caps/<name>/CAP.md`. They are also persisted as a learnings row in `caps.db`. The daemon reads from DB at runtime, and **writes DB content back to disk on restart** unless a manifest entry vouches for the disk body. What decides a delivery is `derived_from_hash` in `manifest.yaml` (shipped as `caps/bundled-caps/manifest.yaml`, kept per installation as `<caps_dir>/manifest.yaml`), not the frontmatter `version:`, which is display only. The digest is `textutil.BodyDigest`: line endings and trailing newlines normalized, case and indentation kept. So:
 
 | Situation | Required step |
 |---|---|
-| Disk SHA = embedded SHA, DB = same version | edit `caps/bundled-caps/<name>/CAP.md` + `make deploy` is enough |
-| DB has a HIGHER version than source | edit the source AND call `save_cap` with the new body in parallel — otherwise the daemon restart overwrites your disk edit with the older DB version |
-| Source disagrees with disk after `make deploy` | DB-vs-disk write-back conflict. Diagnostic: `sha256sum caps/bundled-caps/<name>/CAP.md` vs `sha256sum ~/.claude/caps/<name>/CAP.md`; `grep '^version:' ~/.claude/caps/<name>/CAP.md`. If disk version > source version, DB wrote back. Fix via `save_cap`. |
+| Entry names the installed body, or the bundled body hashes like the installed one | the bundle is that body's successor. Edit `caps/bundled-caps/<name>/CAP.md`, then `make deploy` (builds the binary that carries the new source) and `yesmem migrate` (runs `InstallBundledCaps`). `make deploy` alone installs no cap: measured 2026-10-23, rocketchat stood at v15 before and after a deploy. No `version:` bump needed. |
+| No entry, and a body sits on disk | nothing vouches for the bundle: the installed body is kept and one conflict line names both hashes. Merge the installed body into the repo file, then record the installed digest as `derived_from_hash`. |
+| Entry names a different body | same conflict, same way out: reconcile the repo body with the installed one, then record the digest the line prints. Raising `version:` changes nothing. |
+| Installed copy disagrees with the DB row | the export (`WriteCapToDisk`) writes the row back when the row's version is above the copy and the row is the later state, but never over a delivery its own source is behind. Diagnostic: compare the file's digest with `~/.claude/caps/manifest.yaml`; `sha256sum` alone is misleading because the provenance digest normalizes line endings. If the file is the body you want to keep, make it official via `save_cap`. |
 
 This contradicts a previous note in the skill ("no manual save_cap needed for bundled cap update") — that was incomplete. See `gotchas.md` "DB write-back overrides disk edit".
 

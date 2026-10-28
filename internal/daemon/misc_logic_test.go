@@ -19,22 +19,14 @@ func TestFindProjectDir_Exact(t *testing.T) {
 	}
 }
 
+// The scan fallback that this test used to pin matched on the trailing name
+// segment only; YM-279 (Los 11f) removed it because it wrote into foreign
+// project directories. See memorymd_los11f_test.go for the replacement.
 func TestFindProjectDir_NotFound(t *testing.T) {
 	root := t.TempDir()
 	result := findProjectDir(root, "/nonexistent/path")
 	if result != "" {
 		t.Errorf("expected empty, got %q", result)
-	}
-}
-
-func TestFindProjectDir_FallbackScan(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "some-prefix-myproject")
-	os.MkdirAll(dir, 0755)
-
-	result := findProjectDir(root, "/some/path/myproject")
-	if result != dir {
-		t.Errorf("expected %q via scan fallback, got %q", dir, result)
 	}
 }
 

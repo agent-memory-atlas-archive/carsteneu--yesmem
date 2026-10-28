@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -364,5 +365,114 @@ func TestDecayContextTraitsSupersedesVeryOld(t *testing.T) {
 	trait, _ := s.GetPersonaTrait("default", "context", "session_count")
 	if trait != nil && !trait.Superseded {
 		t.Errorf("very old context trait should be superseded, got conf=%.2f superseded=%v", trait.Confidence, trait.Superseded)
+	}
+}
+
+// dedupVectorSpyProvider returns per-text vectors so similarity can be controlled.
+type dedupVectorSpyProvider struct {
+	vectors map[string][]float32
+}
+
+func (p *dedupVectorSpyProvider) Embed(_ context.Context, texts []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i, txt := range texts {
+		v, ok := p.vectors[txt]
+		if !ok {
+			return nil, fmt.Errorf("unexpected embed text %q", txt)
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+func (p *dedupVectorSpyProvider) Dimensions() int { return 2 }
+func (p *dedupVectorSpyProvider) Enabled() bool   { return true }
+func (p *dedupVectorSpyProvider) Close() error    { return nil }
+
+// YM-124: a trait that dedup already superseded must not displace further traits.
+func TestDedupPersonaTraits_DroppedTraitDoesNotDisplaceOthers(t *testing.T) {
+	_, s := mustHandler(t)
+
+	// Ordered by trait_key: aaa, bbb, ccc — all in the same dimension.
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "workflow", TraitKey: "aaa",
+		TraitValue: "a", Confidence: 0.9, Source: "auto_extracted", EvidenceCount: 5,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "workflow", TraitKey: "bbb",
+		TraitValue: "b", Confidence: 0.95, Source: "auto_extracted", EvidenceCount: 5,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "workflow", TraitKey: "ccc",
+		TraitValue: "c", Confidence: 0.5, Source: "auto_extracted", EvidenceCount: 5,
+	})
+
+	// cos(aaa,bbb)=0.8, cos(aaa,ccc)=0.8, cos(bbb,ccc)=0.28
+	spy := &dedupVectorSpyProvider{vectors: map[string][]float32{
+		"aaa a": {1, 0},
+		"bbb b": {0.8, 0.6},
+		"ccc c": {0.8, -0.6},
+	}}
+
+	dedupPersonaTraits(s, spy)
+
+	// aaa loses to bbb (higher confidence). ccc is NOT similar to the survivor bbb,
+	// so it must stay active — it was only similar to the already-dropped aaa.
+	active, _ := s.GetActivePersonaTraits("default", 0.0)
+	got := map[string]bool{}
+	for _, tr := range active {
+		got[tr.TraitKey] = true
+	}
+	if got["aaa"] {
+		t.Error("aaa should have been superseded (bbb has higher confidence)")
+	}
+	if !got["bbb"] {
+		t.Error("bbb should stay active")
+	}
+	if !got["ccc"] {
+		t.Error("ccc must stay active — it must not be dropped by an already-superseded trait")
+	}
+}
+
+// YM-118/YM-124: a protected (user_override) trait must not be treated as
+// superseded — dedup keeps comparing the pair and reports the real outcome.
+func TestDedupPersonaTraits_ProtectedTraitStaysActive(t *testing.T) {
+	_, s := mustHandler(t)
+
+	// aaa is user-owned (fewer evidence), bbb and ccc were auto-extracted.
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "workflow", TraitKey: "aaa",
+		TraitValue: "a", Confidence: 0.9, Source: "user_override", EvidenceCount: 1,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "workflow", TraitKey: "bbb",
+		TraitValue: "b", Confidence: 0.9, Source: "auto_extracted", EvidenceCount: 5,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "workflow", TraitKey: "ccc",
+		TraitValue: "c", Confidence: 0.5, Source: "auto_extracted", EvidenceCount: 5,
+	})
+
+	// cos(aaa,bbb)=0.8, cos(aaa,ccc)=0.8, cos(bbb,ccc)=0.28
+	spy := &dedupVectorSpyProvider{vectors: map[string][]float32{
+		"aaa a": {1, 0},
+		"bbb b": {0.8, 0.6},
+		"ccc c": {0.8, -0.6},
+	}}
+
+	dedupPersonaTraits(s, spy)
+
+	active, _ := s.GetActivePersonaTraits("default", 0.0)
+	got := map[string]bool{}
+	for _, tr := range active {
+		got[tr.TraitKey] = true
+	}
+	if !got["aaa"] {
+		t.Error("user_override trait must stay active")
+	}
+	if !got["bbb"] {
+		t.Error("bbb must stay active")
+	}
+	if got["ccc"] {
+		t.Error("ccc must still be superseded by the active aaa — a protected trait must not stop the comparison")
 	}
 }

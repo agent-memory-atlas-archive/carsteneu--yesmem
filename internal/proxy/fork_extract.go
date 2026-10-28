@@ -277,23 +277,24 @@ func NewExtractAndEvaluateConfig(model string) ForkConfig {
 		Name:      "extract_and_evaluate",
 		Model:     model,
 		MaxTokens: 3072,
-		// APIFormat is auto-detected from the actual model at runtime in fireForkedAgents.
-		// If the fork model is empty, it inherits from the main request — and the format
-		// is inferred from the inherited model name (deepseek → openai, claude → anthropic).
+		// The wire format is not fixed here: forkIsOpenAI resolves it from
+		// ForkContext.SourceFormat and, for callers that report none, from the
+		// model name (only the "deepseek" prefix counts as OpenAI-compatible). An
+		// empty fork model inherits the main request's model.
 		Gate: func(ctx ForkContext) bool {
 			return ctx.CacheReadTokens > 0
 		},
 		Prompt: extractAndEvaluatePrompt,
-	ParseResult: func(resp ForkResponse, s *Server) error {
-		result, err := parseExtractionJSON(resp.Content)
-		if err != nil {
-			preview := resp.Content
-			if len(preview) > 300 {
-				preview = preview[:300]
+		ParseResult: func(resp ForkResponse, s *Server) error {
+			result, err := parseExtractionJSON(resp.Content)
+			if err != nil {
+				preview := resp.Content
+				if len(preview) > 300 {
+					preview = preview[:300]
+				}
+				s.logger.Printf("[fork] extract_and_evaluate: parse error (%v), response preview: %s", err, preview)
+				return err
 			}
-			s.logger.Printf("[fork] extract_and_evaluate: parse error (%v), response preview: %s", err, preview)
-			return err
-		}
 
 			debugFork := s.cfg.ForkedAgentsDebug
 

@@ -82,6 +82,10 @@ func translateResponsesToAnthropic(req map[string]any) (map[string]any, error) {
 // Handles: role-based messages, function_call → assistant tool_use, function_call_output → user tool_result.
 func translateResponsesInputItems(items []any) []any {
 	var messages []any
+	// call id → tool name, filled from the function_call items. The output item
+	// names no tool, so the shell test (and with it the failure notice) needs the
+	// name of the call it answers.
+	toolNames := make(map[string]string)
 
 	for i := 0; i < len(items); i++ {
 		im, ok := items[i].(map[string]any)
@@ -106,6 +110,9 @@ func translateResponsesInputItems(items []any) []any {
 				callID, _ := call["call_id"].(string)
 				name, _ := call["name"].(string)
 				argsStr, _ := call["arguments"].(string)
+				if callID != "" && name != "" {
+					toolNames[callID] = name
+				}
 				var argsObj any
 				if json.Unmarshal([]byte(argsStr), &argsObj) != nil {
 					argsObj = map[string]any{}
@@ -136,11 +143,19 @@ func translateResponsesInputItems(items []any) []any {
 				}
 				callID, _ := call["call_id"].(string)
 				output, _ := call["output"].(string)
-				toolResults = append(toolResults, map[string]any{
+				result := map[string]any{
 					"type":        "tool_result",
 					"tool_use_id": callID,
 					"content":     output,
-				})
+				}
+				// The Responses format has no error field on an output: a failed
+				// shell call is only visible in the notice the client appends. Read
+				// it here, or every error-driven signal (loop detection, fixation,
+				// associatives) stays blind on this path.
+				isShell := classifyLoopTool(toolNames[callID]) == loopToolShell
+				explicit, _ := call["is_error"].(bool)
+				markToolResultError(result, explicit || (isShell && openAIToolResultIsError(output)))
+				toolResults = append(toolResults, result)
 				i++
 			}
 			messages = append(messages, map[string]any{

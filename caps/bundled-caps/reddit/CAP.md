@@ -1,7 +1,7 @@
 ---
 name: reddit
 description: "Reddit fetch + search + research bundle — fetch single posts (with comments + links), search across subreddits via RSS (www.reddit.com .rss, da old.reddit.com + .json fuer anonyme Requests seit 2026 gesperrt sind), multi-subreddit topic research with synthesis."
-version: 10
+version: 11
 tags: [reddit, fetch, search, research]
 requires: [store]
 scope: user
@@ -16,6 +16,8 @@ Reddit fetch + search + research bundle. Sources sind die anonym erreichbaren RS
 
 ### reddit_fetch
 kind: tool
+sandbox: standard
+allowed_hosts: www.reddit.com, old.reddit.com
 
 ```js
 async ({url, max_comments}) => {
@@ -143,6 +145,8 @@ async ({url, max_comments}) => {
 
 ### reddit_search
 kind: tool
+sandbox: standard
+allowed_hosts: www.reddit.com, old.reddit.com
 
 ```js
 async ({ query, limit = 25, sort = "relevance", t = "week", subreddit, after = "", classify = true }) => {
@@ -274,6 +278,8 @@ async ({ query, limit = 25, sort = "relevance", t = "week", subreddit, after = "
 
 ### reddit_research
 kind: tool
+sandbox: standard
+allowed_hosts: www.reddit.com, old.reddit.com
 
 ```js
 async ({ topic, subreddits, limit = 10, score_min = 2, fetch_top = 5, synthesize = true }) => {

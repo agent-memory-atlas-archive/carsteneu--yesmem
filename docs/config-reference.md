@@ -93,6 +93,8 @@ token_thresholds:
   haiku: 130000
   gpt-5: 180000
   codex: 180000
+  deepseek: 600000
+  glm-5.2: 500000
 ```
 
 ### Cache Keepalive
@@ -103,6 +105,7 @@ Prevents cache expiry during idle periods via periodic pings.
 |-----|------|---------|-------------|
 | `cache_keepalive_enabled` | bool | `true` | Send keepalive pings. |
 | `cache_keepalive_mode` | string | `5m` | `auto` (detect from response), `5m`, `1h`. |
+| `cache_keepalive_min_messages` | int | `10` | Do not ping a thread that has fewer messages than this. |
 | `cache_keepalive_pings_5m` | int | `5` | Pings per idle phase when TTL=5min. |
 | `cache_keepalive_pings_1h` | int | `1` | Pings per idle phase when TTL=1h. |
 
@@ -110,8 +113,9 @@ Prevents cache expiry during idle periods via periodic pings.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `code_nav_mode` | string | `block` | `block` (block Bash, suggest code-nav tools), `nudge` (hint only), `off`. |
-| `code_nav_dismiss_count` | int | `5` | Permanently disable after N dismissals. |
+| `code_nav_mode` | string | `block` | `block` (block shell/read navigation on indexed files, suggest code-nav tools), `nudge` (hint only), `off`. In `nudge` the call runs and the advice is prepended to its tool result; in `off` nothing is checked. Read case-insensitively, surrounding spaces are trimmed; an unknown value blocks. Both layers read it: the Claude Code PreToolUse hook and the opencode plugin's `code_nav` guard, which re-reads config.yaml at most once a minute. The 2-strike auto-allow and `dismiss_code_nav` apply in `block` only. |
+
+One `dismiss_code_nav` call lifts the block for the rest of the session; the threshold is not configurable. `code_nav_dismiss_count` is retired: the field stays in the struct only so an existing config.yaml is not reported as carrying an unknown key, and nothing reads it.
 
 ### Prompt Injections
 
@@ -130,9 +134,13 @@ Each injection can be toggled individually. Default: all `true` except as noted.
 | `prompt_delegation_contract` | bool | `true` | `[yesmem-delegation-contract]` Self-contained prompts + parallel dispatch. |
 | `prompt_clarify_first` | bool | `true` | `[yesmem-clarify-first]` Only clarify when alternative interpretations produce materially different work. |
 | `prompt_code_tools_first` | bool | `true` | `[yesmem-code-tools-first]` Prefer MCP code-navigation tools over agent spawns. |
+| `prompt_wiki_first` | bool | `true` | `[yesmem-wiki-first]` Check the project wiki before broad exploration. |
+| `prompt_fable` | bool | `true` | `[yesmem-fable]` Baseline/rollback/readback discipline for high-stakes changes. |
 | `prompt_pattern_suggest` | bool | `true` | Record repeated shell-command shapes for cap-suggestion analysis. |
 | `effort_floor` | string | `""` | Minimum effort level: `low`, `medium`, `high`, `max`. Empty = off. |
 | `skill_eval_inject` | string | `silent` | `true` (verbose eval output), `silent` (internal eval only), `false` (disabled). |
+
+`complete_provider` is **not** a `proxy:` key: it lives in the `llm:` section (`llm.complete_provider`) and overrides the provider for the `llm_complete` RPC (e.g. `opencode`); empty means the configured `llm.provider`.
 
 ### Profile-Aware Prompt Configuration
 
@@ -144,6 +152,8 @@ Replaces the deprecated flat prompt flags. Each pipeline gets its own prompt pro
 | `claude_prompt` | PromptProfile | `{}` | Claude Code override. Empty = inherit from shared_prompt. |
 | `codex_prompt` | PromptProfile | `{}` | Codex override. Empty = inherit from shared_prompt. |
 | `opencode_prompt` | PromptProfile | `{}` | OpenCode override. Empty = inherit from shared_prompt. |
+
+A key you write explicitly always wins, including an explicit `false`: `no`, `off` and `false` all count as a statement, so `beweislast: no` under `opencode_prompt` switches off an injection inherited from `shared_prompt`. Only keys you leave out inherit.
 
 ### Provider Auto-Discovery
 
@@ -159,13 +169,13 @@ Replaces the default system prompt with the SYSTEM.md template for supported pip
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `custom_system_prompt.enabled_opencode` | bool | `true` | Inject SYSTEM.md for OpenCode/DeepSeek/OpenAI-compatible pipelines. |
-| `custom_system_prompt.enabled_claude_code` | bool | `true` | Inject SYSTEM.md for Claude Code pipeline. Anthropic provides `--system-prompt` as official CLI flag. |
-| `custom_system_prompt.enabled_codex` | bool | `true` | Inject SYSTEM.md for Codex pipeline. |
+| `custom_system_prompt.enabled_claude_code` | bool | `false` | Inject SYSTEM.md for the Claude Code pipeline. |
+| `custom_system_prompt.enabled_codex` | bool | `false` | Inject SYSTEM.md for the Codex pipeline. |
 | `custom_system_prompt.template_path` | string | `~/.claude/yesmem/SYSTEM.md` | Path to the system prompt template file. |
 
 ### Per-Model Feature Gates
 
-Control which yesmem behavioral features are active per model/provider. Keys under `model_features` are model name prefixes matched case-insensitively (longest wins). Models not listed fall back to `feature_defaults`.
+Control which yesmem behavioral features are active per model/provider. Keys under `model_features` are model name prefixes matched case-insensitively (longest wins). A key a matching block does not name falls back to the same key under `feature_defaults`; a key the block does name wins, including a written `false`. Models not listed use `feature_defaults` for every key.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -174,9 +184,9 @@ Control which yesmem behavioral features are active per model/provider. Keys und
 | `model_features.<model>.rules_reminder` | bool | `true` | Periodic reminder of project rules/guidelines. |
 | `model_features.<model>.plan_checkpoint` | bool | `true` | Inject plan checkpoint reminders during long sessions. |
 | `model_features.<model>.think_reminder` | bool | `true` | Inject hybrid_search() hint to check memory before assuming. |
-| `model_features.<model>.think_reminder_min_chars` | int | `0` | Min user text length to trigger think_reminder. `0` = always. Set to `10` to skip short messages like "hi" or "ok". |
+| `model_features.<model>.think_reminder_min_chars` | int | `0` | Min user text length to trigger think_reminder. `0` = inherit from `feature_defaults` (there `0` = always). Set to `10` to skip short messages like "hi" or "ok". |
 | `model_features.<model>.timestamps` | bool | `true` | Inject [HH:MM:SS] [msg:N] [+Δ] markers for temporal awareness. |
-| `feature_defaults.<key>` | — | — | Same keys as above, used as fallback for unlisted models. |
+| `feature_defaults.<key>` | — | — | Same keys as above. Speaks for every key a matching model block does not name, and for every key of an unlisted model. |
 
 Example: per-model gates for DeepSeek with think_reminder gated at 10+ chars:
 
@@ -194,15 +204,13 @@ proxy:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | `local` | `local` (local model, no API call) or `api` (Anthropic/OpenAI embedding API). |
-| `local.model` | string | `multilingual-e5-small` | Local embedding model (384d vectors). |
-| `local.cache_dir` | string | `~/.claude/yesmem/models` | Model cache path. |
-| `vector_db.persist_dir` | string | `~/.claude/yesmem/vectors` | Vector persistence path. |
-| `vector_db.collection` | string | `learnings` | Collection name. |
-| `search.method` | string | `""` | Search method (empty = hybrid). |
-| `search.ivf_threshold` | int | `5000` | Switch to IVF index above N vectors. |
+| `provider` | string | `sse` | `sse` (Stable Static Embeddings, 512d, embedded in the binary), `static` or `none`. There is no `local`/`api` provider and no `local.*` or `vector_db.*` section. |
+| `search.method` | string | `""` | Search method (empty = auto: brute force, or IVF above the threshold). |
+| `search.ivf_threshold` | int | `50000` | Switch to the IVF index above N vectors. |
 | `search.ivf.k` | int | `0` | IVF cluster count (`0` = auto sqrt). |
 | `search.ivf.nprobe` | int | `15` | IVF cluster search breadth. |
+
+The vector store path is fixed at `~/.claude/yesmem/vectors/`; it is not configurable. Dimensions are fixed at 512 for the `sse` provider (the model is embedded, not downloaded).
 
 ---
 
@@ -220,10 +228,10 @@ proxy:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable signal reflection. When off, signal tools are not injected. |
-| `mode` | string | `reflection` | `reflection` = separate async API call. |
-| `model` | string | `sonnet` | Model for reflection calls (haiku is sufficient for classification). |
-| `every_n_turns` | int | `1` | Reflection every N end-turn responses. `1` = every turn. |
+| `enabled` | bool | `true` | Gate for the inline reflection. When off, no signals are scanned at all. |
+| `mode` | string | `reflection` | Inert — configured the removed async reflection call; kept so old files parse. |
+| `model` | string | `haiku` | Inert — same reason. |
+| `every_n_turns` | int | `1` | Inert — same reason. |
 
 ---
 
@@ -254,7 +262,7 @@ max_per_category:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `true` | Start HTTP listener. |
+| `enabled` | bool | `false` | Start HTTP listener. |
 | `listen` | string | `127.0.0.1:9377` | Listen address. |
 | `auth_token` | string | `""` | Bearer token (empty = auto-generated). |
 
@@ -322,10 +330,14 @@ Pass `?gc=1` to sample from live data — it triggers a real garbage collection 
 |-----|------|---------|-------------|
 | `terminal` | string | `""` | Preferred terminal: `ghostty`, `kitty`, `gnome-terminal`, `alacritty`, `wezterm`, `xterm`. Empty = auto-detect. |
 | `viewer_terminal` | string | `""` | Terminal for displaying agent sessions. Falls back to `terminal`. |
-| `max_runtime` | string | `""` | Max runtime per agent (Go duration: `30m`, `1h`). Empty = 30m default. |
+| `default_backend` | string | `claude` | Backend for spawned agents: `claude` or `opencode`. |
+| `max_runtime` | string | `""` | Max runtime per agent (Go duration: `30m`, `1h`). Empty = **48h** default. Read at daemon start; there is no hot reload. |
 | `max_turns` | int | `0` | Max relay turns per agent. `0` = 30 default. |
 | `max_depth` | int | `0` | Max spawn depth (agent → sub-agent). `0` = 3 default. |
-| `token_budget` | int | `0` | Max tokens per agent (input+output). `0` = 500000 default. Overridable per spawn. |
+| `permission_kick` | bool | `true` | Send a double Enter when an agent sits in a permission dialog. **This grants the pending permission**: the Enter confirms the dialog's default selection ("Allow once"). It is a no-op only on the TUI's empty input line; in an interactive child process the Enter hits that process's default. |
+| `permission_kick_delay` | string | `3m` | Stream-inactivity before the first kick (empty = 3m). |
+| `permission_kick_interval` | string | `5m` | Re-kick interval (empty = 5m). |
+| `token_budget` | int | `0` | Max output tokens per agent. `0` = no limit (the default is no limit, not a number). Overridable per spawn. |
 | `themes` | map | `{}` | Agent type → opencode TUI theme for spawned agents (e.g. `yesloop: yesmem-loop`). Empty value disables the type's theme. See [agents.themes](#agentsthemes--agent-tui-themes). |
 
 ### agents.themes — Agent TUI Themes
@@ -391,12 +403,14 @@ agents:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `true` | Enable forked-agent feature. |
-| `model` | string | `""` | Forked-agent model (empty = same model as main thread). |
-| `token_growth_trigger` | int | `30000` | Token growth that triggers a fork. |
-| `max_forks_per_session` | int | `0` | Max forks per session. `0` = unlimited. |
-| `max_cost_per_session` | float64 | `0` | Max cost per session (USD). `0` = no limit. |
+| `enabled` | bool | `false` | Enable forked-agent feature. Off by default. |
+| `model` | string | `sonnet` | Forked-agent model (empty = same model as the main thread). |
+| `token_growth_trigger` | int | `20000` | Token growth that triggers a fork. |
+| `max_forks_per_session` | int | `50` | Max forks per session. `0` = unlimited. |
+| `max_cost_per_session` | float64 | `5.0` | Max cost per session (USD). `0` = no limit. |
 | `debug` | bool | `false` | Debug logging for forked-agent requests. |
+
+A hardcoded absolute floor of 60000 tokens (`minTotalTokens` in `internal/proxy/proxy.go`) applies on top of `token_growth_trigger` and is not configurable.
 
 ---
 
@@ -404,10 +418,10 @@ agents:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `true` | Enable secret redaction (LLM input/output + persisted bash outputs). |
+| `enabled` | bool | `false` | Enable secret redaction (LLM input/output + persisted bash outputs). |
 | `allowed_exceptions` | []string | `[]` | List of strings that bypass redaction (full match, not substring). |
 
-**Important:** `allowed_exceptions` matches the **entire** pattern match, not substrings. Template patterns (`aws_secret_access_key`, `password_in_url`) ignore exceptions entirely — those patterns must be removed from the redactor if suppression is needed.
+**Important:** `allowed_exceptions` matches the **entire** pattern match, not substrings. That rule also holds for the template patterns (`aws_secret_access_key`, `password_in_url`, `generic_api_key`), where only part of the match would be replaced: an exception is compared against the full match, and the allowlisted text is shielded from the remaining patterns. A later pattern can still match that text together with its surrounding context, which loses text but never leaks it.
 
 ---
 
@@ -423,6 +437,8 @@ Per-million-token pricing for budget tracking. Configurable without rebuild.
 | `gpt-5-mini` | `{input, output}` | 0.25 / 2.0 |
 | `gpt-5.2` | `{input, output}` | 1.75 / 14.0 |
 | `gpt-5.4` | `{input, output}` | 2.5 / 15.0 |
+| `deepseek-v4-flash` | `{input, output}` | 0.14 / 0.56 |
+| `deepseek-v4-pro` | `{input, output}` | 0.28 / 1.12 |
 
 ---
 

@@ -38,8 +38,8 @@ Every YesLoop run moves through the same six phases. The agent does this itself,
 2. **PLAN** — write a concrete implementation plan, store it via `set_plan()` so it survives context collapse
 3. **EXECUTE** — work through plan steps one at a time with per-step drift checks, commit after each logical unit
 4. **VERIFY** — full test suite + type checks + lint + golden path + edge cases; loops back to Phase 3 on failure
-5. **REVIEW** — two-stage: inline self-review, then cold review via `task()` subagent. All findings must be fixed autonomously
-6. **FINISH** — merge to main, push, deploy (if Go code changed), sync bundled skill to live skill, `send_to` orchestrator
+5. **REVIEW** — four sub-phases, each with its own evidence: 5.1 self-review (the agent), then 5.2 cold code review, 5.3 consequence & intent and 5.4 security review, each as a separate `task()` subagent with its own `ses_` id. All findings must be fixed autonomously
+6. **FINISH** — commit on the agent's own branch, push that branch (and open a PR if configured), report DONE with the commit hash, `send_to` orchestrator. No merge to main, no deploy: those belong to the orchestrator
 
 ## Phase-Completion Guarantee
 

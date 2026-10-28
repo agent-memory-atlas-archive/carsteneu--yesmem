@@ -262,7 +262,6 @@ func TestBypass_PassesThroughUnmodified(t *testing.T) {
 		httpClient:  backend.Client(),
 		logger:      createTestLogger(),
 		annotations: make(map[string]string),
-		decay:       NewDecayTracker(),
 		narratives:  make(map[string]*Narrative),
 	}
 

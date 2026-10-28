@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/wikidir"
 )
 
 // --- StripOutputEfficiency ---
@@ -861,7 +864,7 @@ func TestInjectWikiFirst_AddsBlock(t *testing.T) {
 		},
 	}
 
-	InjectWikiFirst(req, "")
+	InjectWikiFirst(req, "", "")
 
 	blocks := req["system"].([]any)
 	if len(blocks) != 2 {
@@ -888,7 +891,7 @@ func TestInjectWikiFirst_AddsBlockWithProject(t *testing.T) {
 		},
 	}
 
-	InjectWikiFirst(req, "/home/user/projects/yesmem")
+	InjectWikiFirst(req, "/home/user/projects/yesmem", "~/.claude/yesmem/wiki/yesmem")
 
 	blocks := req["system"].([]any)
 	if len(blocks) != 2 {
@@ -903,6 +906,55 @@ func TestInjectWikiFirst_AddsBlockWithProject(t *testing.T) {
 	}
 	if !strings.Contains(text, "/home/user/projects/yesmem") {
 		t.Errorf("block should contain project path: %s", text)
+	}
+}
+
+// Regression YM-6: the directive must name the concrete wiki directory, not the
+// literal placeholder <project> — agents read this path and open it.
+func TestInjectWikiFirst_NamesConcreteWikiDir(t *testing.T) {
+	req := map[string]any{
+		"system": []any{
+			map[string]any{"type": "text", "text": "You are Claude."},
+		},
+	}
+
+	InjectWikiFirst(req, "/home/user/projects/yesmem", "~/.claude/yesmem/wiki/yesmem")
+
+	blocks := req["system"].([]any)
+	text, _ := blocks[1].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "wiki/yesmem/files/<path>.md") {
+		t.Errorf("block should name the concrete wiki dir for the project: %s", text)
+	}
+	if strings.Contains(text, "wiki/<project>") {
+		t.Errorf("block still contains the <project> placeholder: %s", text)
+	}
+}
+
+// Regression/cold-review F2: the directive must name the directory the writer
+// rendered into, including the collision-suffixed one.
+func TestWikiDir_ResolvesCollisionMarker(t *testing.T) {
+	dataDir := t.TempDir()
+	root := wikidir.Root(dataDir)
+	projects := []string{"/a/samename", "/z/samename"}
+	names := wikidir.AssignNames(root, projects)
+	for _, p := range projects {
+		if err := wikidir.WriteMarker(filepath.Join(root, names[p]), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := &Server{cfg: Config{DataDir: dataDir}}
+	for _, p := range projects {
+		want := filepath.Join(root, names[p])
+		if got := s.wikiDir(p); got != want {
+			t.Errorf("wikiDir(%s) = %q, want %q", p, got, want)
+		}
+	}
+	if s.wikiDir("/a/samename") == s.wikiDir("/z/samename") {
+		t.Error("both projects were sent to the same wiki directory")
+	}
+	if got := s.wikiDir(""); got != "" {
+		t.Errorf("wikiDir(\"\") = %q, want an empty fallback", got)
 	}
 }
 

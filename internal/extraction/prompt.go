@@ -3,6 +3,8 @@ package extraction
 import (
 	"strings"
 	"time"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // germanWeekday returns the German name for a weekday.
@@ -90,6 +92,10 @@ Categories:
    - "idea": Consideration or suggestion, no plan yet (was discussed but not committed)
    - "blocked": Waiting on external precondition (other feature, dependency, person)
    - "stale": Session was abandoned, unclear if still relevant
+   Keep the ticket key (for example YM-123) or the learning id in the content
+   when the task itself names one: a commit closes an open task only when its
+   subject carries that key or id, so a task saved without one can never be
+   closed by a commit. Do not add a key the task does not already reference.
    For time promises ("I'll do it tomorrow", "done by Friday", "I'll take care of it next week"):
    - Set "trigger" to "deadline:YYYY-MM-DD" (absolute date, converted from today)
    - Set "importance" to at least 4
@@ -333,7 +339,7 @@ func DistillationSchema() map[string]any {
 					"type": "object",
 					"properties": map[string]any{
 						"distilled_text": map[string]any{"type": "string"},
-						"category":       map[string]any{"type": "string"},
+						"category":       map[string]any{"type": "string", "enum": models.DistillableCategoryNames()},
 						"supersedes_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
 						"reason":         map[string]any{"type": "string"},
 					},

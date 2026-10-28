@@ -4,8 +4,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
+	"github.com/carsteneu/yesmem/internal/storage"
 )
 
 func TestHandle_Ping(t *testing.T) {
@@ -25,7 +27,29 @@ func TestHandle_UnknownMethod(t *testing.T) {
 }
 
 func TestHandle_UpdateFixationRatio(t *testing.T) {
-	t.Skip("fixation_ratio column not in test schema migration")
+	h, s := mustHandler(t)
+	if err := s.UpsertSession(&models.Session{ID: "sess-fix", Project: "/proj", StartedAt: time.Now()}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	resp := h.Handle(Request{
+		Method: "update_fixation_ratio",
+		Params: map[string]any{"session_id": "sess-fix", "fixation_ratio": 0.5},
+	})
+	if resp.Error != "" {
+		t.Fatalf("update fixation ratio: %s", resp.Error)
+	}
+	if m := resultMap(t, resp); m["status"] != "ok" {
+		t.Errorf("status = %q, want ok", m["status"])
+	}
+
+	ratio, err := s.GetSessionFixationRatio("sess-fix")
+	if err != nil {
+		t.Fatalf("read fixation ratio: %v", err)
+	}
+	if ratio != 0.5 {
+		t.Errorf("fixation ratio = %v, want 0.5", ratio)
+	}
 }
 
 func TestHandle_UpdateFixationRatio_MissingSession(t *testing.T) {
@@ -162,17 +186,121 @@ func TestResolveProjectParam(t *testing.T) {
 	_ = resolved // just ensure no panic
 }
 
+// The session behind a short project name must come from the caller. Under
+// opencode v2 neither the shared service PID (which stands for whichever session
+// registered last) nor a leaked process environment id (which names another
+// session) may decide it. The basename is deliberately ambiguous: the name
+// cannot be resolved on its own, so only a foreign session could pick one.
+func TestResolveProjectParam_ForeignSessionDoesNotSupplyTheProject(t *testing.T) {
+	h := mustHandlerWithAmbiguousProbeProjects(t)
+
+	cases := []struct {
+		name   string
+		params map[string]any
+	}{
+		{"shared service PID", map[string]any{
+			"_source_agent": "opencode", "_caller_pid": float64(opencodeSharedServicePID),
+		}},
+		{"leaked environment id", map[string]any{
+			"_session_id": "opencode:ses_ENVLEAK", "_session_id_source": "env",
+			"_source_agent": "opencode", "_caller_pid": float64(opencodeSharedServicePID),
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			params := map[string]any{"project": "probe"}
+			for k, v := range c.params {
+				params[k] = v
+			}
+			resolved := h.resolveProjectParam(params)
+			if got := resolved["project"]; got != "probe" {
+				t.Fatalf("project = %v, want the ambiguous name to stay unresolved instead of taking another session's project", got)
+			}
+		})
+	}
+}
+
+// A caller whose own session is known keeps its project resolution: the
+// guards above must not disable the session-derived path in general.
+func TestResolveProjectParam_PerCallSessionSuppliesTheProject(t *testing.T) {
+	h := mustHandlerWithAmbiguousProbeProjects(t)
+
+	resolved := h.resolveProjectParam(map[string]any{
+		"project": "probe", "_session_id": "opencode:ses_LASTREG", "_source_agent": "opencode",
+	})
+	if got := resolved["project"]; got != "/elsewhere/probe" {
+		t.Fatalf("project = %v, want the caller's own session project", got)
+	}
+}
+
 func TestInjectExcludeSession(t *testing.T) {
+	h, _ := mustHandler(t)
 	params := map[string]any{"_session_id": "my-session"}
-	injectExcludeSession(params)
+	h.injectExcludeSession(params)
 	if params["exclude_session"] != "my-session" {
 		t.Errorf("expected _session_id propagated to exclude_session")
 	}
 }
 
+// An id the MCP layer took from the shared service environment names another
+// session: excluding it would hide a foreign session's learnings and keep the
+// caller's own — so the caller is identified from its working directory instead.
+func TestInjectExcludeSession_UsesCallerDirectoryForLeakedEnvironmentID(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	const worktree = "/worktrees/exclude-cwd"
+	newStoredAgent(t, h, storage.Agent{
+		ID: "agent-exclude", Project: "/repo/exclude", Section: "exclude-sec",
+		SessionID: "opencode:ses_mine", Status: "running", Backend: "opencode",
+		OpencodeSessionID: "ses_mine",
+	})
+	seedRootSession(t, worktree, "ses_mine")
+
+	params := map[string]any{
+		"_session_id": "opencode:ses_FOREIGN", "_session_id_source": "env",
+		"_source_agent": "opencode", "_caller_pid": float64(opencodeSharedServicePID),
+		"_cwd": worktree,
+	}
+	h.injectExcludeSession(params)
+	if params["exclude_session"] != "opencode:ses_mine" {
+		t.Errorf("exclude_session = %v, want the caller's own session from its directory", params["exclude_session"])
+	}
+}
+
+// Without a directory that identifies the caller, a leaked id still excludes
+// nothing rather than somebody else's session.
+func TestInjectExcludeSession_LeakedIDWithoutDirectoryExcludesNothing(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	params := map[string]any{
+		"_session_id": "opencode:ses_FOREIGN", "_session_id_source": "env",
+		"_source_agent": "opencode", "_caller_pid": float64(opencodeSharedServicePID),
+	}
+	h.injectExcludeSession(params)
+	if got, exists := params["exclude_session"]; exists {
+		t.Errorf("exclude_session = %v, want it unset for a leaked environment id", got)
+	}
+}
+
+// A session the caller named itself keeps the exclusion, even with the shared
+// service PID in play.
+func TestInjectExcludeSession_KeepsInjectedSession(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	params := map[string]any{
+		"_session_id": "opencode:ses_mine", "_source_agent": "opencode",
+		"_caller_pid": float64(opencodeSharedServicePID),
+	}
+	h.injectExcludeSession(params)
+	if params["exclude_session"] != "opencode:ses_mine" {
+		t.Errorf("exclude_session = %v, want the caller's own session", params["exclude_session"])
+	}
+}
+
 func TestInjectExcludeSession_NoSessionID(t *testing.T) {
+	h, _ := mustHandler(t)
 	params := map[string]any{"query": "test"}
-	injectExcludeSession(params)
+	h.injectExcludeSession(params)
 	if _, ok := params["exclude_session"]; ok {
 		t.Error("should not set exclude_session when no _session_id")
 	}
@@ -375,14 +503,19 @@ func TestResolveProjectParam_AmbiguousWithCwdScopedCached(t *testing.T) {
 	// Invalidate — both the scoped error and any other entries are cleared.
 	h.InvalidateProjectCache()
 
-	// Call 4: after invalidation, same cwd → fresh DB lookup, 0 candidates, passthrough.
+	// Call 4: after invalidation, same cwd → fresh DB lookup, 0 candidates. The name
+	// resolves to nothing and the cwd does not carry it, so the value is empty and
+	// marked unresolved: nothing may be written under a basename (YM-300).
 	params = map[string]any{"project": "dupname", "_cwd": "/unrelated"}
 	resolved = h.resolveProjectParam(params)
 	if _, ok := resolved["_project_error"]; ok {
 		t.Errorf("call 4: stale error survived invalidation")
 	}
-	if resolved["project"] != "dupname" {
-		t.Errorf("call 4: expected passthrough 'dupname' after invalidation, got %q", resolved["project"])
+	if resolved["project"] != "" {
+		t.Errorf("call 4: expected the unresolved empty value after invalidation, got %q", resolved["project"])
+	}
+	if resolved["_project_unresolved"] != "dupname" {
+		t.Errorf("call 4: expected the unresolved marker to name %q, got %v", "dupname", resolved["_project_unresolved"])
 	}
 }
 
@@ -412,14 +545,18 @@ func TestInvalidateProjectCache(t *testing.T) {
 		t.Fatalf("delete sessions: %v", err)
 	}
 
-	// After invalidation + DB change: should get passthrough (0 candidates)
+	// After invalidation + DB change: the fresh lookup finds nothing, and the cwd
+	// does not carry the name, so the value is empty and marked unresolved.
 	params = map[string]any{"project": "cachedproj", "_cwd": "/tmp/anywhere"}
 	resolved = h.resolveProjectParam(params)
 	if resolved["project"] == "/tmp/cachedproj" {
 		t.Errorf("cache was not invalidated — returned stale /tmp/cachedproj after DB delete")
 	}
-	if resolved["project"] != "cachedproj" {
-		t.Errorf("expected passthrough 'cachedproj' after invalidation + DB delete, got %q", resolved["project"])
+	if resolved["project"] != "" {
+		t.Errorf("expected the unresolved empty value after invalidation + DB delete, got %q", resolved["project"])
+	}
+	if resolved["_project_unresolved"] != "cachedproj" {
+		t.Errorf("expected the unresolved marker to name %q, got %v", "cachedproj", resolved["_project_unresolved"])
 	}
 }
 

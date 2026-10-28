@@ -6,7 +6,7 @@ import (
 )
 
 func TestRecordReplPattern_NewInsert(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "abc123", "sqlite3 db DELETE", ""); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestRecordReplPattern_NewInsert(t *testing.T) {
 }
 
 func TestRecordReplPattern_StoresMatchedCap(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h1", "sqlite3 caps.db SELECT FROM cap_reddit__posts", "reddit"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestRecordReplPattern_StoresMatchedCap(t *testing.T) {
 }
 
 func TestRecordReplPattern_BackfillsMatchedCapOnConflict(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h1", "first", ""); err != nil {
 		t.Fatalf("first Record: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestRecordReplPattern_BackfillsMatchedCapOnConflict(t *testing.T) {
 }
 
 func TestGetReadyReplPatternSuggestionForActiveCaps_OnlyMatchingActive(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h-reddit", "cap_reddit__posts", "reddit"); err != nil {
 		t.Fatalf("Record reddit: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestGetReadyReplPatternSuggestionForActiveCaps_OnlyMatchingActive(t *testin
 }
 
 func TestGetReadyReplPatternSuggestionForActiveCaps_SkipsInactive(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h-telegram", "cap_telegram__updates", "telegram"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestGetReadyReplPatternSuggestionForActiveCaps_SkipsInactive(t *testing.T) 
 }
 
 func TestGetReadyReplPatternSuggestionForActiveCaps_SkipsEmptyMatchedCap(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h-empty", "git status", ""); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestGetReadyReplPatternSuggestionForActiveCaps_SkipsEmptyMatchedCap(t *test
 }
 
 func TestGetReadyReplPatternSuggestionForActiveCaps_EmptyActiveListReturnsNil(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h-reddit", "cap_reddit__posts", "reddit"); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestGetReadyReplPatternSuggestionForActiveCaps_EmptyActiveListReturnsNil(t 
 }
 
 func TestRecordReplPattern_IncrementExisting(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for i := 0; i < 3; i++ {
 		if err := s.RecordReplPattern("proj", "h1", "cmd", ""); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
@@ -151,7 +151,7 @@ func TestRecordReplPattern_IncrementExisting(t *testing.T) {
 }
 
 func TestGetReadyReplPatternSuggestion_UnderThreshold(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordReplPattern("proj", "h", "cmd", ""); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestGetReadyReplPatternSuggestion_UnderThreshold(t *testing.T) {
 }
 
 func TestGetReadyReplPatternSuggestion_MarksSuggestedOnce(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for i := 0; i < 5; i++ {
 		s.RecordReplPattern("proj", "h", "cmd", "")
 	}
@@ -186,7 +186,7 @@ func TestGetReadyReplPatternSuggestion_MarksSuggestedOnce(t *testing.T) {
 }
 
 func TestGetReadyReplPatternSuggestion_RespectsProjectPartition(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for i := 0; i < 5; i++ {
 		s.RecordReplPattern("proj-a", "h", "cmd", "")
 	}
@@ -200,7 +200,7 @@ func TestGetReadyReplPatternSuggestion_RespectsProjectPartition(t *testing.T) {
 }
 
 func TestDismissReplPattern_ResetsCountAndClearsSuggested(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for i := 0; i < 5; i++ {
 		s.RecordReplPattern("proj", "h", "cmd", "")
 	}
@@ -229,7 +229,7 @@ func TestDismissReplPattern_ResetsCountAndClearsSuggested(t *testing.T) {
 }
 
 func TestDismissReplPattern_ThreeTimesSetsPermanent(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for cycle := 0; cycle < 3; cycle++ {
 		if err := s.RecordReplPattern("proj", "h", "cmd", ""); err != nil {
 			t.Fatalf("Record cycle %d: %v", cycle, err)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/bloom"
+	"github.com/carsteneu/yesmem/internal/codescan"
 	"github.com/carsteneu/yesmem/internal/embedding"
 	"github.com/carsteneu/yesmem/internal/extraction"
 	"github.com/carsteneu/yesmem/internal/indexer"
@@ -22,6 +23,105 @@ import (
 
 func timeNow() time.Time { return time.Now() }
 
+// SetAutoCorrectClient wires the client the failed-bash-job pass asks. The
+// daemon constructs it in its async startup goroutine, which runs while the
+// heartbeat already ticks, so the write is guarded — the pass has to be able to
+// tell "not wired yet" from "wired" without a data race.
+func (h *Handler) SetAutoCorrectClient(c extraction.LLMClient) {
+	h.autoCorrectClientMu.Lock()
+	h.autoCorrectClient = c
+	h.autoCorrectClientMu.Unlock()
+}
+
+// autoCorrectLLM returns the auto-correct client, or nil while it is not wired.
+func (h *Handler) autoCorrectLLM() extraction.LLMClient {
+	h.autoCorrectClientMu.Lock()
+	defer h.autoCorrectClientMu.Unlock()
+	return h.autoCorrectClient
+}
+
+// llmWiring is the LLM client set and the provider routing the daemon
+// publishes once at startup.
+//
+// The publishing goroutine (daemon.go) runs while RPC handlers and the periodic
+// jobs — rules refresh, staleness tick, llm_complete — already read. Every
+// access goes through llmMu: llm_complete must see the clients and the routing
+// as one consistent set, and a client is an interface value (two words), so an
+// unguarded reader can catch a write in flight and see a mismatched pair.
+type llmWiring struct {
+	summarize        extraction.LLMClient
+	quality          extraction.LLMClient
+	commitEval       extraction.LLMClient
+	provider         string // e.g. "opencode", "api", "openai"
+	completeProvider string // override for llm_complete (empty = use provider)
+	baseURL          string
+	overrideClient   func(provider, model string) (extraction.LLMClient, error)
+}
+
+// SetSummarizeClient wires the lightweight client for rules condensation and
+// doc destillation.
+func (h *Handler) SetSummarizeClient(c extraction.LLMClient) {
+	h.llmMu.Lock()
+	h.llm.summarize = c
+	h.llmMu.Unlock()
+}
+
+// SetQualityClient wires the client for quality tasks (rules condensation,
+// narratives, llm_complete default).
+func (h *Handler) SetQualityClient(c extraction.LLMClient) {
+	h.llmMu.Lock()
+	h.llm.quality = c
+	h.llmMu.Unlock()
+}
+
+// SetCommitEvalClient wires the client for commit-triggered staleness work.
+func (h *Handler) SetCommitEvalClient(c extraction.LLMClient) {
+	h.llmMu.Lock()
+	h.llm.commitEval = c
+	h.llmMu.Unlock()
+}
+
+// SetLLMRouting publishes the provider settings of the llm_complete RPC and the
+// factory for a call that overrides model or provider. The factory is built by
+// the daemon from newDaemonLLMClient with the same tracker, api gate and
+// per-call cap as its own paths, so an override cannot bypass the budget.
+func (h *Handler) SetLLMRouting(provider, completeProvider, baseURL string, override func(provider, model string) (extraction.LLMClient, error)) {
+	h.llmMu.Lock()
+	h.llm.provider = provider
+	h.llm.completeProvider = completeProvider
+	h.llm.baseURL = baseURL
+	h.llm.overrideClient = override
+	h.llmMu.Unlock()
+}
+
+// llmSnapshot returns the published wiring as one consistent set.
+func (h *Handler) llmSnapshot() llmWiring {
+	h.llmMu.RLock()
+	defer h.llmMu.RUnlock()
+	return h.llm
+}
+
+// summarizeLLM returns the summarize client, or nil while it is not wired.
+func (h *Handler) summarizeLLM() extraction.LLMClient {
+	h.llmMu.RLock()
+	defer h.llmMu.RUnlock()
+	return h.llm.summarize
+}
+
+// qualityLLMClient returns the quality client, or nil while it is not wired.
+func (h *Handler) qualityLLMClient() extraction.LLMClient {
+	h.llmMu.RLock()
+	defer h.llmMu.RUnlock()
+	return h.llm.quality
+}
+
+// commitEvalLLM returns the staleness client, or nil while it is not wired.
+func (h *Handler) commitEvalLLM() extraction.LLMClient {
+	h.llmMu.RLock()
+	defer h.llmMu.RUnlock()
+	return h.llm.commitEval
+}
+
 // onMutation triggers post-mutation side effects (MEMORY.md regeneration).
 // No-op when OnMutation is nil (e.g. in tests).
 func (h *Handler) onMutation() {
@@ -30,11 +130,32 @@ func (h *Handler) onMutation() {
 	}
 }
 
+// embedWiring is the vector-search wiring the daemon publishes while requests
+// are already running: the indexer, the vector store and the indexing provider
+// come from the async startup goroutine, the dedicated query provider from a
+// second one, the IVF path is read on shutdown, and the queue is created when
+// the embed worker starts.
+//
+// Every access goes through embedMu. hybrid_search, vector_search, the docs
+// removal path, reload_vectors and SaveIVF all read this set, and a provider is
+// an interface value (two words), so an unguarded reader can catch a write in
+// flight. Without the guard the race detector reports a DATA RACE on ivfPath
+// and on the provider fields (YM-432).
+type embedWiring struct {
+	indexer        *embedding.Indexer
+	vectorStore    *embedding.VectorStore
+	embedProvider  embedding.Provider
+	searchProvider embedding.Provider
+	ivfPath        string
+	queue          chan embedJob
+}
+
 // Handler processes socket requests using the daemon's resources.
 type Handler struct {
 	store                       *storage.Store
 	bloom                       *bloom.Manager
 	dataDir                     string        // ~/.claude/yesmem/ — set by daemon after construction
+	capsDir                     string        // CAP.md directory the daemon imports from — set by daemon from config
 	agentTerminal               string        // preferred terminal for agent windows — set by daemon from config
 	agentMaxRuntime             time.Duration // max runtime per agent — set by daemon from config
 	scheduler                   *Scheduler
@@ -48,18 +169,17 @@ type Handler struct {
 	agentThemes                 map[string]string  // agent type → TUI theme — set by daemon from config (agents.themes)
 	disableAgentProcesses       bool               // test guard; production default remains false
 	defaultSandboxProfile       SandboxProfile     // default sandbox for scheduled jobs — set by daemon from config
+	sandboxDefaultSet           bool               // config carried a default_sandbox_profile (none is a valid value)
+	proxyForwardPort            int                // proxy loopback port relayed into a 2.x sandbox — set by daemon from config (proxy.listen)
 	httpRPCAddr                 string             // HTTP API listen address for bun MCP polyfill (e.g. 127.0.0.1:9377)
 	httpAuthToken               string             // bearer token for HTTP API authentication
 	redactor                    sanitize.Sanitizer // optional; nil = passthrough
 	ocDBPath                    string             // opencode session DB for Phase 5 evidence checks — set by daemon from config
 
-	// Optional: vector search (set via SetEmbedding)
-	indexer             *embedding.Indexer
-	vectorStore         *embedding.VectorStore
-	embedProvider       embedding.Provider
-	searchEmbedProvider embedding.Provider
-	embedQueue          chan embedJob
-	ivfPath             string
+	// Optional: vector search, published at startup through the setters in
+	// handler_hybrid.go (guarded by embedMu, see embedWiring)
+	embedMu sync.RWMutex
+	embed   embedWiring
 
 	// IndexProgress returns current indexing status (set by daemon)
 	IndexProgress func() (total, done, skipped int, running bool)
@@ -76,6 +196,12 @@ type Handler struct {
 	headlessSessionsMu sync.Mutex
 	headlessSessions   map[string]string // jobID -> sessionID (in-memory, lost on restart)
 
+	// Runs that are in flight, keyed the way their working directory is keyed.
+	// The directory sweep must not remove a live process's cwd, and a job row
+	// deleted during its run leaves no other trace of it.
+	activeRunsMu sync.Mutex
+	activeRuns   map[string]int
+
 	// Auto-correct rate limiting (T4): per-cap cooldown + cross-tick semaphore.
 	// Bash-job auto-correct is rate-limited so a cap with a persistent bug
 	// can't burn through the LLM budget. autoCorrectRunning gives mutual
@@ -85,23 +211,36 @@ type Handler struct {
 	autoCorrectRunning  bool
 	autoCorrectCooldown map[string]time.Time
 
+	// bashErrorsMu/bashErrorsRunning keep one failed-bash-job pass in flight at
+	// a time now that the heartbeat dispatches it to its own goroutine.
+	bashErrorsMu      sync.Mutex
+	bashErrorsRunning bool
+
+	// startedAt is when this handler was built, i.e. when its daemon started. It
+	// bounds how long the failed-bash-job pass waits for the async wiring of the
+	// auto-correct client before it reports failures undiagnosed.
+	startedAt time.Time
+
 	// Optional: called after mutations. Nil in tests.
 	OnMutation func()
 
-	// Optional: LLM client for destillation (set by daemon after client init)
-	SummarizeClient extraction.LLMClient
+	// LLM wiring — clients and provider routing, published once at startup
+	// through the setters above (guarded by llmMu, see llmWiring).
+	llmMu sync.RWMutex
+	llm   llmWiring
 
-	// Optional: LLM client for quality tasks (rules condensation, narratives)
-	QualityClient extraction.LLMClient
+	// AutoCorrectClient answers the bash-job diagnosis and repair prompts. It is
+	// wired through SetAutoCorrectClient with the shared budget, gate and per-call
+	// cap, so the loop is not a second, undecorated LLM path. Nil while the daemon
+	// is still starting (and in tests): the pass then leaves its rows queued.
+	autoCorrectClientMu sync.Mutex
+	autoCorrectClient   extraction.LLMClient
 
-	// LLM provider config for on-the-fly client creation (llm_complete RPC)
-	LLMProvider         string // e.g. "opencode", "api", "openai"
-	LLMCompleteProvider string // override for handleLLMComplete (empty = use LLMProvider)
-	LLMAPIKey           string
-	LLMBaseURL          string
-
-	// Optional: LLM client for commit-triggered staleness evaluation
-	CommitEvalClient extraction.LLMClient
+	// autoCorrectVerify runs a proposed fix once before it is persisted. It is
+	// nil in production — autoCorrectBashCap then builds the sandbox and runs the
+	// body there. Tests inject a stub so the persist paths can be exercised
+	// without ai-jail; nil-without-sandbox still fails closed.
+	autoCorrectVerify func(body string, timeoutSec int, profile SandboxProfile) (int, error)
 
 	// Embed subprocess lifecycle (Option B: killed on daemon shutdown, restarts fresh)
 	embedProcessMu sync.Mutex
@@ -109,10 +248,14 @@ type Handler struct {
 
 	// Active session tracking — set by proxy via set_active_session RPC
 	activeSessionMu sync.Mutex
+	opencodeBind    bindThrottle // on-demand opencode session binding (opencode_bind.go)
 	activeSessionID string
 
-	// Briefing config — set by daemon after config load
-	BriefingUserProfile bool
+	// Reporting of guessed identities (resolveActiveSessionFallback): one line
+	// per guess and window, so the last-writer-wins fallback stays visible
+	// without flooding the log on every request.
+	guessedSessionMu   sync.Mutex
+	guessedSessionLast map[string]time.Time
 
 	// PID tracking for stdin injection (session_id → OS PID of claude process)
 	pidMapMu sync.Mutex
@@ -148,12 +291,9 @@ type Handler struct {
 	// Code graph per project — lazy initialized on first MCP tool access
 	codeGraphMu sync.RWMutex
 	codeGraphs  map[string]*codeGraphEntry
-
-	// Auto-discovered modelID → providerID map, lazy initialized on first agent spawn.
-	// Used by resolveSpawnModel to resolve bare model names ("glm-5.2") to
-	// "providerID/modelID" ("zai/glm-5.2"). Coding variants excluded upstream.
-	modelProviderMapOnce sync.Once
-	modelProviderMap     map[string]string
+	// codeScanner overrides the scanner used to build a project graph. It exists
+	// so tests can exercise build and failure paths without the CBM binary.
+	codeScanner func() codescan.Scanner
 }
 
 // recentLearning holds a recently remembered learning with its ID for injection.
@@ -162,11 +302,23 @@ type recentLearning struct {
 	Text string `json:"text"`
 }
 
-// injectExcludeSession copies _session_id into exclude_session for search handlers.
-// This prevents the self-referential echo loop where a session finds its own
-// messages in search results. expand_context deliberately does NOT use this —
-// finding own-session messages is its purpose.
-func injectExcludeSession(params map[string]any) {
+// injectExcludeSession copies the caller's own session into exclude_session for
+// search handlers. This prevents the self-referential echo loop where a session
+// finds its own messages in search results. expand_context deliberately does NOT
+// use this — finding own-session messages is its purpose.
+//
+// An id the MCP layer took from the shared service environment names another
+// session (see envDerivedSessionUntrusted), so it must not be excluded; the
+// caller's own session is then taken from its working directory (agentByCallerCWD),
+// which is what resolveSessionID does for the same layout. Dropping the exclusion
+// instead would hand the caller its own learnings back.
+func (h *Handler) injectExcludeSession(params map[string]any) {
+	if h.envDerivedSessionUntrusted(params) {
+		if agent := h.agentByCallerCWD(params); agent != nil && agent.SessionID != "" {
+			params["exclude_session"] = agent.SessionID
+		}
+		return
+	}
 	if sid, ok := params["_session_id"].(string); ok && sid != "" {
 		params["exclude_session"] = sid
 	}
@@ -188,13 +340,36 @@ func (h *Handler) resolveProjectParam(params map[string]any) map[string]any {
 	// a caller standing inside one of the candidate directories.
 	cwd, _ := params["_cwd"].(string)
 
+	// finish stamps the unresolved state on every return path, cached or fresh: a
+	// caller that got its short name back (or nothing at all) must not have it
+	// persisted, and the cache would otherwise hand out the value without this
+	// marker on the second call (YM-300, cold review F1).
+	finish := func() map[string]any {
+		if strings.HasPrefix(project, "/") {
+			return params
+		}
+		if _, hasErr := params["_project_error"]; hasErr {
+			return params
+		}
+		if resolved, _ := params["project"].(string); resolved == "" || resolved == project {
+			params["_project_unresolved"] = project
+		}
+		return params
+	}
+
 	// Resolve authoritative per-call session context before shared cwd/global
 	// cache entries. A resumed process can carry the same stale cwd while serving
 	// different same-basename sessions, so session-derived results need their own
 	// cache key and must never be shadowed by another caller's cwd entry.
 	if !strings.HasPrefix(project, "/") {
 		sessionID, _ := params["_session_id"].(string)
-		if sessionID == "" {
+		// A leaked environment id names another session, and a PID that belongs
+		// to no agent names the last session that registered — neither may decide
+		// this caller's project (see envDerivedSessionUntrusted, callerPIDIsAgent).
+		if h.envDerivedSessionUntrusted(params) {
+			sessionID = ""
+		}
+		if sessionID == "" && h.callerPIDIsAgent(params) {
 			if pid, ok := params["_caller_pid"].(float64); ok && pid > 0 {
 				sessionID = h.resolveSessionIDFromPID(int(pid))
 			}
@@ -207,7 +382,7 @@ func (h *Handler) resolveProjectParam(params map[string]any) map[string]any {
 			h.projectCacheMu.RUnlock()
 			if found {
 				params["project"] = cached
-				return params
+				return finish()
 			}
 
 			if session, err := h.store.GetSession(sessionID); err == nil && session != nil && filepath.Base(session.Project) == project {
@@ -220,7 +395,7 @@ func (h *Handler) resolveProjectParam(params map[string]any) map[string]any {
 				}
 				h.projectCacheMu.Unlock()
 				params["project"] = session.Project
-				return params
+				return finish()
 			}
 		}
 	}
@@ -247,19 +422,24 @@ func (h *Handler) resolveProjectParam(params map[string]any) map[string]any {
 			} else {
 				params["project"] = cached
 			}
-			return params
+			return finish()
 		}
 	}
 	// Global key: deterministic results shared across all callers.
 	if cached, ok := h.projectCache[project]; ok {
 		h.projectCacheMu.RUnlock()
 		if !isAmbiguousMarker(cached) {
-			params["project"] = cached
-			return params
-		}
-		if cwd == "" {
+			// A passthrough cached by a cwd-less caller must not answer a caller that
+			// brought a cwd: the directory is exactly what turns the name into a
+			// project, and the cached value would keep that branch from running
+			// (YM-300, cold review F1).
+			if cwd == "" || cached != project || strings.HasPrefix(cached, "/") {
+				params["project"] = cached
+				return finish()
+			}
+		} else if cwd == "" {
 			params["_project_error"] = stripMarker(cached)
-			return params
+			return finish()
 		}
 		// Global ambiguous marker but cwd present: fall through to
 		// DB lookup — the cwd tiebreaker may resolve it.
@@ -327,11 +507,34 @@ func (h *Handler) resolveProjectParam(params map[string]any) map[string]any {
 		params["_project_error"] = err.Error()
 	} else {
 		params["project"] = resolved
+		if !strings.HasPrefix(project, "/") && (resolved == "" || resolved == project) {
+			// Nothing resolved: the value is either the name handed back or empty.
+			// Nothing may be written under a basename — a row keyed on one is read by
+			// no project once the real path appears (YM-300). Handlers that persist
+			// the value read this marker and refuse with the name the caller sent.
+			params["_project_unresolved"] = project
+		}
 	}
-	return params
+	return finish()
 }
 
 const ambiguousPrefix = "__ambiguous__:"
+
+// handlesUnresolvedProject names the methods that deal with a name nothing
+// resolves themselves instead of taking it as a project: remember attributes the
+// row to the caller's repository (attributeLearningProject), so the central
+// refusal would take that fallback away. Every other method is refused, because
+// an empty project would drop its filter and read across all projects.
+func handlesUnresolvedProject(method string) bool {
+	return method == "remember"
+}
+
+// unresolvedProjectResponse is the one wording for a short name that names no
+// project: it quotes what the caller sent, because that is the only handle an
+// operator has on the case (YM-300).
+func unresolvedProjectResponse(name string) Response {
+	return errorResponse(fmt.Sprintf("project %q is not a known project: no session carries that name. Pass the project's absolute path", name))
+}
 
 func ambiguousMarker(msg string) string { return ambiguousPrefix + msg }
 func isAmbiguousMarker(s string) bool   { return strings.HasPrefix(s, ambiguousPrefix) }
@@ -360,9 +563,18 @@ type idleTickResult struct {
 	Reminder string `json:"reminder,omitempty"`
 }
 
+// newProductionHandler assembles the handler the daemon serves on its socket.
+// It is separate from NewHandler because the extra wiring (MEMORY.md regen on
+// mutation) must stay out of tests.
+func newProductionHandler(store *storage.Store, bloomMgr *bloom.Manager, claudeProjects string) *Handler {
+	h := NewHandler(store, bloomMgr)
+	wireMutationHook(h, store, claudeProjects)
+	return h
+}
+
 // NewHandler creates a request handler with access to all daemon resources.
 func NewHandler(store *storage.Store, bloomMgr *bloom.Manager) *Handler {
-	h := &Handler{store: store, bloom: bloomMgr, pidMap: make(map[string]int), windowMap: make(map[string]string), terminalMap: make(map[string]string), headlessSessions: make(map[string]string), autoCorrectCooldown: make(map[string]time.Time)}
+	h := &Handler{store: store, bloom: bloomMgr, pidMap: make(map[string]int), windowMap: make(map[string]string), terminalMap: make(map[string]string), headlessSessions: make(map[string]string), activeRuns: make(map[string]int), autoCorrectCooldown: make(map[string]time.Time), startedAt: time.Now()}
 	h.initIdleState()
 	return h
 }
@@ -439,14 +651,14 @@ func (h *Handler) Handle(req Request) Response {
 		h.idleMu.Unlock()
 	}
 
-	// Persist CWD for opencode sessions (not sent in HTTP request body).
-	// opencode sends promptCacheKey in API requests — proxy looks up cwd:<session_id>.
+	// Persist the source agent for opencode sessions (not sent in HTTP request
+	// body): the briefing reads source_agent:<session> to identify a non-Claude
+	// caller. The working directory is not persisted: the proxy takes it from the
+	// request, and _cwd reaches the agent resolution directly, so a cwd:<session>
+	// row had no reader and grew one row per session (YM-307).
 	if cwd, _ := req.Params["_cwd"].(string); cwd != "" {
 		sid, _ := req.Params["_session_id"].(string)
 		sa, _ := req.Params["_source_agent"].(string)
-		if sid != "" {
-			_ = h.store.SetProxyState("cwd:"+sid, cwd)
-		}
 		if sid != "" && sa != "" {
 			_ = h.store.SetProxyState("source_agent:"+sid, sa)
 		}
@@ -458,15 +670,27 @@ func (h *Handler) Handle(req Request) Response {
 	if errStr, ok := req.Params["_project_error"].(string); ok {
 		return errorResponse(errStr)
 	}
+	// A short name nothing resolves names no project. A name that resolved to
+	// nothing at all (a cwd was given and does not carry it) is refused centrally:
+	// no handler may read unscoped because the filter vanished (YM-300). The
+	// cwd-less passthrough keeps working for the CLI's short-name flow; of the
+	// handlers that store under that value, the two broadcast handlers refuse it
+	// themselves (see unresolvedProjectResponse). Other writers keep their previous
+	// short-name behaviour and are out of this ticket's scope.
+	if unresolved, ok := req.Params["_project_unresolved"].(string); ok && unresolved != "" {
+		if resolved, _ := req.Params["project"].(string); resolved == "" && !handlesUnresolvedProject(req.Method) {
+			return unresolvedProjectResponse(unresolved)
+		}
+	}
 
 	switch req.Method {
 	case "search":
 		params := req.Params
-		injectExcludeSession(params)
+		h.injectExcludeSession(params)
 		return h.handleSearch(params)
 	case "deep_search":
 		params := req.Params
-		injectExcludeSession(params)
+		h.injectExcludeSession(params)
 		return h.handleDeepSearch(params)
 	case "remember":
 		return h.handleRemember(req.Params)
@@ -518,8 +742,14 @@ func (h *Handler) Handle(req Request) Response {
 		return h.handleResolve(req.Params)
 	case "resolve_by_text":
 		return h.handleResolveByText(req.Params)
+	case "resolve_by_commit":
+		return h.handleResolveByCommit(req.Params)
+	case "reopen":
+		return h.handleReopen(req.Params)
 	case "quarantine_session":
 		return h.handleQuarantineSession(req.Params)
+	case "unquarantine_session":
+		return h.handleUnquarantineSession(req.Params)
 	case "skip_indexing":
 		return h.handleSkipIndexing(req.Params)
 	case "resolve_project":
@@ -538,7 +768,7 @@ func (h *Handler) Handle(req Request) Response {
 		return h.handleCompletePlan(h.resolveProjectParam(req.Params))
 	case "hybrid_search":
 		params := h.resolveProjectParam(req.Params)
-		injectExcludeSession(params)
+		h.injectExcludeSession(params)
 		return h.handleHybridSearch(params)
 	case "vector_search":
 		return h.handleVectorSearch(h.resolveProjectParam(req.Params))
@@ -564,10 +794,20 @@ func (h *Handler) Handle(req Request) Response {
 			return errorResponse(err.Error())
 		}
 		return jsonResponse(map[string]any{"status": "ok", "session_id": sessionID})
+	case "is_code_nav_dismissed":
+		// Read side of dismiss_code_nav: the opencode plugin blocks in its own
+		// process and cannot see the counter, so it asks here before it blocks
+		// again (YM-425).
+		sessionID, _ := req.Params["session_id"].(string)
+		if sessionID == "" {
+			return errorResponse("session_id required")
+		}
+		return jsonResponse(map[string]any{
+			"session_id": sessionID,
+			"dismissed":  h.store.CodeNavDismissed(sessionID),
+		})
 	case "expand_context":
 		return h.handleExpandContext(req.Params)
-	case "store_compacted_block":
-		return h.handleStoreCompactedBlock(req.Params)
 	case "get_proxy_state":
 		return h.handleGetProxyState(req.Params)
 	case "set_proxy_state":
@@ -755,13 +995,14 @@ func (h *Handler) Handle(req Request) Response {
 	case "get_fork_learnings":
 		return h.handleGetForkLearnings(req.Params)
 	case "reload_vectors":
-		if h.vectorStore == nil {
+		vecStore := h.VectorStore()
+		if vecStore == nil {
 			return errorResponse("vector store not initialized")
 		}
-		if err := h.vectorStore.Reload(); err != nil {
+		if err := vecStore.Reload(); err != nil {
 			return errorResponse(fmt.Sprintf("reload_vectors failed: %v", err))
 		}
-		return jsonResponse(map[string]any{"status": "ok", "count": h.vectorStore.Count()})
+		return jsonResponse(map[string]any{"status": "ok", "count": vecStore.Count()})
 
 	// Code Intelligence tools
 	case "search_code_index":
@@ -803,18 +1044,22 @@ func (h *Handler) handleLLMComplete(params map[string]any) Response {
 		return errorResponse("system or prompt required")
 	}
 
-	client := h.QualityClient
+	wiring := h.llmSnapshot()
+	client := wiring.quality
 	if client == nil {
-		client = h.SummarizeClient
+		client = wiring.summarize
 	}
-	provider := h.LLMProvider
-	if h.LLMCompleteProvider != "" {
-		provider = h.LLMCompleteProvider
+	provider := wiring.provider
+	if wiring.completeProvider != "" {
+		provider = wiring.completeProvider
 	}
 	if model != "" && provider != "" {
 		if client == nil || client.Model() != model || client.Name() != provider {
-			mc, err := extraction.NewLLMClient(provider, h.LLMAPIKey, model, "", h.LLMBaseURL)
-			if err == nil && mc != nil {
+			if wiring.overrideClient == nil {
+				log.Printf("[llm_complete] model override ignored: no metered client factory wired")
+			} else if mc, err := wiring.overrideClient(provider, model); err != nil {
+				log.Printf("[llm_complete] model override failed: %v", err)
+			} else if mc != nil {
 				client = mc
 			}
 		}
@@ -859,6 +1104,11 @@ func (h *Handler) handleLLMComplete(params map[string]any) Response {
 	if tools {
 		opts = append(opts, extraction.WithTools())
 	}
+	// llm_complete is a boundary: the prompt comes from an arbitrary caller (a
+	// cap, the llm() primitive), so the redactor is applied here regardless of
+	// how the client behind it was wired upstream.
+	client = h.sanitizeClient(client)
+
 	result, err := client.Complete(injectedSystem, prompt, opts...)
 	if err != nil {
 		return errorResponse(fmt.Sprintf("llm call failed: %v", err))

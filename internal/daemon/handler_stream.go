@@ -186,10 +186,11 @@ func (h *Handler) updateParentStreamCount(threadID string, active bool) {
 // getStreamFields returns stream state fields for an agent response.
 func (h *Handler) getStreamFields(sessionID string) map[string]any {
 	fields := map[string]any{
-		"stream_active":    false,
-		"stream_bytes":     int64(0),
-		"stream_started":   "",
-		"subagent_streams": 0,
+		"stream_active":      false,
+		"stream_bytes":       int64(0),
+		"stream_started":     "",
+		"stream_is_subagent": false,
+		"subagent_streams":   0,
 	}
 
 	// Always populate subagent count — independent of StreamState.
@@ -223,6 +224,10 @@ func (h *Handler) getStreamFields(sessionID string) map[string]any {
 
 	fields["stream_active"] = state.Active
 	fields["stream_bytes"] = state.BytesSoFar
+	// Whether the newest stream on this thread belonged to a subagent. The idle
+	// guard reads it for backends without a session source (YM-253): a Claude
+	// Code task() subagent leaves no child session row behind, only this marker.
+	fields["stream_is_subagent"] = state.IsSubagent
 	if !state.StartedAt.IsZero() {
 		fields["stream_started"] = state.StartedAt.Format(time.RFC3339)
 	}

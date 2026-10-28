@@ -37,7 +37,7 @@ search(query), hybrid_search(query), deep_search(query), query_facts(entity, act
 const tmplMilestones = `{{if .D.Items}}
 {{.S.Milestones}}
 {{range .D.Items}}- [{{.Ago}}] ({{.IntensityLabel}}) {{.Flavor}}
-{{end}}(Mehr über get_learnings("pivot_moment"))
+{{end}}({{.S.MoreVia}}("pivot_moment"))
 {{end}}`
 
 const tmplPerson = `{{if .D.Items}}{{.S.YourCounterpart}}
@@ -47,32 +47,32 @@ const tmplPerson = `{{if .D.Items}}{{.S.YourCounterpart}}
 const tmplKnowledge = `{{if .D.Decisions}}
 {{.S.DecisionsMade}}
 {{range .D.Decisions}}- {{.}}
-{{end}}{{if .D.MoreDecisions}}({{.D.MoreDecisions}} {{.S.MoreVia}} get_learnings("decision"))
+{{end}}{{if .D.MoreDecisions}}({{.D.MoreDecisions}} {{.S.MoreVia}}("decision"))
 {{end}}
 {{end}}{{if .D.Pivots}}
 {{.S.KeyMoments}}
 {{range .D.Pivots}}- {{.}}
-{{end}}{{if gt .D.MorePivots 0}}({{.D.MorePivots}} {{.S.MoreVia}} get_learnings get_learnings("pivot_moment"))
+{{end}}{{if gt .D.MorePivots 0}}({{.D.MorePivots}} {{.S.MoreVia}}("pivot_moment"))
 {{end}}
 {{end}}{{if .D.Gotchas}}
 {{.S.KnownPitfalls}}
 {{range .D.Gotchas}}- {{.}}
-{{end}}{{if gt .D.MoreGotchas 0}}({{.D.MoreGotchas}} {{.S.MoreVia}} get_learnings("gotcha"))
+{{end}}{{if gt .D.MoreGotchas 0}}({{.D.MoreGotchas}} {{.S.MoreVia}}("gotcha"))
 {{end}}
 {{end}}{{if .D.Patterns}}
 {{.S.ProvenPatterns}}
 {{range .D.Patterns}}- {{.}}
-{{end}}{{if gt .D.MorePatterns 0}}({{.D.MorePatterns}} {{.S.MoreVia}} get_learnings("pattern"))
+{{end}}{{if gt .D.MorePatterns 0}}({{.D.MorePatterns}} {{.S.MoreVia}}("pattern"))
 {{end}}
 {{end}}{{if .D.Teachings}}
 {{.S.Reminders}}
 {{range .D.Teachings}}- {{.}}
-{{end}}{{if gt .D.MoreTeachings 0}}({{.D.MoreTeachings}} {{.S.MoreVia}} get_learnings("explicit_teaching"))
+{{end}}{{if gt .D.MoreTeachings 0}}({{.D.MoreTeachings}} {{.S.MoreVia}}("explicit_teaching"))
 {{end}}
 {{end}}{{if .D.Facts}}
 {{.S.ExternalFacts}}
 {{range .D.Facts}}- {{.}}
-{{end}}{{if gt .D.MoreFacts 0}}({{.D.MoreFacts}} {{.S.MoreVia}} get_learnings("fact"))
+{{end}}{{if gt .D.MoreFacts 0}}({{.D.MoreFacts}} {{.S.MoreVia}}("fact"))
 {{end}}
 {{end}}`
 
@@ -95,9 +95,9 @@ const tmplCaps = `{{if .D.Items}}
 const tmplOpenWork = `{{if .D.Items}}
 {{if .D.IsReminder}}{{.S.UserReminder}}{{else}}{{.S.OpenWork}}{{end}}
 {{if .D.AbsenceNote}}({{.D.AbsenceNote}})
-{{end}}{{range .D.Items}}- {{if .Project}}[{{.Project}}] {{end}}{{.Content}}{{if .Deadline}} (Deadline: {{.Deadline}}){{end}}
-{{end}}{{if or .D.IdeaCount .D.StaleCount}}(+ {{if .D.IdeaCount}}{{.D.IdeaCount}} ideas{{end}}{{if and .D.IdeaCount .D.StaleCount}}, {{end}}{{if .D.StaleCount}}{{.D.StaleCount}} stale{{end}} — get_learnings(category="unfinished:idea") to retrieve)
-{{end}}{{.S.AgentName}}: Bring up these points ACTIVELY — not casually, but directly: "By the way, you have open items..."
+{{end}}{{range .D.Items}}- {{if .Project}}[{{.Project}}] {{end}}{{.Content}}{{if .Deadline}} ({{$.S.LabelDeadline}}: {{.Deadline}}){{end}}
+{{end}}{{if or .D.IdeaCount .D.StaleCount}}(+ {{if .D.IdeaCount}}{{.D.IdeaCount}} {{$.S.OpenWorkIdeasLabel}} — get_learnings(category="unfinished", task_type="idea"){{end}}{{if and .D.IdeaCount .D.StaleCount}}; {{end}}{{if .D.StaleCount}}{{.D.StaleCount}} {{$.S.OpenWorkStaleLabel}} — get_learnings(category="unfinished", task_type="stale"){{end}})
+{{end}}{{.S.AgentName}}: {{.S.OpenWorkBringUp}}
 {{end}}`
 
 // templateData wraps translated strings and section data for templates.
@@ -217,7 +217,7 @@ type OpenWorkData struct {
 type OpenWorkItem struct {
 	Project  string
 	Content  string
-	Deadline string // formatted deadline e.g. "Fr 28.03." or empty
+	Deadline string // formatted deadline e.g. "Sat 28 March" or empty
 }
 
 // renderTemplate executes a named template with translated strings and data.

@@ -192,8 +192,12 @@ func (h *Handler) handleDeepSearch(params map[string]any) Response {
 			}
 		}
 		for sid, r := range ranges {
+			// The body of a thinking or tool_result message can sit only in
+			// content_blob with content empty (migrated rows), so the window falls
+			// back to the blob or the neighbour renders as a blank line.
 			rows, err := msgDB.Query(
-				`SELECT sequence, content, timestamp FROM messages WHERE session_id = ? AND sequence BETWEEN ? AND ? ORDER BY sequence`,
+				`SELECT sequence, COALESCE(NULLIF(content, ''), CAST(content_blob AS TEXT), ''), timestamp
+				 FROM messages WHERE session_id = ? AND sequence BETWEEN ? AND ? ORDER BY sequence`,
 				sid, r.min, r.max)
 			if err != nil {
 				continue
@@ -239,11 +243,16 @@ func (h *Handler) handleDeepSearch(params map[string]any) Response {
 				if m.seq < hit.Sequence-3 || m.seq > hit.Sequence+3 {
 					continue
 				}
+				// The blob fallback above can surface a whole thinking block, so both
+				// the snippet and the context line are bounded; otherwise one hit
+				// carries a multi-megabyte body into the response.
 				content := m.content
+				if len(content) > 4000 {
+					content = content[:4000] + "..."
+				}
 				if m.seq == hit.Sequence {
 					snippet = content
-				}
-				if m.seq != hit.Sequence && len(content) > 1000 {
+				} else if len(content) > 1000 {
 					content = content[:1000] + "..."
 				}
 				date := ""

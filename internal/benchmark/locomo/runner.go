@@ -55,11 +55,17 @@ func (r *Runner) Ingest(samples []Sample) ([]IngestStats, error) {
 	return IngestAll(r.store, samples)
 }
 
+// ExtractStats counts the outcome of one extraction pass.
+type ExtractStats struct {
+	Extracted int
+	Failed    int
+}
+
 // Extract iterates over projects, loads sessions and messages, and calls extractor.ExtractAndStore.
 // Uses concurrent workers for parallel extraction.
-func (r *Runner) Extract(samples []Sample, concurrency int) error {
+func (r *Runner) Extract(samples []Sample, concurrency int) (ExtractStats, error) {
 	if r.extractor == nil {
-		return fmt.Errorf("no extractor configured — call SetExtractor first or use skipExtract=true")
+		return ExtractStats{}, fmt.Errorf("no extractor configured — call SetExtractor first or use skipExtract=true")
 	}
 	if concurrency < 1 {
 		concurrency = 3
@@ -76,12 +82,12 @@ func (r *Runner) Extract(samples []Sample, concurrency int) error {
 		project := fmt.Sprintf("locomo_%s", sample.ID)
 		sessions, err := r.store.ListAllSessions(project, 100)
 		if err != nil {
-			return fmt.Errorf("list sessions for %s: %w", project, err)
+			return ExtractStats{}, fmt.Errorf("list sessions for %s: %w", project, err)
 		}
 		for _, sess := range sessions {
 			msgs, err := r.store.GetMessagesBySession(sess.ID)
 			if err != nil {
-				return fmt.Errorf("get messages for %s: %w", sess.ID, err)
+				return ExtractStats{}, fmt.Errorf("get messages for %s: %w", sess.ID, err)
 			}
 			if len(msgs) == 0 {
 				continue
@@ -94,7 +100,7 @@ func (r *Runner) Extract(samples []Sample, concurrency int) error {
 
 	var wg sync.WaitGroup
 	jobCh := make(chan extractJob, len(jobs))
-	var extracted int64
+	var extracted, failed, processed int64
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -103,10 +109,13 @@ func (r *Runner) Extract(samples []Sample, concurrency int) error {
 			for job := range jobCh {
 				if err := r.extractor.ExtractAndStore(job.sessionID, job.project, job.msgs, false); err != nil {
 					log.Printf("warn: extract session %s: %v", job.sessionID, err)
+					atomic.AddInt64(&failed, 1)
+				} else {
+					atomic.AddInt64(&extracted, 1)
 				}
-				n := atomic.AddInt64(&extracted, 1)
-				if n%10 == 0 {
-					log.Printf("  Extracted %d/%d sessions", n, len(jobs))
+				if n := atomic.AddInt64(&processed, 1); n%10 == 0 {
+					log.Printf("  Extracted %d/%d sessions (%d failed)",
+						atomic.LoadInt64(&extracted), len(jobs), atomic.LoadInt64(&failed))
 				}
 			}
 		}()
@@ -117,9 +126,9 @@ func (r *Runner) Extract(samples []Sample, concurrency int) error {
 	}
 	close(jobCh)
 	wg.Wait()
-	log.Printf("  Extracted %d sessions total", len(jobs))
+	log.Printf("  Extracted %d of %d sessions (%d failed)", extracted, len(jobs), failed)
 
-	return nil
+	return ExtractStats{Extracted: int(extracted), Failed: int(failed)}, nil
 }
 
 // GenerateAQ generates anticipated_queries for learnings that have fewer than targetCount.
@@ -430,8 +439,15 @@ func (r *Runner) runFullInternal(samples []Sample, cfg QueryConfig, skipExtract,
 		cfg.UseMessages = true
 	} else {
 		log.Printf("Step 2/5: Extracting learnings...")
-		if err := r.Extract(samples, cfg.Concurrency); err != nil {
+		stats, err := r.Extract(samples, cfg.Concurrency)
+		if err != nil {
 			return Report{}, fmt.Errorf("extract: %w", err)
+		}
+		// A run in which nothing was extracted measures the query pipeline on an
+		// empty corpus. Reporting that as a normal run would publish an outage as
+		// a benchmark result.
+		if stats.Failed > 0 && stats.Extracted == 0 {
+			return Report{}, fmt.Errorf("extract: all %d sessions failed", stats.Failed)
 		}
 	}
 

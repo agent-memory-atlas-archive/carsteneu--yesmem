@@ -2,6 +2,7 @@ package wikirender
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -27,6 +28,37 @@ func seedLearning(t *testing.T, s *storage.Store, table string, cols []string, a
 	q := "INSERT INTO " + table + " (" + strings.Join(cols, ",") + ") VALUES (" + strings.Join(placeholders, ",") + ")"
 	if _, err := s.DB().Exec(q, args...); err != nil {
 		t.Fatalf("seed %s %v: %v", table, args[0], err)
+	}
+}
+
+// More sessions than the limit share one started_at: the truncation must keep a
+// deterministic set. Without a tie-breaker the kept 200 follow whatever row order
+// the query plan happens to produce, so the session data a render sees is not
+// reproducible (YM-341).
+func TestLoadSessionsForIDsTruncatesDeterministically(t *testing.T) {
+	s := mustOpen(t)
+	const total = 205
+	sids := make(map[string]bool, total)
+	for i := 1; i <= total; i++ {
+		id := fmt.Sprintf("s%04d", i)
+		sids[id] = true
+		seedLearning(t, s, "sessions",
+			[]string{"id", "project", "project_short", "started_at", "jsonl_path", "indexed_at"},
+			id, "test", "test", "2026-05-01T10:00:00Z", "/tmp/session.jsonl", "2026-05-01T10:00:00Z")
+	}
+
+	rs := newRenderState(&RenderConfig{Project: "test", Store: s})
+	if err := rs.loadSessionsForIDs(context.Background(), sids); err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.sessions) != 200 {
+		t.Fatalf("loaded %d sessions, want the limit of 200", len(rs.sessions))
+	}
+	if _, ok := rs.sessions["s0205"]; !ok {
+		t.Error("s0205 was dropped: the truncation follows the scan order, not the sort")
+	}
+	if _, ok := rs.sessions["s0001"]; ok {
+		t.Error("s0001 survived the truncation: equal started_at has no deterministic order")
 	}
 }
 

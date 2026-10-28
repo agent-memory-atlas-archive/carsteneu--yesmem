@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/daemon"
@@ -58,6 +59,16 @@ func runSpawnAgents(args []string) {
 	for i := 0; i < *count; i++ {
 		section := sections[i]
 
+		// The prompt is typed into the spawned TUI as keyboard input, so build and
+		// validate it before the daemon creates a row: a field that cannot be
+		// rendered is refused here instead of leaving a row behind that no process
+		// owns (YM-255).
+		prompt, err := buildAgentPrompt(*project, section, *callerSession)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "section %q: %v\n", section, err)
+			continue
+		}
+
 		// 1. Create agent record in DB via daemon RPC
 		client.SetDeadline(time.Now().Add(10 * time.Second))
 		result, err := client.Call("spawn_agent", map[string]any{
@@ -79,8 +90,7 @@ func runSpawnAgents(args []string) {
 			continue
 		}
 
-		// 2. Create PTY bridge locally
-		prompt := buildAgentPrompt(*project, section, *callerSession)
+		// 2. Create PTY bridge locally (the prompt was built and validated above)
 		sockPath := filepath.Join(dataDir, fmt.Sprintf("%s.sock", spawnResult.ID))
 		bridge, err := orchestrator.NewAgentBridge("claude", []string{"--session-id", spawnResult.SessionID, "--name", fmt.Sprintf("%s-%s", *project, section), prompt}, sockPath, "")
 		if err != nil {
@@ -99,13 +109,22 @@ func runSpawnAgents(args []string) {
 			continue
 		}
 
-		// 4. Register PID + socket path with daemon
+		// 4. Register PID + socket path with daemon. The daemon refuses a row that
+		// is no longer live (stopped in the meantime) — this CLI started the
+		// process, so a refusal has to end it here instead of printing a spawn
+		// whose process belongs to nobody.
 		client.SetDeadline(time.Now().Add(5 * time.Second))
-		client.Call("register_agent", map[string]any{
-			"id":        spawnResult.ID,
-			"pid":       float64(bridge.Cmd.Process.Pid),
-			"sock_path": sockPath,
-		})
+		if _, err := client.Call("register_agent", map[string]any{
+			"id":         spawnResult.ID,
+			"pid":        float64(bridge.Cmd.Process.Pid),
+			"sock_path":  sockPath,
+			"session_id": spawnResult.SessionID,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: register_agent refused: %v — shutting the process down\n", spawnResult.ID, err)
+			bridge.Close()
+			bridge.Cmd.Process.Signal(syscall.SIGTERM)
+			continue
+		}
 
 		fmt.Printf("Spawned %s -> section '%s' (PID %d, session %s)\n", spawnResult.ID, section, bridge.Cmd.Process.Pid, spawnResult.SessionID)
 
@@ -127,8 +146,8 @@ func runSpawnAgents(args []string) {
 		wg.Add(1)
 		go func(ag spawnedAgent) {
 			defer wg.Done()
-			defer ag.bridge.Close()
 			exitErr := ag.bridge.Cmd.Wait()
+			ourPID := ag.bridge.Cmd.Process.Pid
 
 			// Update daemon with final status
 			status := "finished"
@@ -141,20 +160,62 @@ func runSpawnAgents(args []string) {
 				fmt.Printf("%s finished\n", ag.id)
 			}
 
+			// The pid and the socket paths belong to the agent id, not to this
+			// process: a resume or a restart can bind a successor while this one is
+			// still winding down. The exit write is therefore a compare-and-set on
+			// our pid, and only a row that still names this process may lose the
+			// socket files — otherwise a stale process unlinked the sockets its
+			// successor is listening on (YM-202, same rule as the daemon's spawn exit
+			// tail).
+			// A failed write leaves the row as ours: a resume or a restart can only
+			// rebind it through the daemon, and this daemon answered nothing at all.
+			// The socket files are therefore removed as before instead of being left
+			// behind by every exit with an unreachable daemon.
+			ours := true
 			c, err := daemon.DialTimeout(dataDir, 3*time.Second)
 			if err == nil {
 				defer c.Close()
 				c.SetDeadline(time.Now().Add(5 * time.Second))
-				fields := map[string]any{"status": status, "stopped_at": time.Now().UTC().Format(time.RFC3339)}
-				if errMsg != "" {
-					fields["error"] = errMsg
+				res, callErr := c.Call("update_agent", agentExitWrite(ag.id, ourPID, status, errMsg))
+				if callErr == nil {
+					var out struct {
+						Written bool `json:"written"`
+					}
+					if json.Unmarshal(res, &out) == nil {
+						ours = out.Written
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "%s: recording the exit state failed: %v\n", ag.id, callErr)
 				}
-				c.Call("update_agent", map[string]any{"id": ag.id, "fields": fields})
+			} else {
+				fmt.Fprintf(os.Stderr, "%s: recording the exit state failed: %v\n", ag.id, err)
+			}
+
+			if ours {
+				ag.bridge.Close()
+			} else {
+				ag.bridge.CloseKeepingSockets()
 			}
 		}(a)
 	}
 	wg.Wait()
 	fmt.Printf("All %d agents finished.\n", len(spawned))
+}
+
+// agentExitWrite builds the update_agent request that records a CLI-started
+// agent's exit. expected_pid makes the write a compare-and-set: a resume or a
+// restart can bind a successor to the row while this process winds down, and the
+// reply's "written" flag then tells the caller that the socket files belong to the
+// successor (YM-202).
+func agentExitWrite(id string, pid int, status, errMsg string) map[string]any {
+	fields := map[string]any{
+		"status":     status,
+		"stopped_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	if errMsg != "" {
+		fields["error"] = errMsg
+	}
+	return map[string]any{"id": id, "fields": fields, "expected_pid": float64(pid)}
 }
 
 // buildSections returns a slice of length count. Entries from the comma-separated
@@ -178,8 +239,22 @@ func buildSections(tasks string, count int) []string {
 	return sections
 }
 
-// buildAgentPrompt returns the initial instruction for each spawned agent.
-func buildAgentPrompt(project, section, callerSession string) string {
+// buildAgentPrompt returns the initial instruction for each spawned agent, or an
+// error when a field cannot be rendered into it. The CLI hands the prompt to the
+// backend as one argv element (no shell, no TUI keystrokes), so a quote cannot
+// break an argument here; the fields are refused anyway because the same values are
+// echoed into the text the agent reads, and because the daemon's own builder, which
+// does type into a TUI, applies this rule (orchestrator.PromptFieldUnsafe).
+func buildAgentPrompt(project, section, callerSession string) (string, error) {
+	for _, f := range []struct{ name, value string }{
+		{"project", project},
+		{"section", section},
+		{"caller_session", callerSession},
+	} {
+		if orchestrator.PromptFieldUnsafe(f.value) {
+			return "", fmt.Errorf("%s contains characters that cannot be rendered into the agent prompt (quotes, control or bidi characters)", f.name)
+		}
+	}
 	prompt := fmt.Sprintf(
 		"You are working on project '%s', section '%s'. "+
 			"FIRST ACTION: Immediately write scratchpad_append(project=\"%s\", section=\"%s\", content=\"Status: started\") so the main agent can see you are working. "+
@@ -193,5 +268,5 @@ func buildAgentPrompt(project, section, callerSession string) string {
 			callerSession, section, project,
 		)
 	}
-	return prompt
+	return prompt, nil
 }

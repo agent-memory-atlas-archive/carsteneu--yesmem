@@ -82,6 +82,12 @@ func TestCBMScanner_Scan(t *testing.T) {
 }
 
 func TestCBMProjectName(t *testing.T) {
+	// cbmProjectName encodes the resolved path, and macOS resolves /tmp to
+	// /private/tmp and /home through autofs, so these Linux fixtures do not name
+	// the same directories there.
+	if runtime.GOOS == "darwin" {
+		t.Skip("the fixture paths resolve through macOS autofs and /private/tmp")
+	}
 	tests := []struct {
 		input string
 		want  string
@@ -418,7 +424,7 @@ esac
 
 func tempGitRepo(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := realPath(t, t.TempDir())
 	cmd := exec.Command("git", "init", "-q", dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
@@ -668,5 +674,75 @@ func TestScanHappyPathNoIndexing(t *testing.T) {
 
 	if calls := readCallLog(t, tmp); strings.Contains(calls, "index_repository") {
 		t.Fatalf("Scan indexed although data existed, calls:\n%s", calls)
+	}
+}
+
+// The CBM CLI writes the reason for a failed query to stderr. Discarding it
+// left daemon.log with a bare "exit status 1" (DT27 / YM-4).
+func TestCBMQuery_ErrorCarriesStderr(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "codebase-memory-mcp")
+	script := "#!/bin/sh\necho 'error: project not found: tmp-x' >&2\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := cbmQuery(bin, "tmp-x", "MATCH (f:File) RETURN f.file_path")
+	if err == nil {
+		t.Fatal("expected error from failed query")
+	}
+	if !strings.Contains(err.Error(), "project not found: tmp-x") {
+		t.Fatalf("error must carry the CBM stderr, got: %v", err)
+	}
+}
+
+// The captured stderr reaches daemon.log and a DB column, so it must stay one
+// line and bounded — while keeping the reason visible (review finding M-3).
+func TestStderrSuffix_CollapsesAndBounds(t *testing.T) {
+	if got := stderrSuffix("  \n\t "); got != "" {
+		t.Errorf("blank stderr must not be appended, got %q", got)
+	}
+
+	multi := "level=warn something\nlevel=error project not found\r\n"
+	want := ": level=warn something level=error project not found"
+	if got := stderrSuffix(multi); got != want {
+		t.Errorf("stderr must collapse to one line: got %q, want %q", got, want)
+	}
+
+	long := strings.Repeat("x", maxStderrSuffix*2) + " REASON-AT-THE-END"
+	got := stderrSuffix(long)
+	if strings.Contains(got, "\n") {
+		t.Error("capped stderr must stay on one line")
+	}
+	if len(got) > maxStderrSuffix+len(":  ...(truncated)... ") {
+		t.Errorf("capped stderr too long: %d bytes", len(got))
+	}
+	if !strings.Contains(got, "REASON-AT-THE-END") {
+		t.Error("truncation must keep the tail, where the reason can be")
+	}
+}
+
+// A directory that has no CBM database of its own has simply not been indexed
+// — that must be reported as such, and must not trigger inline indexing
+// (DT27 / YM-4).
+func TestScanMissingIndexReportsNotIndexed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no ~/.cache/codebase-memory-mcp entry for root
+	tmp := t.TempDir()
+	t.Setenv("FAKE_CBM_LOG", filepath.Join(tmp, "fake-calls.log"))
+	t.Setenv("FAKE_CBM_BEHAVIOR", "error")
+	bin, _ := writeFakeCBM(t)
+	root := tempGitRepo(t)
+
+	s := NewCBMScanner()
+	s.bin = bin
+	s.ensureIndex = func(string) {}
+	_, err := s.Scan(root)
+	if err == nil {
+		t.Fatal("expected error for a directory without an index")
+	}
+	if !strings.Contains(err.Error(), "not indexed") {
+		t.Fatalf("want a not-indexed classification, got: %v", err)
+	}
+	if calls := readCallLog(t, tmp); strings.Contains(calls, "index_repository") {
+		t.Fatalf("Scan indexed inline for a missing index, calls:\n%s", calls)
 	}
 }

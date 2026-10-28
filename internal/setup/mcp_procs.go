@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -255,4 +256,71 @@ func formatMCPHelper(h MCPHelper) string {
 		flags = strings.Join(parts, ", ")
 	}
 	return fmt.Sprintf("  pid %-7d ppid %-7d age %-10s %s", h.PID, h.PPID, age, flags)
+}
+
+// ReapStaleMCPHelpers terminates the live helpers whose binary was replaced on
+// disk and returns the pids it signalled — or, with a nil kill function, the pids
+// it would signal.
+//
+// The selection is the scan `yesmem status` renders, not a name grep: a process
+// counts only when argv[0] names a yesmem binary and argv[1] is "mcp". The former
+// shell rule matched every command line containing "yesmem mcp" (a grep, a search
+// subcommand, another installation's helper) and killed whatever it found with a
+// "(deleted)" executable. Two further guards: only helpers of the current user
+// (a reap under sudo is not a licence to end another account's sessions), and a
+// fresh scan right before the signal, so a pid the scan saw cannot have been
+// recycled meanwhile.
+func ReapStaleMCPHelpers(procRoot string, now time.Time, selfPID int, kill func(pid int) error) ([]int, error) {
+	helpers, err := scanMCPHelpers(procRoot, now)
+	if err != nil {
+		return nil, err
+	}
+	var reaped []int
+	for _, h := range helpers {
+		if !h.Stale || h.PID <= 1 || h.PID == selfPID {
+			continue
+		}
+		if !ownedByCurrentUser(procRoot, h.PID) {
+			continue
+		}
+		if !stillStaleHelper(procRoot, h.PID, selfPID) {
+			continue
+		}
+		if kill != nil {
+			if err := kill(h.PID); err != nil {
+				continue
+			}
+		}
+		reaped = append(reaped, h.PID)
+	}
+	return reaped, nil
+}
+
+// stillStaleHelper re-reads one process entry: the scan that selected it finished
+// some time ago, and only a second look can tell whether the pid still names a
+// stale helper. One pid, not a second full sweep — the reap may be looking at
+// several candidates.
+func stillStaleHelper(procRoot string, pid, selfPID int) bool {
+	if pid <= 1 || pid == selfPID {
+		return false
+	}
+	dir := filepath.Join(procRoot, strconv.Itoa(pid))
+	if !isMCPHelperArgs(procCmdline(filepath.Join(dir, "cmdline"))) {
+		return false
+	}
+	target, err := os.Readlink(filepath.Join(dir, "exe"))
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(target, " (deleted)")
+}
+
+// ownedByCurrentUser reports whether a process belongs to the user running this
+// command.
+func ownedByCurrentUser(procRoot string, pid int) bool {
+	var st syscall.Stat_t
+	if err := syscall.Stat(filepath.Join(procRoot, strconv.Itoa(pid)), &st); err != nil {
+		return false
+	}
+	return int(st.Uid) == os.Geteuid()
 }

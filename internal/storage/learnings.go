@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -34,6 +35,53 @@ func (s *Store) resolveCanonicalProject(project string) string {
 	return project
 }
 
+// projectReadRoot returns the directory a project id is scoped by: the path itself,
+// or, for a path inside a worktree checkout, the repository root before the marker.
+// It deliberately avoids models.RepositoryRoot, which resolves the enclosing
+// checkout (YM-321): folding is only ever wanted for the worktree copies of one
+// project, and ascending to the checkout would merge sibling projects of that
+// checkout with each other.
+func projectReadRoot(project string) string {
+	cut := len(project)
+	for _, marker := range []string{"/.worktrees/", "/.claude/worktrees/"} {
+		if i := strings.Index(project, marker); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	root := filepath.Clean(project[:cut])
+	if root == string(filepath.Separator) {
+		return ""
+	}
+	return root
+}
+
+// ActiveLearningsForProject returns the active learnings a briefing for project
+// should see. For a repository checkout it reads the rows at or below the project
+// path instead of the canonical basename: a repository whose work happens in
+// worktree checkouts has no row under its own path, and the basename scope answers
+// with every repository carrying the same folder name. The path scope needs no
+// decision before the read, so a concurrent insert cannot change what it matches.
+//
+// A worktree copy keeps the canonical scope (it folds to its repository), and a
+// directory that merely contains projects keeps it too: such a directory describes
+// none of them and must not answer with theirs. One limit is accepted on purpose:
+// rows that still carry a legacy short name reach every repository of that name
+// (167 active rows with a relative project and a set canonical on the live DB,
+// among them leftovers of a foreign project).
+func (s *Store) ActiveLearningsForProject(project, category string, limit int) ([]models.Learning, error) {
+	if !filepath.IsAbs(project) {
+		return s.GetActiveLearnings(category, project, "", "", limit)
+	}
+	clean := filepath.Clean(project)
+	if markerRoot := projectReadRoot(clean); markerRoot != "" && markerRoot != clean {
+		return s.GetActiveLearnings(category, project, "", "", limit)
+	}
+	if !isRepositoryRoot(clean) {
+		return s.GetActiveLearnings(category, project, "", "", limit)
+	}
+	return s.GetActiveLearningsFiltered(LearningsFilter{Category: category, ProjectSubtree: clean}, limit)
+}
+
 // InsertLearning inserts a learning and returns its ID.
 func (s *Store) InsertLearning(l *models.Learning) (int64, error) {
 	ids, err := s.InsertLearningBatch([]*models.Learning{l})
@@ -61,9 +109,9 @@ func (s *Store) GetPulseLearningsSince(project string, since time.Time, limit in
 	canonical := s.resolveCanonicalProject(project)
 	rows, err := s.readerDB().Query(`SELECT id, session_id, content, created_at FROM learnings
 		WHERE category = 'pulse' AND canonical_project = ?
-		AND created_at > ? AND superseded_by IS NULL
+		AND julianday(created_at) > julianday(?) AND `+models.RecallableLearningSQL+`
 		ORDER BY created_at ASC LIMIT ?`,
-		canonical, since.Format(time.RFC3339), limit)
+		canonical, SQLiteFilterTime(fmtTime(since)), limit)
 	if err != nil {
 		return nil, fmt.Errorf("get pulse learnings: %w", err)
 	}
@@ -125,6 +173,28 @@ func (s *Store) InsertLearningBatch(learnings []*models.Learning) ([]int64, erro
 	}
 	turnCounts, _ := s.GetTurnCountsBulk(projectList)
 
+	// Provenance (YM-74): agent_role and dialog_id exist as columns, conflict
+	// detection and the wiki read them, and no path ever wrote them. Both are
+	// resolved once per session, before the transaction opens, from data the store
+	// already holds.
+	provenanceCache := make(map[string]provenance)
+	for _, l := range learnings {
+		if l.AgentRole != "" && l.DialogID != 0 {
+			continue
+		}
+		p, ok := provenanceCache[l.SessionID]
+		if !ok {
+			p = s.sessionProvenance(l.SessionID)
+			provenanceCache[l.SessionID] = p
+		}
+		if l.AgentRole == "" {
+			l.AgentRole = p.agentRole
+		}
+		if l.DialogID == 0 {
+			l.DialogID = p.dialogID
+		}
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -132,8 +202,8 @@ func (s *Store) InsertLearningBatch(learnings []*models.Learning) ([]int64, erro
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`INSERT INTO learnings
-		(session_id, category, content, project, confidence, created_at, expires_at, model_used, source, emotional_intensity, session_flavor, supersedes, importance, context, domain, trigger_rule, embedding_text, embedding_status, embedding_content_hash, embedded_at, source_file, source_hash, doc_chunk_ref, content_hash, task_type, turns_at_creation, source_msg_from, source_msg_to, origin_tool, source_agent, target_agent, canonical_project, attribution, project_source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(session_id, category, content, project, confidence, created_at, expires_at, valid_until, model_used, source, emotional_intensity, session_flavor, supersedes, importance, hit_count, fail_count, context, domain, trigger_rule, embedding_text, embedding_status, embedding_content_hash, embedded_at, source_file, source_hash, doc_chunk_ref, content_hash, task_type, turns_at_creation, source_msg_from, source_msg_to, origin_tool, source_agent, target_agent, canonical_project, attribution, project_source, agent_role, dialog_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return nil, fmt.Errorf("prepare: %w", err)
 	}
@@ -153,6 +223,11 @@ func (s *Store) InsertLearningBatch(learnings []*models.Learning) ([]int64, erro
 		if l.ExpiresAt != nil {
 			t := fmtTime(*l.ExpiresAt)
 			expiresAt = &t
+		}
+		var validUntil *string
+		if l.ValidUntil != nil {
+			t := fmtTime(*l.ValidUntil)
+			validUntil = &t
 		}
 
 		source := l.Source
@@ -174,6 +249,14 @@ func (s *Store) InsertLearningBatch(learnings []*models.Learning) ([]int64, erro
 			default:
 				importance = 3
 			}
+		}
+
+		// A zero CreatedAt used to reach the column as "" (fmtTime renders the zero
+		// time as the empty string), and every julianday() window drops such a row.
+		// Extraction passes the session start and leaves it zero when that start
+		// never parsed, so the insertion instant is the honest fallback.
+		if l.CreatedAt.IsZero() {
+			l.CreatedAt = time.Now()
 		}
 
 		turnKey := l.Project
@@ -201,8 +284,8 @@ func (s *Store) InsertLearningBatch(learnings []*models.Learning) ([]int64, erro
 
 		result, err := stmt.Exec(
 			l.SessionID, l.Category, l.Content, l.Project, l.Confidence,
-			fmtTime(l.CreatedAt), expiresAt, l.ModelUsed, source, l.EmotionalIntensity, l.SessionFlavor, l.Supersedes, importance,
-			l.Context, l.Domain, l.TriggerRule, l.EmbeddingText, embeddingStatus, embeddingContentHash, l.SourceFile, l.SourceHash, l.DocChunkRef, l.ContentHash, l.TaskType, turnCounts[turnKey], sourceMsgFrom, sourceMsgTo, l.OriginTool, srcAgent, tgtAgent, l.CanonicalProject, l.Attribution, l.ProjectSource)
+			fmtTime(l.CreatedAt), expiresAt, validUntil, l.ModelUsed, source, l.EmotionalIntensity, l.SessionFlavor, l.Supersedes, importance, l.HitCount, l.FailCount,
+			l.Context, l.Domain, l.TriggerRule, l.EmbeddingText, embeddingStatus, embeddingContentHash, l.SourceFile, l.SourceHash, l.DocChunkRef, l.ContentHash, l.TaskType, turnCounts[turnKey], sourceMsgFrom, sourceMsgTo, l.OriginTool, srcAgent, tgtAgent, l.CanonicalProject, l.Attribution, l.ProjectSource, l.AgentRole, l.DialogID)
 		if err != nil {
 			return ids, fmt.Errorf("insert learning: %w", err)
 		}
@@ -230,14 +313,6 @@ func (s *Store) InsertLearningBatch(learnings []*models.Learning) ([]int64, erro
 		for _, q := range l.AnticipatedQueries {
 			tx.Exec("INSERT INTO learning_anticipated_queries (learning_id, value) VALUES (?, ?)", id, q)
 			tx.Exec("INSERT INTO anticipated_queries_fts (value, learning_id) VALUES (?, ?)", q, id)
-		}
-
-		// Expand FTS5 index to include anticipated queries for BM25 discovery.
-		// The trigger already inserted with content only — replace with expanded version.
-		if len(l.AnticipatedQueries) > 0 {
-			expanded := l.Content + " " + strings.Join(l.AnticipatedQueries, " ")
-			tx.Exec("INSERT INTO learnings_fts(learnings_fts, rowid, content) VALUES ('delete', ?, ?)", id, l.Content)
-			tx.Exec("INSERT INTO learnings_fts(rowid, content) VALUES (?, ?)", id, expanded)
 		}
 	}
 
@@ -398,16 +473,16 @@ func (s *Store) GetLearningsSince(project string, since time.Time, limit int) ([
 		COALESCE(canonical_project, ''),
 		COALESCE(attribution, ''),
 		COALESCE(staleness_score, 0.0), COALESCE(staleness_reason, ''), staleness_checked_at, COALESCE(staleness_type, ''), COALESCE(code_fingerprint, ''), COALESCE(project_source, '')
-		FROM learnings WHERE superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)
-		AND created_at > ?
+		FROM learnings WHERE ` + models.RecallableLearningSQL + `
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
+		AND julianday(created_at) > julianday(?)
 		AND category IN ('decision', 'pattern', 'gotcha', 'pivot_moment', 'unfinished', 'explicit_teaching')
 		AND canonical_project = ?
 		ORDER BY created_at DESC
 		LIMIT ?`
 
 	canonical := s.resolveCanonicalProject(project)
-	rows, err := s.readerDB().Query(query, fmtTime(time.Now()), fmtTime(since), canonical, limit)
+	rows, err := s.readerDB().Query(query, fmtTime(time.Now()), SQLiteFilterTime(fmtTime(since)), canonical, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get learnings since: %w", err)
 	}
@@ -420,16 +495,16 @@ func (s *Store) GetSessionFlavorsSince(project string, since time.Time, limit in
 	canonical := s.resolveCanonicalProject(project)
 	query := `SELECT session_flavor, MIN(created_at) as first_seen, session_id
 		FROM learnings
-		WHERE superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)
-		AND created_at > ?
+		WHERE ` + models.RecallableLearningSQL + `
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
+		AND julianday(created_at) > julianday(?)
 		AND length(session_flavor) > 0
 		AND canonical_project = ?
 		GROUP BY session_id
 		ORDER BY first_seen ASC
 		LIMIT ?`
 
-	rows, err := s.readerDB().Query(query, fmtTime(time.Now()), fmtTime(since), canonical, limit)
+	rows, err := s.readerDB().Query(query, fmtTime(time.Now()), SQLiteFilterTime(fmtTime(since)), canonical, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get session flavors since: %w", err)
 	}
@@ -514,7 +589,7 @@ func (s *Store) GetConsolidationLearnings(afterID, throughID int64) ([]models.Le
 		SELECT DISTINCT category, COALESCE(NULLIF(canonical_project, ''), COALESCE(project, ''))
 		FROM learnings
 		WHERE id > ? AND id <= ? AND superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
 		AND category NOT IN ('narrative', 'cap')
 	)
 	SELECT l.id, l.session_id, l.category, l.content, l.project, l.confidence,
@@ -529,8 +604,8 @@ func (s *Store) GetConsolidationLearnings(afterID, throughID int64) ([]models.Le
 	FROM learnings l
 	JOIN dirty d ON d.category = l.category
 		AND d.project = COALESCE(NULLIF(l.canonical_project, ''), COALESCE(l.project, ''))
-	WHERE l.id <= ? AND l.superseded_by IS NULL
-	AND (l.expires_at IS NULL OR l.expires_at > ?)
+	WHERE l.id <= ? AND ` + models.RecallableLearningSQLAlias + `
+	AND (l.expires_at IS NULL OR julianday(l.expires_at) > julianday(?))
 	ORDER BY l.category, l.canonical_project, l.project, l.id DESC`, afterID, throughID, now, throughID, now)
 	if err != nil {
 		return nil, fmt.Errorf("get consolidation learnings: %w", err)
@@ -539,9 +614,38 @@ func (s *Store) GetConsolidationLearnings(afterID, throughID int64) ([]models.Le
 	return scanLearnings(rows)
 }
 
+// LearningsFilter narrows a GetActiveLearningsFiltered query. Empty fields do
+// not filter.
+type LearningsFilter struct {
+	Category string
+	Project  string
+	Since    string
+	Before   string
+	TaskType string
+	// ProjectSubtree selects the rows at or below this absolute path instead of the
+	// canonical scope of Project, which it replaces when both are set. It is the
+	// path-scoped read for a project whose work lives in checkouts below its own
+	// path.
+	ProjectSubtree string
+}
+
 // GetActiveLearnings returns all non-superseded, non-expired learnings.
 // Filter by category and/or project (empty string = no filter).
 func (s *Store) GetActiveLearnings(category, project, since, before string, limit int) ([]models.Learning, error) {
+	return s.GetActiveLearningsFiltered(LearningsFilter{
+		Category: category, Project: project, Since: since, Before: before,
+	}, limit)
+}
+
+// GetActiveLearningsFiltered is GetActiveLearnings with every filter applied in
+// the query. A task_type filter has to run here: applied to an already capped
+// result it silently drops rows that the window did not contain.
+func (s *Store) GetActiveLearningsFiltered(f LearningsFilter, limit int) ([]models.Learning, error) {
+	category, project, since, before, taskType := f.Category, f.Project, f.Since, f.Before, f.TaskType
+	subtree := f.ProjectSubtree
+	if err := validateFilterBounds(since, before); err != nil {
+		return nil, err
+	}
 	query := `SELECT id, session_id, category, content, project, confidence,
 		superseded_by, supersede_reason, created_at, expires_at, model_used, source,
 		COALESCE(hit_count, 0), COALESCE(emotional_intensity, 0.0), last_hit_at, COALESCE(session_flavor, ''), valid_until, supersedes, COALESCE(importance, 3), supersede_status, COALESCE(noise_count, 0), COALESCE(fail_count, 0),
@@ -551,26 +655,39 @@ func (s *Store) GetActiveLearnings(category, project, since, before string, limi
 		COALESCE(canonical_project, ''),
 		COALESCE(attribution, ''),
 		COALESCE(staleness_score, 0.0), COALESCE(staleness_reason, ''), staleness_checked_at, COALESCE(staleness_type, ''), COALESCE(code_fingerprint, ''), COALESCE(project_source, '')
-		FROM learnings WHERE superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)`
+		FROM learnings WHERE ` + models.RecallableLearningSQL + `
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))`
 	args := []any{fmtTime(time.Now())}
 
 	if category != "" {
 		query += ` AND category = ?`
 		args = append(args, category)
 	}
-	if project != "" {
+	if subtree != "" {
+		prefix := subtree + string(filepath.Separator)
+		hi := prefix[:len(prefix)-1] + string(byte(filepath.Separator)+1)
+		query += ` AND (canonical_project = '' OR project = ? OR (project >= ? AND project < ?) OR (project NOT LIKE '/%' AND canonical_project = ?))`
+		args = append(args, subtree, prefix, hi, models.CanonicalProject(subtree))
+	} else if project != "" {
 		canonical := s.resolveCanonicalProject(project)
 		query += ` AND (canonical_project = ? OR canonical_project = '')`
 		args = append(args, canonical)
 	}
+	// Compare parsed instants: created_at is RFC3339 in the writer's zone, so a
+	// lexical compare against a UTC or date-only bound is off by the offset. The
+	// column-side julianday() is what makes mixed offsets comparable; it costs the
+	// created_at index, which only this since/before path paid for anyway.
 	if since != "" {
-		query += ` AND created_at >= ?`
-		args = append(args, since)
+		query += ` AND julianday(created_at) >= julianday(?)`
+		args = append(args, SQLiteFilterTime(since))
 	}
 	if before != "" {
-		query += ` AND created_at < ?`
-		args = append(args, before)
+		query += ` AND julianday(created_at) < julianday(?)`
+		args = append(args, SQLiteFilterTime(before))
+	}
+	if taskType != "" {
+		query += ` AND COALESCE(task_type, '') = ?`
+		args = append(args, taskType)
 	}
 	query += ` ORDER BY category, created_at DESC`
 	if limit > 0 {
@@ -584,7 +701,16 @@ func (s *Store) GetActiveLearnings(category, project, since, before string, limi
 	}
 	defer rows.Close()
 
-	return scanLearnings(rows)
+	learnings, err := scanLearnings(rows)
+	if err != nil {
+		return nil, err
+	}
+	// Every consumer of this read path scores with models.ComputeScore, which
+	// reads CurrentTurnCount. Resolve it here, once, instead of expecting each
+	// caller to remember (none did: turn-based decay never ran).
+	rows.Close()
+	s.EnrichTurnCounts(learnings)
+	return learnings, nil
 }
 
 // GetActiveLearningsBySessionIDs returns active learnings for the given session IDs.
@@ -593,36 +719,60 @@ func (s *Store) GetActiveLearningsBySessionIDs(sessionIDs []string) ([]models.Le
 		return nil, nil
 	}
 
-	placeholders := make([]string, len(sessionIDs))
-	args := make([]any, 0, len(sessionIDs)+1)
-	args = append(args, fmtTime(time.Now()))
-	for i, sessionID := range sessionIDs {
-		placeholders[i] = "?"
-		args = append(args, sessionID)
+	// Dedupe: with batching, an ID repeated in two batches would return its rows
+	// twice, while a single IN list deduplicated them implicitly.
+	unique := make([]string, 0, len(sessionIDs))
+	seen := make(map[string]struct{}, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if _, ok := seen[sessionID]; ok {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		unique = append(unique, sessionID)
 	}
 
-	query := `SELECT id, session_id, category, content, project, confidence,
-		superseded_by, supersede_reason, created_at, expires_at, model_used, source,
-		COALESCE(hit_count, 0), COALESCE(emotional_intensity, 0.0), last_hit_at, COALESCE(session_flavor, ''), valid_until, supersedes, COALESCE(importance, 3), supersede_status, COALESCE(noise_count, 0), COALESCE(fail_count, 0),
-		COALESCE(match_count, 0), COALESCE(inject_count, 0), COALESCE(use_count, 0), COALESCE(save_count, 0), COALESCE(stability, 30.0),
-		COALESCE(context, ''), COALESCE(domain, 'code'), COALESCE(trigger_rule, ''), COALESCE(embedding_text, ''),
-		COALESCE(source_file, ''), COALESCE(source_hash, ''), COALESCE(doc_chunk_ref, 0), COALESCE(task_type, ''), COALESCE(turns_at_creation, 0), COALESCE(origin_tool, ''), COALESCE(source_msg_from, -1), COALESCE(source_msg_to, -1),
-		COALESCE(canonical_project, ''),
-		COALESCE(attribution, ''),
-		COALESCE(staleness_score, 0.0), COALESCE(staleness_reason, ''), staleness_checked_at, COALESCE(staleness_type, ''), COALESCE(code_fingerprint, ''), COALESCE(project_source, '')
-		FROM learnings
-		WHERE superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)
-		AND session_id IN (` + strings.Join(placeholders, ",") + `)
-		ORDER BY created_at DESC`
+	const batchSize = 500
+	now := fmtTime(time.Now())
+	var all []models.Learning
+	// One placeholder per ID exceeds SQLite's variable limit on a large list and
+	// fails the whole read, so the IDs go in batches. The result is ordered per
+	// batch, no longer globally by created_at; no caller depends on that order.
+	for _, batch := range chunkStrings(unique, batchSize) {
+		placeholders := make([]string, len(batch))
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, now)
+		for i, sessionID := range batch {
+			placeholders[i] = "?"
+			args = append(args, sessionID)
+		}
 
-	rows, err := s.readerDB().Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("get active learnings by session IDs: %w", err)
+		query := `SELECT id, session_id, category, content, project, confidence,
+			superseded_by, supersede_reason, created_at, expires_at, model_used, source,
+			COALESCE(hit_count, 0), COALESCE(emotional_intensity, 0.0), last_hit_at, COALESCE(session_flavor, ''), valid_until, supersedes, COALESCE(importance, 3), supersede_status, COALESCE(noise_count, 0), COALESCE(fail_count, 0),
+			COALESCE(match_count, 0), COALESCE(inject_count, 0), COALESCE(use_count, 0), COALESCE(save_count, 0), COALESCE(stability, 30.0),
+			COALESCE(context, ''), COALESCE(domain, 'code'), COALESCE(trigger_rule, ''), COALESCE(embedding_text, ''),
+			COALESCE(source_file, ''), COALESCE(source_hash, ''), COALESCE(doc_chunk_ref, 0), COALESCE(task_type, ''), COALESCE(turns_at_creation, 0), COALESCE(origin_tool, ''), COALESCE(source_msg_from, -1), COALESCE(source_msg_to, -1),
+			COALESCE(canonical_project, ''),
+			COALESCE(attribution, ''),
+			COALESCE(staleness_score, 0.0), COALESCE(staleness_reason, ''), staleness_checked_at, COALESCE(staleness_type, ''), COALESCE(code_fingerprint, ''), COALESCE(project_source, '')
+			FROM learnings
+			WHERE superseded_by IS NULL
+			AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
+			AND session_id IN (` + strings.Join(placeholders, ",") + `)
+			ORDER BY created_at DESC`
+
+		rows, err := s.readerDB().Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("get active learnings by session IDs: %w", err)
+		}
+		learnings, err := scanLearnings(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, learnings...)
 	}
-	defer rows.Close()
-
-	return scanLearnings(rows)
+	return all, nil
 }
 
 // GetLearningsForClaudeMd returns active learnings for a project with per-category caps.
@@ -719,12 +869,25 @@ func (s *Store) GetLearning(id int64) (*models.Learning, error) {
 
 // GetLearningChain returns the full version history of a learning by traversing
 // the supersedes chain in both directions. The result is ordered oldest-first.
+// Rows that one successor retired together (a batch supersede) are placed
+// directly before that successor, in ID order.
+//
+// A non-positive superseded_by value is a sentinel, not a learning ID: -1 junk
+// cleanup, -2 resolved, -3 re-extract, -4 successor deleted, and 0 for the
+// rule-based substance-free retire. The row carrying it is the last member of
+// the chain; the walk ends there instead of following it to a row that does not
+// exist.
 //
 // Both loops carry a visited-set: if a row references itself (supersedes=id or
 // superseded_by=id) or forms a longer cycle, traversal terminates instead of
 // spinning forever. This is defense-in-depth against malformed rows; the
 // migration in schema.go nulls self-cycles on startup and SupersedeLearningBatch
 // rejects self-loops at write time.
+//
+// A positive edge whose target row no longer exists is a boundary as well. Hard
+// deletes used to remove rows without clearing the references that point at
+// them, so the walk ends at that row instead of failing the whole history. Only
+// the start id itself must exist.
 func (s *Store) GetLearningChain(id int64) ([]models.Learning, error) {
 	visited := map[int64]bool{id: true}
 
@@ -736,9 +899,20 @@ func (s *Store) GetLearningChain(id int64) ([]models.Learning, error) {
 		var supersedes *int64
 		err := s.readerDB().QueryRow(`SELECT supersedes FROM learnings WHERE id=?`, cur).Scan(&supersedes)
 		if err != nil {
+			if cur != id && errors.Is(err, sql.ErrNoRows) {
+				// A hard delete removed the row this edge names without clearing
+				// the reference. The walk already collected that id, so it must be
+				// dropped again: the target is not a chain member. The branch found
+				// so far stays readable and the history ends at the boundary.
+				backIDs = backIDs[:len(backIDs)-1]
+				break
+			}
 			return nil, fmt.Errorf("get learning chain: traverse backward from %d: %w", id, err)
 		}
-		if supersedes == nil || *supersedes == cur || visited[*supersedes] {
+		if supersedes == nil || *supersedes <= 0 || *supersedes == cur || visited[*supersedes] {
+			// <= 0 mirrors the forward guard: the backward edge is only written
+			// with a real ID, so a non-positive value can only be a sentinel and
+			// must not be chased either.
 			// *supersedes == cur is the explicit self-loop short-circuit;
 			// visited[*supersedes] covers longer cycles. Both terminate safely.
 			break
@@ -755,9 +929,20 @@ func (s *Store) GetLearningChain(id int64) ([]models.Learning, error) {
 		var supersededBy *int64
 		err := s.readerDB().QueryRow(`SELECT superseded_by FROM learnings WHERE id=?`, cur).Scan(&supersededBy)
 		if err != nil {
+			if cur != id && errors.Is(err, sql.ErrNoRows) {
+				// Same boundary as the backward walk: the successor was deleted
+				// without clearing the edge. Drop the unresolvable id and keep the
+				// branch that was already found.
+				forwardIDs = forwardIDs[:len(forwardIDs)-1]
+				break
+			}
 			return nil, fmt.Errorf("get learning chain: traverse forward from %d: %w", id, err)
 		}
-		if supersededBy == nil || *supersededBy == cur || visited[*supersededBy] {
+		if supersededBy == nil || *supersededBy <= 0 || *supersededBy == cur || visited[*supersededBy] {
+			// <= 0 stops the walk on a sentinel instead of querying a row that
+			// cannot exist (a negative ID is not a learning, and 0 is the
+			// substance-free marker). Those rows are still chain members; they
+			// simply have no successor.
 			// *supersededBy == cur is the explicit self-loop short-circuit;
 			// visited[*supersededBy] covers longer cycles. Both terminate safely.
 			break
@@ -784,12 +969,99 @@ func (s *Store) GetLearningChain(id int64) ([]models.Learning, error) {
 		}
 		results = append(results, *l)
 	}
+
+	// A batch supersede retires several rows into one successor. Only one of
+	// them fits into the scalar backward edge (learnings.supersedes), while each
+	// retired row keeps its own forward edge in superseded_by. Walking the
+	// scalar edge alone would hide the rest of the batch from the history, so
+	// the remaining predecessors are read from the forward column. A retired row
+	// can carry a predecessor of its own, so the read repeats for every row it
+	// finds; visited bounds the recursion.
+	pending := make([]int64, 0, len(backIDs)+len(forwardIDs))
+	pending = append(pending, backIDs...)
+	pending = append(pending, forwardIDs...)
+	var extra []models.Learning
+	for len(pending) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(pending)), ",")
+		args := make([]any, 0, len(pending))
+		for _, m := range pending {
+			args = append(args, m)
+		}
+		rows, err := s.readerDB().Query(
+			`SELECT id FROM learnings WHERE superseded_by IN (`+placeholders+`) ORDER BY id`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("get learning chain: read batch predecessors: %w", err)
+		}
+		next := []int64{}
+		for rows.Next() {
+			var pid int64
+			if err := rows.Scan(&pid); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("get learning chain: scan batch predecessor: %w", err)
+			}
+			if visited[pid] {
+				continue
+			}
+			visited[pid] = true
+			next = append(next, pid)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("get learning chain: read batch predecessors: %w", err)
+		}
+		for _, pid := range next {
+			l, err := s.GetLearning(pid)
+			if err != nil {
+				return nil, fmt.Errorf("get learning chain: get %d: %w", pid, err)
+			}
+			extra = append(extra, *l)
+		}
+		pending = next
+	}
+	// Each predecessor stays directly before the row that replaced it, in ID
+	// order within the group that shares one successor.
+	for _, l := range extra {
+		pos := len(results)
+		if l.SupersededBy != nil {
+			successor := *l.SupersededBy
+			for i := range results {
+				if results[i].SupersededBy != nil && *results[i].SupersededBy == successor && results[i].ID > l.ID {
+					pos = i
+					break
+				}
+			}
+			if pos == len(results) {
+				for i := range results {
+					if results[i].ID == successor {
+						pos = i
+						break
+					}
+				}
+			}
+		}
+		results = append(results, models.Learning{})
+		copy(results[pos+1:], results[pos:])
+		results[pos] = l
+	}
 	return results, nil
 }
 
 const (
 	SupersededByResolved  int64 = -2
 	SupersededByReextract int64 = -3
+
+	// SupersededByDeleted marks a row whose successor was hard-deleted by a
+	// delete path. The row stays retired (NULL would put it back into every
+	// active query) and its chain ends there.
+	SupersededByDeleted int64 = -4
+
+	// SupersededByLegacyCleanup marks a row retired by the one-off,
+	// user-approved cleanup batches of July and August 2026. The 182 rows that
+	// carry it are a closed historical set: no code in the tree writes this
+	// value, and the batches kept their own backups outside the database. It is
+	// named so a reader of the data can tell a deliberate batch retirement from
+	// a broken edge (YM-445).
+	SupersededByLegacyCleanup int64 = -6
 
 	TaskTypeStale = "stale"
 
@@ -814,9 +1086,31 @@ func (s *Store) ResolveLearning(id int64, reason string) error {
 	return nil
 }
 
-// GetTriggeredLearnings returns active learnings with non-empty trigger_rule
-// that haven't been triggered recently (12h cooldown via last_hit_at).
-func (s *Store) GetTriggeredLearnings(project string) ([]models.Learning, error) {
+// ReopenLearning clears a closure so the learning is active again. It handles
+// resolutions (superseded_by = SupersededByResolved) and the automated stale
+// batch cleanup, which uses the same sentinel; a learning that points at a real
+// successor keeps its link.
+func (s *Store) ReopenLearning(id int64) error {
+	result, err := s.db.Exec(`UPDATE learnings
+		SET superseded_by = NULL, supersede_reason = NULL, valid_until = NULL, supersede_status = NULL
+		WHERE id = ? AND superseded_by = ?`, id, SupersededByResolved)
+	if err != nil {
+		return fmt.Errorf("reopen learning %d: %w", id, err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("learning %d is not a resolved item (unknown id, still active, or superseded by another learning)", id)
+	}
+	return nil
+}
+
+// GetTriggeredLearnings returns active learnings whose trigger_rule starts with
+// triggerPrefix, is not older than minRule (inclusive, compared lexicographically;
+// empty = no lower bound) and that haven't been triggered recently (12h cooldown
+// via last_hit_at). Rows are ordered by trigger_rule, so for deadline rules
+// ("deadline:YYYY-MM-DD") the earliest still-relevant deadline comes first and is
+// not crowded out of the row limit by unrelated or long-expired rules.
+func (s *Store) GetTriggeredLearnings(project, triggerPrefix, minRule string) ([]models.Learning, error) {
 	canonical := s.resolveCanonicalProject(project)
 	now := time.Now()
 	cooldown := now.Add(-12 * time.Hour)
@@ -830,13 +1124,16 @@ func (s *Store) GetTriggeredLearnings(project string) ([]models.Learning, error)
 		COALESCE(attribution, ''),
 		COALESCE(staleness_score, 0.0), COALESCE(staleness_reason, ''), staleness_checked_at, COALESCE(staleness_type, ''), COALESCE(code_fingerprint, ''), COALESCE(project_source, '')
 		FROM learnings
-		WHERE superseded_by IS NULL
+		WHERE ` + models.RecallableLearningSQL + `
 		AND trigger_rule != '' AND trigger_rule IS NOT NULL
-		AND (expires_at IS NULL OR expires_at > ?)
-		AND (last_hit_at IS NULL OR last_hit_at < ?)
+		AND trigger_rule LIKE ?
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
+		AND (last_hit_at IS NULL OR julianday(last_hit_at) < julianday(?))
 		AND (canonical_project = ? OR canonical_project = '')
+		AND (? = '' OR trigger_rule >= ?)
+		ORDER BY trigger_rule ASC
 		LIMIT 10`
-	rows, err := s.readerDB().Query(query, fmtTime(now), fmtTime(cooldown), canonical)
+	rows, err := s.readerDB().Query(query, triggerPrefix+"%", fmtTime(now), fmtTime(cooldown), canonical, minRule, minRule)
 	if err != nil {
 		return nil, fmt.Errorf("get triggered learnings: %w", err)
 	}
@@ -1078,12 +1375,18 @@ func (s *Store) SupersedeLearningBatch(ids []int64, supersededByID int64, reason
 	defer linkStmt.Close()
 
 	for _, id := range ids {
-		markStmt.Exec(supersededByID, reason, id)
+		if _, err := markStmt.Exec(supersededByID, reason, id); err != nil {
+			return fmt.Errorf("mark learning %d superseded by %d: %w", id, supersededByID, err)
+		}
 		if supersededByID > 0 {
-			linkStmt.Exec(id, supersededByID)
+			if _, err := linkStmt.Exec(id, supersededByID); err != nil {
+				return fmt.Errorf("link learning %d to successor %d: %w", id, supersededByID, err)
+			}
 		}
 		// Clean up AQ-FTS for superseded learning
-		tx.Exec("DELETE FROM anticipated_queries_fts WHERE learning_id = ?", id)
+		if _, err := tx.Exec("DELETE FROM anticipated_queries_fts WHERE learning_id = ?", id); err != nil {
+			return fmt.Errorf("clear anticipated queries for %d: %w", id, err)
+		}
 	}
 
 	return tx.Commit()
@@ -1091,8 +1394,9 @@ func (s *Store) SupersedeLearningBatch(ids []int64, supersededByID int64, reason
 
 // ResolveSupersededIDs takes a list of learning IDs and returns a map from
 // superseded ID → active successor. Follows chains (A→B→C) up to 10 hops.
-// IDs that are active (superseded_by IS NULL) or resolved (superseded_by < 0)
-// are not included in the map — they need no redirect.
+// Active IDs (superseded_by IS NULL) are not included in the map — they need
+// no redirect. A superseded ID whose chain has no active end maps to 0
+// ("drop me"); callers must treat any value <= 0 as "no usable successor".
 func (s *Store) ResolveSupersededIDs(ids []int64) (map[int64]int64, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -1108,7 +1412,11 @@ func (s *Store) ResolveSupersededIDs(ids []int64) (map[int64]int64, error) {
 	// Single recursive CTE replaces N+1 per-hop queries.
 	// Walks each supersede chain up to 10 hops, then picks the deepest
 	// (= final) target per original_id.
-	// Also captures negative superseded_by (junk/resolved) so the caller can drop them.
+	// The final SELECT only reports a target that is itself active
+	// (superseded_by IS NULL). A chain that ends on a resolved row (negative
+	// superseded_by), on a substance-free row (superseded_by = 0) or on a
+	// dangling ID reports 0 instead — the caller drops those, so an inactive
+	// learning can never be surfaced as an "active successor".
 	query := `WITH RECURSIVE chain(original_id, current_id, depth) AS (
 		SELECT id, CAST(superseded_by AS INTEGER), 1
 		FROM learnings
@@ -1121,11 +1429,14 @@ func (s *Store) ResolveSupersededIDs(ids []int64) (map[int64]int64, error) {
 		WHERE l.superseded_by IS NOT NULL AND l.superseded_by > 0
 		AND c.depth < 10
 	)
-	SELECT original_id, current_id FROM chain
+	SELECT c.original_id,
+		CASE WHEN t.id IS NOT NULL AND t.superseded_by IS NULL THEN c.current_id ELSE 0 END AS target_id
+	FROM chain c
+	LEFT JOIN learnings t ON t.id = c.current_id
 	WHERE NOT EXISTS (
 		SELECT 1 FROM chain c2
-		WHERE c2.original_id = chain.original_id
-		AND c2.depth > chain.depth
+		WHERE c2.original_id = c.original_id
+		AND c2.depth > c.depth
 	)`
 
 	rows, err := s.readerDB().Query(query, args...)
@@ -1165,10 +1476,10 @@ func (s *Store) GetRecentNarratives(project string, limit int) ([]models.Learnin
 		COALESCE(l.staleness_score, 0.0), COALESCE(l.staleness_reason, ''), l.staleness_checked_at, COALESCE(l.staleness_type, ''), COALESCE(l.code_fingerprint, ''), COALESCE(l.project_source, '')
 		FROM learnings l
 		LEFT JOIN sessions s ON l.session_id = s.id
-		WHERE l.category = 'narrative' AND l.canonical_project = ? AND l.superseded_by IS NULL
-		AND (s.message_count IS NULL OR s.message_count = 0 OR s.message_count >= 10)
+		WHERE l.category = 'narrative' AND l.canonical_project = ? AND ` + models.RecallableLearningSQLAlias + `
+		AND (s.message_count IS NULL OR s.message_count = 0 OR s.message_count >= ?)
 		AND (s.flavor_learnings_count != 0 OR s.flavor_learnings_count IS NULL) /* -1=unknown, >0=grounded, NULL=no session */
-		ORDER BY l.created_at DESC LIMIT ?`, canonical, limit)
+		ORDER BY l.created_at DESC LIMIT ?`, canonical, ShortSessionMaxMessages, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get recent narratives: %w", err)
 	}
@@ -1357,22 +1668,46 @@ func (s *Store) BatchLoadActions(ids []int64) map[int64][]string {
 	return result
 }
 
-// collectIDs runs a SELECT query and returns all matching integer IDs.
-func (s *Store) collectIDs(query string, args ...any) ([]int64, error) {
-	rows, err := s.readerDB().Query(query, args...)
+// supersedeIDs runs an UPDATE ... RETURNING id and returns the ids it changed.
+//
+// One statement on one handle, inside a transaction. The former shape — collect
+// the ids on the read pool, then update on the write pool — could hand back a set
+// the update never touched: a row that appeared between the two statements was
+// superseded without being reported, and a vector-store cleanup that trusts the
+// reported set then removed vectors of learnings that stayed active, or kept the
+// vectors of ones that were gone (YM-367). RETURNING makes the returned set the
+// changed set by construction, and the transaction keeps the rows it reads stable
+// until the commit.
+func (s *Store) supersedeIDs(query string, args ...any) ([]int64, error) {
+	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer tx.Rollback()
+
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
 	var ids []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
-	return ids, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // InsertContradiction records a contradiction flagged by Claude.
@@ -1396,7 +1731,7 @@ func (s *Store) GetLearningCounts(project string) (map[string]int, error) {
 	}
 	query := `SELECT category, COUNT(*) FROM learnings
 		WHERE superseded_by IS NULL
-		AND (expires_at IS NULL OR expires_at > ?)
+		AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))
 		AND category NOT IN ('unfinished', 'preference', 'relationship', 'narrative')
 		AND ` + projectFilter + `
 		GROUP BY category`
@@ -1423,8 +1758,12 @@ func (s *Store) GetLearningByContentHash(hash string) (*models.Learning, error) 
 	if hash == "" {
 		return nil, nil
 	}
+	// Quarantined rows must not answer this lookup. It is the write-side dedup
+	// gate: if a quarantined row matched, the same content could never be saved
+	// again (the caller reports "duplicate" and inserts nothing) while nobody can
+	// read the row that it matched.
 	row := s.readerDB().QueryRow(`SELECT id, content, category, project, COALESCE(match_count, 0)
-		FROM learnings WHERE content_hash = ? AND superseded_by IS NULL LIMIT 1`, hash)
+		FROM learnings WHERE content_hash = ? AND `+models.RecallableLearningSQL+` LIMIT 1`, hash)
 	var l models.Learning
 	err := row.Scan(&l.ID, &l.Content, &l.Category, &l.Project, &l.MatchCount)
 	if err != nil {
@@ -1436,14 +1775,37 @@ func (s *Store) GetLearningByContentHash(hash string) (*models.Learning, error) 
 // CountLearningSince returns the number of learnings created after the given timestamp.
 func (s *Store) CountLearningSince(since time.Time) int {
 	var count int
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE created_at > ?`, fmtTime(since)).Scan(&count)
+	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE julianday(created_at) > julianday(?)`, fmtTime(since)).Scan(&count)
 	return count
 }
 
-// GetRecentLearningIDs returns the N most recently created learning IDs.
-// Used by hybrid_search skip_recent to prevent echo injection of just-extracted learnings.
-func (s *Store) GetRecentLearningIDs(n int) ([]int64, error) {
-	rows, err := s.readerDB().Query(`SELECT id FROM learnings ORDER BY id DESC LIMIT ?`, n)
+// CountLearningsSinceID counts the learnings that arrived after the given ID.
+// Alerts are excluded: they are derived rows and would otherwise let a detection
+// run satisfy the next gate by itself.
+func (s *Store) CountLearningsSinceID(afterID int64) (int, error) {
+	var count int
+	err := s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings
+		WHERE id > ? AND category != 'recurrence_alert'`, afterID).Scan(&count)
+	return count, err
+}
+
+// GetRecentLearningIDs returns the N most recently created recallable learning IDs,
+// restricted to sessionID when one is given.
+// Used by hybrid_search skip_recent to prevent echo injection of just-extracted
+// learnings. Quarantined and superseded rows are excluded: they must not consume
+// a skip slot. Ordering is by insertion id, not created_at: an extraction that
+// backdates a row to its session start is still the newest arrival.
+func (s *Store) GetRecentLearningIDs(n int, sessionID string) ([]int64, error) {
+	query := `SELECT id FROM learnings WHERE ` + models.RecallableLearningSQL
+	args := make([]any, 0, 2)
+	if sessionID != "" {
+		query += ` AND session_id = ?`
+		args = append(args, sessionID)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, n)
+
+	rows, err := s.readerDB().Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1496,6 +1858,51 @@ func (s *Store) GetCategoriesBulk(ids []string) (map[string]string, error) {
 		}
 	}
 	return result, rows.Err()
+}
+
+// QuarantinedIDs returns the subset of ids that are quarantined. IDs that do not
+// exist are not in the map. Callers use it as a last gate when a hit can arrive
+// without passing a SQL filter (anticipated-query vectors, supersede redirects).
+//
+// The list is queried in batches: a caller-controlled result count must not be
+// able to push the statement past SQLite's variable ceiling, which would turn
+// the gate into a no-op.
+func (s *Store) QuarantinedIDs(ids []string) (map[string]bool, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	const batchSize = 500
+	result := make(map[string]bool)
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		rows, err := s.readerDB().Query(
+			`SELECT CAST(id AS TEXT) FROM learnings WHERE id IN (`+strings.Join(placeholders, ",")+`) AND COALESCE(quarantined_at, '') <> ''`,
+			args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				result[id] = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 // GetSupersededChain returns the supersede history for a learning (newest first).
@@ -1571,9 +1978,54 @@ func (s *Store) GetForkLearnings(sessionID string) ([]ForkLearning, error) {
 }
 
 // InsertForkCoverage records that a fork has processed a message range.
+//
+// Coverage is a trust signal: a row that reaches the session's last message
+// tells the batch pass there is nothing left to extract. The upper bound is
+// therefore clamped to the session's real message count, so a caller cannot
+// claim more than exists and silence extraction for the whole session. The
+// lower bound must be a real index and the range must not be inverted.
 func (s *Store) InsertForkCoverage(sessionID string, fromIdx, toIdx, forkIndex int) error {
+	if sessionID == "" {
+		return fmt.Errorf("fork coverage: session id required")
+	}
+	if fromIdx < 0 || toIdx < fromIdx {
+		return fmt.Errorf("fork coverage: invalid range %d..%d for %s", fromIdx, toIdx, sessionID)
+	}
+	var messageCount int
+	if err := s.db.QueryRow(`SELECT message_count FROM sessions WHERE id = ?`, sessionID).Scan(&messageCount); err == nil && messageCount > 0 {
+		if toIdx > messageCount-1 {
+			toIdx = messageCount - 1
+		}
+		if toIdx < fromIdx {
+			return fmt.Errorf("fork coverage: range %d..%d starts beyond the session's %d messages", fromIdx, toIdx, messageCount)
+		}
+	}
 	_, err := s.db.Exec(`INSERT INTO fork_coverage (session_id, from_msg_idx, to_msg_idx, fork_index) VALUES (?, ?, ?, ?)`, sessionID, fromIdx, toIdx, forkIndex)
 	return err
+}
+
+// ForkCoverageIncomplete reports whether a fork-extracted session has at least
+// minTail messages beyond the message ranges its forks covered. Sessions without
+// coverage rows were never fork-extracted and report false, so they keep their
+// extracted marker.
+func (s *Store) ForkCoverageIncomplete(sessionID string, messageCount, minTail int) bool {
+	if sessionID == "" || messageCount <= 0 {
+		return false
+	}
+	if minTail < 1 {
+		minTail = 1
+	}
+	var rows int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM fork_coverage WHERE session_id = ?`, sessionID,
+	).Scan(&rows); err != nil || rows == 0 {
+		return false
+	}
+	target := messageCount - minTail
+	if target < 0 {
+		target = 0
+	}
+	return !s.IsCoveredByFork(sessionID, 0, target)
 }
 
 // IsCoveredByFork checks if a message range is fully covered by a previous fork.
@@ -1581,6 +2033,60 @@ func (s *Store) IsCoveredByFork(sessionID string, fromIdx, toIdx int) bool {
 	var count int
 	s.db.QueryRow(`SELECT COUNT(*) FROM fork_coverage WHERE session_id = ? AND from_msg_idx <= ? AND to_msg_idx >= ?`, sessionID, fromIdx, toIdx).Scan(&count)
 	return count > 0
+}
+
+// provenance is the lineage a learning inherits from the session it was extracted
+// from: the kind of agent that produced it and the dialog it was written in.
+type provenance struct {
+	agentRole string
+	dialogID  int64
+}
+
+// SessionAgentRole is the role a learning from this session carries: the kind of
+// agent bound to it, else its own agent_type, else "". Exported for the
+// pre-admission check, which runs before the row exists (YM-74).
+func (s *Store) SessionAgentRole(sessionID string) string {
+	return s.sessionProvenance(sessionID).agentRole
+}
+
+// sessionProvenance resolves a learning's lineage from data the store already
+// holds. The agent bound to the session names the kind of agent; a session that no
+// agent row points at falls back to its own agent_type (set for subagent
+// transcripts); the dialog the session takes part in is the dialog context the
+// learning originated from. Every source may be absent — then the column stays
+// empty rather than being guessed (YM-74).
+func (s *Store) sessionProvenance(sessionID string) provenance {
+	if sessionID == "" {
+		return provenance{}
+	}
+	p := provenance{}
+	if a, err := s.AgentGetAnyBySession(sessionID); err == nil && a != nil {
+		p.agentRole = agentRoleFromSection(a.Section)
+	}
+	if p.agentRole == "" {
+		if sess, err := s.GetSession(sessionID); err == nil && sess != nil {
+			p.agentRole = sess.AgentType
+		}
+	}
+	if d, err := s.GetActiveDialogForSession(sessionID); err == nil && d != nil {
+		p.dialogID = d.ID
+	} else if stripped := stripAgentPrefix(sessionID); stripped != sessionID {
+		if d, err := s.GetActiveDialogForSession(stripped); err == nil && d != nil {
+			p.dialogID = d.ID
+		}
+	}
+	return p
+}
+
+// agentRoleFromSection names the kind of agent a section belongs to — the value
+// conflict detection compares and the wiki renders: "yesloop-los-21" is a
+// "yesloop" agent. Two lose of one campaign share the role on purpose, so parallel
+// agents writing about the same topic are not reported as a cross-agent conflict.
+func agentRoleFromSection(section string) string {
+	if i := strings.Index(section, "-"); i > 0 {
+		return section[:i]
+	}
+	return section
 }
 
 // sessionSourceAgent returns the source_agent for a session, or "claude" if unknown.

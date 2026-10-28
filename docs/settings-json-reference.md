@@ -26,7 +26,7 @@ Registers the YesMem MCP server with Claude Code. Without this entry, no YesMem 
 | `command` | Absolute path to the yesmem binary. |
 | `args` | MCP mode arguments (always `["mcp"]`). |
 
-Set automatically by `yesmem install` and updated by `yesmem update` via `EnsureMCPRegistration()`.
+Set automatically by `yesmem install` and updated by `yesmem update` via the MCP registration helpers in `internal/setup` (there is no `EnsureMCPRegistration()` function; the merge lives in the settings and opencode-settings writers).
 
 ---
 
@@ -79,7 +79,7 @@ Fires at session start (`startup`, `resume`, `clear`, `compact`).
 
 ### SessionEnd
 
-Fires at session end (`clear`, `compact`).
+Fires at session end. Registered **without a matcher** on purpose: `compact` is not one of the SessionEnd reasons, so it must not be baked into a matcher. The documented reasons are `clear`, `resume`, `logout`, `prompt_input_exit` and `other`; `RunSessionEnd` selects the ones yesmem actually tracks.
 
 ```json
 {
@@ -87,8 +87,7 @@ Fires at session end (`clear`, `compact`).
     "hooks": [{
       "command": "~/.local/bin/yesmem session-end",
       "type": "command"
-    }],
-    "matcher": "clear|compact"
+    }]
   }]
 }
 ```
@@ -198,11 +197,16 @@ Fires on certain events (context warnings, etc.).
 
 ### UserPromptSubmit
 
-Empty — reserved for future hooks.
+Carries the idle tick that turns a prompt into a yesmem usage reminder when the session has been idle:
 
 ```json
 {
-  "UserPromptSubmit": []
+  "UserPromptSubmit": [{
+    "hooks": [{
+      "command": "~/.local/bin/yesmem idle-tick",
+      "type": "command"
+    }]
+  }]
 }
 ```
 
@@ -291,8 +295,8 @@ YesMem MCP tools require `allow` entries in Claude Code permissions. These are s
 
 | Field | Description |
 |-------|-------------|
-| `allow` | List of all permitted YesMem MCP tools. |
-| `defaultMode` | `auto` — tools not explicitly listed are prompted for approval on first use. |
+| `allow` | List of all permitted YesMem MCP tools, written as `mcp__yesmem__<tool>`. |
+| `defaultMode` | `auto` is the **classifier** mode: Claude Code decides per tool call instead of prompting for everything. Tools not listed in `allow` are not silently permitted — they go through that decision. |
 
 ---
 

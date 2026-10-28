@@ -36,15 +36,15 @@ func TestFormatAbsence(t *testing.T) {
 		hours float64
 		want  string
 	}{
-		{5, "Du warst 5 Stunden nicht da."},
-		{23, "Du warst 23 Stunden nicht da."},
-		{25, "Du warst seit gestern nicht da."},
-		{47, "Du warst seit gestern nicht da."},
-		{49, "Du warst 2 Tage nicht da."},
-		{120, "Du warst 5 Tage nicht da."},
+		{5, "5 hours away"},
+		{23, "23 hours away"},
+		{25, "away since yesterday"},
+		{47, "away since yesterday"},
+		{49, "2 days away"},
+		{120, "5 days away"},
 	}
 	for _, tt := range tests {
-		got := formatAbsence(tt.hours)
+		got := formatAbsence(DefaultStrings(), tt.hours)
 		if got != tt.want {
 			t.Errorf("formatAbsence(%v) = %q, want %q", tt.hours, got, tt.want)
 		}
@@ -56,15 +56,15 @@ func TestFormatDeadline(t *testing.T) {
 		trigger string
 		want    string
 	}{
-		{"deadline:2026-03-28", "Sa 28.03."},
-		{"deadline:2026-03-24", "Di 24.03."},
-		{"deadline:2026-01-01", "Do 01.01."},
+		{"deadline:2026-03-28", "Sat 28 March"},
+		{"deadline:2026-03-24", "Tue 24 March"},
+		{"deadline:2026-01-01", "Thu 1 January"},
 		{"deadline:invalid", ""},
 		{"", ""},
 		{"Freitext trigger", ""},
 	}
 	for _, tt := range tests {
-		got := formatDeadline(tt.trigger)
+		got := formatDeadline(DefaultStrings(), tt.trigger)
 		if got != tt.want {
 			t.Errorf("formatDeadline(%q) = %q, want %q", tt.trigger, got, tt.want)
 		}
@@ -107,7 +107,7 @@ func TestRenderOpenWork_ReminderMode(t *testing.T) {
 	if !strings.Contains(result, "High importance") {
 		t.Error("should keep importance >= 3 in reminder mode")
 	}
-	if !strings.Contains(result, "Du warst") {
+	if !strings.Contains(result, "hours away") {
 		t.Error("should contain absence note in reminder mode")
 	}
 	if !strings.Contains(result, "Bring up these points") {
@@ -123,7 +123,7 @@ func TestRenderOpenWork_DeadlineDisplay(t *testing.T) {
 		{Content: "Normal task", Importance: 3},
 	}
 	result := g.renderOpenWork(s, items, 0, nil)
-	if !strings.Contains(result, "Deadline: Sa 28.03.") {
+	if !strings.Contains(result, "Deadline: Sat 28 March") {
 		t.Errorf("should show deadline suffix, got: %s", result)
 	}
 	// Normal task should NOT have deadline
@@ -174,12 +174,12 @@ func TestRenderOpenWork_TriggerReasonOverridesStaticDeadline(t *testing.T) {
 	items := []models.Learning{
 		{ID: 42, Content: "Billing Migration", TriggerRule: "deadline:2026-03-28", Importance: 4},
 	}
-	reasons := map[int64]string{42: "Deadline morgen"}
+	reasons := map[int64]string{42: "tomorrow"}
 	result := g.renderOpenWork(s, items, 0, reasons)
-	if !strings.Contains(result, "Deadline morgen") {
+	if !strings.Contains(result, "(Deadline: tomorrow)") {
 		t.Errorf("should show urgency reason, got: %s", result)
 	}
-	if strings.Contains(result, "Sa 28.03.") {
+	if strings.Contains(result, "Sat 28 March") {
 		t.Error("urgency reason should override static date format")
 	}
 }
@@ -222,7 +222,7 @@ func TestRenderOpenWork_CapIdeasSurviveReminderMode(t *testing.T) {
 	if !strings.Contains(result, "Confirm: `remember(") {
 		t.Fatalf("expected confirm hint, got %q", result)
 	}
-	if !strings.Contains(result, "Dismiss: `resolve_by_text(") {
+	if !strings.Contains(result, "Dismiss: `resolve(learning_id=") {
 		t.Fatalf("expected dismiss hint, got %q", result)
 	}
 }

@@ -14,10 +14,10 @@ type Budget struct {
 
 // NewBudget creates a token budget proportional to the threshold.
 func NewBudget(threshold int) *Budget {
-	narrative := threshold * 2 / 100    // 2%
-	retrieval := threshold * 3 / 100    // 3%
-	reExpansion := threshold * 25 / 100 // 25%
-	fresh := threshold * 30 / 100       // 30%
+	narrative := threshold * 2 / 100                                 // 2%
+	retrieval := threshold * 3 / 100                                 // 3%
+	reExpansion := threshold * 25 / 100                              // 25%
+	fresh := threshold * 30 / 100                                    // 30%
 	stubs := threshold - narrative - retrieval - reExpansion - fresh // 40%
 
 	return &Budget{

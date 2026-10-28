@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,33 +41,19 @@ func TestOpenAIIntegration_StreamingRoundTrip(t *testing.T) {
 	defer upstream.Close()
 
 	// Find a free port
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	addr := freePort(t)
 
-	// Start proxy in background
+	// Start proxy in background; it ends with the test (YM-399)
 	cfg := Config{
-		ListenAddr:            fmt.Sprintf("127.0.0.1:%d", port),
+		ListenAddr:            addr,
 		TargetURL:             upstream.URL,
 		OpenAITargetURL:       upstream.URL,
 		TokenThreshold:        250000,
 		TokenMinimumThreshold: 100000,
 		KeepRecent:            10,
+		DataDir:               t.TempDir(),
 	}
-
-	go Run(cfg)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			conn.Close()
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	startProxyForTest(t, cfg)
 
 	// Send OpenAI streaming request
 	oaiReq := OpenAIChatRequest{
@@ -81,7 +66,7 @@ func TestOpenAIIntegration_StreamingRoundTrip(t *testing.T) {
 	body, _ := json.Marshal(oaiReq)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port), "application/json", bytes.NewReader(body))
+	resp, err := client.Post("http://"+addr+"/v1/chat/completions", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}

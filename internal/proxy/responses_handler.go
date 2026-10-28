@@ -18,6 +18,12 @@ func isResponsesPath(r *http.Request) bool {
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	reqIdx := int(s.requestIdx.Add(1))
 
+	// Process-wide housekeeping, not per-session work: this handler returns
+	// before the Anthropic handler's prune block, so it has to run it itself.
+	if reqIdx%50 == 0 {
+		s.pruneIdleThreadState(reqIdx)
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
@@ -42,7 +48,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Printf("[req %d] %sResponses adapter: model=%s stream=%v input=%d%s",
-		reqIdx, colorBlue, model, wantsStream, inputCount, colorReset)
+		reqIdx, colorBlue, journalToken(model), wantsStream, inputCount, colorReset)
 
 	anthReq, err := translateResponsesToAnthropic(reqMap)
 	if err != nil {
@@ -52,9 +58,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	ocSessionID := opencodeSessionID(r.Header)
 	if ocSessionID != "" {
-		s.logger.Printf("[req %d] %sopencode session=%s%s", reqIdx, colorGreen, ocSessionID, colorReset)
+		s.logger.Printf("[req %d] %sopencode session=%s%s", reqIdx, colorGreen, journalToken(ocSessionID), colorReset)
 	}
-	ctx := s.prepareOpenAIRequestContext(anthReq, reqIdx, r.Header.Get("X-Claude-Code-Session-Id"), ocSessionID, r.Header.Get("User-Agent"))
+	ctx := s.prepareOpenAIRequestContext(anthReq, reqIdx, r.Header.Get("X-Claude-Code-Session-Id"), ocSessionID, r.Header.Get("User-Agent"), r.Header)
 	ctx.Model = model
 
 	// Persist active opencode session so whoami can resolve it.
@@ -79,6 +85,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	headerClaudeSession := r.Header.Get("X-Claude-Code-Session-Id")
 	ua := strings.ToLower(r.Header.Get("User-Agent"))
 	isCodex := strings.Contains(ua, "codex") || strings.Contains(ua, "codexcli")
+	// A codex request carries no session header, so its mailbox is resolved from
+	// the process behind the connection. The lookup walks /proc; it runs for that
+	// one client only, never for the harnesses that bring their own id.
+	if isCodex && ocSessionID == "" && headerClaudeSession == "" {
+		s.registerCodexIdentity(&ctx, r.RemoteAddr)
+	}
 	if ocSessionID == "" && headerClaudeSession == "" && !isCodex {
 		s.logger.Printf("[req %d] non-interactive request — skipping proxy pipeline", reqIdx)
 	} else {
@@ -87,10 +99,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			skillBlock := extractSkillBlock(anthReq)
 			workDir := extractWorkingDirectory(anthReq)
 			tplCtx := buildSystemContext(buildSystemContextOpts{
-				WorkingDir:        workDir,
-				ModelID:           ctx.Model,
-				ModelDisplayName:  modelDisplayName(ctx.Model),
-				HostAgentName:     "Codex",
+				WorkingDir:       workDir,
+				ModelID:          ctx.Model,
+				ModelDisplayName: modelDisplayName(ctx.Model),
+				HostAgentName:    "Codex",
 			})
 			tpl := s.resolveSystemTemplateForDir(workDir, ctx.Model)
 			if tpl == nil {
@@ -118,7 +130,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "marshal: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.forwardOpenAIWithTracking(w, r, outBody, reqIdx, ctx.ToolUseIDs, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID, ctx.EstimatedTokens, ctx.MessageCount, responsesParser{})
+	s.forwardOpenAIWithTracking(w, r, outBody, reqIdx, ctx.ToolUseIDs, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID, ctx.EstimatedTokens, ctx.MessageCount, ctx.Subagent, responsesParser{})
 }
 
 func copyResponsesPassthroughFields(dst, src map[string]any) {

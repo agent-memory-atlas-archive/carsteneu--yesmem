@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +24,9 @@ type CacheKeepaliveConfig struct {
 	MinMessages      int               // skip keepalive when request body has fewer messages (0 = always)
 	Detector         *CacheTTLDetector // for auto mode
 	IntervalOverride time.Duration     // testing only: override computed interval
+	TimeoutOverride  time.Duration     // testing only: override the derived ping timeout
 	Logger           *log.Logger
-	OnPing           func(threadID string, cacheRead, cacheWrite int) // optional callback
+	OnPing           func(threadID string, cacheRead, cacheWrite, ephemeral1h int) // optional callback, successful pings only
 }
 
 // threadState stores per-thread request body, timer, and ping state.
@@ -45,14 +49,104 @@ type CacheKeepalive struct {
 	client  *http.Client
 }
 
-const threadEvictionAge = 2 * time.Hour
+const (
+	threadEvictionAge = 2 * time.Hour
+	// keepaliveMaxThreads bounds the tracked threads. Every entry keeps a full
+	// prompt body, so the age rule alone leaves the memory bound to whatever a
+	// caller invents as thread IDs within two hours.
+	keepaliveMaxThreads = 256
+	// keepaliveMaxResponseBytes bounds the ping response body. A ping asks for up
+	// to 8000 output tokens and the body is upstream-controlled content, so an
+	// unbounded read is an unbounded allocation on every ping.
+	keepaliveMaxResponseBytes = 1 << 20
+
+	// A ping is a cache read of the whole prompt, so the time it needs grows
+	// with the context. The fixed 20s client timeout failed every ping above
+	// roughly 750k tokens (live 2026-10-18, YM-347) while real requests kept
+	// working: the window belongs to the request size, not to a constant.
+	keepalivePingTimeoutFloor = 30 * time.Second
+	// keepalivePingTimeoutCeil is the hard bound of that window and at the same
+	// time the client timeout. A hung upstream must not pin the ping slot until
+	// the thread is evicted two hours later, so the bound stays below the
+	// shortest ping interval (270s in 5m mode) and a ping cannot swallow the slot
+	// of the next one. The cycle is interval plus ping duration either way.
+	keepalivePingTimeoutCeil = 4 * time.Minute
+	// keepaliveBytesPerToken estimates the prompt size from the stored JSON
+	// body. This is a scale estimate for the budget, not billing arithmetic.
+	keepaliveBytesPerToken = 4
+	// keepaliveTokensPerSecond is the cache-read rate the budget assumes. It is
+	// deliberately far below the measured throughput: a ping must survive a slow
+	// day, and its latency costs nobody anything because it runs off the request
+	// path.
+	keepaliveTokensPerSecond = 10000
+)
+
+// keepalivePingTimeout is the deadline for one ping of a body of that size.
+// The step is a full second: a packet of a few hundred bytes must land exactly
+// on the floor, and sub-second additions buy nothing.
+func keepalivePingTimeout(bodyLen int) time.Duration {
+	if bodyLen <= 0 {
+		return keepalivePingTimeoutFloor
+	}
+	seconds := bodyLen / keepaliveBytesPerToken / keepaliveTokensPerSecond
+	// Clamp before the multiplication: a body big enough to overflow a duration
+	// is past the ceiling anyway.
+	if seconds > int(keepalivePingTimeoutCeil/time.Second) {
+		return keepalivePingTimeoutCeil
+	}
+	d := keepalivePingTimeoutFloor + time.Duration(seconds)*time.Second
+	if d > keepalivePingTimeoutCeil {
+		return keepalivePingTimeoutCeil
+	}
+	return d
+}
+
+// pingTimeout applies the test override to the derived budget.
+func (ka *CacheKeepalive) pingTimeout(bodyLen int) time.Duration {
+	if ka.cfg.TimeoutOverride > 0 {
+		return ka.cfg.TimeoutOverride
+	}
+	return keepalivePingTimeout(bodyLen)
+}
+
+// errPingBudget reports a ping that spent its own deadline. It is a separate
+// value because the transport's timeout errors satisfy
+// errors.Is(err, context.DeadlineExceeded) too: net's errTimeout matches that
+// sentinel on purpose, and a dial timeout is an upstream failure, not a large
+// context. Only the request's own context can witness which one fired.
+var errPingBudget = errors.New("keepalive ping budget exceeded")
+
+// isPingTimeout separates a spent local budget from an upstream answer, so
+// proxy_health can count the first apart from the second.
+func isPingTimeout(err error) bool {
+	return errors.Is(err, errPingBudget)
+}
+
+// pingErrorFor labels a ping failure as a spent budget when the request's own
+// deadline expired, and leaves it as an upstream failure otherwise.
+func pingErrorFor(ctx context.Context, err error) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("%w: %v", errPingBudget, err)
+	}
+	return err
+}
 
 // NewCacheKeepalive creates a new keepalive timer (initially idle).
 func NewCacheKeepalive(cfg CacheKeepaliveConfig) *CacheKeepalive {
 	return &CacheKeepalive{
 		cfg:     cfg,
 		threads: make(map[string]*threadState),
-		client:  &http.Client{Timeout: 20 * time.Second},
+		client: &http.Client{
+			// The per-request deadline (derived from the body size) governs the
+			// ping; this is only its hard upper bound.
+			Timeout: keepalivePingTimeoutCeil,
+			// The ping carries the session credential in x-api-key, and Go copies
+			// that header to a redirect target. A redirect is no ping answer
+			// either, so the client keeps it and the ping reports it as an error.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -99,7 +193,7 @@ func (ka *CacheKeepalive) effectivePings() int {
 }
 
 // Reset stores the request body for a thread and starts/resets only that thread's timer.
-// Skips internal/automated threads (UUID format) — only real user sessions get keepalive.
+// Skips internal/automated threads — only real user sessions get keepalive.
 // anthropicBeta is the original request's anthropic-beta header; the ping must
 // resend it, otherwise beta-gated body fields are rejected as extra inputs.
 func (ka *CacheKeepalive) Reset(threadID string, requestBody []byte, apiKey, anthropicBeta string) {
@@ -152,10 +246,15 @@ func (ka *CacheKeepalive) Reset(threadID string, requestBody []byte, apiKey, ant
 	})
 }
 
-// Retrigger restarts keepalive timers for all threads with recalculated interval and ping count.
+// Retrigger restarts keepalive timers for all threads with recalculated interval
+// and ping count. A detection change starts a new phase: the thread that spent
+// its pings while discovering the change gets the new budget too.
 func (ka *CacheKeepalive) Retrigger() {
 	ka.mu.Lock()
 	defer ka.mu.Unlock()
+	// Expired threads must not be resurrected by a new phase: their stored body
+	// is a full prompt and their session stopped asking long ago.
+	ka.evictStaleLocked()
 	if len(ka.threads) == 0 {
 		return
 	}
@@ -224,6 +323,8 @@ func (ka *CacheKeepalive) sendPingForThread(threadID string, expectedGen uint64)
 		return
 	}
 	ts.pingsRemaining--
+	// The slot is spent before the request: a failing ping must not turn the
+	// bounded phase into an unbounded retry loop.
 	remaining := ts.pingsRemaining
 	body := make([]byte, len(ts.body))
 	copy(body, ts.body)
@@ -232,19 +333,42 @@ func (ka *CacheKeepalive) sendPingForThread(threadID string, expectedGen uint64)
 	ka.mu.Unlock()
 
 	pingBody := buildPingBody(body)
-	cacheRead, cacheWrite, outputTokens := ka.doHTTPPing(pingBody, apiKey, anthropicBeta)
+	cacheRead, cacheWrite, outputTokens, ephemeral1h, pingErr := ka.doHTTPPing(pingBody, apiKey, anthropicBeta)
 
-	if ka.cfg.OnPing != nil {
-		ka.cfg.OnPing(threadID, cacheRead, cacheWrite)
-	}
-
-	if ka.cfg.Logger != nil {
-		ka.cfg.Logger.Printf("[keepalive] ping tid=%s cache_read=%d cache_write=%d out=%d remaining=%d mode=%s",
-			threadID, cacheRead, cacheWrite, outputTokens, remaining, ka.cfg.Mode)
+	if pingErr != nil {
+		// A failed ping neither warms the cache nor proves it is warm, so the
+		// OnPing consumers (sawtooth pause timestamp, frozen stubs, TTL detector)
+		// must stay untouched.
+		//
+		// A spent local budget and an upstream failure are different diagnoses:
+		// the first says the context outgrew its window (and names the size),
+		// the second says the provider failed. proxy_health counts them apart.
+		if ka.cfg.Logger != nil {
+			ctxTokens := len(pingBody) / keepaliveBytesPerToken
+			timeout := ka.pingTimeout(len(pingBody))
+			if isPingTimeout(pingErr) {
+				ka.cfg.Logger.Printf("[keepalive] ping timeout tid=%s ctx_tokens=%d body_bytes=%d timeout=%s remaining=%d mode=%s: %v",
+					journalToken(threadID), ctxTokens, len(pingBody), timeout.Truncate(time.Millisecond), remaining, ka.cfg.Mode, pingErr)
+			} else {
+				ka.cfg.Logger.Printf("[keepalive] ping error tid=%s ctx_tokens=%d remaining=%d mode=%s: %v",
+					journalToken(threadID), ctxTokens, remaining, ka.cfg.Mode, pingErr)
+			}
+		}
+	} else {
+		if ka.cfg.OnPing != nil {
+			ka.cfg.OnPing(threadID, cacheRead, cacheWrite, ephemeral1h)
+		}
+		if ka.cfg.Logger != nil {
+			ka.cfg.Logger.Printf("[keepalive] ping tid=%s cache_read=%d cache_write=%d out=%d remaining=%d mode=%s",
+				journalToken(threadID), cacheRead, cacheWrite, outputTokens, remaining, ka.cfg.Mode)
+		}
 	}
 
 	ka.mu.Lock()
 	if ts.generation == expectedGen && ts.pingsRemaining > 0 {
+		// An armed phase is activity: without this stamp a 1h phase with several
+		// pings lives longer than threadEvictionAge and evicts itself.
+		ts.lastUsed = time.Now()
 		gen := ts.generation
 		ts.timer = time.AfterFunc(ka.effectiveInterval(), func() {
 			ka.sendPingForThread(threadID, gen)
@@ -253,42 +377,103 @@ func (ka *CacheKeepalive) sendPingForThread(threadID string, expectedGen uint64)
 	ka.mu.Unlock()
 }
 
+// evictStaleLocked drops expired threads and enforces the hard cap oldest
+// first. Caller holds mu. The thread being reset has just been stamped with
+// now, so it is never the first to go.
 func (ka *CacheKeepalive) evictStaleLocked() {
 	cutoff := time.Now().Add(-threadEvictionAge)
 	for tid, ts := range ka.threads {
 		if ts.lastUsed.Before(cutoff) {
-			if ts.timer != nil {
-				ts.timer.Stop()
-			}
-			delete(ka.threads, tid)
+			ka.dropThreadLocked(tid, ts)
+		}
+	}
+	if len(ka.threads) <= keepaliveMaxThreads {
+		return
+	}
+	type entry struct {
+		tid  string
+		used time.Time
+	}
+	entries := make([]entry, 0, len(ka.threads))
+	for tid, ts := range ka.threads {
+		entries = append(entries, entry{tid, ts.lastUsed})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].used.Before(entries[j].used) })
+	for _, e := range entries[:len(entries)-keepaliveMaxThreads] {
+		if ts, ok := ka.threads[e.tid]; ok {
+			ka.dropThreadLocked(e.tid, ts)
 		}
 	}
 }
 
-func (ka *CacheKeepalive) doHTTPPing(body []byte, apiKey, anthropicBeta string) (cacheRead, cacheWrite, outputTokens int) {
+func (ka *CacheKeepalive) dropThreadLocked(threadID string, ts *threadState) {
+	if ts.timer != nil {
+		ts.timer.Stop()
+	}
+	delete(ka.threads, threadID)
+}
+
+// setPingAuth applies the thread's credential in the form the upstream accepts:
+// subscription clients (Claude Code OAuth) send Authorization: Bearer, API-key
+// clients x-api-key. A Bearer value in x-api-key is rejected with 401.
+func setPingAuth(req *http.Request, credential string) {
+	if strings.HasPrefix(credential, "Bearer ") {
+		req.Header.Set("Authorization", credential)
+		return
+	}
+	req.Header.Set("x-api-key", credential)
+}
+
+// doHTTPPing sends one keepalive ping. A ping only counts as successful when
+// the upstream answered with cache accounting: a 200 without cache_read and
+// cache_write tokens proves nothing about the cache (live log: 33 of 124 pings
+// reported exactly that with no error at all).
+func (ka *CacheKeepalive) doHTTPPing(body []byte, apiKey, anthropicBeta string) (cacheRead, cacheWrite, outputTokens, ephemeral1h int, err error) {
 	endpoint := ka.resolveTarget(body) + "/v1/messages"
 	req, err := http.NewRequest("POST", endpoint, nil)
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
+	setPingAuth(req, apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	if anthropicBeta != "" {
 		req.Header.Set("anthropic-beta", anthropicBeta)
 	}
 	req.Body = io.NopCloser(bytesReader(body))
 	req.ContentLength = int64(len(body))
+	// The budget is the request size, not a constant: a ping of a 750k-token
+	// context is a large upload and a large cache read (YM-347).
+	ctx, cancel := context.WithTimeout(context.Background(), ka.pingTimeout(len(body)))
+	defer cancel()
+	req = req.WithContext(ctx)
 
 	resp, err := ka.client.Do(req)
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, 0, pingErrorFor(ctx, err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, keepaliveMaxResponseBytes+1))
 
-	if resp.StatusCode != http.StatusOK && ka.cfg.Logger != nil {
-		ka.cfg.Logger.Printf("[keepalive] ping error: HTTP %d body=%s", resp.StatusCode, truncateBytes(respBody, 200))
+	if resp.StatusCode != http.StatusOK {
+		// The status check comes first, like the size check below: an error answer
+		// keeps its status in the message even when its body breaks off mid-read.
+		// The body is foreign text on a journal line the health cap reads, so a
+		// line break must not survive into the error (YM-380).
+		return 0, 0, 0, 0, fmt.Errorf("HTTP %d body=%s", resp.StatusCode, oneLineForJournal(truncateBytes(respBody, 200)))
+	}
+	if readErr != nil {
+		// The budget usually runs out here, not at the header: the upstream
+		// writes the headers in milliseconds and the body is the expensive part.
+		// Dropping this error turned a spent budget into "unparsable response",
+		// which proxy_health then counted as an upstream failure (YM-347).
+		return 0, 0, 0, 0, pingErrorFor(ctx, fmt.Errorf("reading response body: %w", readErr))
+	}
+
+	// The size check runs after the status check: an error answer keeps its
+	// status in the message even when its body is larger than the limit.
+	if len(respBody) > keepaliveMaxResponseBytes {
+		return 0, 0, 0, 0, fmt.Errorf("response body exceeds %d bytes", keepaliveMaxResponseBytes)
 	}
 
 	var usage struct {
@@ -296,10 +481,20 @@ func (ka *CacheKeepalive) doHTTPPing(body []byte, apiKey, anthropicBeta string) 
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
+			CacheCreation            struct {
+				Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
+			} `json:"cache_creation"`
 		} `json:"usage"`
 	}
-	json.Unmarshal(respBody, &usage)
-	return usage.Usage.CacheReadInputTokens, usage.Usage.CacheCreationInputTokens, usage.Usage.OutputTokens
+	if err := json.Unmarshal(respBody, &usage); err != nil {
+		// The body of a 200 is upstream-controlled content (could be a full
+		// completion); the status and the token counters are enough to diagnose.
+		return 0, 0, 0, 0, fmt.Errorf("unparsable response: %v", err)
+	}
+	if usage.Usage.CacheReadInputTokens == 0 && usage.Usage.CacheCreationInputTokens == 0 {
+		return 0, 0, 0, 0, fmt.Errorf("response without cache accounting (cache_read=0 cache_write=0 out=%d)", usage.Usage.OutputTokens)
+	}
+	return usage.Usage.CacheReadInputTokens, usage.Usage.CacheCreationInputTokens, usage.Usage.OutputTokens, usage.Usage.CacheCreation.Ephemeral1hInputTokens, nil
 }
 
 // buildPingBody sets max_tokens=8000 and stream=false on the request body.
@@ -358,22 +553,10 @@ func (ka *CacheKeepalive) resolveTarget(body []byte) string {
 		Model string `json:"model"`
 	}
 	json.Unmarshal(body, &tmp)
-	model := strings.ToLower(tmp.Model)
-	if len(ka.cfg.ProviderTargets) > 0 {
-		for key, url := range ka.cfg.ProviderTargets {
-			if url == "" {
-				continue
-			}
-			keyLower := strings.ToLower(key)
-			if strings.HasPrefix(model, keyLower) || strings.HasPrefix(model, keyLower+"-") {
-				return strings.TrimRight(url, "/")
-			}
-		}
-		for key, url := range ka.cfg.ProviderTargets {
-			if url != "" && strings.EqualFold(key, tmp.Model) {
-				return strings.TrimRight(url, "/")
-			}
-		}
+	// Same rule as the request path, from the same helper: a ping must reach the
+	// upstream the request it keeps warm is routed to.
+	if url, ok := matchProviderTarget(tmp.Model, ka.cfg.ProviderTargets); ok {
+		return url
 	}
 	return ka.cfg.Target
 }

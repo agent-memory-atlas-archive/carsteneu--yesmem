@@ -13,7 +13,7 @@ import (
 type SessionEndInput struct {
 	SessionID string `json:"session_id"`
 	CWD       string `json:"cwd"`
-	Reason    string `json:"reason"` // "clear", "compact", "logout", etc.
+	Reason    string `json:"reason"` // "clear", "logout", "prompt_input_exit", "other"
 }
 
 // RunSessionEnd reads SessionEnd JSON from stdin and tracks the session end
@@ -26,7 +26,11 @@ func RunSessionEnd(dataDir string) {
 		return
 	}
 
-	if input.Reason != "clear" && input.Reason != "compact" {
+	// Only /clear continues as a new session that needs the old context. The
+	// other SessionEnd reasons (logout, prompt_input_exit, other) end the work,
+	// and compaction does not end a session at all — it reports PreCompact, never
+	// SessionEnd, so "compact" here would be a case that cannot occur.
+	if input.Reason != "clear" {
 		fmt.Print("{}")
 		return
 	}

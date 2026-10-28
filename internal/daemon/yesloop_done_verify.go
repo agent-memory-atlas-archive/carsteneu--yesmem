@@ -55,9 +55,22 @@ type yesloopDoneVerifyState struct {
 	refireCount    int
 	lastRelayAt    time.Time
 	transitionedAt time.Time
+	// createdAt identifies the row the verdict belongs to. Since YM-151 the
+	// allocator never reuses a number, so this binding is defense in depth: a
+	// hand-made or restored row that lands on an id this map still carries must
+	// not inherit its verdict — both guard layers would stay silent for it
+	// (review round 3).
+	createdAt string
+	// subagentFrozenAt is when the freeze was last reported, so a frozen guard
+	// reports itself on a clock instead of once per tick.
+	subagentFrozenAt time.Time
 }
 
 var (
+	// yesloopDoneVerifyAgents is pruned against the live agent rows on every sweep
+	// (pruneDoneVerifyStates): an entry is only added for an agent that emitted a
+	// DONE-claim, and a row that no longer exists loses it. The map used to grow by
+	// one small struct per DONE-claim until the daemon restarted (YM-203).
 	yesloopDoneVerifyAgents   = make(map[string]*yesloopDoneVerifyState)
 	yesloopDoneVerifyAgentsMu sync.Mutex
 )
@@ -135,6 +148,26 @@ func (h *Handler) checkYesloopDoneVerify() {
 	for _, agent := range agents {
 		h.checkOneDoneVerify(agent)
 	}
+	h.pruneDoneVerifyStates(agents)
+}
+
+// pruneDoneVerifyStates drops the bookkeeping of agents that no longer have a
+// row. The map is in-memory; before YM-203 it kept one entry per agent that had
+// ever emitted a DONE-claim until the daemon restarted. A row that still exists
+// keeps its verdict — doneVerifySettled (idle guard) reads it, and the idle layer
+// must stay silent for an agent this layer already settled.
+func (h *Handler) pruneDoneVerifyStates(agents []storage.Agent) {
+	live := make(map[string]struct{}, len(agents))
+	for i := range agents {
+		live[agents[i].ID] = struct{}{}
+	}
+	yesloopDoneVerifyAgentsMu.Lock()
+	defer yesloopDoneVerifyAgentsMu.Unlock()
+	for id := range yesloopDoneVerifyAgents {
+		if _, ok := live[id]; !ok {
+			delete(yesloopDoneVerifyAgents, id)
+		}
+	}
 }
 
 // checkOneDoneVerify drives a single agent through the verify state machine.
@@ -150,46 +183,168 @@ func (h *Handler) checkOneDoneVerify(agent storage.Agent) {
 	}
 
 	content := h.readAgentScratchpad(agent)
+	claim := content != "" && hasDoneClaim(content)
+	// Only an agent this layer tracks or one that just claimed DONE can act here;
+	// every other running yesloop agent would pay for the child lookup every tick
+	// (two sqlite3 spawns) without a decision hanging on it.
+	if !claim && !doneVerifyHasState(agent.ID) {
+		return
+	}
+	// An opencode agent whose session id is not bound yet has no child signal at
+	// all; the on-demand bind is rate-limited per agent.
+	agent = *h.ensureOpencodeSession(&agent)
+	// Read before the lock: the child lookup hits opencode's session table.
+	inSubagent := h.agentWaitingInSubagent(agent)
 
+	action, reason := h.advanceDoneVerify(agent, content, claim, inSubagent)
+
+	// The state mutex is released again; everything below is I/O — a daemon
+	// send_to that pushes into an opencode inbox, a pause write, or a dial the
+	// agent's socket may not answer for seconds. Holding the map mutex across
+	// those stalls every other agent's tick (YM-344).
+	switch action {
+	case doneVerifyActionVerified:
+		log.Printf("[yesloop-done-verify] agent %s (%s) verified DONE",
+			safeAgentText(agent.ID), safeAgentText(agent.Section))
+		h.notifyOrchestrator(agent, fmt.Sprintf(
+			"Agent %s (%s) verified DONE — BEWEISEN + send_to + 6 phases COMPLETE",
+			safeAgentText(agent.ID), safeAgentText(agent.Section)))
+
+	case doneVerifyActionRelay:
+		h.sendDoneVerifyRelay(agent)
+
+	case doneVerifyActionEscalate:
+		h.pauseAgent(agent.ID, fmt.Sprintf("yesloop-done-verify escalation: %s", reason))
+		h.notifyOrchestrator(agent, fmt.Sprintf(
+			"DEAD_AGENT: Agent %s (%s) done-verify escalation — %s%s",
+			safeAgentText(agent.ID), safeAgentText(agent.Section), safeAgentText(reason), orchestratorPauseHint))
+	}
+}
+
+// doneVerifyAction is the I/O one tick owes the agent. The state machine decides
+// it under the mutex; the caller runs it after the mutex is released.
+type doneVerifyAction int
+
+const (
+	doneVerifyActionNone doneVerifyAction = iota
+	doneVerifyActionRelay
+	doneVerifyActionEscalate
+	doneVerifyActionVerified
+)
+
+// advanceDoneVerify drives the verify state machine for one agent and returns the
+// action the caller must carry out. Everything that touches the network or
+// another handler stays out of this function: the mutex it holds is the one
+// every other agent's tick needs.
+func (h *Handler) advanceDoneVerify(agent storage.Agent, content string, claim, inSubagent bool) (doneVerifyAction, string) {
 	yesloopDoneVerifyAgentsMu.Lock()
 	defer yesloopDoneVerifyAgentsMu.Unlock()
 
 	state, exists := yesloopDoneVerifyAgents[agent.ID]
 	if !exists {
 		// No state yet. Only start tracking when a DONE-claim appears.
-		if content == "" || !hasDoneClaim(content) {
-			return
+		if !claim {
+			return doneVerifyActionNone, ""
 		}
-		state = &yesloopDoneVerifyState{state: yesloopDoneVerifyStateNotDone}
+		state = &yesloopDoneVerifyState{state: yesloopDoneVerifyStateNotDone, createdAt: agent.CreatedAt}
 		yesloopDoneVerifyAgents[agent.ID] = state
 	}
 
+	// Terminal verdicts need no relay: reporting a freeze for them would point a
+	// log reader at an agent this layer has nothing left to say to.
+	if state.state == yesloopDoneVerifyStateDoneVerified ||
+		state.state == yesloopDoneVerifyStateDeadAgentEscalation {
+		return doneVerifyActionNone, ""
+	}
+
+	// Settlement is bookkeeping, not a relay: an agent that already proved its
+	// completion must not wait for a child it is no longer waiting on.
+	if state.state == yesloopDoneVerifyStateVerifyRequested && isVerified(content) {
+		state.subagentFrozenAt = time.Time{}
+		h.transitionDoneVerify(agent, state, yesloopDoneVerifyStateDoneVerified)
+		return doneVerifyActionVerified, ""
+	}
+
+	// A relay into an agent blocked inside a task() subagent only queues as a
+	// pending user message and hits it after the subagent returns (#89428). No
+	// transition, no refire and no escalation while the child runs; the relay
+	// interval restarts when the child ends.
+	if inSubagent {
+		if now := time.Now(); now.Sub(state.subagentFrozenAt) >= subagentFreezeLogEvery {
+			log.Printf("[yesloop-done-verify] agent %s (%s) frozen: a task() subagent is active",
+				safeAgentText(agent.ID), safeAgentText(agent.Section))
+			state.subagentFrozenAt = now
+		}
+		state.lastRelayAt = time.Now()
+		return doneVerifyActionNone, ""
+	}
+	state.subagentFrozenAt = time.Time{}
+
 	switch state.state {
 	case yesloopDoneVerifyStateNotDone:
-		if hasDoneClaim(content) {
+		if claim {
 			h.transitionDoneVerify(agent, state, yesloopDoneVerifyStateVerifyRequested)
-			h.sendDoneVerifyRelay(agent, state)
+			// Stamped here rather than in the relay: a failed dial still counts as
+			// a relay attempt for the refire gate, and the caller must not write
+			// the state without the mutex.
+			state.lastRelayAt = time.Now()
+			return doneVerifyActionRelay, ""
 		}
 
 	case yesloopDoneVerifyStateVerifyRequested:
-		if isVerified(content) {
-			h.transitionDoneVerify(agent, state, yesloopDoneVerifyStateDoneVerified)
-			log.Printf("[yesloop-done-verify] agent %s (%s) verified DONE", agent.ID, agent.Section)
-			h.notifyOrchestrator(agent, fmt.Sprintf(
-				"Agent %s (%s) verified DONE — BEWEISEN + send_to + 6 phases COMPLETE",
-				agent.ID, agent.Section))
-			return
-		}
-		h.maybeDoneVerifyRefire(agent, state, "no BEWEISEN/send_to/6-phases evidence")
-
-	case yesloopDoneVerifyStateDoneVerified:
-		// Terminal — no further action.
-		return
-
-	case yesloopDoneVerifyStateDeadAgentEscalation:
-		// Terminal — no further action.
-		return
+		return h.refireOrEscalate(agent, state)
 	}
+	return doneVerifyActionNone, ""
+}
+
+// refireOrEscalate advances the refire ladder. Called with the state mutex held;
+// the caller performs the returned action after releasing it.
+func (h *Handler) refireOrEscalate(agent storage.Agent, state *yesloopDoneVerifyState) (doneVerifyAction, string) {
+	const reason = "no BEWEISEN/send_to/6-phases evidence"
+	if time.Since(state.lastRelayAt) < yesloopDoneVerifyRefireInterval {
+		return doneVerifyActionNone, ""
+	}
+	state.refireCount++
+	if state.refireCount >= yesloopDoneVerifyMaxRefires {
+		log.Printf("[yesloop-done-verify] agent %s (%s) ESCALATION: %s (refireCount=%d, max=%d)",
+			safeAgentText(agent.ID), safeAgentText(agent.Section), reason, state.refireCount, yesloopDoneVerifyMaxRefires)
+		state.state = yesloopDoneVerifyStateDeadAgentEscalation
+		state.transitionedAt = time.Now()
+		return doneVerifyActionEscalate, reason
+	}
+	state.lastRelayAt = time.Now()
+	return doneVerifyActionRelay, ""
+}
+
+// doneVerifyHasState reports whether the layer already holds state for this
+// agent. The child lookup and the scratchpad-driven transitions only matter for
+// a tracked agent or one that just claimed DONE.
+func doneVerifyHasState(agentID string) bool {
+	yesloopDoneVerifyAgentsMu.Lock()
+	defer yesloopDoneVerifyAgentsMu.Unlock()
+	_, ok := yesloopDoneVerifyAgents[agentID]
+	return ok
+}
+
+// doneVerifySettled reports whether the done-verify layer has already reached a
+// verdict for this agent: DONE_VERIFIED means the agent proved its completion,
+// DEAD_AGENT_ESCALATION means the layer escalated and paused it. Either way the
+// idle layer must not relay into the agent — two layers of one daemon
+// contradicting each other was the reported symptom (YM-149: DONE_VERIFIED at
+// 23:36, idle relays from 23:42).
+//
+// The verdict is bound to the row it was reached for: a new agent must not
+// inherit a silence it never earned. Since YM-151 the allocator does not reuse
+// ids, so the createdAt comparison is defense in depth rather than the only
+// guard.
+func doneVerifySettled(agent storage.Agent) bool {
+	yesloopDoneVerifyAgentsMu.Lock()
+	defer yesloopDoneVerifyAgentsMu.Unlock()
+	st, ok := yesloopDoneVerifyAgents[agent.ID]
+	if !ok || st.createdAt != agent.CreatedAt {
+		return false
+	}
+	return st.state == yesloopDoneVerifyStateDoneVerified || st.state == yesloopDoneVerifyStateDeadAgentEscalation
 }
 
 // transitionDoneVerify moves the agent to a new verify state.
@@ -197,51 +352,34 @@ func (h *Handler) transitionDoneVerify(agent storage.Agent, state *yesloopDoneVe
 	oldName := yesloopDoneVerifyStateNames[state.state]
 	newName := yesloopDoneVerifyStateNames[newState]
 	log.Printf("[yesloop-done-verify] agent %s (%s) state %s -> %s",
-		agent.ID, agent.Section, oldName, newName)
+		safeAgentText(agent.ID), safeAgentText(agent.Section), oldName, newName)
 	state.state = newState
 	state.refireCount = 0
 	state.transitionedAt = time.Now()
 }
 
-// maybeDoneVerifyRefire checks if a re-fire is needed and escalates if the
-// max re-fire count is exceeded.
-func (h *Handler) maybeDoneVerifyRefire(agent storage.Agent, state *yesloopDoneVerifyState, reason string) {
-	if time.Since(state.lastRelayAt) < yesloopDoneVerifyRefireInterval {
-		return
-	}
-	state.refireCount++
-	if state.refireCount >= yesloopDoneVerifyMaxRefires {
-		log.Printf("[yesloop-done-verify] agent %s (%s) ESCALATION: %s (refireCount=%d, max=%d)",
-			agent.ID, agent.Section, reason, state.refireCount, yesloopDoneVerifyMaxRefires)
-		state.state = yesloopDoneVerifyStateDeadAgentEscalation
-		state.transitionedAt = time.Now()
-		h.pauseAgent(agent.ID, fmt.Sprintf("yesloop-done-verify escalation: %s", reason))
-		h.notifyOrchestrator(agent, fmt.Sprintf(
-			"DEAD_AGENT: Agent %s (%s) done-verify escalation — %s%s",
-			agent.ID, agent.Section, reason, orchestratorPauseHint))
-		return
-	}
-	h.sendDoneVerifyRelay(agent, state)
+// doneVerifyDial is the dial the relay uses. A variable so a test can hold the
+// dial open and observe what the guard does while it waits — the wait itself is
+// the reason the caller must not hold the state mutex.
+var doneVerifyDial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout(network, addr, timeout)
 }
 
 // sendDoneVerifyRelay sends the verify relay to a yesloop agent via the inject
 // socket. Single metachar-free write (no markdown, no backticks, no parens).
-func (h *Handler) sendDoneVerifyRelay(agent storage.Agent, state *yesloopDoneVerifyState) {
-	if agent.SockPath == "" {
-		log.Printf("[yesloop-done-verify] relay to agent %s skipped: no sock_path", agent.ID)
+// The caller stamps state.lastRelayAt before calling: it owns the state mutex,
+// and this function runs with the mutex released.
+func (h *Handler) sendDoneVerifyRelay(agent storage.Agent) {
+	injectPath := h.agentInjectPath(agent.ID)
+	if injectPath == "" {
+		log.Printf("[yesloop-done-verify] relay to agent %s skipped: no derivable socket path", safeAgentText(agent.ID))
 		return
 	}
-
-	injectPath := agent.SockPath + ".inject"
 	wrapped := fmt.Sprintf("[RELAY from=yesloop-done-verify] %s", doneVerifyRelayMessage)
 
-	// Record the attempt before dialing — a failed dial still counts as a
-	// relay attempt for refire-gating purposes, preventing rapid escalation.
-	state.lastRelayAt = time.Now()
-
-	conn, err := net.DialTimeout("unix", injectPath, 3*time.Second)
+	conn, err := doneVerifyDial("unix", injectPath, 3*time.Second)
 	if err != nil {
-		log.Printf("[yesloop-done-verify] relay to agent %s failed: %v", agent.ID, err)
+		log.Printf("[yesloop-done-verify] relay to agent %s failed: %v", safeAgentText(agent.ID), safeAgentText(err.Error()))
 		return
 	}
 	defer conn.Close()

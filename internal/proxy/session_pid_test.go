@@ -22,7 +22,7 @@ func TestPeerSessionPID_ResolvesDialerPID(t *testing.T) {
 	defer ln.Close()
 
 	type result struct {
-		addr net.Addr
+		conn net.Conn
 		err  error
 	}
 	got := make(chan result, 1)
@@ -32,7 +32,7 @@ func TestPeerSessionPID_ResolvesDialerPID(t *testing.T) {
 			got <- result{err: err}
 			return
 		}
-		got <- result{addr: conn.RemoteAddr()}
+		got <- result{conn: conn}
 	}()
 
 	client, err := net.Dial("tcp", ln.Addr().String())
@@ -45,14 +45,18 @@ func TestPeerSessionPID_ResolvesDialerPID(t *testing.T) {
 	if res.err != nil {
 		t.Fatalf("accept: %v", res.err)
 	}
+	// The accepted side has to stay open and ESTABLISHED: peerClientSocketInode only
+	// matches row state 01, so a dropped connection flaked this lookup to 0.
+	defer res.conn.Close()
+	remote := res.conn.RemoteAddr().String()
 
-	pid := peerSessionPID(ln.Addr().String(), res.addr.String())
+	pid := peerSessionPID(ln.Addr().String(), remote)
 	if pid != os.Getpid() {
-		t.Fatalf("peerSessionPID(%s) = %d, want own pid %d", res.addr.String(), pid, os.Getpid())
+		t.Fatalf("peerSessionPID(%s) = %d, want own pid %d", remote, pid, os.Getpid())
 	}
 
 	// Cache: zweiter Aufruf gleicher Addr → gleiche PID
-	if pid2 := peerSessionPID(ln.Addr().String(), res.addr.String()); pid2 != os.Getpid() {
+	if pid2 := peerSessionPID(ln.Addr().String(), remote); pid2 != os.Getpid() {
 		t.Fatalf("cached second call = %d, want %d", pid2, os.Getpid())
 	}
 }

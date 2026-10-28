@@ -21,10 +21,18 @@ func runBenchmark() {
 	jsonOut := fs.Bool("json", false, "output as JSON")
 	fs.Parse(os.Args[2:])
 
+	sinceArg, err := parseTimeArg(*since)
+	if err != nil {
+		log.Fatalf("--since: %v", err)
+	}
+	beforeArg, err := parseTimeArg(*before)
+	if err != nil {
+		log.Fatalf("--before: %v", err)
+	}
 	f := storage.StatsFilter{
 		Project: *project,
-		Since:   parseTimeArg(*since),
-		Before:  parseTimeArg(*before),
+		Since:   sinceArg,
+		Before:  beforeArg,
 	}
 
 	dataDir := yesmemDataDir()
@@ -160,12 +168,24 @@ func runBenchmark() {
 		}
 	}
 
-	if evolution != nil && evolution.TotalSuperseded > 0 {
-		ruleBasedPct := float64(evolution.RuleBasedCount) / float64(evolution.TotalSuperseded) * 100
+	if evolution != nil {
 		fmt.Fprintf(os.Stderr, "\nEvolution:\n")
 		fmt.Fprintf(os.Stderr, "  Total superseded:        %d\n", evolution.TotalSuperseded)
-		fmt.Fprintf(os.Stderr, "  Rule-based:              %d (%.0f%%)\n", evolution.RuleBasedCount, ruleBasedPct)
-		fmt.Fprintf(os.Stderr, "  LLM-based:               %d (%.0f%%)\n", evolution.LLMCount, 100-ruleBasedPct)
+		// The base is every retirement except the deleted-predecessor rows, so a
+		// project with nothing but those has no base to apportion. It still counts
+		// the sentinel retirements (-1/-2/-3/0) as superseded here, by the same
+		// Los-61e definition the rest of the surface uses.
+		if evolution.TotalSuperseded > 0 {
+			ruleBasedPct := float64(evolution.RuleBasedCount) / float64(evolution.TotalSuperseded) * 100
+			fmt.Fprintf(os.Stderr, "  Rule-based:              %d (%.0f%%)\n", evolution.RuleBasedCount, ruleBasedPct)
+			fmt.Fprintf(os.Stderr, "  LLM-based:               %d (%.0f%%)\n", evolution.LLMCount, 100-ruleBasedPct)
+		} else {
+			fmt.Fprintf(os.Stderr, "  Rule-based:              %d\n", evolution.RuleBasedCount)
+			fmt.Fprintf(os.Stderr, "  LLM-based:               %d\n", evolution.LLMCount)
+		}
+		// A row whose successor was hard-deleted is a loss, not a replacement:
+		// it is named apart instead of inflating the total (YM-445).
+		fmt.Fprintf(os.Stderr, "  Deleted predecessor:     %d\n", evolution.DeletedPredecessorCount)
 		fmt.Fprintf(os.Stderr, "  Avg chain length:        %.1f\n", evolution.AvgChainLength)
 	}
 

@@ -110,7 +110,7 @@ func TestNormalize(t *testing.T) {
 	}{
 		{"CGO_ENABLED=0 muss gesetzt sein", 2}, // "cgo_enabled=0", "gesetzt" (muss+sein are stop-words)
 		{"", 0},
-		{"der die das ein eine", 0},     // all stop-words
+		{"der die das ein eine", 0},       // all stop-words
 		{"modernc.org/sqlite pure Go", 4}, // modernc, org, sqlite, pure ("go"=en stop-word)
 	}
 	for _, tt := range tests {
@@ -159,6 +159,28 @@ func TestSimilarity(t *testing.T) {
 	// Disjoint sets should give 0.0
 	if s := similarity([]string{"a"}, []string{"b"}); s != 0.0 {
 		t.Errorf("disjoint sets: got %f, want 0.0", s)
+	}
+}
+
+// YM-103: callers pass learnings that are already ranked by relevance
+// (models.ContextualScoreAndSort). Deduplicate used to re-sort them by
+// CreatedAt, so the briefing showed the newest instead of the most relevant.
+// The group must stay at the position of its best-ranked member and only swap
+// in the newest formulation.
+func TestLos16DeduplicateKeepsCallerRanking(t *testing.T) {
+	best := makeLearning("los16 adamant harbour clause", 100*time.Hour)
+	dupOld := makeLearning("los16 bitter meadows requiem", 50*time.Hour)
+	dupNew := makeLearning("los16 bitter meadows requiem note", 1*time.Hour)
+
+	result := Deduplicate([]models.Learning{best, dupOld, dupNew}, 0.4)
+	if len(result) != 2 {
+		t.Fatalf("got %d results, want 2", len(result))
+	}
+	if result[0].Content != best.Content {
+		t.Errorf("rank 1 is %q, want %q: the caller's relevance order was re-sorted by age", result[0].Content, best.Content)
+	}
+	if result[1].Content != dupNew.Content {
+		t.Errorf("rank 2 is %q, want %q: the duplicate group lost the rank it had earned", result[1].Content, dupNew.Content)
 	}
 }
 

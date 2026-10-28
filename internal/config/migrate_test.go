@@ -636,8 +636,10 @@ func TestMigrateConfig_CreatesFeatureDefaultsWhenMissing(t *testing.T) {
 			t.Errorf("feature_defaults block missing %q; got:\n%s", want, fdBlock)
 		}
 	}
-	if !strings.Contains(fdBlock, "assoc_context: false") {
-		t.Errorf("feature_defaults assoc_context should be false; got:\n%s", fdBlock)
+	// assoc_context moved to true with YM-302: it is the documented default in
+	// config.Default(), so the template and the migration have to write it.
+	if !strings.Contains(fdBlock, "assoc_context: true") {
+		t.Errorf("feature_defaults assoc_context should be true; got:\n%s", fdBlock)
 	}
 	if !strings.Contains(fdBlock, "think_reminder_min_chars: 0") {
 		t.Errorf("feature_defaults think_reminder_min_chars should be 0; got:\n%s", fdBlock)
@@ -785,5 +787,261 @@ func TestMigrateConfig_PricingDeepseekIndent(t *testing.T) {
 	pricing := parsed["pricing"].(map[string]any)
 	if _, ok := pricing["deepseek-v4-flash"]; !ok {
 		t.Error("deepseek-v4-flash not a child of pricing (wrong indent)")
+	}
+}
+
+// YM-97: a known proxy key on the top level is inert. The migration moves it
+// under proxy: (values and nesting intact) and reports what it moved.
+func TestMoveMisplacedProxyKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "agents:\n  token_budget: 0\nproxy:\n  enabled: true\n  cache_ttl: ephemeral\ntoken_threshold: 800000\nprovider_targets:\n  privateTomMax: https://tom.example/v1\n  deepseek: https://api.deepseek.com\nextraction:\n  model: sonnet\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := MoveMisplacedProxyKeys(path)
+	if err != nil {
+		t.Fatalf("MoveMisplacedProxyKeys: %v", err)
+	}
+	if len(moved) != 2 || moved[0] != "token_threshold" || moved[1] != "provider_targets" {
+		t.Fatalf("moved = %v, want [token_threshold provider_targets]", moved)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("migrated config not valid YAML: %v\n---\n%s", err, data)
+	}
+
+	if _, ok := parsed["token_threshold"]; ok {
+		t.Error("token_threshold is still on the top level")
+	}
+	if _, ok := parsed["provider_targets"]; ok {
+		t.Error("provider_targets is still on the top level")
+	}
+
+	proxy, ok := parsed["proxy"].(map[string]any)
+	if !ok {
+		t.Fatalf("proxy section lost: %s", data)
+	}
+	if got := proxy["token_threshold"]; got != 800000 {
+		t.Errorf("proxy.token_threshold = %v (%T), want 800000 (moved value wins)", got, got)
+	}
+	targets, ok := proxy["provider_targets"].(map[string]any)
+	if !ok {
+		t.Fatalf("proxy.provider_targets missing: %s", data)
+	}
+	if targets["privateTomMax"] != "https://tom.example/v1" || targets["deepseek"] != "https://api.deepseek.com" {
+		t.Errorf("proxy.provider_targets = %v", targets)
+	}
+
+	// Known top-level sections stay untouched.
+	if _, ok := parsed["agents"].(map[string]any); !ok {
+		t.Errorf("agents section damaged: %s", data)
+	}
+	if extraction, ok := parsed["extraction"].(map[string]any); !ok || extraction["model"] != "sonnet" {
+		t.Errorf("extraction section damaged: %s", data)
+	}
+
+	backups, _ := filepath.Glob(path + ".bak.*")
+	if len(backups) == 0 {
+		t.Error("expected a timestamped backup before the rewrite")
+	}
+
+	// Idempotent: a second run has nothing left to move.
+	if moved, err = MoveMisplacedProxyKeys(path); err != nil {
+		t.Fatalf("second run: %v", err)
+	} else if len(moved) != 0 {
+		t.Errorf("second run moved %v, want nothing", moved)
+	}
+}
+
+// YM-97: when proxy: already sets the key, its value is the one in effect. The
+// inert top-level value must not overwrite it (and keeping both would make the
+// document invalid YAML); the key stays and CheckKeys keeps reporting it.
+func TestMoveMisplacedProxyKeysKeepsEffectiveValueOnCollision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "proxy:\n  enabled: true\n  token_threshold: 600000\ntoken_threshold: 800000\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := MoveMisplacedProxyKeys(path)
+	if err != nil {
+		t.Fatalf("MoveMisplacedProxyKeys: %v", err)
+	}
+	if len(moved) != 0 {
+		t.Errorf("moved = %v, want nothing (proxy already sets the key)", moved)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Errorf("file changed although nothing moved:\n%s", data)
+	}
+
+	issues, err := CheckKeys(path)
+	if err != nil {
+		t.Fatalf("CheckKeys: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Key != "token_threshold" || issues[0].Kind != IssueMisplaced {
+		t.Errorf("issues = %+v, want one misplaced token_threshold", issues)
+	}
+}
+
+// YM-97: configs written by yaml.Marshal use four-space nesting; the move must
+// keep that indentation instead of assuming two spaces.
+func TestMoveMisplacedProxyKeysFourSpaceIndent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "proxy:\n    enabled: true\n    cache_ttl: ephemeral\ntoken_threshold: 800000\nextraction:\n    model: sonnet\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := MoveMisplacedProxyKeys(path); err != nil {
+		t.Fatalf("MoveMisplacedProxyKeys: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("migrated config not valid YAML: %v\n---\n%s", err, data)
+	}
+	proxy, _ := parsed["proxy"].(map[string]any)
+	if proxy == nil {
+		t.Fatalf("proxy section lost: %s", data)
+	}
+	if got := proxy["token_threshold"]; got != 800000 {
+		t.Errorf("proxy.token_threshold = %v (%T), want 800000\n%s", got, got, data)
+	}
+	if extraction, ok := parsed["extraction"].(map[string]any); !ok || extraction["model"] != "sonnet" {
+		t.Errorf("extraction section damaged: %s", data)
+	}
+	if !strings.Contains(string(data), "    enabled: true") {
+		t.Errorf("four-space nesting was reformatted:\n%s", data)
+	}
+}
+
+// YM-97: "proxy: {}" is not a block header. Appending indented children under
+// it would produce invalid YAML, so the key stays and CheckKeys reports it.
+func TestMoveMisplacedProxyKeysSkipsInlineProxySection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "proxy: {}\ntoken_threshold: 800000\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := MoveMisplacedProxyKeys(path)
+	if err != nil {
+		t.Fatalf("MoveMisplacedProxyKeys: %v", err)
+	}
+	if len(moved) != 0 {
+		t.Errorf("moved = %v, want nothing", moved)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Errorf("file changed although nothing moved:\n%s", data)
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("result is not valid YAML: %v", err)
+	}
+	if _, ok := parsed["token_threshold"]; !ok {
+		t.Error("top-level token_threshold vanished")
+	}
+}
+
+// Cold review F4: a banner comment below the proxy section belongs to the next
+// section. The moved keys go in front of it, not behind.
+func TestMoveMisplacedProxyKeysPlacesBeforeBannerComment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "proxy:\n  enabled: true\n\n# --- Signals ---\nsignals:\n  enabled: true\ntoken_threshold: 800000\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := MoveMisplacedProxyKeys(path); err != nil {
+		t.Fatalf("MoveMisplacedProxyKeys: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	text := string(data)
+	banner := strings.Index(text, "# --- Signals ---")
+	key := strings.Index(text, "  token_threshold: 800000")
+	if banner < 0 || key < 0 {
+		t.Fatalf("expected banner and moved key, got:\n%s", text)
+	}
+	if key > banner {
+		t.Errorf("moved key landed behind the banner comment:\n%s", text)
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("result is not valid YAML: %v", err)
+	}
+}
+
+// Cold review F5: without a proxy section there was no way to repair the file.
+func TestMoveMisplacedProxyKeysCreatesMissingProxySection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "agents:\n  token_budget: 0\ntoken_threshold: 800000\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := MoveMisplacedProxyKeys(path)
+	if err != nil {
+		t.Fatalf("MoveMisplacedProxyKeys: %v", err)
+	}
+	if len(moved) != 1 || moved[0] != "token_threshold" {
+		t.Fatalf("moved = %v, want [token_threshold]", moved)
+	}
+
+	data, _ := os.ReadFile(path)
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("result is not valid YAML: %v\n%s", err, data)
+	}
+	proxy, ok := parsed["proxy"].(map[string]any)
+	if !ok {
+		t.Fatalf("proxy section missing:\n%s", data)
+	}
+	if got := proxy["token_threshold"]; got != 800000 {
+		t.Errorf("proxy.token_threshold = %v (%T), want 800000", got, got)
+	}
+	if _, ok := parsed["token_threshold"]; ok {
+		t.Errorf("top-level token_threshold survived:\n%s", data)
+	}
+}
+
+// Cold review F6: a file this code cannot read must not be rewritten.
+func TestMoveMisplacedProxyKeysLeavesBrokenFileUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := "proxy:\n  enabled: true\ntoken_threshold: [unclosed\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := MoveMisplacedProxyKeys(path); err == nil {
+		t.Fatal("expected an error for a document that cannot be written back")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Errorf("broken file was rewritten:\n%s", data)
+	}
+	if backups, _ := filepath.Glob(path + ".bak.*"); len(backups) != 0 {
+		t.Errorf("unexpected backup for an aborted write: %v", backups)
 	}
 }

@@ -193,7 +193,7 @@ func TestSupersedePersonaTrait(t *testing.T) {
 	})
 
 	// Supersede it
-	if err := s.SupersedePersonaTrait("default", "communication", "language"); err != nil {
+	if _, err := s.SupersedePersonaTrait("default", "communication", "language"); err != nil {
 		t.Fatalf("supersede: %v", err)
 	}
 
@@ -446,6 +446,154 @@ func TestApplyConfidenceDeltaNegative(t *testing.T) {
 	got, _ := s.GetPersonaTrait("default", "communication", "language")
 	if got.Confidence != 0.3 {
 		t.Errorf("confidence after -0.2: got %f, want 0.3", got.Confidence)
+	}
+}
+
+// YM-118: automatic extraction must not overwrite a user_override trait.
+func TestUpsertPersonaTraitPreservesUserOverride(t *testing.T) {
+	s := mustOpen(t)
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "de", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+
+	// Same key, different value, automatic source.
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "en", Confidence: 0.5, Source: "auto_extracted", EvidenceCount: 1,
+	})
+
+	// A write without any source must not slip past the guard either.
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "fr", Confidence: 0.3, EvidenceCount: 9,
+	})
+
+	got, err := s.GetPersonaTrait("default", "communication", "language")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("trait should still exist")
+	}
+	if got.TraitValue != "de" {
+		t.Errorf("value: got %q, want %q (user_override must win)", got.TraitValue, "de")
+	}
+	if got.Confidence != 1.0 {
+		t.Errorf("confidence: got %f, want 1.0 (user_override untouched)", got.Confidence)
+	}
+	if got.EvidenceCount != 1 {
+		t.Errorf("evidence_count: got %d, want 1 (user_override untouched)", got.EvidenceCount)
+	}
+	if got.Source != "user_override" {
+		t.Errorf("source: got %q, want %q (no downgrade)", got.Source, "user_override")
+	}
+}
+
+// YM-118 boundary: an explicit user_override write still replaces an automatic trait.
+func TestUpsertPersonaTraitUserOverrideStillWins(t *testing.T) {
+	s := mustOpen(t)
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "en", Confidence: 0.8, Source: "auto_extracted", EvidenceCount: 5,
+	})
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "de", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+
+	got, _ := s.GetPersonaTrait("default", "communication", "language")
+	if got.TraitValue != "de" || got.Source != "user_override" || got.Confidence != 1.0 {
+		t.Errorf("user_override write must win: value=%q source=%q conf=%f",
+			got.TraitValue, got.Source, got.Confidence)
+	}
+}
+
+// YM-118: confidence deltas from automatic paths must not touch user_override traits.
+func TestApplyConfidenceDeltaSkipsUserOverride(t *testing.T) {
+	s := mustOpen(t)
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "communication", TraitKey: "language",
+		TraitValue: "de", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+
+	if err := s.ApplyConfidenceDelta("default", "communication", "language", -0.2); err != nil {
+		t.Fatalf("apply delta: %v", err)
+	}
+
+	got, _ := s.GetPersonaTrait("default", "communication", "language")
+	if got.Confidence != 1.0 {
+		t.Errorf("confidence: got %f, want 1.0 (user_override must not decay)", got.Confidence)
+	}
+	if got.EvidenceCount != 1 {
+		t.Errorf("evidence_count: got %d, want 1 (automatic evidence must not accumulate)", got.EvidenceCount)
+	}
+}
+
+// YM-118: automatic supersede (decay, dedup, cleanup) must not remove user_override traits.
+func TestSupersedePersonaTraitSkipsUserOverride(t *testing.T) {
+	s := mustOpen(t)
+
+	s.UpsertPersonaTrait(&models.PersonaTrait{
+		UserID: "default", Dimension: "context", TraitKey: "os",
+		TraitValue: "linux", Confidence: 1.0, Source: "user_override", EvidenceCount: 1,
+	})
+
+	affected, err := s.SupersedePersonaTrait("default", "context", "os")
+	if err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	if affected != 0 {
+		t.Errorf("affected rows: got %d, want 0 (user_override is protected)", affected)
+	}
+
+	got, _ := s.GetPersonaTrait("default", "context", "os")
+	if got == nil {
+		t.Fatal("user_override trait must not be superseded by an automatic path")
+	}
+}
+
+// YM-123: dotted key names (node.js) must not be truncated to their last segment.
+func TestUpsertPersonaTraitKeepsDottedKeys(t *testing.T) {
+	tests := []struct {
+		name      string
+		dimension string
+		traitKey  string
+		wantKey   string
+	}{
+		{name: "node.js kept", dimension: "context", traitKey: "node.js", wantKey: "node.js"},
+		{name: "next.js kept", dimension: "context", traitKey: "next.js", wantKey: "next.js"},
+		{name: "dotted expertise key kept", dimension: "expertise", traitKey: "alpine.js", wantKey: "alpine.js"},
+		{name: "dimension prefix stripped from dotted key", dimension: "context", traitKey: "context.node.js", wantKey: "node.js"},
+		{name: "boundary shorthand prefix stripped", dimension: "boundaries", traitKey: "boundary.force_push", wantKey: "force_push"},
+		{name: "learning shorthand prefix stripped", dimension: "learning_style", traitKey: "learning.visual_thinker", wantKey: "visual_thinker"},
+		{name: "dimension prefix still stripped", dimension: "communication", traitKey: "communication.directness", wantKey: "directness"},
+		{name: "repeated dimension prefix still stripped", dimension: "context", traitKey: "context.context.yesmem_depth", wantKey: "yesmem_depth"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := mustOpen(t)
+
+			err := s.UpsertPersonaTrait(&models.PersonaTrait{
+				UserID: "default", Dimension: tt.dimension, TraitKey: tt.traitKey,
+				TraitValue: "test", Confidence: 0.5, Source: "auto_extracted", EvidenceCount: 1,
+			})
+			if err != nil {
+				t.Fatalf("upsert: %v", err)
+			}
+
+			got, err := s.GetPersonaTrait("default", tt.dimension, tt.wantKey)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if got == nil {
+				t.Fatalf("trait not stored under key %q (input %q)", tt.wantKey, tt.traitKey)
+			}
+		})
 	}
 }
 

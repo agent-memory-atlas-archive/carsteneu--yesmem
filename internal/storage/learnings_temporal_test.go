@@ -7,16 +7,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-func newTestStore(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatalf("open test store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 func insertTestLearning(s *Store, content string, category ...string) int64 {
 	cat := "gotcha"
 	if len(category) > 0 {
@@ -34,7 +24,7 @@ func insertTestLearning(s *Store, content string, category ...string) int64 {
 }
 
 func TestSupersedeSetValidUntil(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id1 := insertTestLearning(s, "old truth")
 	id2 := insertTestLearning(s, "new truth")
 
@@ -67,7 +57,7 @@ func TestSupersedeSetValidUntil(t *testing.T) {
 }
 
 func TestBulkSupersedeReturnsIDs(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Insert 3 narratives for a session
 	for i := 0; i < 3; i++ {
@@ -96,7 +86,7 @@ func TestBulkSupersedeReturnsIDs(t *testing.T) {
 }
 
 func TestSupersededChain(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id1 := insertTestLearning(s, "v1")
 	id2 := insertTestLearning(s, "v2")
 	id3 := insertTestLearning(s, "v3")
@@ -120,7 +110,7 @@ func TestSupersededChain(t *testing.T) {
 }
 
 func TestVolatility(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id1 := insertTestLearning(s, "v1")
 	id2 := insertTestLearning(s, "v2")
 	id3 := insertTestLearning(s, "v3")
@@ -145,7 +135,7 @@ func TestVolatility(t *testing.T) {
 }
 
 func TestCleanupJunkReturnsIDs(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Insert junk (too short)
 	s.InsertLearning(&models.Learning{
@@ -176,7 +166,7 @@ func TestCleanupJunkReturnsIDs(t *testing.T) {
 }
 
 func TestRememberWithSupersedes(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	oldID := insertTestLearning(s, "Go binary at /usr/local/go/bin/go")
 
 	// Simulate remember() with supersedes

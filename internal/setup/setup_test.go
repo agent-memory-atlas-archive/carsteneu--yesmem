@@ -122,51 +122,6 @@ func TestGenerateConfigLLMOpenAIBaseURL(t *testing.T) {
 	}
 }
 
-func TestMergeOpencodeJSON_AddsPlugin(t *testing.T) {
-	dir := t.TempDir()
-	cfgDir := filepath.Join(dir, ".config", "opencode")
-	os.MkdirAll(cfgDir, 0755)
-	cfgPath := filepath.Join(cfgDir, "opencode.json")
-	os.WriteFile(cfgPath, []byte(`{"$schema": "https://opencode.ai/config.json"}`), 0644)
-
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", dir)
-	defer os.Setenv("HOME", origHome)
-
-	err := mergeOpencodeJSON(dir, "/test/plugin/index.ts", "", "")
-	if err != nil {
-		t.Fatalf("merge: %v", err)
-	}
-
-	data, _ := os.ReadFile(cfgPath)
-	if !strings.Contains(string(data), "/test/plugin/index.ts") {
-		t.Errorf("plugin entry missing: %s", string(data))
-	}
-}
-
-func TestMergeOpencodeJSON_Idempotent(t *testing.T) {
-	dir := t.TempDir()
-	cfgDir := filepath.Join(dir, ".config", "opencode")
-	os.MkdirAll(cfgDir, 0755)
-	cfgPath := filepath.Join(cfgDir, "opencode.json")
-	os.WriteFile(cfgPath, []byte(`{"$schema":"https://opencode.ai/config.json","plugin":["/test/plugin/index.ts"]}`), 0644)
-
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", dir)
-	defer os.Setenv("HOME", origHome)
-
-	err := mergeOpencodeJSON(dir, "/test/plugin/index.ts", "", "")
-	if err != nil {
-		t.Fatalf("merge: %v", err)
-	}
-
-	data, _ := os.ReadFile(cfgPath)
-	count := strings.Count(string(data), "/test/plugin/index.ts")
-	if count != 1 {
-		t.Errorf("expected 1 plugin entry, got %d: %s", count, string(data))
-	}
-}
-
 // Regression: step 7d (installOpencodePlugin) used to call mergeOpencodeSettings
 // WITHOUT the user-chosen model, which wrote the hardcoded deepseek-reasoner
 // default. Step 7d2 (mergeOpencodeSettingsWith) was then unable to overwrite it
@@ -174,8 +129,8 @@ func TestMergeOpencodeJSON_Idempotent(t *testing.T) {
 // big-pickle (or any non-DeepSeek model) at install time still ended up with
 // deepseek/deepseek-reasoner in opencode.json.
 //
-// Fix: thread primaryModel/smallModel through installOpencodePlugin and
-// mergeOpencodeJSON so the user's choice is written in a single pass.
+// Fix: thread primaryModel/smallModel through installOpencodePlugin into
+// mergeOpencodeSettingsWith so the user's choice is written in a single pass.
 func TestInstallOpencodePlugin_PreservesChosenModel(t *testing.T) {
 	dir := t.TempDir()
 	cfgDir := filepath.Join(dir, ".config", "opencode")
@@ -188,10 +143,14 @@ func TestInstallOpencodePlugin_PreservesChosenModel(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	os.Setenv("HOME", dir)
 	defer os.Setenv("HOME", origHome)
+	pinOpencodeMajor(t, 1)
 
-	// Simulate step 7d with the user-chosen model threaded through.
-	if err := installOpencodePlugin(dir, "/test/yesmem", "opencode/big-pickle", "opencode/big-pickle"); err != nil {
-		t.Fatalf("installOpencodePlugin: %v", err)
+	// Step 7d on a v1 host: the plugin install is refused with the
+	// unsupported-version message, the provider/model settings still land so
+	// the host keeps a usable opencode config until it upgrades.
+	_, err := installOpencodePlugin(dir, "/test/yesmem", "opencode/big-pickle", "opencode/big-pickle")
+	if err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("expected the unsupported-version message, got %v", err)
 	}
 
 	data, err := os.ReadFile(cfgPath)

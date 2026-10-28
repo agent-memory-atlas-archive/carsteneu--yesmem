@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 type stubMatch struct {
@@ -15,9 +16,16 @@ type stubMatch struct {
 }
 
 // reexpandStubs checks if any stubs match the user's current query and
-// temporarily replaces them with original content from search.
+// replaces them with original content from search.
 // Max 3 stubs, max 25% of token threshold.
-func (s *Server) reexpandStubsFor(messages []any, threshold int, userQuery string) []any {
+//
+// The replacement is what leaves the proxy: in the sawtooth path the expanded
+// array is frozen right afterwards (freezeStubsAndInjectBreakpoint), so the
+// restored content becomes part of the cached prefix until the prefix rotates.
+// That is deliberate — rewriting a frozen prefix on every matching request
+// would cost a cache write each time — but it means a re-expansion is not
+// undone after the request.
+func (s *Server) reexpandStubsFor(messages []any, threshold int, userQuery, project string) []any {
 	if len(userQuery) < 10 {
 		return messages
 	}
@@ -36,10 +44,12 @@ func (s *Server) reexpandStubsFor(messages []any, threshold int, userQuery strin
 		if !ok {
 			// String content — check if it's a stub
 			if text, ok := m["content"].(string); ok {
-				if hint := extractSearchHint(text); hint != "" {
-					overlap := countOverlap(queryWords, significantWords(hint))
-					if overlap >= 2 {
-						matches = append(matches, stubMatch{i, text, hint, overlap})
+				if isStubText(text) {
+					if hint := extractSearchHint(text); hint != "" {
+						overlap := countHintOverlap(queryWords, significantWords(hint))
+						if overlap >= 2 {
+							matches = append(matches, stubMatch{i, text, hint, overlap})
+						}
 					}
 				}
 			}
@@ -51,12 +61,20 @@ func (s *Server) reexpandStubsFor(messages []any, threshold int, userQuery strin
 			if !ok {
 				continue
 			}
+			// A compressed tool_result carries its hint in "content", a text
+			// block in "text" (YM-141).
 			text, _ := b["text"].(string)
+			if text == "" {
+				text, _ = b["content"].(string)
+			}
+			if !isStubText(text) {
+				continue
+			}
 			hint := extractSearchHint(text)
 			if hint == "" {
 				continue
 			}
-			overlap := countOverlap(queryWords, significantWords(hint))
+			overlap := countHintOverlap(queryWords, significantWords(hint))
 			if overlap >= 2 {
 				matches = append(matches, stubMatch{i, text, hint, overlap})
 			}
@@ -82,9 +100,12 @@ func (s *Server) reexpandStubsFor(messages []any, threshold int, userQuery strin
 	budget := NewBudget(threshold)
 
 	for _, match := range matches {
+		// Scope the archive lookup to this project: an unscoped search pulls
+		// conversation content of other projects into this prompt.
 		result, err := s.queryDaemon("search", map[string]any{
-			"query": match.searchHint,
-			"limit": float64(1),
+			"query":   match.searchHint,
+			"limit":   float64(1),
+			"project": project,
 		})
 		if err != nil {
 			s.logger.Printf("  re-expand: search failed for %q: %v", truncateStr(match.searchHint, 40), err)
@@ -116,11 +137,33 @@ func (s *Server) reexpandStubsFor(messages []any, threshold int, userQuery strin
 		messages = replaceStubInMessage(messages, match.msgIdx, match.stubText,
 			fmt.Sprintf("[re-expanded from archive]\n%s", content))
 
-		s.logger.Printf("re-expanded stub #%d (%s) for this request (%d tokens)",
+		s.logger.Printf("re-expanded stub #%d (%s) (%d tokens)",
 			match.msgIdx, truncateStr(match.searchHint, 40), contentTokens)
 	}
 
 	return messages
+}
+
+// maxStubRunes bounds the text a proxy stub may occupy. The unit is the rune,
+// not the byte: the producers cap their pieces in runes (60-rune signature
+// hints, a 120-rune keyword hint), so a CJK stub legitimately reaches ~1300
+// bytes while staying far below this bound, and a byte bound would refuse a stub
+// the proxy wrote itself.
+const maxStubRunes = 800
+
+// isStubText reports whether text is one of the proxy's own stub shapes. Only
+// those may be re-expanded: a real tool_result can quote a deep_search('...')
+// hint (a Grep over this repo does), and replacing such a block would silently
+// delete the content the model just received. A stub is a single, bounded line,
+// so a message that quotes the format inside a longer explanation is not one
+// (YM-275).
+func isStubText(text string) bool {
+	if utf8.RuneCountInString(text) > maxStubRunes || strings.Contains(text, "\n") {
+		return false
+	}
+	return strings.HasPrefix(text, "[context compressed:") ||
+		strings.HasPrefix(text, "[tool result archived") ||
+		strings.HasPrefix(text, "[→]")
 }
 
 // extractSearchHint extracts the query from a deep_search('...') hint in a stub.
@@ -135,6 +178,31 @@ func extractSearchHint(stub string) string {
 		return ""
 	}
 	return stub[start : start+end]
+}
+
+// countHintOverlap counts query words that occur in the hint, including a query
+// word that sits inside a longer hint token. Keyword hints carry tool names and
+// whole paths ("Read /repo/internal/proxy/decay.go"), so a user asking about
+// "decay.go" or "proxy" has to match; plain token equality found only "read"
+// (YM-141).
+func countHintOverlap(query, hint map[string]bool) int {
+	count := 0
+	for q := range query {
+		if hint[q] {
+			count++
+			continue
+		}
+		if len(q) < 4 {
+			continue
+		}
+		for h := range hint {
+			if strings.Contains(h, q) {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 // extractFirstSearchContent gets the best content from a search result.
@@ -178,16 +246,27 @@ func replaceStubInMessage(messages []any, msgIdx int, oldStub, newContent string
 			newBlocks[i] = block
 			continue
 		}
-		text, _ := b["text"].(string)
-		if text == oldStub && !replaced {
-			newBlocks[i] = map[string]any{
-				"type": "text",
-				"text": newContent,
-			}
-			replaced = true
-		} else {
+		if replaced {
 			newBlocks[i] = block
+			continue
 		}
+		// Text blocks carry the stub in "text", a compressed tool_result in
+		// "content". Only the stub text is swapped: type and tool_use_id stay,
+		// otherwise the API rejects the orphaned tool_result (YM-141).
+		nb := shallowCopyMap(b)
+		if text, _ := b["text"].(string); text == oldStub {
+			nb["text"] = newContent
+			newBlocks[i] = nb
+			replaced = true
+			continue
+		}
+		if content, _ := b["content"].(string); content == oldStub {
+			nb["content"] = newContent
+			newBlocks[i] = nb
+			replaced = true
+			continue
+		}
+		newBlocks[i] = block
 	}
 
 	newMsg := make(map[string]any)

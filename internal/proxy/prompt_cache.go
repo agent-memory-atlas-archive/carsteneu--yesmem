@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -99,6 +100,13 @@ func StripMessagesCacheControl(req map[string]any, start, end int) int {
 	if !ok {
 		return 0
 	}
+	return stripCacheControlFromMessages(msgs, start, end)
+}
+
+// stripCacheControlFromMessages removes every cache_control block marker from
+// msgs[start:end] and returns how many it removed. It mutates the block maps,
+// so callers that must not touch the request pass a deep copy.
+func stripCacheControlFromMessages(msgs []any, start, end int) int {
 	if end > len(msgs) {
 		end = len(msgs)
 	}
@@ -124,6 +132,30 @@ func StripMessagesCacheControl(req map[string]any, start, end int) int {
 		}
 	}
 	return removed
+}
+
+// messagesHaveCacheControl reports whether any content block in msgs carries a
+// cache_control marker. It walks the blocks without copying, so a caller can
+// skip the copy-and-strip path when there is nothing to strip.
+func messagesHaveCacheControl(msgs []any) bool {
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, block := range content {
+			if b, ok := block.(map[string]any); ok {
+				if _, has := b["cache_control"]; has {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // ShiftMessageBreakpoint moves the cache_control breakpoint from the last user message
@@ -311,6 +343,7 @@ func InjectFrozenStubCacheBreakpoint(req map[string]any, frozenCount int, logger
 func IsAPIKeyAuth(h http.Header) bool {
 	return h.Get("x-api-key") != ""
 }
+
 // Claude Code sets {type: "ephemeral"} (5m default) — we upgrade or normalize all
 // discovered blocks so Anthropic never sees mixed 5m/1h TTLs in request order.
 func UpgradeCacheTTL(req map[string]any, ttl string) int {
@@ -401,6 +434,7 @@ func countCacheBreakpoints(req map[string]any) int {
 // If requests come faster than the cache TTL (5 min), caching saves tokens.
 // If slower, the 25% write surcharge makes it a net loss.
 type CacheGate struct {
+	mu          sync.Mutex
 	lastRequest time.Time
 	maxGap      time.Duration // disable caching if gap exceeds this
 }
@@ -408,6 +442,15 @@ type CacheGate struct {
 // NewCacheGate creates a gate with the given max gap (typically 4 min for 5 min TTL).
 func NewCacheGate(maxGap time.Duration) *CacheGate {
 	return &CacheGate{maxGap: maxGap}
+}
+
+// SetMaxGap moves the gate to a different cache lifetime. The measured TTL wins
+// over the configured one: a confirmed 1h cache makes a 30 minute gap a cache
+// hit, a denied one turns it into a write surcharge.
+func (g *CacheGate) SetMaxGap(maxGap time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.maxGap = maxGap
 }
 
 // cacheGapForTTL returns the appropriate max gap for the given cache TTL config.
@@ -424,6 +467,8 @@ func cacheGapForTTL(ttl string) time.Duration {
 // ShouldCache returns true if caching is expected to save tokens.
 // It records the current time for subsequent calls.
 func (g *CacheGate) ShouldCache() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	now := time.Now()
 	defer func() { g.lastRequest = now }()
 

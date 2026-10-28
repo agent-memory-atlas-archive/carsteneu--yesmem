@@ -98,7 +98,7 @@ Bash-mode jobs run inside an [ai-jail](https://github.com/akitaonrails/ai-jail) 
 
 ### Sandbox Setup
 
-The `ai-jail` binary is automatically downloaded from GitHub on first use and cached at `~/.local/bin/ai-jail`. If the download fails (e.g., asset naming mismatch), the job falls back to unsandboxed execution with a warning logged.
+The `ai-jail` binary is automatically downloaded from GitHub on first use and cached at `~/.local/bin/ai-jail`. If the binary is unavailable, the run **fails closed**: every sandboxed call site constructs its sandbox with `FallbackUnsandboxed: false`, so the job returns an error instead of running unsandboxed.
 
 ### Sandbox Construction
 
@@ -125,10 +125,12 @@ processBashJobErrors()          ← daemon tick polls for unprocessed errors
     │
     ├─ cap_name set? ──yes──▶ autoCorrectBashCap()
     │                             │
-    │                             ├─ Load capability handler_bash
-    │                             ├─ Send error + script to Claude Sonnet
-    │                             ├─ Receive corrected script
-    │                             ├─ Update capability via save_cap
+    │                             ├─ Resolve the cap row and the failing script
+    │                             ├─ Send the failure excerpt (failing command,
+    │                             │  error, output) + cap metadata — not the script
+    │                             ├─ Receive a REPLACE block or UNFIXABLE
+    │                             ├─ Apply the block to the live script body
+    │                             ├─ Verify in the sandbox, then save_cap
     │                             └─ Broadcast result to active sessions
     │
     └─ no cap_name ──────────▶ diagnoseBashError()
@@ -141,15 +143,25 @@ processBashJobErrors()          ← daemon tick polls for unprocessed errors
 ### What Sonnet Receives
 
 The auto-correct prompt includes:
-- The original bash command that failed
+- The failing command, identified from the error text (withheld when the line
+  carries a redacted literal)
 - The exit code
-- stdout/stderr output (truncated to ~2000 chars, UTF-8 safe)
-- The capability name and description (if applicable)
+- stdout/stderr output (truncated to ~2000 chars, UTF-8 safe, redacted)
+- The cap metadata: name, description, the script names, and the script kind
+
+The script body itself is deliberately absent: the pass may save its result into
+a live cap, so the body stays on the daemon side.
 
 ### What Sonnet Returns
 
-- A corrected version of the bash script
-- The corrected handler is saved back to the capability definition, so the next scheduled run uses the fixed version
+- One `REPLACE` block: the text to replace plus its replacement, or
+  `UNFIXABLE: <reason>`
+- The block is applied to the live body only if it matches exactly once. No
+  match, several matches, more than one block, or a replacement carrying a
+  redaction marker aborts the pass with the reason and writes nothing.
+- An applied fix is classified: a minimal change is verified in the sandbox and
+  saved to the capability definition, a substantial one is staged as a
+  `cap_proposed` row for review and never executed.
 
 ### Error Storage
 
@@ -169,20 +181,7 @@ Every bash job run is recorded in the `bash_job_runs` table:
 | `processed` | BOOLEAN | Whether auto-correct has handled this error |
 | `created_at` | TIMESTAMP | When the run occurred |
 
-Query run history via `cap_store`:
-
-```javascript
-await mcp__yesmem__cap_store({
-  capability: "scheduler",
-  action: "query",
-  table: "bash_job_runs",
-  where: "job_name = ? AND status = ?",
-  args: '["proxy-health-check", "error"]',
-  limit: 10
-})
-```
-
-Or directly through the storage API:
+`bash_job_runs` lives in **`yesmem.db`**, not in a cap-owned table, so `cap_store` cannot reach it — a `cap_store({table: "bash_job_runs"})` call resolves against the cap's own namespace in `caps.db` and finds nothing. Use the storage API or read the daemon's `get_job`/run output instead:
 
 ```go
 runs, err := store.GetBashJobRuns(jobID, 10)
@@ -192,7 +191,7 @@ store.MarkBashJobRunProcessed(runID)
 
 ## Scheduler Loop
 
-The daemon runs a scheduler tick every 30 seconds. On each tick:
+The daemon runs a scheduler tick every second. On each tick:
 
 1. Load all enabled jobs from SQLite
 2. For each job, evaluate whether the cron expression matches the current time
@@ -257,7 +256,15 @@ CREATE TABLE IF NOT EXISTS bash_job_runs (
 
 ## Adding New Fields
 
-When adding a new field to scheduled jobs, it must be synchronized across 10+ locations. Missing any one of them compiles successfully but silently defaults the field. The full list:
+When adding a new field to scheduled jobs, it must be synchronized across 10+ locations. Missing any one of them compiles successfully but silently defaults the field. The full list, plus the extra sites that fields with their own semantics touch:
+
+| Field kind | Additional sites beyond the 12 below |
+|---|---|
+| `sandbox` | script-level `Script.Sandbox` in `CAP.md`, resolution order (script > job > daemon default), `RunWithProfile` call sites |
+| `interval_seconds` | cron/interval parsing and the one-shot cleanup |
+| `model` | agent spawn argument construction |
+| `script_name` | `findBashScript` resolution (mandatory when a cap declares several bash scripts) |
+| `backend` | agent spawn plan per backend |
 
 1. Schema `CREATE TABLE` definition (for fresh databases)
 2. `ALTER TABLE` migration (for existing databases)

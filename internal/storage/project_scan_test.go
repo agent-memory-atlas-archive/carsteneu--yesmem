@@ -5,11 +5,14 @@ import (
 )
 
 func TestProjectScan_SaveAndLoad(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
+	// The key names the checkout the document was walked from (YM-453), so the
+	// fixture keeps both in agreement.
+	root := t.TempDir()
 	scan := &ProjectScanRow{
-		Project:  "yesmem",
-		ScanJSON: `{"RootDir":"/tmp/yesmem","Tier":"large"}`,
+		Project:  root,
+		ScanJSON: `{"RootDir":"` + root + `","Tier":"large"}`,
 		GitHead:  "abc123",
 		CbmMtime: 1776338702,
 	}
@@ -18,7 +21,7 @@ func TestProjectScan_SaveAndLoad(t *testing.T) {
 		t.Fatalf("SaveProjectScan: %v", err)
 	}
 
-	got, err := s.GetProjectScan("yesmem")
+	got, err := s.GetProjectScan(root)
 	if err != nil {
 		t.Fatalf("GetProjectScan: %v", err)
 	}
@@ -37,7 +40,7 @@ func TestProjectScan_SaveAndLoad(t *testing.T) {
 }
 
 func TestProjectScan_Upsert(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	scan1 := &ProjectScanRow{Project: "yesmem", ScanJSON: `{"v":1}`, GitHead: "aaa", CbmMtime: 100}
 	scan2 := &ProjectScanRow{Project: "yesmem", ScanJSON: `{"v":2}`, GitHead: "bbb", CbmMtime: 200}
@@ -55,7 +58,7 @@ func TestProjectScan_Upsert(t *testing.T) {
 }
 
 func TestProjectScan_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	got, err := s.GetProjectScan("nonexistent")
 	if err != nil {

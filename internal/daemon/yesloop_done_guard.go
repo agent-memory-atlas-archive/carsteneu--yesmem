@@ -38,6 +38,13 @@ type doneGuardState struct {
 	state       int
 	refireCount int
 	lastRelayAt time.Time
+	// subagentFrozenAt is when the freeze was last reported, so a frozen guard
+	// reports itself on a clock instead of once per tick.
+	subagentFrozenAt time.Time
+	// relayed records that a relay was already sent for this row. The refire
+	// counter cannot answer that: the freeze branch registers a row before any
+	// relay went out, so refireCount 0 does not mean the first relay is owed.
+	relayed bool
 }
 
 var (
@@ -52,6 +59,25 @@ func resetDoneGuardState() {
 	yesloopDoneGuardAgentsMu.Unlock()
 }
 
+// pruneDoneGuardStates drops the bookkeeping of agents that no longer have a row.
+// The map is in-memory and is only written for agents that failed validation, so
+// before YM-285 one entry per such agent stayed until the daemon restarted. A row
+// that still exists keeps its entry — a paused DONE-GUARD row is revalidated
+// against it on every tick.
+func (h *Handler) pruneDoneGuardStates(agents []storage.Agent) {
+	live := make(map[string]struct{}, len(agents))
+	for i := range agents {
+		live[agents[i].ID] = struct{}{}
+	}
+	yesloopDoneGuardAgentsMu.Lock()
+	defer yesloopDoneGuardAgentsMu.Unlock()
+	for id := range yesloopDoneGuardAgents {
+		if _, ok := live[id]; !ok {
+			delete(yesloopDoneGuardAgents, id)
+		}
+	}
+}
+
 // checkOneDoneGuardAgent is the per-agent refire state machine. Called from
 // heartbeat.checkYesloopDoneGuard with the agent's current validation result.
 // The separate signature lets tests drive the machine without going through
@@ -63,9 +89,14 @@ func resetDoneGuardState() {
 func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationResult) {
 	// Phase 5 evidence verification: when the format is compliant, verify the
 	// reported review subagent session ids against opencode's own session DB.
-	// Agents without a captured opencode session id skip verification. A
-	// failure downgrades to a non-compliant result that feeds the same
-	// refire/pause machine as a format failure, naming the invalid field.
+	// An agent whose session was never captured would skip verification
+	// silently, so an unbound opencode agent is bound here first — the evidence
+	// check is worthless if it is skipped exactly for the agents the bind fix
+	// exists for. A failure downgrades to a non-compliant result that feeds the
+	// same refire/pause machine as a format failure, naming the invalid field.
+	if result.Compliant && len(result.Phase5Evidence) > 0 {
+		agent = *h.ensureOpencodeSession(&agent)
+	}
 	if result.Compliant && agent.OpencodeSessionID != "" && len(result.Phase5Evidence) > 0 {
 		if evErrs := VerifySubagentEvidence(h.ocDBPath, agent.OpencodeSessionID, result.Phase5Evidence); len(evErrs) > 0 {
 			result = ValidationResult{
@@ -76,6 +107,16 @@ func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationR
 			}
 		}
 	}
+
+	// Read before the lock: the child lookup hits opencode's session table. Only
+	// a failing validation leads to a relay, so the lookup is skipped for the
+	// compliant (and the recovery) path. An opencode agent whose session id is
+	// not bound yet has no child signal at all, so it is bound on demand here —
+	// rate-limited per agent, like the evidence check above.
+	if !result.Compliant {
+		agent = *h.ensureOpencodeSession(&agent)
+	}
+	inSubagent := !result.Compliant && h.agentWaitingInSubagent(agent)
 
 	yesloopDoneGuardAgentsMu.Lock()
 
@@ -88,21 +129,56 @@ func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationR
 	if result.Compliant {
 		if exists {
 			log.Printf("[done-guard] agent %s (%s) now compliant — clearing refire state",
-				agent.ID, agent.Section)
+				safeAgentText(agent.ID), safeAgentText(agent.Section))
 			delete(yesloopDoneGuardAgents, agent.ID)
 		}
 		if agent.Status == "paused" && strings.HasPrefix(agent.Progress, "paused: DONE-GUARD:") {
 			log.Printf("[done-guard] agent %s (%s) RECOVERED: scratchpad now compliant — unpausing (was: %s)",
-				agent.ID, agent.Section, agent.Progress)
+				safeAgentText(agent.ID), safeAgentText(agent.Section), safeAgentText(agent.Progress))
 			yesloopDoneGuardAgentsMu.Unlock()
-			h.unpauseAgent(agent.ID, "DONE-GUARD", fmt.Sprintf("scratchpad now compliant (was: %s)", agent.Progress))
+			h.unpauseAgent(agent.ID, "DONE-GUARD", fmt.Sprintf("scratchpad now compliant (was: %s)", safeAgentText(agent.Progress)))
 			h.notifyOrchestrator(agent, fmt.Sprintf(
 				"RECOVERED: agent %s (%s) unpaused by DONE-GUARD — scratchpad now compliant (was: %s)",
-				agent.ID, agent.Section, agent.Progress))
+				safeAgentText(agent.ID), safeAgentText(agent.Section), safeAgentText(agent.Progress)))
 			return
 		}
 		yesloopDoneGuardAgentsMu.Unlock()
 		return
+	}
+
+	// A relay into an agent blocked inside a task() subagent only queues as a
+	// pending user message and hits it after the subagent returns (#89428), and a
+	// pause would stop an agent in the middle of the review its child is running.
+	// Nothing is relayed and nothing is counted while the child runs; the refire
+	// window restarts when it ends, and the relay the guard owes the agent then
+	// fires on the first tick after the child is gone.
+	if inSubagent {
+		if !exists {
+			state = &doneGuardState{state: doneGuardStateRefiring}
+			yesloopDoneGuardAgents[agent.ID] = state
+			exists = true
+		}
+		if now := time.Now(); now.Sub(state.subagentFrozenAt) >= subagentFreezeLogEvery {
+			log.Printf("[done-guard] agent %s (%s) frozen: a task() subagent is active",
+				safeAgentText(agent.ID), safeAgentText(agent.Section))
+			state.subagentFrozenAt = now
+		}
+		state.lastRelayAt = time.Now()
+		yesloopDoneGuardAgentsMu.Unlock()
+		return
+	}
+	if exists && !state.subagentFrozenAt.IsZero() {
+		state.subagentFrozenAt = time.Time{}
+		if !state.relayed {
+			// Nothing was relayed for this row yet: the first relay belongs to the
+			// initial-detection path below, with its own counter.
+			delete(yesloopDoneGuardAgents, agent.ID)
+			exists = false
+		} else {
+			// The next relay, or the escalation its refire budget already earned,
+			// is owed; do not wait for the interval.
+			state.lastRelayAt = time.Time{}
+		}
 	}
 
 	// First detection: register state and send initial relay (refireCount=0).
@@ -110,10 +186,11 @@ func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationR
 		state = &doneGuardState{
 			state:       doneGuardStateRefiring,
 			lastRelayAt: time.Now(),
+			relayed:     true,
 		}
 		yesloopDoneGuardAgents[agent.ID] = state
 		log.Printf("[done-guard] agent %s (%s) validation failed — sending initial relay (errors: %s)",
-			agent.ID, agent.Section, summarizeErrors(result))
+			safeAgentText(agent.ID), safeAgentText(agent.Section), safeAgentText(summarizeErrors(result)))
 		yesloopDoneGuardAgentsMu.Unlock()
 		h.sendDoneGuardRelay(agent, result)
 		return
@@ -135,21 +212,23 @@ func (h *Handler) checkOneDoneGuardAgent(agent storage.Agent, result ValidationR
 	if state.refireCount > doneGuardMaxRefires {
 		// Pause. Terminal state for this agent's tracking.
 		state.state = doneGuardStatePaused
-		reason := fmt.Sprintf("DONE-GUARD: phase validation failed — %s", summarizeErrors(result))
+		reason := fmt.Sprintf("DONE-GUARD: phase validation failed — %s", safeAgentText(summarizeErrors(result)))
 		log.Printf("[done-guard] agent %s (%s) ESCALATION: pausing after %d refires (errors: %s)",
-			agent.ID, agent.Section, state.refireCount, summarizeErrors(result))
+			safeAgentText(agent.ID), safeAgentText(agent.Section), state.refireCount, safeAgentText(summarizeErrors(result)))
 		yesloopDoneGuardAgentsMu.Unlock()
 		h.pauseAgent(agent.ID, reason)
 		h.notifyOrchestrator(agent, fmt.Sprintf(
 			"DEAD_AGENT: Agent %s (%s) paused by DONE-GUARD after %d relay attempts — phase validation failed: %s%s",
-			agent.ID, agent.Section, state.refireCount, summarizeErrors(result), orchestratorPauseHint))
+			safeAgentText(agent.ID), safeAgentText(agent.Section), state.refireCount,
+			safeAgentText(summarizeErrors(result)), orchestratorPauseHint))
 		return
 	}
 
 	// Refire: send relay again, update timestamp.
 	log.Printf("[done-guard] agent %s (%s) refire %d/%d (errors: %s)",
-		agent.ID, agent.Section, state.refireCount, doneGuardMaxRefires, summarizeErrors(result))
+		safeAgentText(agent.ID), safeAgentText(agent.Section), state.refireCount, doneGuardMaxRefires, safeAgentText(summarizeErrors(result)))
 	state.lastRelayAt = time.Now()
+	state.relayed = true
 	yesloopDoneGuardAgentsMu.Unlock()
 	h.sendDoneGuardRelay(agent, result)
 }
@@ -162,7 +241,7 @@ func buildDoneGuardRelayMessage(result ValidationResult) string {
 	return fmt.Sprintf(
 		"DONE-GUARD: phase validation failed. Missing or invalid fields: %s. "+
 			"Fix the listed fields in your scratchpad phase blocks and call update_agent_status when done.",
-		summarizeErrors(result))
+		safeAgentText(summarizeErrors(result)))
 }
 
 // sendDoneGuardRelay sends the validation-failure relay to a yesloop agent
@@ -171,16 +250,16 @@ func buildDoneGuardRelayMessage(result ValidationResult) string {
 // failed dial still counts as a relay attempt for refire-gating purposes
 // (prevents rapid escalation when sockets are flaky).
 func (h *Handler) sendDoneGuardRelay(agent storage.Agent, result ValidationResult) {
-	if agent.SockPath == "" {
-		log.Printf("[done-guard] relay to agent %s skipped: no sock_path", agent.ID)
+	injectPath := h.agentInjectPath(agent.ID)
+	if injectPath == "" {
+		log.Printf("[done-guard] relay to agent %s skipped: no derivable socket path", safeAgentText(agent.ID))
 		return
 	}
-	injectPath := agent.SockPath + ".inject"
-	wrapped := fmt.Sprintf("[RELAY from=done-guard] %s", buildDoneGuardRelayMessage(result))
+	wrapped := fmt.Sprintf("[RELAY from=done-guard] %s", safeAgentText(buildDoneGuardRelayMessage(result)))
 
 	conn, err := net.DialTimeout("unix", injectPath, 3*time.Second)
 	if err != nil {
-		log.Printf("[done-guard] relay to agent %s failed: %v", agent.ID, err)
+		log.Printf("[done-guard] relay to agent %s failed: %v", safeAgentText(agent.ID), safeAgentText(err.Error()))
 		return
 	}
 	defer conn.Close()

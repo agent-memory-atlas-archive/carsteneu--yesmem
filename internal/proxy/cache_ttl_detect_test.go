@@ -18,7 +18,7 @@ func TestCacheTTLDetector_InitialState(t *testing.T) {
 func TestCacheTTLDetector_ImmediateNegative(t *testing.T) {
 	det := NewCacheTTLDetector()
 	// Substantial write (read=0) with ephemeral_1h=0 → server rejected 1h
-	det.RecordResponse(0, 87000, 0)
+	det.RecordResponse("t1", 0, 87000, 0)
 
 	sup := det.Is1hSupported()
 	if sup == nil || *sup {
@@ -31,11 +31,10 @@ func TestCacheTTLDetector_PositiveAfterGap_CacheWarm(t *testing.T) {
 	// Simulate >5:01 gap
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-6 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
 
 	// After gap: 97% cache hit → 1h confirmed
-	det.RecordResponse(112000, 2000, 0)
+	det.RecordResponse("t1", 112000, 2000, 0)
 
 	sup := det.Is1hSupported()
 	if sup == nil || !*sup {
@@ -51,11 +50,10 @@ func TestCacheTTLDetector_NegativeAfterGap_CacheCold(t *testing.T) {
 	// Simulate >5:01 gap
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-6 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
 
 	// After gap: cache cold (0% read), ephemeral_1h=0 → 5min
-	det.RecordResponse(0, 87000, 0)
+	det.RecordResponse("t1", 0, 87000, 0)
 
 	sup := det.Is1hSupported()
 	if sup == nil || *sup {
@@ -65,9 +63,8 @@ func TestCacheTTLDetector_NegativeAfterGap_CacheCold(t *testing.T) {
 
 func TestCacheTTLDetector_FirstResponseInconclusive(t *testing.T) {
 	det := NewCacheTTLDetector()
-	det.RecordRequest("t1")
 	// First response: ephemeral_1h > 0 but no gap → inconclusive
-	det.RecordResponse(35000, 87000, 87000)
+	det.RecordResponse("t1", 35000, 87000, 87000)
 
 	if det.Is1hSupported() != nil {
 		t.Error("first response with no gap should remain unknown")
@@ -77,7 +74,7 @@ func TestCacheTTLDetector_FirstResponseInconclusive(t *testing.T) {
 func TestCacheTTLDetector_IgnoresDeltaWrites(t *testing.T) {
 	det := NewCacheTTLDetector()
 	// read=100k, write=2k (2%) — but >80% hit ratio → no gap so stays unknown
-	det.RecordResponse(100000, 2000, 0)
+	det.RecordResponse("t1", 100000, 2000, 0)
 	if det.Is1hSupported() != nil {
 		t.Error("no gap: should remain unknown")
 	}
@@ -87,11 +84,10 @@ func TestCacheTTLDetector_ShortGapInconclusive(t *testing.T) {
 	det := NewCacheTTLDetector()
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-2 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
 
 	// 2min gap with warm cache — not enough to confirm
-	det.RecordResponse(100000, 5000, 5000)
+	det.RecordResponse("t1", 100000, 5000, 5000)
 	if det.Is1hSupported() != nil {
 		t.Error("<5:01 gap should remain unknown even with warm cache")
 	}
@@ -99,7 +95,7 @@ func TestCacheTTLDetector_ShortGapInconclusive(t *testing.T) {
 
 func TestCacheTTLDetector_IgnoresEmpty(t *testing.T) {
 	det := NewCacheTTLDetector()
-	det.RecordResponse(0, 0, 0)
+	det.RecordResponse("t1", 0, 0, 0)
 	if det.Is1hSupported() != nil {
 		t.Error("no tokens should not change state")
 	}
@@ -112,8 +108,7 @@ func TestCacheTTLDetector_PerThreadGapMeasurement(t *testing.T) {
 	det := NewCacheTTLDetector()
 
 	// Thread A at t=0
-	det.RecordRequest("thread-A")
-	det.RecordResponse(0, 87000, 87000) // initial write, inconclusive
+	det.RecordResponse("thread-A", 0, 87000, 87000) // initial write, inconclusive
 
 	// Thread B at t=3min — should NOT affect thread A's gap
 	det.mu.Lock()
@@ -122,8 +117,7 @@ func TestCacheTTLDetector_PerThreadGapMeasurement(t *testing.T) {
 	det.mu.Unlock()
 
 	// Thread A at t=7min (7min gap > 5:01)
-	det.RecordRequest("thread-A")
-	det.RecordResponse(100000, 2000, 0) // >80% read after gap → 1h confirmed
+	det.RecordResponse("thread-A", 100000, 2000, 0) // >80% read after gap → 1h confirmed
 
 	sup := det.Is1hSupported()
 	if sup == nil || !*sup {
@@ -138,9 +132,8 @@ func TestCacheTTLDetector_PersistAndReload(t *testing.T) {
 	// Simulate 1h detection
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-6 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
-	det.RecordResponse(100000, 2000, 0) // >80% read after gap → 1h
+	det.RecordResponse("t1", 100000, 2000, 0) // >80% read after gap → 1h
 
 	sup := det.Is1hSupported()
 	if sup == nil || !*sup {

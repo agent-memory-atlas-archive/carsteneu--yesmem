@@ -166,8 +166,9 @@ func applyPersonaUpdates(store *storage.Store, result *extraction.PersonaExtract
 			}
 			store.ApplyConfidenceDelta("default", dim, key, delta)
 		} else {
-			// Trait doesn't exist yet — treat as new
-			store.UpsertPersonaTrait(&models.PersonaTrait{
+			// Trait doesn't exist yet — treat as new. A rejected value (control
+			// characters) is logged, not dropped silently.
+			if err := store.UpsertPersonaTrait(&models.PersonaTrait{
 				UserID:        "default",
 				Dimension:     dim,
 				TraitKey:      key,
@@ -175,7 +176,9 @@ func applyPersonaUpdates(store *storage.Store, result *extraction.PersonaExtract
 				Confidence:    0.5 + delta,
 				Source:        "auto_extracted",
 				EvidenceCount: 1,
-			})
+			}); err != nil {
+				log.Printf("  warn: persona trait %s.%s not stored: %v", dim, key, err)
+			}
 		}
 	}
 
@@ -202,7 +205,9 @@ func applyPersonaUpdates(store *storage.Store, result *extraction.PersonaExtract
 		if confidence <= 0 || confidence > 1.0 {
 			confidence = 0.5
 		}
-		store.UpsertPersonaTrait(&models.PersonaTrait{
+		// Count rows, not attempts: a write the user_override guard blocks
+		// changes nothing and must not consume one of the two per-session slots.
+		n, err := store.UpsertPersonaTraitAffected(&models.PersonaTrait{
 			UserID:        "default",
 			Dimension:     dim,
 			TraitKey:      key,
@@ -211,8 +216,26 @@ func applyPersonaUpdates(store *storage.Store, result *extraction.PersonaExtract
 			Source:        "auto_extracted",
 			EvidenceCount: 1,
 		})
-		newCount++
+		if err != nil {
+			log.Printf("  warn: persona trait %s.%s not stored: %v", dim, key, err)
+			continue
+		}
+		newCount += int(n)
 	}
+}
+
+// directiveTraits keeps the traits the directive may be built from: the six
+// structured dimensions, plus every explicit user statement regardless of its
+// dimension label — a user_override with a legacy dimension is still the user's
+// own rule and must not vanish because its bucket is called "general".
+func directiveTraits(traits []models.PersonaTrait) []models.PersonaTrait {
+	kept := make([]models.PersonaTrait, 0, len(traits))
+	for _, t := range traits {
+		if validDimensions[t.Dimension] || t.Source == "user_override" {
+			kept = append(kept, t)
+		}
+	}
+	return kept
 }
 
 // synthesizePersonaDirective generates a new persona directive if traits have changed.
@@ -223,7 +246,11 @@ func synthesizePersonaDirective(store *storage.Store, client extraction.LLMClien
 
 	// Only use well-evidenced traits for directive (evidence >= 3, or user_override/bootstrapped)
 	traits, err := store.GetWellEvidencedTraits("default", 0.4, 3)
-	if err != nil || len(traits) == 0 {
+	if err != nil {
+		return
+	}
+	traits = directiveTraits(traits)
+	if len(traits) == 0 {
 		return
 	}
 
@@ -354,7 +381,7 @@ func synthesizeUserProfile(store *storage.Store, client extraction.LLMClient) {
 	if len(filteredTraits) > 0 {
 		sb.WriteString("\nTechnische Expertise (aus Analyse):\n")
 		for _, t := range filteredTraits {
-			sb.WriteString(fmt.Sprintf("- %s: %s (confidence: %.1f, evidence: %d)\n",
+			sb.WriteString(fmt.Sprintf("- %q = %q (confidence: %.1f, evidence: %d)\n",
 				t.TraitKey, t.TraitValue, t.Confidence, t.EvidenceCount))
 		}
 	}
@@ -444,8 +471,10 @@ func bootstrapPersonaFromLearningsForce(store *storage.Store) int {
 	for _, l := range all {
 		traits := learningToTraits(l)
 		for _, t := range traits {
-			if err := store.UpsertPersonaTrait(&t); err == nil {
-				count++
+			// Count rows, not attempts: a write the user_override guard blocks
+			// changes nothing and must not show up as a created trait.
+			if n, err := store.UpsertPersonaTraitAffected(&t); err == nil {
+				count += int(n)
 			}
 		}
 	}
@@ -542,8 +571,9 @@ func CleanupGenericTraits(store *storage.Store) int {
 	cleaned := 0
 	for _, t := range traits {
 		if t.Dimension == "preferences" && t.Source == "bootstrapped" {
-			store.SupersedePersonaTrait("default", t.Dimension, t.TraitKey)
-			cleaned++
+			if n, err := store.SupersedePersonaTrait("default", t.Dimension, t.TraitKey); err == nil {
+				cleaned += int(n)
+			}
 		}
 	}
 	if cleaned > 0 {
@@ -624,7 +654,9 @@ func extractExpertiseFromLearnings(store *storage.Store) int {
 			confidence = 0.9
 		}
 
-		store.UpsertPersonaTrait(&models.PersonaTrait{
+		// Count rows, not attempts: a protected user_override trait makes this
+		// write a no-op, and the log must not claim a trait was created.
+		n, err := store.UpsertPersonaTraitAffected(&models.PersonaTrait{
 			UserID:        "default",
 			Dimension:     "expertise",
 			TraitKey:      traitKey,
@@ -633,7 +665,9 @@ func extractExpertiseFromLearnings(store *storage.Store) int {
 			Source:        "learning_scan",
 			EvidenceCount: count,
 		})
-		created++
+		if err == nil {
+			created += int(n)
+		}
 	}
 
 	if created > 0 {
@@ -668,6 +702,10 @@ func DecayContextTraits(store *storage.Store) int {
 	now := time.Now()
 	for _, t := range traits {
 		if t.Dimension != "context" {
+			continue
+		}
+		if t.Source == "user_override" {
+			// user-owned traits do not decay (the storage guard enforces this too)
 			continue
 		}
 		age := now.Sub(t.UpdatedAt)
@@ -753,13 +791,30 @@ func dedupPersonaTraits(store *storage.Store, provider embedding.Provider) {
 				dropIdx = i
 			}
 
+			affected, err := store.SupersedePersonaTrait("default", drop.Dimension, drop.TraitKey)
+			if err != nil {
+				log.Printf("  Persona dedup: supersede %s.%s failed: %v", drop.Dimension, drop.TraitKey, err)
+				continue
+			}
+			if affected == 0 {
+				// Protected (user_override) or already gone — both traits stay active.
+				log.Printf("  Persona dedup: [%.2f] %s.%s is protected — pair stays active",
+					sim, drop.Dimension, drop.TraitKey)
+				continue
+			}
+
 			log.Printf("  Persona dedup: [%.2f] KEEP %s.%s=%q (conf:%.2f) DROP %s.%s=%q (conf:%.2f)",
 				sim, keep.Dimension, keep.TraitKey, keep.TraitValue, keep.Confidence,
 				drop.Dimension, drop.TraitKey, drop.TraitValue, drop.Confidence)
 
-			store.SupersedePersonaTrait("default", drop.Dimension, drop.TraitKey)
 			superseded[dropIdx] = true
 			dedupCount++
+
+			// i was just superseded — a dropped trait must not act as the survivor
+			// against the remaining traits, or it displaces them.
+			if dropIdx == i {
+				break
+			}
 		}
 	}
 

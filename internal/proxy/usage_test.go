@@ -267,11 +267,11 @@ func TestParseOpenAIUsage_DeepSeekOnlyHitTokens(t *testing.T) {
 
 func TestUsageLogLine_DeepSeekCache(t *testing.T) {
 	u := &UsageTracker{
-		InputTokens:         10000,
+		InputTokens:          10000,
 		CacheReadInputTokens: 50000,
-		CacheMissTokens:     10000,
-		OutputTokens:        800,
-		Complete:            true,
+		CacheMissTokens:      10000,
+		OutputTokens:         800,
+		Complete:             true,
 	}
 	line := u.LogLine(5, 0, 0, "test-thread")
 	if !strings.Contains(line, "in=60000") {

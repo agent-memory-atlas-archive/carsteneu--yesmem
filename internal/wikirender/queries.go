@@ -418,9 +418,11 @@ func (s *renderState) loadSessionsForIDs(ctx context.Context, sids map[string]bo
 		ids = append(ids, id)
 		placeholders = append(placeholders, "?")
 	}
+	// The id tie-breaker keeps the truncated set stable when sessions share a
+	// started_at; without it the kept 200 depend on the scan order (YM-341).
 	q := fmt.Sprintf(`SELECT id, COALESCE(started_at,''), COALESCE(ended_at,''), COALESCE(message_count,0)
 		FROM sessions WHERE id IN (%s)
-		ORDER BY started_at DESC LIMIT 200`, strings.Join(placeholders, ","))
+		ORDER BY started_at DESC, id DESC LIMIT 200`, strings.Join(placeholders, ","))
 	rows, err := s.cfg.Store.DB().QueryContext(ctx, q, ids...)
 	if err != nil {
 		return fmt.Errorf("loadSessions: %w", err)

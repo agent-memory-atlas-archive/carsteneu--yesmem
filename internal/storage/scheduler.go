@@ -2,22 +2,25 @@ package storage
 
 import (
 	"database/sql"
+	"log"
 	"time"
 )
 
 type ScheduledJobRow struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Cron        string    `json:"cron"`
-	Prompt      string    `json:"prompt"`
-	Enabled     bool      `json:"enabled"`
-	Recurring   bool      `json:"recurring"`
-	Mode        string    `json:"mode"`
-	CapName     string    `json:"cap_name"`
-	ScriptName  string    `json:"script_name"`
-	AutoCorrect bool      `json:"auto_correct"`
-	AllowedPorts string   `json:"allowed_ports"`
-	Sandbox      string   `json:"sandbox"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	Cron            string    `json:"cron"`
+	Prompt          string    `json:"prompt"`
+	Enabled         bool      `json:"enabled"`
+	Recurring       bool      `json:"recurring"`
+	Mode            string    `json:"mode"`
+	CapName         string    `json:"cap_name"`
+	ScriptName      string    `json:"script_name"`
+	Project         string    `json:"project,omitempty"`
+	AutoCorrect     bool      `json:"auto_correct"`
+	AllowedPorts    string    `json:"allowed_ports"`
+	AllowedHosts    string    `json:"allowed_hosts"`
+	Sandbox         string    `json:"sandbox"`
 	IntervalSeconds int       `json:"interval_seconds"`
 	Model           string    `json:"model"`
 	Backend         string    `json:"backend"`
@@ -25,16 +28,38 @@ type ScheduledJobRow struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+// SaveScheduledJob persists a job. last_run is written as an explicit RFC3339
+// string, and as NULL when the job never ran: the driver's own rendering of a
+// time.Time is not RFC3339, and ListScheduledJobs reads the column through
+// COALESCE, which loses the declared DATETIME type and with it the driver-side
+// conversion. A raw time.Time therefore came back unparseable (YM-170).
 func (s *Store) SaveScheduledJob(job ScheduledJobRow) error {
 	mode := job.Mode
 	if mode == "" {
 		mode = "agent"
 	}
+	var lastRun any
+	if !job.LastRun.IsZero() {
+		lastRun = job.LastRun.UTC().Format(time.RFC3339)
+	}
 	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO scheduled_jobs (id, name, cron, prompt, enabled, recurring, mode, cap_name, script_name, auto_correct, allowed_ports, sandbox, interval_seconds, model, backend, last_run, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		job.ID, job.Name, job.Cron, job.Prompt, job.Enabled, job.Recurring, mode, job.CapName, job.ScriptName, job.AutoCorrect, job.AllowedPorts, job.Sandbox, job.IntervalSeconds, job.Model, job.Backend, job.LastRun, job.CreatedAt,
+		`INSERT OR REPLACE INTO scheduled_jobs (id, name, cron, prompt, enabled, recurring, mode, cap_name, script_name, project, auto_correct, allowed_ports, allowed_hosts, sandbox, interval_seconds, model, backend, last_run, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Name, job.Cron, job.Prompt, job.Enabled, job.Recurring, mode, job.CapName, job.ScriptName, job.Project, job.AutoCorrect, job.AllowedPorts, job.AllowedHosts, job.Sandbox, job.IntervalSeconds, job.Model, job.Backend, lastRun, job.CreatedAt,
 	)
 	return err
+}
+
+// DeleteFiredOneShotJobs removes one-shot rows that already fired. Before YM-169 a
+// fired one-shot was removed from memory only, so the row stayed behind and fired
+// again on the next start. Rows that never ran carry the zero time the old write
+// path produced, and those are kept: they are still pending.
+func (s *Store) DeleteFiredOneShotJobs() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM scheduled_jobs
+		WHERE recurring = 0 AND last_run IS NOT NULL AND last_run NOT LIKE '0001-01-01%'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) DeleteScheduledJob(id string) error {
@@ -50,7 +75,7 @@ func (s *Store) DeleteScheduledJob(id string) error {
 }
 
 func (s *Store) ListScheduledJobs() ([]ScheduledJobRow, error) {
-	rows, err := s.db.Query(`SELECT id, name, cron, prompt, enabled, COALESCE(recurring, 1), COALESCE(mode, 'agent'), COALESCE(cap_name, ''), COALESCE(script_name, ''), COALESCE(auto_correct, 1), COALESCE(allowed_ports, '80,443'), COALESCE(sandbox, 'standard'), COALESCE(interval_seconds, 0), COALESCE(model, ''), COALESCE(backend, ''), COALESCE(last_run, ''), created_at FROM scheduled_jobs ORDER BY name`)
+	rows, err := s.db.Query(`SELECT id, name, cron, prompt, enabled, COALESCE(recurring, 1), COALESCE(mode, 'agent'), COALESCE(cap_name, ''), COALESCE(script_name, ''), COALESCE(project, ''), COALESCE(auto_correct, 1), COALESCE(allowed_ports, '80,443'), COALESCE(allowed_hosts, ''), COALESCE(sandbox, 'standard'), COALESCE(interval_seconds, 0), COALESCE(model, ''), COALESCE(backend, ''), COALESCE(last_run, ''), created_at FROM scheduled_jobs ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -60,11 +85,18 @@ func (s *Store) ListScheduledJobs() ([]ScheduledJobRow, error) {
 		var j ScheduledJobRow
 		var lastRun string
 		var autoCorrect int
-		if err := rows.Scan(&j.ID, &j.Name, &j.Cron, &j.Prompt, &j.Enabled, &j.Recurring, &j.Mode, &j.CapName, &j.ScriptName, &autoCorrect, &j.AllowedPorts, &j.Sandbox, &j.IntervalSeconds, &j.Model, &j.Backend, &lastRun, &j.CreatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.Name, &j.Cron, &j.Prompt, &j.Enabled, &j.Recurring, &j.Mode, &j.CapName, &j.ScriptName, &j.Project, &autoCorrect, &j.AllowedPorts, &j.AllowedHosts, &j.Sandbox, &j.IntervalSeconds, &j.Model, &j.Backend, &lastRun, &j.CreatedAt); err != nil {
 			continue
 		}
 		if lastRun != "" {
-			j.LastRun, _ = time.Parse(time.RFC3339, lastRun)
+			parsed, err := time.Parse(time.RFC3339, lastRun)
+			if err != nil {
+				// Rows written before the RFC3339 switch carry the driver's own
+				// rendering. There is nothing to recover, but the loss should not be
+				// silent (YM-170).
+				log.Printf("storage: scheduled job %s: unparseable last_run %q, leaving it empty", j.ID, lastRun)
+			}
+			j.LastRun = parsed
 		}
 		j.AutoCorrect = autoCorrect == 1
 		jobs = append(jobs, j)
@@ -72,24 +104,27 @@ func (s *Store) ListScheduledJobs() ([]ScheduledJobRow, error) {
 	return jobs, nil
 }
 
+// UpdateJobLastRun stamps the last fire time. It writes RFC3339 because the
+// column is read back through COALESCE, which strips the declared DATETIME type,
+// so the driver no longer converts and ListScheduledJobs parses the raw text.
 func (s *Store) UpdateJobLastRun(id string, t time.Time) error {
-	_, err := s.db.Exec(`UPDATE scheduled_jobs SET last_run = ? WHERE id = ?`, t, id)
+	_, err := s.db.Exec(`UPDATE scheduled_jobs SET last_run = ? WHERE id = ?`, t.UTC().Format(time.RFC3339), id)
 	return err
 }
 
 type BashJobRun struct {
-	ID        int64     `json:"id"`
-	JobID     string    `json:"job_id"`
-	JobName   string    `json:"job_name"`
+	ID         int64     `json:"id"`
+	JobID      string    `json:"job_id"`
+	JobName    string    `json:"job_name"`
 	CapName    string    `json:"cap_name"`
 	ScriptName string    `json:"script_name"`
 	Command    string    `json:"command"`
-	Status    string    `json:"status"`
-	ExitCode  int       `json:"exit_code"`
-	Output    string    `json:"output"`
-	ErrorMsg  string    `json:"error_msg"`
-	Processed bool      `json:"processed"`
-	CreatedAt time.Time `json:"created_at"`
+	Status     string    `json:"status"`
+	ExitCode   int       `json:"exit_code"`
+	Output     string    `json:"output"`
+	ErrorMsg   string    `json:"error_msg"`
+	Processed  bool      `json:"processed"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func (s *Store) SaveBashJobRun(run BashJobRun) error {

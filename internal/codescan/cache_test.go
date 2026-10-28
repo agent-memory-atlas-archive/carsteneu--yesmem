@@ -189,7 +189,7 @@ func TestProjectKey_Worktree(t *testing.T) {
 	os.MkdirAll(worktreeDir, 0755)
 	os.WriteFile(filepath.Join(worktreeDir, ".git"), []byte("gitdir: "+filepath.Join(mainRepo, ".git", "worktrees", "feat-x")+"\n"), 0644)
 
-	key := projectKey(worktreeDir)
+	key := ProjectKey(worktreeDir)
 	if key != "myproject" {
 		t.Errorf("expected project key 'myproject' (repo name), got %q", key)
 	}
@@ -199,9 +199,43 @@ func TestProjectKey_RegularRepo(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "myrepo")
 	os.MkdirAll(filepath.Join(dir, ".git"), 0755)
 
-	key := projectKey(dir)
+	key := ProjectKey(dir)
 	if key != "myrepo" {
 		t.Errorf("expected 'myrepo', got %q", key)
+	}
+}
+
+// A cwd below the repository root resolves to the repository, not to the
+// subdirectory: the index is stored and read under the repository key, so a
+// subdirectory key would name an index nothing writes (DT31 / YM-7).
+func TestProjectKey_SubdirectoryOfRepo(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "myrepo")
+	sub := filepath.Join(root, "internal", "proxy")
+	os.MkdirAll(filepath.Join(root, ".git"), 0755)
+	os.MkdirAll(sub, 0755)
+
+	if key := ProjectKey(sub); key != "myrepo" {
+		t.Errorf("expected the repository key 'myrepo', got %q", key)
+	}
+}
+
+// The same holds inside a linked worktree, which carries the .git pointer file
+// at its own root.
+func TestProjectKey_SubdirectoryOfWorktree(t *testing.T) {
+	base := t.TempDir()
+	mainRepo := filepath.Join(base, "myproject")
+	os.MkdirAll(filepath.Join(mainRepo, ".git", "worktrees", "feat-x"), 0755)
+
+	worktreeDir := filepath.Join(base, "feat-x")
+	os.MkdirAll(worktreeDir, 0755)
+	os.WriteFile(filepath.Join(worktreeDir, ".git"),
+		[]byte("gitdir: "+filepath.Join(mainRepo, ".git", "worktrees", "feat-x")+"\n"), 0644)
+
+	sub := filepath.Join(worktreeDir, "internal", "codescan")
+	os.MkdirAll(sub, 0755)
+
+	if key := ProjectKey(sub); key != "myproject" {
+		t.Errorf("expected the repository key 'myproject', got %q", key)
 	}
 }
 

@@ -1,7 +1,7 @@
 ---
 name: adapter_e2e_test
 description: "E2E test: verify adapter rewrites store() correctly"
-version: 68
+version: 518
 tags: [test, e2e]
 requires: [store]
 scope: user
@@ -18,6 +18,7 @@ E2E test: verify adapter rewrites store() correctly
 ### adapter_e2e_test
 kind: tool
 schema: {"type":"object","properties":{"table":{"type":"string","description":"Optional table name (currently unused; tool just lists tables)"}}}
+sandbox: standard
 
 ```javascript
 async ({table}) => {

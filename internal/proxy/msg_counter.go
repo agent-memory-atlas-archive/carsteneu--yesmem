@@ -33,3 +33,16 @@ func (mc *msgCounters) nextFor(threadID string, localIdx int) int {
 	mc.counts[threadID] = next
 	return next
 }
+
+// prune bounds the counter map. The map has no production reader today (the
+// [msg:N] number comes from the message position), so a dropped entry costs
+// nothing — the cap is here so the map cannot grow with a client-chosen key if
+// a reader ever returns.
+func (mc *msgCounters) prune(keep int) int {
+	if mc == nil {
+		return 0
+	}
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return pruneThreadKeyed(mc.counts, keep)
+}

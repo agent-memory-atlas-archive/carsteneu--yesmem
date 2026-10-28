@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only token: no job here needs to write to the repository (YM-434).
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -29,6 +33,20 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      # ai-jail refuses to start a profile without bubblewrap, and the runner image
+      # does not carry it; the sandbox tests exercise real profiles, so the package
+      # has to be there.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, and
+      # bwrap then fails with "loopback: Failed RTM_NEWADDR". Best effort: when the
+      # runner refuses the sysctl, the sandbox tests skip with that reason.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Build
         env:
           CGO_ENABLED: "0"
@@ -37,4 +55,66 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: "0"
-        run: go test ./... -count=1 -timeout 120s
+          # macOS caps a unix socket path at 104 bytes and t.TempDir() under
+          # /var/folders/... exceeds it, so every socket test failed with
+          # "bind: invalid argument". A short TMPDIR fixes the whole class.
+          TMPDIR: /tmp
+        # 120s was set when the suite was smaller; the YM campaign grew the daemon
+        # package past it, and the timeout surfaced as a cascade of unrelated
+        # failures next to the panic. Measured locally before raising it.
+        run: go test ./... -count=1 -timeout 600s
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      # effect@4.0.1 is a devDependency: without the install the suite aborts
+      # and looks like a code failure. --frozen-lockfile keeps CI on the
+      # committed bun.lock instead of resolving a newer dependency set.
+      - name: Install plugin dev dependencies
+        working-directory: plugins/opencode-yesmem-v2
+        run: bun install --frozen-lockfile
+
+      - name: Test plugin
+        working-directory: plugins/opencode-yesmem-v2
+        run: bun test
+
+  # A full -race run over every package is not affordable: internal/hooks takes
+  # 653s, internal/storage 875s on a warm cache, and the whole daemon suite
+  # exceeds the 600s default cap and panics in
+  # TestLos57eClaudeResumeCarriesTheAllowlist. This gate therefore targets the
+  # packages that carried the race classes (YM-413/YM-432) and, inside them, the
+  # wiring tests, with a raised timeout (YM-438). The package list and the -run
+  # selection are identical to RACE_PKGS/RACE_RUN in the Makefile; the guard
+  # test ci_build_surface_los60e_test.go fails if the two drift apart. The
+  # workflow needs no GOROOT from the Makefile, which is why it calls go
+  # directly instead of `make test-race`.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+
+      - name: Race gate on the wiring tests
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go test -race -count=1 -timeout 900s ./internal/proxy
+          go test -race -count=1 -timeout 900s -run 'TestLLMWiringIsRaceFreeAndVisible|TestEmbedWiringIsRaceFreeAndVisible|TestVectorSearchWithoutWiring|TestStartEmbedWorkerPublishesQueue|TestConsolidationRunnerPersistsBaselineAndCoalescesConcurrentRuns|TestResolveProjectParam_GenerationRaceGuard|TestResolveProjectParam_GenerationConcurrentAccess|TestAttemptRestart_RaceGuard|TestLos58e_TwoConcurrentSpawnsKeepTheirOwnSession|TestAgentNextIDConcurrent_Unique|TestCapStoreConcurrent_NoDeadlock|TestCapsUpsert_CrossGoroutineReadAfterWrite|TestCapsClaimAndRead_ClaimsAtomic|TestDeleteDocSource_IsAtomic|TestEnsureUniqueMessageSequenceUnderConcurrentCallers|TestEnsureUniqueMessageSequenceWaitsForAConcurrentRepair|TestReplaceMessagesBySessionIsAtomic|TestGetPendingRecoveryIsAtomicUnderConcurrency|TestIncrementTurnCount_Concurrent|TestEvaluateGuard_CacheHit|TestDaemonCall_Success|TestDaemonCall_Unreachable|TestRunSessionEnd_CallsDaemon|TestRunSessionEnd_DaemonUnreachable' ./internal/storage ./internal/daemon ./internal/hooks

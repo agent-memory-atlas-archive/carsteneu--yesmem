@@ -135,6 +135,91 @@ func TestRegenerateRefinedBriefing_Success(t *testing.T) {
 	}
 }
 
+func TestRegenerateRefinedBriefing_KeepsLearningIDs(t *testing.T) {
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	// The refinement rewrites the briefing as prose and drops the [ID:n] markers.
+	client := &mockLLMClient{
+		response: "Ich bin wieder da. Narrativer Text ohne die Kennungen der Learnings.",
+		model:    "test-opus",
+	}
+	raw := "- [ID:11] Deploy order matters\n- [ID:22] Retry logic lives in the proxy\n\nHow my memory works:\nsearch()"
+
+	if err := RegenerateRefinedBriefing(store, "proj", raw, client, log.Default()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, err := store.GetRefinedBriefing("proj")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// Without the IDs the proxy's inline-reflection tracking runs empty.
+	for _, want := range []string{"[ID:11]", "[ID:22]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("refined briefing lost %s:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "Deploy order matters") {
+		t.Errorf("learning index has no label for [ID:11]:\n%s", got)
+	}
+	if strings.Count(got, "[ID:11]") != 1 {
+		t.Errorf("expected exactly one [ID:11] entry:\n%s", got)
+	}
+}
+
+func TestRegenerateRefinedBriefing_NoLearningIDsNoIndex(t *testing.T) {
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	client := &mockLLMClient{response: "Ich bin wieder da. Nur Prosa, keine Kennungen.", model: "test"}
+	if err := RegenerateRefinedBriefing(store, "proj", "roher Text ohne Kennungen", client, log.Default()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, _ := store.GetRefinedBriefing("proj")
+	if learningIndexPattern.MatchString(got) {
+		t.Errorf("unexpected index for a briefing without IDs:\n%s", got)
+	}
+}
+
+// An ID cited inside a learning's own text is not an injected learning: it must
+// not enter the index, or the proxy registers it as a briefing injection and a
+// citation of it bumps a learning that was never injected.
+func TestRegenerateRefinedBriefing_IndexIgnoresCitedIDs(t *testing.T) {
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	client := &mockLLMClient{response: "Ich bin wieder da. Prosa ohne Kennungen, lang genug für die Validierung.", model: "test"}
+	raw := "- [ID:11] Compare with [ID:999] before merging\n- [ID:22] Plain entry\n  [ID:998] cited on its own continuation line"
+
+	if err := RegenerateRefinedBriefing(store, "proj", raw, client, log.Default()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, _ := store.GetRefinedBriefing("proj")
+	for _, want := range []string{"[ID:11]", "[ID:22]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("index misses %s:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"[ID:999]", "[ID:998]"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("cited ID %s leaked into the index:\n%s", unwanted, got)
+		}
+	}
+	if !strings.Contains(got, "Compare with before merging") {
+		t.Errorf("label not cleaned of the cited ID:\n%s", got)
+	}
+}
+
 func TestRegenerateRefinedBriefing_StripsLLMToolsBlock(t *testing.T) {
 	store, err := storage.Open(":memory:")
 	if err != nil {

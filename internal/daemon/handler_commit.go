@@ -28,7 +28,8 @@ func (h *Handler) handleInvalidateOnCommit(params map[string]any) Response {
 	if hash == "" {
 		return errorResponse("hash required")
 	}
-	if h.CommitEvalClient == nil {
+	client := h.commitEvalLLM()
+	if client == nil {
 		return errorResponse("no LLM client for commit evaluation")
 	}
 
@@ -54,7 +55,7 @@ func (h *Handler) handleInvalidateOnCommit(params map[string]any) Response {
 	}
 
 	// Step 4: LLM evaluation
-	decisions, err := evaluateStaleness(h.CommitEvalClient, diff, affected)
+	decisions, err := evaluateStaleness(client, diff, affected)
 	if err != nil {
 		log.Printf("[commit-invalidate] LLM eval failed for %s: %v", hash, err)
 		return errorResponse(fmt.Sprintf("LLM evaluation: %v", err))

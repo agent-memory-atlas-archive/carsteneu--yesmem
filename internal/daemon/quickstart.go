@@ -62,6 +62,7 @@ func RunQuickstart(store *storage.Store, cfg *config.Config, client extraction.L
 
 	// Create extractor on the (already-wrapped, when enabled) client
 	ext := extraction.NewExtractor(client, store)
+	ext.SetChunkSize(cfg.Extraction.ChunkSize)
 
 	// ━━━ Phase 2: Extraction ━━━
 	if len(toExtract) > 0 {
@@ -80,7 +81,12 @@ func RunQuickstart(store *storage.Store, cfg *config.Config, client extraction.L
 
 	// ━━━ Phase 4: Narratives ━━━
 	log.Println("━━━ Phase 4: Session Narratives ━━━")
-	GenerateMissingNarratives(store, viable, cfg, qualityClient)
+	pendingNarratives, err := pendingNarrativeSessions(store)
+	if err != nil {
+		log.Printf("  Phase 4 skipped: pending narratives: %v", err)
+	} else {
+		GenerateMissingNarratives(store, viable, cfg, qualityClient, pendingNarratives)
+	}
 
 	// ━━━ Phase 4.5: Clustering ━━━
 	log.Println("━━━ Phase 4.5: Learning Clustering ━━━")

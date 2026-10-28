@@ -59,7 +59,7 @@ var goldenRegistry = map[models.PromptProfile][]goldenSpec{
 			Name:            "001_synthetic_opencode_openai_parity",
 			Synthetic:       true,
 			PreSHA256:       "9bc7f1964dcba0ce77328d8bc6b2e5fa9c14aa96f7a8cedc417a52a3f4e5e0c9",
-		FinalSHA256:     "f96234def5db03e7047a24e24692e4caa320fc75198254453ec67c19aedd7d5b",
+			FinalSHA256:     "f96234def5db03e7047a24e24692e4caa320fc75198254453ec67c19aedd7d5b",
 			RequiredTokens:  openAIRequiredTokens(),
 			ForbiddenTokens: openAIForbiddenTokens(),
 		},
@@ -380,7 +380,7 @@ func replaySyntheticOpenAIFixture(t *testing.T, pre []byte) []byte {
 		logger: log.New(io.Discard, "", 0),
 	}
 	messages, _ := req["messages"].([]any)
-	ctx := s.prepareOpenAIRequestContext(req, 1, "", "", "synthetic-golden")
+	ctx := s.prepareOpenAIRequestContext(req, 1, "", "", "synthetic-golden", nil)
 	ctx.ThreadID = ""
 	ctx.SessionID = ""
 	ctx.Project = ""

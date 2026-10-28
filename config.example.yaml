@@ -276,6 +276,5 @@ secrets_sanitization:
 # Only set these if you need a custom location.
 # paths:
 #   db: ~/.claude/yesmem/yesmem.db
-#   bleve_index: ~/.claude/yesmem/bleve-index
 #   archive: ~/.claude/yesmem/archive
 #   claude_projects: ~/.claude/projects

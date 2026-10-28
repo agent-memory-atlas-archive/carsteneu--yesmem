@@ -358,14 +358,19 @@ func createExtractor(store *storage.Store, extractModel string) extraction.Sessi
 	if err != nil {
 		log.Fatalf("extraction LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 
 	if extractModel == "" && cfg.Extraction.Mode == "two-pass" {
 		extractClient, qErr := extraction.NewLLMClient(cfg.LLM.Provider, apiKey, cfg.QualityModelID(), cfg.LLM.ClaudeBinary, baseURL)
 		if qErr == nil && extractClient != nil {
-			return extraction.NewTwoPassExtractor(client, extractClient, store)
+			ext := extraction.NewTwoPassExtractor(client, redacted(cfg, extractClient), store)
+			ext.SetChunkSize(cfg.Extraction.ChunkSize)
+			return ext
 		}
 	}
-	return extraction.NewExtractor(client, store)
+	ext := extraction.NewExtractor(client, store)
+	ext.SetChunkSize(cfg.Extraction.ChunkSize)
+	return ext
 }
 
 // requireEnv returns the value of an environment variable or exits with an error.

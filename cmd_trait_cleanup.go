@@ -11,7 +11,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/clustering"
 	"github.com/carsteneu/yesmem/internal/config"
 	"github.com/carsteneu/yesmem/internal/embedding"
-	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -101,42 +100,61 @@ func runTraitCleanup() {
 
 	fmt.Fprintf(os.Stderr, "\nFound %d similar pairs:\n\n", len(similar))
 
-	// Track which traits to supersede (keep highest confidence per cluster)
-	superseded := make(map[int]bool)
-	var toSupersede []models.PersonaTrait
+	// Track which traits are resolved, so a pair is not re-processed. In dry-run
+	// mode a drop is resolved unless the storage guard would refuse it; in the
+	// live mode the affected row count decides. A protected trait therefore
+	// stays unresolved in both modes and its remaining pairs are still compared.
+	resolved := make(map[int]bool)
+	candidates := 0
+	supersededCount := 0
 
 	for _, p := range similar {
-		if superseded[p.i] || superseded[p.j] {
+		if resolved[p.i] || resolved[p.j] {
 			continue // Already handled
 		}
 
 		ti, tj := traits[p.i], traits[p.j]
 		keep, drop := ti, tj
-		keepIdx, dropIdx := p.i, p.j
+		dropIdx := p.i
 		if tj.Confidence > ti.Confidence || (tj.Confidence == ti.Confidence && tj.EvidenceCount > ti.EvidenceCount) {
 			keep, drop = tj, ti
-			keepIdx, dropIdx = p.j, p.i
+			dropIdx = p.j
 		}
 
-		fmt.Fprintf(os.Stderr, "  [%.2f] KEEP: %s.%s=%q (conf:%.2f, ev:%d)\n",
+		fmt.Fprintf(os.Stderr, "  [%.2f] KEEP: %q.%q=%q (conf:%.2f, ev:%d)\n",
 			p.sim, keep.Dimension, keep.TraitKey, keep.TraitValue, keep.Confidence, keep.EvidenceCount)
-		fmt.Fprintf(os.Stderr, "         DROP: %s.%s=%q (conf:%.2f, ev:%d)\n",
+		fmt.Fprintf(os.Stderr, "         DROP: %q.%q=%q (conf:%.2f, ev:%d)\n",
 			drop.Dimension, drop.TraitKey, drop.TraitValue, drop.Confidence, drop.EvidenceCount)
+		// A user_override drop is refused by the storage guard, so it does not
+		// count as a supersede candidate in either mode.
+		if drop.Source != "user_override" {
+			candidates++
+		}
 
-		superseded[dropIdx] = true
-		_ = keepIdx
-		toSupersede = append(toSupersede, drop)
+		if dryRun {
+			if drop.Source != "user_override" {
+				resolved[dropIdx] = true
+			}
+			continue
+		}
+
+		affected, err := store.SupersedePersonaTrait("default", drop.Dimension, drop.TraitKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "         supersede failed: %v\n", err)
+			continue
+		}
+		if affected == 0 {
+			fmt.Fprintf(os.Stderr, "         PROTECTED (user_override) — kept active\n")
+			continue
+		}
+		resolved[dropIdx] = true
+		supersededCount += int(affected)
 	}
 
-	fmt.Fprintf(os.Stderr, "\n%d traits to supersede.\n", len(toSupersede))
-
 	if dryRun {
+		fmt.Fprintf(os.Stderr, "\n%d traits to supersede.\n", candidates)
 		fmt.Fprintln(os.Stderr, "--dry-run: no changes made.")
 		return
 	}
-
-	for _, t := range toSupersede {
-		store.SupersedePersonaTrait("default", t.Dimension, t.TraitKey)
-	}
-	fmt.Fprintf(os.Stderr, "Done: %d traits superseded. %d remaining.\n", len(toSupersede), len(traits)-len(toSupersede))
+	fmt.Fprintf(os.Stderr, "\nDone: %d traits superseded. %d remaining.\n", supersededCount, len(traits)-supersededCount)
 }

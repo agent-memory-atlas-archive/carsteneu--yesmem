@@ -141,6 +141,47 @@ func TestCallerWindowFromParams(t *testing.T) {
 	}
 }
 
+// A leaked environment id names another session, so its window is not the
+// caller's: the reply target decides instead.
+func TestCallerWindowFromParams_IgnoresLeakedEnvironmentID(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	h.windowMap = map[string]string{
+		"opencode:ses_FOREIGN": "0x05a00004",
+		"opencode:ses_mine":    "0x04c00004",
+	}
+	h.terminalMap = map[string]string{}
+
+	got := h.callerWindowFromParams(map[string]any{
+		"_session_id": "opencode:ses_FOREIGN", "_session_id_source": "env",
+		"_source_agent": "opencode", "_caller_pid": float64(opencodeSharedServicePID),
+		"caller_session": "opencode:ses_mine",
+	})
+	if got != "0x04c00004" {
+		t.Fatalf("callerWindowFromParams = %q, want the reply target's window", got)
+	}
+}
+
+// The same id without the environment marker is the caller's own and keeps
+// winning.
+func TestCallerWindowFromParams_KeepsInjectedSessionWindow(t *testing.T) {
+	h, _ := mustHandler(t)
+	isolateHome(t)
+	h.windowMap = map[string]string{
+		"opencode:ses_mine":  "0x04c00004",
+		"opencode:ses_other": "0x05a00004",
+	}
+	h.terminalMap = map[string]string{}
+
+	got := h.callerWindowFromParams(map[string]any{
+		"_session_id": "opencode:ses_mine", "_source_agent": "opencode",
+		"_caller_pid": float64(opencodeSharedServicePID), "caller_session": "opencode:ses_other",
+	})
+	if got != "0x04c00004" {
+		t.Fatalf("callerWindowFromParams = %q, want the caller's own window", got)
+	}
+}
+
 // The full producer→consumer path inside the daemon: what the opencode TUI
 // plugin registers is what spawn_agent hands to agent-tty.
 func TestRegisterWindowFeedsCallerWindow(t *testing.T) {

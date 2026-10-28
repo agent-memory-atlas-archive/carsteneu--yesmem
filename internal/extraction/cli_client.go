@@ -46,10 +46,16 @@ func NewCLIClient(binary, model, sourceAgent string) *CLIClient {
 // SetMaxBudgetPerCall sets the per-call budget limit on CLI clients.
 // No-op for non-CLI clients. Safe to call on any LLMClient.
 func SetMaxBudgetPerCall(client LLMClient, usd float64) {
-	// Unwrap GatedClient → BudgetClient → inner
+	// Unwrap SanitizingClient → GatedClient → BudgetClient → inner. Construction
+	// sites apply the cap before the sanitization wrap, so today no caller holds a
+	// redacted handle here; the SanitizingClient case is defensive. Without it the
+	// cap is silently dropped on any handle that does carry a redactor, and the
+	// safety of the call order would be a convention nobody tests.
 	switch c := client.(type) {
 	case *CLIClient:
 		c.MaxBudgetPerCall = usd
+	case *SanitizingClient:
+		SetMaxBudgetPerCall(c.inner, usd)
 	case *BudgetClient:
 		SetMaxBudgetPerCall(c.inner, usd)
 	case *GatedClient:
@@ -85,13 +91,14 @@ func (c *CLIClient) run(system, userMsg string, schema map[string]any, opts ...C
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
+	o := applyOpts(opts)
 	if c.sourceAgent == models.SourceAgentClaude {
-		return c.runClaude(ctx, system, userMsg, schema)
+		return c.runClaude(ctx, system, userMsg, schema, o)
 	}
-	return c.runStdin(ctx, system, userMsg, schema, applyOpts(opts))
+	return c.runStdin(ctx, system, userMsg, schema, o)
 }
 
-func (c *CLIClient) runClaude(ctx context.Context, system, userMsg string, schema map[string]any) (string, error) {
+func (c *CLIClient) runClaude(ctx context.Context, system, userMsg string, schema map[string]any, o callOpts) (string, error) {
 	sysFile, err := os.CreateTemp("", "yesmem-sys-*.txt")
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
@@ -142,6 +149,9 @@ func (c *CLIClient) runClaude(ctx context.Context, system, userMsg string, schem
 
 	if err := cmd.Run(); err != nil {
 		stderrStr := stderr.String()
+		// --output-format json prints the envelope with usage even for a failed
+		// run, and the provider bills it, so report before the error returns.
+		c.extractAndReportUsage(stdout.String(), o.usageSink)
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("cli timeout (300s): %s", stderrStr)
 		}
@@ -159,7 +169,7 @@ func (c *CLIClient) runClaude(ctx context.Context, system, userMsg string, schem
 	}
 
 	// Parse JSON response — extract result text and report usage
-	result = c.extractAndReportUsage(result)
+	result = c.extractAndReportUsage(result, o.usageSink)
 
 	return result, nil
 }
@@ -217,6 +227,11 @@ func (c *CLIClient) runStdin(ctx context.Context, system, userMsg string, schema
 
 	if err := cmd.Wait(); err != nil {
 		stderrStr := stderr.String()
+		// A failing run has still emitted (and been billed for) its step_finish
+		// events, so parse the events already in the buffer before returning.
+		if c.sourceAgent == models.SourceAgentOpencode {
+			_, _ = parseOpencodeOutput(stdout.String(), c.model, o.usageSink)
+		}
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("%s timeout (300s): %s", c.sourceAgent, stderrStr)
 		}
@@ -236,7 +251,7 @@ func (c *CLIClient) runStdin(ctx context.Context, system, userMsg string, schema
 	}
 	if c.sourceAgent == models.SourceAgentOpencode {
 		var err error
-		result, err = parseOpencodeOutput(result, c.model)
+		result, err = parseOpencodeOutput(result, c.model, o.usageSink)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", c.sourceAgent, err)
 		}
@@ -244,10 +259,37 @@ func (c *CLIClient) runStdin(ctx context.Context, system, userMsg string, schema
 	return result, nil
 }
 
+// cacheReadTokensPerInputToken is how many cache-read tokens cost as much as one
+// input token. Anthropic and DeepSeek both bill a cache hit at a tenth of the
+// input rate, which is the ratio the metering chain assumes; it carries one
+// input counter for all transports instead of a second rate per model. Rounding
+// up keeps a step with a handful of cache reads from falling back to the char
+// estimate.
+const cacheReadTokensPerInputToken = 10
+
+// cacheReadInputEquivalent converts measured cache-read tokens into input tokens
+// at the discount above. Rounding up keeps a step with a handful of cache reads
+// from falling back to the char estimate.
+func cacheReadInputEquivalent(cacheReadTokens int) int {
+	n := clampTokens(cacheReadTokens)
+	if n == 0 {
+		return 0
+	}
+	return (n + cacheReadTokensPerInputToken - 1) / cacheReadTokensPerInputToken
+}
+
+// billableInput is the metering input count of one step or call: raw input and
+// cache creation at the full rate, cache reads at their discount. Each part is
+// clamped before the sum, so an absurd count from the other process cannot wrap
+// the addition into a negative and silently drop the report.
+func billableInput(inputTokens, cacheWriteTokens, cacheReadTokens int) int {
+	return clampTokens(inputTokens) + clampTokens(cacheWriteTokens) + cacheReadInputEquivalent(cacheReadTokens)
+}
+
 // parseOpencodeOutput parses opencode ndjson output (--format json):
 // collects all type=text part.text fragments and reports usage from type=step_finish.
 // Returns an error when no text events are found (empty completion).
-func parseOpencodeOutput(output string, model string) (string, error) {
+func parseOpencodeOutput(output string, model string, sink usageSink) (string, error) {
 	if output == "" {
 		return "", fmt.Errorf("opencode emitted no text events")
 	}
@@ -264,7 +306,6 @@ func parseOpencodeOutput(output string, model string) (string, error) {
 			Part struct {
 				Text   string `json:"text"`
 				Tokens struct {
-					Total  int `json:"total"`
 					Input  int `json:"input"`
 					Output int `json:"output"`
 					Cache  struct {
@@ -284,10 +325,13 @@ func parseOpencodeOutput(output string, model string) (string, error) {
 				hasText = true
 			}
 		case "step_finish":
-			if OnUsage != nil && event.Part.Tokens.Total > 0 {
-				billableIn := event.Part.Tokens.Input + event.Part.Tokens.Cache.Write
-				OnUsage(model, billableIn, event.Part.Tokens.Output)
-			}
+			// Cache reads are billed at a tenth of the input rate (Anthropic and
+			// DeepSeek both use 0.1x), so they enter the counter as input
+			// equivalents. Without that, a step whose whole prompt was a cache hit
+			// reports nothing and the call falls back to the char estimate, which
+			// prices the full prompt at the input rate.
+			billableIn := billableInput(event.Part.Tokens.Input, event.Part.Tokens.Cache.Write, event.Part.Tokens.Cache.Read)
+			reportMeasuredUsage(sink, model, billableIn, event.Part.Tokens.Output)
 		}
 	}
 	if !hasText {
@@ -355,22 +399,23 @@ type cliResult struct {
 	} `json:"usage"`
 }
 
-// extractAndReportUsage parses the CLI JSON output, reports token usage
-// via OnUsage callback, and returns the LLM response text.
-// Falls back to raw output if JSON parsing fails.
-func (c *CLIClient) extractAndReportUsage(output string) string {
+// extractAndReportUsage parses the CLI JSON output, reports token usage to this
+// call's sink (or the package-wide hook when none is installed), and returns the
+// LLM response text. Falls back to raw output if JSON parsing fails.
+func (c *CLIClient) extractAndReportUsage(output string, sink usageSink) string {
 	var resp cliResult
-	if err := json.Unmarshal([]byte(output), &resp); err != nil || resp.Result == "" {
-		// Fallback: not valid JSON or no result — return raw output
+	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+		// Fallback: not valid JSON — return raw output
 		return output
 	}
 
-	// Report real token usage (same callback as API client)
-	if OnUsage != nil {
-		// Billable input = non-cached + cache creation (cache reads are discounted)
-		inputTokens := resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens
-		OnUsage(c.model, inputTokens, resp.Usage.OutputTokens)
-	}
+	// Billable input = non-cached + cache creation + cache reads at their
+	// discount. The counts come from an external process: reportMeasuredUsage
+	// clamps them and drops an all-zero report, which would otherwise mark the
+	// call as measured and let it vanish from the budget.
+	reportMeasuredUsage(sink, c.model,
+		billableInput(resp.Usage.InputTokens, resp.Usage.CacheCreationInputTokens, resp.Usage.CacheReadInputTokens),
+		resp.Usage.OutputTokens)
 
 	if resp.TotalCostUSD > 0 {
 		log.Printf("CLI call cost: $%.4f (in: %d, out: %d, cache_create: %d, cache_read: %d)",
@@ -381,6 +426,10 @@ func (c *CLIClient) extractAndReportUsage(output string) string {
 			resp.Usage.CacheReadInputTokens)
 	}
 
+	if resp.Result == "" {
+		// No result text (typical for an errored run): keep returning raw output.
+		return output
+	}
 	return resp.Result
 }
 

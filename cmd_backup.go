@@ -23,26 +23,60 @@ func runBackup() {
 		backupDir = os.Args[2]
 	}
 
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
 		log.Fatalf("create backup dir: %v", err)
 	}
-
-	// Back up main DB
-	mainDB := filepath.Join(dataDir, "yesmem.db")
-	mainDest := filepath.Join(backupDir, fmt.Sprintf("yesmem-%s.db", now))
-	if err := vacuumInto(mainDB, mainDest); err != nil {
-		log.Fatalf("backup yesmem.db: %v", err)
+	// MkdirAll leaves the mode of a directory it did not create, so an existing
+	// backup directory keeps whatever mode an earlier version gave it (0755). The
+	// snapshots are full transcripts, and VACUUM INTO writes them readable for the
+	// whole duration of a multi-gigabyte run, so the directory has to close the gap.
+	if err := os.Chmod(backupDir, 0700); err != nil {
+		log.Fatalf("harden backup dir: %v", err)
 	}
-	printResult("yesmem.db", mainDB, mainDest, backupDir)
 
-	// Back up runtime DB
-	runtimeDB := filepath.Join(dataDir, "runtime.db")
-	if info, err := os.Stat(runtimeDB); err == nil && info.Size() > 0 {
-		runtimeDest := filepath.Join(backupDir, fmt.Sprintf("yesmem-%s-runtime.db", now))
-		if err := vacuumInto(runtimeDB, runtimeDest); err != nil {
-			log.Fatalf("backup runtime.db: %v", err)
+	// The databases storage.Open keeps in the data directory. messages.db carries
+	// the message bodies since the migrate-messages split, caps.db the cap_store
+	// tables of every saved cap; a backup without either restores the knowledge
+	// base but loses part of the installation.
+	for _, db := range []struct {
+		name   string
+		suffix string
+	}{
+		{"yesmem.db", ""},
+		{"runtime.db", "-runtime"},
+		{"messages.db", "-messages"},
+		{"caps.db", "-caps"},
+	} {
+		src := filepath.Join(dataDir, db.name)
+		info, statErr := os.Stat(src)
+		if os.IsNotExist(statErr) {
+			// A fresh installation creates its side databases on first use; the
+			// main database is the installation itself.
+			if db.name == "yesmem.db" {
+				log.Fatalf("backup %s: %v", db.name, statErr)
+			}
+			fmt.Printf("! %s not present, skipped\n", db.name)
+			continue
 		}
-		printResult("runtime.db", runtimeDB, runtimeDest, backupDir)
+		if statErr != nil {
+			log.Fatalf("backup %s: %v", db.name, statErr)
+		}
+		if info.Size() == 0 {
+			// An empty file is a broken database, not a missing one. Skipping it
+			// would report a successful backup that cannot be restored.
+			log.Fatalf("backup %s: file %s is empty", db.name, src)
+		}
+		dest := filepath.Join(backupDir, fmt.Sprintf("yesmem-%s%s.db", now, db.suffix))
+		if err := vacuumInto(src, dest); err != nil {
+			log.Fatalf("backup %s: %v", db.name, err)
+		}
+		// VACUUM INTO writes the copy under the process umask, and a backup holds
+		// full transcripts. The data directory protects the live files; the backup
+		// directory is a command argument and may be anywhere.
+		if err := os.Chmod(dest, 0o600); err != nil {
+			log.Fatalf("harden %s: %v", dest, err)
+		}
+		printResult(db.name, src, dest, backupDir)
 	}
 }
 
@@ -52,6 +86,12 @@ func vacuumInto(srcPath, destPath string) error {
 		return fmt.Errorf("open %s: %w", srcPath, err)
 	}
 	defer db.Close()
+
+	// The source can carry a live writer; without a timeout VACUUM INTO fails with
+	// SQLITE_BUSY on the first competing write.
+	if _, err := db.Exec("PRAGMA busy_timeout=10000"); err != nil {
+		return fmt.Errorf("busy_timeout: %w", err)
+	}
 
 	_, err = db.Exec("VACUUM INTO ?", destPath)
 	if err != nil {

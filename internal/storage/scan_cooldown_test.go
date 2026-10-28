@@ -6,7 +6,7 @@ import (
 )
 
 func TestScanCooldown_RecordGetClear(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	failedAt, errMsg, err := s.GetScanFailure("someproject")
 	if err != nil {
@@ -36,7 +36,7 @@ func TestScanCooldown_RecordGetClear(t *testing.T) {
 }
 
 func TestScanCooldown_OverwritesPreviousFailure(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.RecordScanFailure("proj", "first"); err != nil {
 		t.Fatalf("RecordScanFailure 1: %v", err)
@@ -64,7 +64,7 @@ func TestScanCooldown_OverwritesPreviousFailure(t *testing.T) {
 }
 
 func TestScanCooldown_Clear(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.RecordScanFailure("projectX", "boom"); err != nil {
 		t.Fatalf("RecordScanFailure: %v", err)

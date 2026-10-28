@@ -1,6 +1,10 @@
 package codescan
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 // These fixtures are verbatim outputs captured from
 // `codebase-memory-mcp cli <tool> ... --json` v0.10.8.
@@ -76,3 +80,29 @@ func TestParseCBMResponse_Empty(t *testing.T) {
 		t.Fatal("expected error for empty content")
 	}
 }
+
+// The error text of the CBM CLI is client data. It must reach the error
+// message bounded and quoted: raw line breaks forge log lines, and an unbounded
+// body floods the daemon log (YM-277 / DEV-DT45).
+func TestParseCBMResponse_ErrorTextIsBoundedAndQuoted(t *testing.T) {
+	forged := "forged: everything fine"
+	payload := fmt.Sprintf(`{"content":[{"type":"text","text":%q}],"isError":true}`,
+		"expected token type 85\n"+forged+strings.Repeat("x", 4096))
+
+	_, err := parseCBMResponse([]byte(payload))
+	if err == nil {
+		t.Fatal("expected error for isError envelope")
+	}
+	msg := err.Error()
+
+	if strings.Contains(msg, "\n") {
+		t.Fatalf("error message carries a raw line break: %q", msg)
+	}
+	if len(msg) > 400 {
+		t.Fatalf("error message is unbounded (%d chars): %q", len(msg), msg[:80])
+	}
+	if !strings.Contains(msg, "expected token type 85") {
+		t.Fatalf("the reason did not survive: %q", msg)
+	}
+}
+

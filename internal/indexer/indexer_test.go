@@ -256,6 +256,37 @@ func TestProjectDirName(t *testing.T) {
 	}
 }
 
+// projectExcluded is the single exclusion predicate for both indexers. It must
+// not depend on the case of either operand, because the configured list is
+// stored lowercased while the compared values come from stored rows and rows
+// parsed from files.
+func TestProjectExcludedIgnoresCaseOfBothOperands(t *testing.T) {
+	exclude := map[string]bool{"/proj/a": true}
+
+	cases := []struct {
+		name           string
+		project, short string
+		want           bool
+	}{
+		{"exact project", "/proj/a", "", true},
+		{"project in upper case", "/PROJ/A", "", true},
+		{"short form only", "/proj/b", "/Proj/A", true},
+		{"empty project does not match the list's empty key", "", "", false},
+		{"unrelated project", "/proj/b", "/proj/c", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := projectExcluded(exclude, tc.project, tc.short); got != tc.want {
+				t.Errorf("projectExcluded(%q, %q) = %v, want %v", tc.project, tc.short, got, tc.want)
+			}
+		})
+	}
+
+	if projectExcluded(nil, "/proj/a", "/proj/a") {
+		t.Error("an empty exclusion list must not exclude anything")
+	}
+}
+
 func TestIndexSession_ExcludeProject(t *testing.T) {
 	store, err := storage.Open(":memory:")
 	if err != nil {

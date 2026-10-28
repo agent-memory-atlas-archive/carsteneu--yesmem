@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/carsteneu/yesmem/internal/archive"
 	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
 
@@ -23,6 +25,7 @@ type OpencodeScanner struct {
 	dbPath         string
 	sourceKey      string
 	store          *storage.Store
+	archiver       *archive.Archiver
 	scanMu         sync.Mutex
 	lastScanAt     time.Time
 	lastSessionID  string
@@ -32,11 +35,8 @@ type OpencodeScanner struct {
 	excludeProject map[string]bool
 }
 
-func NewOpencodeScanner(dbPath string, store *storage.Store, logger *log.Logger, notifyCh chan<- struct{}, excludeProjects []string) *OpencodeScanner {
-	exclude := make(map[string]bool, len(excludeProjects))
-	for _, p := range excludeProjects {
-		exclude[strings.ToLower(p)] = true
-	}
+func NewOpencodeScanner(dbPath string, store *storage.Store, logger *log.Logger, notifyCh chan<- struct{}, excludeProjects []string, arch *archive.Archiver) *OpencodeScanner {
+	exclude := normalizeExcludedProjects(excludeProjects)
 	sourceKey, err := filepath.Abs(dbPath)
 	if err != nil {
 		sourceKey = filepath.Clean(dbPath)
@@ -45,6 +45,7 @@ func NewOpencodeScanner(dbPath string, store *storage.Store, logger *log.Logger,
 		dbPath:         dbPath,
 		sourceKey:      sourceKey,
 		store:          store,
+		archiver:       arch,
 		lastCheckAt:    time.Now(),
 		logger:         logger,
 		notifyCh:       notifyCh,
@@ -66,6 +67,65 @@ func (s *OpencodeScanner) logf(format string, args ...any) {
 	}
 }
 
+// sessionExportFormat marks the document written for a session that has no JSONL
+// file of its own, so a later reader can tell layouts apart.
+const sessionExportFormat = "yesmem-session-export/1"
+
+// sessionExport is one session's archived record: the indexed row plus its
+// messages, which is everything yesmem knows about the session.
+type sessionExport struct {
+	Format   string           `json:"format"`
+	Session  *models.Session  `json:"session"`
+	Messages []models.Message `json:"messages"`
+}
+
+// writeSessionExport writes the session into the archive. Opencode sessions live
+// in opencode.db, a database the archive exists to outlive, so they are exported
+// as one document per session instead of being copied file by file. The encoder
+// writes straight to the file: a long session would otherwise be materialised as
+// one buffer before anything reaches the disk.
+//
+// It is a package function so the catch-up path (ArchiveMissingSessions) writes
+// byte-identical documents; a session that arrives through either path must not
+// be recognisable by its shape.
+func writeSessionExport(arch *archive.Archiver, sess *models.Session, msgs []models.Message) error {
+	return arch.WriteSessionDoc(
+		archive.ProjectDirName(sess.Project),
+		archiveDocumentName(sess.ID),
+		func(w io.Writer) error {
+			enc := json.NewEncoder(w)
+			enc.SetIndent("", "  ")
+			return enc.Encode(sessionExport{
+				Format:   sessionExportFormat,
+				Session:  sess,
+				Messages: msgs,
+			})
+		},
+	)
+}
+
+// archiveDocumentName turns a session id into a file name. Normalized ids carry
+// the source agent as a prefix ("opencode:ses_..."); the colon is legal on disk
+// but not portable, and separators would escape the project folder.
+func archiveDocumentName(sessionID string) string {
+	name := strings.NewReplacer(":", "-", "/", "-", "\\", "-").Replace(sessionID)
+	switch name {
+	case "", ".", "..":
+		return "session.json"
+	}
+	return name + ".json"
+}
+
+// openOpencodeDB opens the opencode session database. The file belongs to another
+// application: the scanner only reads it (querySessions, queryMessages), so the
+// handle is opened read-only and refuses writes. SQLite still keeps its own WAL
+// bookkeeping files beside a WAL-mode database; that is the driver's business, the
+// point here is that no statement of ours can modify the foreign database. It is a
+// function of its own so the handle the scanner works with can be tested directly.
+func openOpencodeDB(path string) (*sql.DB, error) {
+	return storage.OpenSQLiteReadOnly(path)
+}
+
 func (s *OpencodeScanner) MaybeScan() int {
 	// MaybeScan is called both by the daemon ticker and idle ticks. Do not make
 	// either caller wait behind a potentially long full scan.
@@ -81,7 +141,7 @@ func (s *OpencodeScanner) MaybeScan() int {
 	// than the interval can be followed immediately by another scan.
 	defer func() { s.lastCheckAt = time.Now() }()
 
-	db, err := sql.Open("sqlite", s.dbPath)
+	db, err := openOpencodeDB(s.dbPath)
 	if err != nil {
 		s.logf("opencode scanner: open db: %v", err)
 		return 0
@@ -114,7 +174,7 @@ func (s *OpencodeScanner) MaybeScan() int {
 	for _, sess := range sessions {
 		dbMsgs, err := s.queryMessages(db, sess.ID)
 		if err != nil {
-			s.logf("opencode scanner: session %s messages: %v", sess.ID, err)
+			s.logf("opencode scanner: session %q messages: %v", sess.ID, err)
 			watermarkBlocked = true
 			continue
 		}
@@ -130,13 +190,13 @@ func (s *OpencodeScanner) MaybeScan() int {
 		yesSess := buildOpencodeSession(sess, msgs)
 
 		// Skip projects on the exclusion list
-		if s.excludeProject[strings.ToLower(yesSess.Project)] || s.excludeProject[yesSess.ProjectShort] {
+		if projectExcluded(s.excludeProject, yesSess.Project, yesSess.ProjectShort) {
 			advanceWatermark(sess)
 			continue
 		}
 
 		if err := s.store.UpsertSession(yesSess); err != nil {
-			s.logf("opencode scanner: upsert session %s: %v", yesSess.ID, err)
+			s.logf("opencode scanner: upsert session %q: %v", yesSess.ID, err)
 			watermarkBlocked = true
 			continue
 		}
@@ -144,13 +204,13 @@ func (s *OpencodeScanner) MaybeScan() int {
 		s.normalizeMessages(msgs, yesSess.ID)
 
 		if err := s.store.DeleteMessagesBySession(yesSess.ID); err != nil {
-			s.logf("opencode scanner: delete old messages %s: %v", yesSess.ID, err)
+			s.logf("opencode scanner: delete old messages %q: %v", yesSess.ID, err)
 			watermarkBlocked = true
 			continue
 		}
 		if len(msgs) > 0 {
 			if err := s.store.InsertMessages(msgs); err != nil {
-				s.logf("opencode scanner: insert messages %s: %v", yesSess.ID, err)
+				s.logf("opencode scanner: insert messages %q: %v", yesSess.ID, err)
 				watermarkBlocked = true
 				continue
 			}
@@ -158,6 +218,13 @@ func (s *OpencodeScanner) MaybeScan() int {
 
 		newlyIndexed++
 		advanceWatermark(sess)
+		if s.archiver != nil {
+			if err := writeSessionExport(s.archiver, yesSess, msgs); err != nil {
+				// The archive is a second copy, not the index: a failure there must
+				// not keep the session out of the search path.
+				s.logf("opencode scanner: archive session %q: %v", yesSess.ID, err)
+			}
+		}
 	}
 
 	if !watermarkAt.Equal(s.lastScanAt) || watermarkSessionID != s.lastSessionID {
@@ -192,24 +259,69 @@ func (s *OpencodeScanner) normalizeMessages(msgs []models.Message, sessionID str
 	}
 }
 
+// hasV2Tables reports whether the database carries the v2 session storage. The
+// fork moved sessions to session_v2/session_message (migration #40723) and
+// stopped writing the legacy session/message/part tables; reading the legacy
+// names then yields a database frozen at the migration.
+func hasV2Tables(db *sql.DB) bool {
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN ('session_v2', 'session_message')`).Scan(&n); err != nil {
+		return false
+	}
+	return n == 2
+}
+
+// newestTime returns the newest time_updated of a table, 0 when the table is
+// missing or empty. It exists to choose between the two session storages by
+// their content rather than by their presence.
+func newestTime(db *sql.DB, table string) int64 {
+	var newest sql.NullInt64
+	if err := db.QueryRow(`SELECT MAX(time_updated) FROM ` + table).Scan(&newest); err != nil {
+		return 0
+	}
+	if !newest.Valid {
+		return 0
+	}
+	return newest.Int64
+}
+
+// sessionStorage decides which session tables this database really uses. Both
+// generations can be present at once: a migrated database keeps the legacy
+// tables, and the fork stops writing them. Deciding by the newer timestamp
+// covers v1-only, v2-only, and the mixed case where a host still writes v1.
+func sessionStorage(db *sql.DB) string {
+	if !hasV2Tables(db) {
+		return "v1"
+	}
+	if newestTime(db, "session_v2") >= newestTime(db, "session") {
+		return "v2"
+	}
+	return "v1"
+}
+
 func (s *OpencodeScanner) querySessions(db *sql.DB) ([]opencodeDBSession, error) {
+	table := "session"
+	if sessionStorage(db) == "v2" {
+		table = "session_v2"
+	}
 	var rows *sql.Rows
 	var err error
 
 	if s.lastScanAt.IsZero() {
 		rows, err = db.Query(`
-			SELECT id, directory, title,
+			SELECT id, COALESCE(directory, ''), COALESCE(title, ''),
 				time_created, time_updated, parent_id,
 				COALESCE(model, ''), COALESCE(agent, '')
-			FROM session
+			FROM ` + table + `
 			ORDER BY time_updated, id
 		`)
 	} else {
 		rows, err = db.Query(`
-			SELECT id, directory, title,
+			SELECT id, COALESCE(directory, ''), COALESCE(title, ''),
 				time_created, time_updated, parent_id,
 				COALESCE(model, ''), COALESCE(agent, '')
-			FROM session
+			FROM `+table+`
 			WHERE time_updated > ? OR (time_updated = ? AND id > ?)
 			ORDER BY time_updated, id
 		`, s.lastScanAt.UnixMilli(), s.lastScanAt.UnixMilli(), s.lastSessionID)
@@ -243,6 +355,9 @@ func (s *OpencodeScanner) querySessions(db *sql.DB) ([]opencodeDBSession, error)
 }
 
 func (s *OpencodeScanner) queryMessages(db *sql.DB, sessionID string) ([]opencodeDBMessage, error) {
+	if v2 := sessionStorage(db) == "v2"; v2 {
+		return s.queryMessagesV2(db, sessionID)
+	}
 	rows, err := db.Query(`
 		SELECT m.id, m.session_id,
 			json_extract(m.data, '$.role') as role,
@@ -294,4 +409,56 @@ func isExtractionPipelineSession(msgs []models.Message) bool {
 		}
 	}
 	return false
+}
+
+// queryMessagesV2 reads the v2 message rows: one row per turn, with the parts in
+// data.content for an assistant turn and a plain text for a user or system turn.
+// The mapper works one part per entry, so a turn becomes as many entries as it
+// carries parts. Row types that are not conversation (idle, compaction,
+// model-switched, ...) produce no messages.
+func (s *OpencodeScanner) queryMessagesV2(db *sql.DB, sessionID string) ([]opencodeDBMessage, error) {
+	rows, err := db.Query(`
+		SELECT id, type, time_created, data
+		FROM session_message
+		WHERE session_id = ?
+		ORDER BY seq
+	`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query session_message: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []opencodeDBMessage
+	for rows.Next() {
+		var id, typ, data string
+		var createdMs int64
+		if err := rows.Scan(&id, &typ, &createdMs, &data); err != nil {
+			return nil, fmt.Errorf("scan session_message: %w", err)
+		}
+		var payload struct {
+			Text    string           `json:"text"`
+			Content []opencodeDBPart `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			return nil, fmt.Errorf("parse %s row: %w", typ, err)
+		}
+		switch typ {
+		case "user", "system":
+			if payload.Text == "" {
+				continue
+			}
+			msgs = append(msgs, opencodeDBMessage{
+				ID: id, SessionID: sessionID, Role: typ, CreatedMs: createdMs,
+				Part: opencodeDBPart{Type: "text", Text: payload.Text},
+			})
+		case "assistant":
+			for i, part := range payload.Content {
+				msgs = append(msgs, opencodeDBMessage{
+					ID: fmt.Sprintf("%s-%d", id, i), SessionID: sessionID, Role: typ,
+					CreatedMs: createdMs, Part: part,
+				})
+			}
+		}
+	}
+	return msgs, rows.Err()
 }

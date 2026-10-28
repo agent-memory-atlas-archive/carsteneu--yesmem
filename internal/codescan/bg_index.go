@@ -91,10 +91,10 @@ func EnsureIndex(rootDir string) {
 		}()
 		start := time.Now()
 		if err := indexWorker(rootDir); err != nil {
-			log.Printf("cbm: background index %s failed after %s: %v", project, time.Since(start).Round(time.Second), err)
+			log.Printf("cbm: background index %q failed after %s: %v", project, time.Since(start).Round(time.Second), err)
 			return
 		}
-		log.Printf("cbm: background index %s done in %s", project, time.Since(start).Round(time.Second))
+		log.Printf("cbm: background index %q done in %s", project, time.Since(start).Round(time.Second))
 	}()
 }
 

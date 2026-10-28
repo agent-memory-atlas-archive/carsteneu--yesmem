@@ -128,10 +128,10 @@ func (m *EagerStubMemory) persist(threadID string) {
 type EagerStubOption func(*eagerStubConfig)
 
 type eagerStubConfig struct {
-	memory      *EagerStubMemory
-	threadID    string
-	stickyHits  *int
-	freshStubs  *int
+	memory     *EagerStubMemory
+	threadID   string
+	stickyHits *int
+	freshStubs *int
 }
 
 func WithStubMemory(memory *EagerStubMemory, threadID string) EagerStubOption {
@@ -149,4 +149,34 @@ func WithStubCounters(sticky, fresh *int) EagerStubOption {
 		c.stickyHits = sticky
 		c.freshStubs = fresh
 	}
+}
+
+// eagerStubIDsPerThread bounds the tool_use_ids remembered per thread. The ids
+// come from the client, so the outer thread cap alone would leave one long
+// session unbounded — and persist serializes the whole id list per new id.
+const eagerStubIDsPerThread = 2000
+
+// pruneThreads bounds the memory maps, outer and inner. The inner cap drops
+// arbitrary ids (map order), so a tool result still on the wire can lose its
+// stub and change bytes near the tail. It only fires above eagerStubIDsPerThread
+// ids in one thread.
+func (m *EagerStubMemory) pruneThreads(keep int) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	removed := pruneThreadKeyed(m.stubbed, keep)
+	removed += pruneThreadKeyed(m.loaded, keep)
+	for _, ids := range m.stubbed {
+		if len(ids) <= eagerStubIDsPerThread {
+			continue
+		}
+		drop := len(ids) - eagerStubIDsPerThread
+		for id := range ids {
+			if drop <= 0 {
+				break
+			}
+			delete(ids, id)
+			drop--
+		}
+	}
+	return removed
 }

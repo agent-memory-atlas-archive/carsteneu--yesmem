@@ -68,6 +68,7 @@ func runVolatileSweep() {
 	if err != nil {
 		log.Fatalf("LLM client: %v", err)
 	}
+	client = redacted(cfg, client)
 	fmt.Fprintf(os.Stderr, "Sentinel-Client: %s (provider %s, model %s, quality %s)\n",
 		client.Name(), cfg.LLM.Provider, client.Model(), cfg.QualityModelID())
 

@@ -44,6 +44,10 @@ func categoryWeight(category string) float64 {
 func TurnBasedDecay(turnsAtCreation, currentTurnCount int64, stability float64, source string, useCount, saveCount int) float64 {
 	turnsSince := currentTurnCount - turnsAtCreation
 	if turnsSince <= 0 {
+		// Includes rows whose turns_at_creation is on an older counter scale
+		// (turn_counters was keyed by short project name before 2026-07-03 and
+		// by full path after). Such a row has no comparable age, so it keeps
+		// full relevance rather than being assigned a fabricated one.
 		return 1.0
 	}
 
@@ -160,8 +164,21 @@ func fixationPenalty(ratio float64) float64 {
 
 // ComputeScore calculates the relevance score for a learning.
 func ComputeScore(l *Learning) float64 {
+	return scoreFactors(l) *
+		TurnBasedDecay(l.TurnsAtCreation, l.CurrentTurnCount, l.Stability, l.Source, l.UseCount, l.SaveCount)
+}
+
+// ComputeIntrinsicScore is ComputeScore without turn-based decay. Use it where
+// recency is already handled separately and the question is only whether a
+// learning carries any value at all: the briefing's fade cut was calibrated
+// against this score, before decay ran on the read path.
+func ComputeIntrinsicScore(l *Learning) float64 {
+	return scoreFactors(l)
+}
+
+// scoreFactors is the decay-independent part of the relevance score.
+func scoreFactors(l *Learning) float64 {
 	return categoryWeight(l.Category) *
-		TurnBasedDecay(l.TurnsAtCreation, l.CurrentTurnCount, l.Stability, l.Source, l.UseCount, l.SaveCount) *
 		useBoost(l.UseCount, l.SaveCount) *
 		noisePenalty(l.NoiseCount) *
 		precisionFactor(l.UseCount, l.InjectCount) *

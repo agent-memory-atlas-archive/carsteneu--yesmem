@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -148,9 +149,8 @@ func TestCacheKeepalive_Retrigger(t *testing.T) {
 	// Simulate detection → 1h confirmed
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-6 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
-	det.RecordResponse(100000, 2000, 0) // >80% read after gap → 1h
+	det.RecordResponse("t1", 100000, 2000, 0) // >80% read after gap → 1h
 
 	// Retrigger → should now start pinging with pings_1h=1
 	ka.Retrigger()
@@ -184,15 +184,14 @@ func TestCacheKeepalive_DynamicInterval(t *testing.T) {
 	// Mode "auto", detector confirms 1h → 3240s
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-6 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
-	det.RecordResponse(50000, 10000, 8000)
+	det.RecordResponse("t1", 50000, 10000, 8000)
 	if got := kaAuto.effectiveInterval(); got != 3240*time.Second {
 		t.Errorf("auto 1h confirmed: expected 3240s, got %v", got)
 	}
 
 	// Mode "auto", detector denies 1h → 270s
-	det.RecordResponse(0, 15000, 0)
+	det.RecordResponse("t1", 0, 15000, 0)
 	if got := kaAuto.effectiveInterval(); got != 270*time.Second {
 		t.Errorf("auto 5m: expected 270s, got %v", got)
 	}
@@ -215,7 +214,7 @@ func TestCacheKeepalive_PerThreadTimerIndependence(t *testing.T) {
 		Mode:             "5m",
 		Pings5m:          3,
 		IntervalOverride: 80 * time.Millisecond,
-		OnPing: func(threadID string, cacheRead, cacheWrite int) {
+		OnPing: func(threadID string, cacheRead, cacheWrite, ephemeral1h int) {
 			if counter, ok := pingsPerThread[threadID]; ok {
 				counter.Add(1)
 			}
@@ -302,8 +301,8 @@ func TestCacheKeepalive_PingLogsErrorResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var logBuf bytes.Buffer
-	logger := log.New(&logBuf, "", 0)
+	logBuf := &lockedLogBuffer{}
+	logger := log.New(logBuf, "", 0)
 
 	ka := NewCacheKeepalive(CacheKeepaliveConfig{
 		Target: srv.URL, Mode: "5m", Pings5m: 1, IntervalOverride: 10 * time.Millisecond,
@@ -311,12 +310,48 @@ func TestCacheKeepalive_PingLogsErrorResponse(t *testing.T) {
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
 	ka.Reset("opencode:ses_test", body, "test-key", "")
-	time.Sleep(80 * time.Millisecond)
+	// Wait for the ping instead of sleeping a fixed 80ms. Under load the first
+	// tick can land later than that, and the assertion then read a log that was
+	// still empty - the test failed as a "load-dependent flake" while nothing
+	// was wrong (Learning #102234). Stop() only stops the timer, so the buffer
+	// must also be safe against a ping still in flight.
+	logBuf.waitFor(t, "400", 2*time.Second)
 	ka.Stop()
 
 	logOutput := logBuf.String()
 	if !strings.Contains(logOutput, "400") {
 		t.Errorf("expected log to contain HTTP status 400, got: %s", logOutput)
+	}
+}
+
+// lockedLogBuffer is a log destination that is safe to read while a keepalive
+// ping is still writing to it.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitFor polls until the buffer contains sub or the deadline passes.
+func (b *lockedLogBuffer) waitFor(t *testing.T, sub string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !strings.Contains(b.String(), sub) {
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -351,7 +386,9 @@ func TestCacheKeepalive_PingStripsThinkingEndToEnd(t *testing.T) {
 	}
 }
 
-func TestCacheKeepalive_SkipsUUIDThread(t *testing.T) {
+// YM-127: Claude Code identifies its session by the bare UUID in
+// X-Claude-Code-Session-Id, so keepalive must run for that form too.
+func TestCacheKeepalive_KeepsBareUUIDThread(t *testing.T) {
 	var pingCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pingCount.Add(1)
@@ -363,12 +400,33 @@ func TestCacheKeepalive_SkipsUUIDThread(t *testing.T) {
 		Target: srv.URL, Mode: "5m", Pings5m: 2, IntervalOverride: 50 * time.Millisecond,
 	})
 	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
-	ka.Reset("503485dc-b636-4c53-909a-00ed1374a31b", body, "test-key", "") // UUID format
+	ka.Reset("503485dc-b636-4c53-909a-00ed1374a31b", body, "test-key", "") // Claude Code session UUID
 	time.Sleep(200 * time.Millisecond)
 	ka.Stop()
 
-	if int(pingCount.Load()) != 0 {
-		t.Errorf("expected 0 pings for UUID thread, got %d", pingCount.Load())
+	if int(pingCount.Load()) == 0 {
+		t.Error("expected pings for a Claude Code UUID thread, got 0")
+	}
+}
+
+func TestCacheKeepalive_SkipsDerivedThread(t *testing.T) {
+	var pingCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pingCount.Add(1)
+		fmt.Fprintf(w, `{"type":"message","usage":{"cache_read_input_tokens":100}}`)
+	}))
+	defer srv.Close()
+
+	ka := NewCacheKeepalive(CacheKeepaliveConfig{
+		Target: srv.URL, Mode: "5m", Pings5m: 2, IntervalOverride: 50 * time.Millisecond,
+	})
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":"test"}]}`)
+	ka.Reset("503485dcb6364c53", body, "test-key", "") // DeriveThreadID form: 16 hex chars
+	time.Sleep(200 * time.Millisecond)
+	ka.Stop()
+
+	if got := int(pingCount.Load()); got != 0 {
+		t.Errorf("expected 0 pings for a derived thread, got %d", got)
 	}
 }
 
@@ -416,15 +474,14 @@ func TestCacheKeepalive_EffectivePings(t *testing.T) {
 	// Mode "auto", 1h confirmed → Pings1h
 	det.mu.Lock()
 	det.threadRequests["t1"] = time.Now().Add(-6 * time.Minute)
-	det.currentThread = "t1"
 	det.mu.Unlock()
-	det.RecordResponse(50000, 10000, 8000)
+	det.RecordResponse("t1", 50000, 10000, 8000)
 	if got := kaAuto.effectivePings(); got != 1 {
 		t.Errorf("auto 1h: expected 1, got %d", got)
 	}
 
 	// Mode "auto", 5m → Pings5m
-	det.RecordResponse(0, 15000, 0)
+	det.RecordResponse("t1", 0, 15000, 0)
 	if got := kaAuto.effectivePings(); got != 3 {
 		t.Errorf("auto 5m: expected 3, got %d", got)
 	}

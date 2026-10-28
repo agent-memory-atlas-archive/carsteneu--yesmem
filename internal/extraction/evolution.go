@@ -107,6 +107,47 @@ Antwort als JSON.`, newLearning.Category, existingList.String(), newID, newLearn
 	}
 }
 
+// supersedeUnlessHighTrust marks loser as superseded by winnerID unless the
+// loser is protected. With a successor the protection is high trust: a
+// high-trust loser stays active and the pair is recorded as an edge of the given
+// relation type (Decision D6: there is no confirmation path, therefore nothing is
+// parked in a pending state). Without a successor (substance-free rows) there is
+// nothing to link, so the protection is ownership: a row the user owns stays
+// active and everything else is retired without an edge. A user-owned row that is
+// not high trust is therefore still displaced on the successor path; that guard
+// is the trust score by design (YM-45).
+// Callers pass the relation their detector actually found: "contradicts" for a
+// judged conflict, "relates_to" for a rule-based near-duplicate — labelling a
+// duplicate a contradiction would inflate the contradiction count in the
+// briefing health.
+// It reports whether the loser was superseded; the error is non-nil only when a
+// write failed.
+func supersedeUnlessHighTrust(store *storage.Store, loser models.Learning, winnerID int64, reason, relation string) (bool, error) {
+	if winnerID > 0 {
+		trust := storage.TrustScore(&loser)
+		if storage.ClassifyTrust(trust) == storage.TrustHigh {
+			if err := store.EnsureTypedAssociation(loser.ID, winnerID, relation); err != nil {
+				log.Printf("warn: %s edge #%d<->#%d: %v", relation, loser.ID, winnerID, err)
+			}
+			log.Printf("Learning #%d: supersede blocked (trust %.1f, high) — kept active, %s #%d", loser.ID, trust, relation, winnerID)
+			return false, nil
+		}
+	} else if storage.IsUserOwnedSource(loser.Source) {
+		// No successor to point at, so the trust score cannot decide this: a retire
+		// here simply deletes what the user said. The source predicate is the one
+		// the cleanups use, so "the user owns this row" has a single definition
+		// (user_stated, agreed_upon, user_override) — a low weight is no claim.
+		log.Printf("Learning #%d: substance-free retire blocked (source %q, user-owned) — kept active", loser.ID, loser.Source)
+		return false, nil
+	}
+
+	if err := store.SupersedeLearning(loser.ID, winnerID, reason); err != nil {
+		return false, fmt.Errorf("supersede #%d by #%d: %w", loser.ID, winnerID, err)
+	}
+	log.Printf("Learning #%d supersedes #%d: %s", winnerID, loser.ID, reason)
+	return true, nil
+}
+
 func applyQualityRankedSupersede(store *storage.Store, candidates []models.Learning, reason string, onSupersede func(int64)) int {
 	if len(candidates) < 2 {
 		return 0
@@ -125,24 +166,18 @@ func applyQualityRankedSupersede(store *storage.Store, candidates []models.Learn
 			continue
 		}
 		seen[loser.ID] = true
-		trust := storage.TrustScore(&loser)
-		if storage.ClassifyTrust(trust) == storage.TrustHigh {
-			if err := store.SetSupersedeStatus(loser.ID, "pending_confirmation"); err != nil {
-				log.Printf("warn: set pending confirmation for #%d: %v", loser.ID, err)
-				continue
-			}
-			log.Printf("Learning #%d: supersede blocked (trust %.1f, high) — set pending_confirmation", loser.ID, trust)
+		ok, err := supersedeUnlessHighTrust(store, loser, winner.ID, reason, "contradicts")
+		if err != nil {
+			log.Printf("warn: %v", err)
 			continue
 		}
-		if err := store.SupersedeLearning(loser.ID, winner.ID, reason); err != nil {
-			log.Printf("warn: supersede #%d by #%d: %v", loser.ID, winner.ID, err)
+		if !ok {
 			continue
 		}
 		superseded++
 		if onSupersede != nil {
 			onSupersede(loser.ID)
 		}
-		log.Printf("Learning #%d supersedes #%d: %s (trust %.1f)", winner.ID, loser.ID, reason, trust)
 	}
 	return superseded
 }

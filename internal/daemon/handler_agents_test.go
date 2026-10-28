@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/carsteneu/yesmem/internal/orchestrator"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -38,8 +41,9 @@ func TestHandleSpawnAgent_Success(t *testing.T) {
 	h.agentDefaultBackend = "claude" // explicit — deterministisch, kein exec.LookPath
 
 	resp := h.handleSpawnAgent(map[string]any{
-		"project": "proj",
-		"section": "task-a",
+		"project":  "proj",
+		"work_dir": t.TempDir(),
+		"section":  "task-a",
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -81,7 +85,7 @@ func TestHandleSpawnAgent_DuplicateSection(t *testing.T) {
 		Status: "running", Backend: "claude",
 	})
 
-	resp := h.handleSpawnAgent(map[string]any{"project": "proj", "section": "task-a"})
+	resp := h.handleSpawnAgent(map[string]any{"project": "proj", "work_dir": t.TempDir(), "section": "task-a"})
 	if resp.Error == "" {
 		t.Fatal("expected error for duplicate section")
 	}
@@ -102,6 +106,7 @@ func TestHandleSpawnAgent_MaxDepthEnforced(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "child", "caller_session": "parent-sess",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error == "" {
 		t.Fatal("expected error for max depth exceeded")
@@ -117,6 +122,7 @@ func TestHandleSpawnAgent_BackendCodex(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "codex-task", "backend": "codex",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -134,6 +140,7 @@ func TestHandleSpawnAgent_BackendFromConfig(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "config-task",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -151,6 +158,7 @@ func TestHandleSpawnAgent_BackendParamOverridesConfig(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "override-task", "backend": "codex",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -168,6 +176,7 @@ func TestHandleSpawnAgent_DefaultBackendFallback(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "fallback-task",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -184,6 +193,7 @@ func TestHandleSpawnAgent_TokenBudgetFromParam(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "budget-task",
+		"work_dir":     t.TempDir(),
 		"token_budget": float64(50000), "max_turns": float64(10),
 	})
 	if resp.Error != "" {
@@ -207,6 +217,7 @@ func TestHandleSpawnAgent_TokenBudgetFromConfig(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "default-budget",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -248,6 +259,7 @@ func TestHandleSpawnAgent_DefaultMaxDepth(t *testing.T) {
 	// Depth 3 should be blocked by default max_depth=3
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "d3", "caller_session": "sess-d2",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error == "" {
 		t.Fatal("expected error for default max depth (3) exceeded")
@@ -282,14 +294,20 @@ func TestHandleRegisterAgent_RequiresSockPath(t *testing.T) {
 
 func TestHandleRegisterAgent_Success(t *testing.T) {
 	h, s := mustHandler(t)
+	// The test process stands in for the backend: the identity gate needs its
+	// command line to name it (same seam as the other identity tests).
+	stubProcCmdline(t, agentProcCmdlineStub)
 
 	s.AgentCreate(storage.Agent{
 		ID: "agent-1", Project: "proj", Section: "task",
-		Status: "pending", Backend: "claude",
+		SessionID: "sess-agent-1", Status: "pending", Backend: "opencode",
 	})
 
 	resp := h.handleRegisterAgent(map[string]any{
-		"id": "agent-1", "pid": float64(9999), "sock_path": "/tmp/agent-1.sock",
+		// A live pid: register_agent must not bind a process nobody holds (YM-351).
+		// session_id is the row's capability — only the spawner holds it (YM-356).
+		"id": "agent-1", "pid": float64(os.Getpid()), "sock_path": "/tmp/agent-1.sock",
+		"session_id": "sess-agent-1",
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -299,8 +317,8 @@ func TestHandleRegisterAgent_Success(t *testing.T) {
 	if agent.Status != "running" {
 		t.Errorf("status = %q, want running", agent.Status)
 	}
-	if agent.PID != 9999 {
-		t.Errorf("pid = %d, want 9999", agent.PID)
+	if agent.PID != os.Getpid() {
+		t.Errorf("pid = %d, want %d", agent.PID, os.Getpid())
 	}
 	if agent.SockPath != "/tmp/agent-1.sock" {
 		t.Errorf("sock_path = %q, want /tmp/agent-1.sock", agent.SockPath)
@@ -401,19 +419,23 @@ func TestHandleRelayAgent_AgentNotRunning(t *testing.T) {
 	}
 }
 
-func TestHandleRelayAgent_NoSockPath(t *testing.T) {
+// YM-338 (Los 24d): agents.sock_path is no longer the dial target, so an empty
+// value is not a relay error — the path comes from the id. Only an id that cannot
+// name a socket inside the data directory is refused.
+func TestHandleRelayAgent_RefusesAnUnderivableSocketPath(t *testing.T) {
 	h, s := mustHandler(t)
 
 	s.AgentCreate(storage.Agent{
 		ID: "agent-1", Project: "proj", Section: "task",
 		Status: "running", Backend: "claude",
 	})
+	h.dataDir = "" // nothing to derive a path from
 
 	resp := h.handleRelayAgent(map[string]any{"to": "agent-1", "content": "hello"})
 	if resp.Error == "" {
-		t.Fatal("expected error for missing socket path")
+		t.Fatal("expected error for an underivable socket path")
 	}
-	if !strings.Contains(resp.Error, "no socket path") {
+	if !strings.Contains(resp.Error, "socket path could not be derived") {
 		t.Errorf("unexpected error text: %s", resp.Error)
 	}
 }
@@ -428,6 +450,7 @@ func TestHandleRelayAgent_ResolveBySection(t *testing.T) {
 
 	resp := h.handleRelayAgent(map[string]any{
 		"to": "task-x", "project": "proj", "content": "hello",
+		"work_dir": t.TempDir(),
 	})
 	// Should resolve by section, then fail because it's not running
 	if resp.Error == "" {
@@ -518,6 +541,1074 @@ func TestHandleStopAgent_StoppableStatuses(t *testing.T) {
 				t.Fatalf("unexpected error for status %q: %s", status, resp.Error)
 			}
 		})
+	}
+}
+
+// Agents whose process is already gone (error, crashed) must be
+// stoppable too: stop is how an orchestrator closes an agent for good. Without
+// it an `error` agent with a restart strategy is revived by attemptRestart and
+// cannot be ended through the API at all.
+func TestHandleStopAgent_DormantStatusesAreStoppable(t *testing.T) {
+	for _, status := range []string{"error", "crashed"} {
+		t.Run(status, func(t *testing.T) {
+			h, s := mustHandler(t)
+			s.AgentCreate(storage.Agent{
+				ID: "agent-1", Project: "proj", Section: "task",
+				Status: status, Backend: "opencode",
+			})
+
+			resp := h.handleStopAgent(map[string]any{"to": "agent-1"})
+			if resp.Error != "" {
+				t.Fatalf("unexpected error for status %q: %s", status, resp.Error)
+			}
+			a, _ := s.AgentGet("agent-1")
+			if a.Status != "stopped" || a.StoppedAt == "" {
+				t.Errorf("persisted status=%q stopped_at=%q, want stopped with a timestamp", a.Status, a.StoppedAt)
+			}
+		})
+	}
+}
+
+// A stopped error agent must not be revived by the supervisor.
+func TestHandleStopAgent_ErrorAgentIsNotRestartedAfterStop(t *testing.T) {
+	h, s := mustHandler(t)
+	s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "task",
+		Status: "error", Backend: "claude", RestartStrategy: "permanent", MaxRestarts: 3,
+	})
+
+	if resp := h.handleStopAgent(map[string]any{"to": "agent-1"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+	h.attemptRestart()
+
+	a, _ := s.AgentGet("agent-1")
+	if a.Status != "stopped" || a.RestartCount != 0 {
+		t.Errorf("status=%q restart_count=%d, want stopped/0 (no restart after stop)", a.Status, a.RestartCount)
+	}
+}
+
+// The PID of a dormant agent is stale by definition; it may already belong to an
+// unrelated process. Stopping such an agent must not signal it.
+func TestHandleStopAgent_DormantAgentDoesNotSignalStalePID(t *testing.T) {
+	h, s := mustHandler(t)
+	bystander := exec.Command("sleep", "30")
+	if err := bystander.Start(); err != nil {
+		t.Fatalf("start bystander: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() { bystander.Wait(); close(exited) }()
+	t.Cleanup(func() { bystander.Process.Kill(); <-exited })
+
+	s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "task",
+		Status: "error", Backend: "claude", PID: bystander.Process.Pid,
+	})
+
+	if resp := h.handleStopAgent(map[string]any{"to": "agent-1"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+	select {
+	case <-exited:
+		t.Error("stop sent a signal to the stale PID of a dormant agent")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// register_agent binds a pid too, so it must write the spawn marker with it —
+// otherwise a row bound this way is unverifiable and every guard reads a live
+// agent as gone (the F1 failure mode, reached through a second writer).
+func TestHandleRegisterAgent_WritesSpawnMarker(t *testing.T) {
+	// The identity check reads the process table via /proc, which darwin does not
+	// expose; isAgentProcess abstains there by design.
+	if !procTableReadable {
+		t.Skip("the agent identity check needs the process table")
+	}
+	h, s := mustHandler(t)
+	stubProcCmdline(t, agentProcCmdlineStub)
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "reg-1", Project: "p", Section: "s1", SessionID: "sess-reg-1",
+		Status: "pending", Backend: "opencode",
+		CreatedAt: time.Now().Add(-48 * time.Hour).Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	resp := h.handleRegisterAgent(map[string]any{
+		"id": "reg-1", "pid": float64(os.Getpid()), "sock_path": "/tmp/reg.sock",
+		"session_id": "sess-reg-1",
+	})
+	if resp.Error != "" {
+		t.Fatalf("register_agent: %s", resp.Error)
+	}
+
+	a, err := s.AgentGet("reg-1")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "running" || a.PID != os.Getpid() || a.SockPath != "/tmp/reg.sock" {
+		t.Errorf("register did not record the process: status=%q pid=%d sock=%q", a.Status, a.PID, a.SockPath)
+	}
+	if a.LastRestartAt == "" {
+		t.Fatal("register_agent wrote a pid without the spawn marker — this row can never verify")
+	}
+	if !isAgentProcess(*a) {
+		t.Error("a row bound by register_agent must verify as its own process")
+	}
+}
+
+// --- C2.2: a restart must bind the backend process, not the launcher ---
+
+// stubRestartSpawn makes the spawn/restart path harmless and observable: the
+// bridge runs a sleeping child instead of a real LLM CLI, the display command is
+// a no-op instead of a terminal window, and the returned func reports the pid
+// the bridge actually created.
+func stubRestartSpawn(t *testing.T) func() int {
+	t.Helper()
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep not available: %v", err)
+	}
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("true not available: %v", err)
+	}
+	// The restart resolves the opencode session's directory; without this stub the
+	// tests would query the developer's live opencode database.
+	origDB := opencodeDBPath
+	opencodeDBPath = func() string { return filepath.Join(t.TempDir(), "no-opencode.db") }
+	t.Cleanup(func() { opencodeDBPath = origDB })
+	var pid int
+	// The stub child is sleep, so the bind's identity gate needs a process whose
+	// command line names the backend the daemon asked for — otherwise the test
+	// passes without ever binding (cold review F4). Derived from the name the
+	// spawn passes, so it holds for every backend.
+	prevCmdline := procCmdline
+	t.Cleanup(func() { procCmdline = prevCmdline })
+	prevBridge, prevDisplay := newAgentBridge, agentDisplayCommand
+	newAgentBridge = func(name string, args []string, sock, workDir string, extraEnv ...string) (*orchestrator.AgentBridge, error) {
+		procCmdline = func(int) string { return name + "\x00" }
+		b, err := orchestrator.NewAgentBridge(sleepBin, []string{"30"}, sock, workDir)
+		if err == nil {
+			pid = b.Cmd.Process.Pid
+		}
+		return b, err
+	}
+	agentDisplayCommand = func(terminal, binPath, title string, innerArgs ...string) (string, []string) {
+		return trueBin, nil
+	}
+	t.Cleanup(func() {
+		newAgentBridge, agentDisplayCommand = prevBridge, prevDisplay
+		if pid != 0 {
+			if p, err := os.FindProcess(pid); err == nil {
+				p.Kill()
+			}
+		}
+	})
+	return func() int { return pid }
+}
+
+// attemptRestart used to remove the sockets and launch only the console client
+// (agent-tty dials an existing socket; it never creates a backend), recording the
+// terminal emulator's PID as the agent's. The row now has to hold the process the
+// bridge created — the same invariant bindAgentProcess writes everywhere else.
+func TestAttemptRestart_BindsTheBackendProcess(t *testing.T) {
+	// The identity check reads the process table via /proc, which darwin does not
+	// expose; isAgentProcess abstains there by design.
+	if !procTableReadable {
+		t.Skip("the agent identity check needs the process table")
+	}
+	h, s := mustHandler(t)
+	h.disableAgentProcesses = false
+	bridgePid := stubRestartSpawn(t)
+	sockPath := filepath.Join(shortSockDir(t), "restart-bind.sock")
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-bind", Project: "p", Section: "s-rb", SessionID: "sess-rb",
+		Status: "error", Backend: "opencode", OpencodeSessionID: "ses_rb",
+		SockPath: sockPath, RestartStrategy: "permanent",
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	h.attemptRestart()
+
+	// The bind runs in the spawn goroutine.
+	var got *storage.Agent
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, err := s.AgentGet("restart-bind"); err == nil && a != nil && a.PID != 0 {
+			got = a
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got == nil {
+		t.Fatal("attemptRestart never bound a process to the row")
+	}
+	if want := bridgePid(); want == 0 {
+		t.Fatal("the restart created no bridge — no backend process was started at all")
+	} else if got.PID != want {
+		t.Errorf("row pid = %d, want the bridge's process %d (the launcher's pid is not the agent's)", got.PID, want)
+	}
+	if got.LastRestartAt == "" {
+		t.Error("spawn marker missing — the row's process can never be verified")
+	}
+}
+
+// The socket paths belong to the agent id, not to one process, and a resume or a
+// restart can bind a successor while the previous process is still winding down.
+// The stale process's exit tail must therefore leave the successor's pid, socket
+// path and status — and its socket files — alone (YM-70).
+func TestSpawnAgentProcess_StaleExitTailLeavesTheSuccessorsBindingAlone(t *testing.T) {
+	h, s := mustHandler(t)
+	stubProcCmdline(t, agentProcCmdlineStub)
+	h.disableAgentProcesses = false
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep not available: %v", err)
+	}
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("true not available: %v", err)
+	}
+	sockPath := filepath.Join(shortSockDir(t), "stale-exit.sock")
+	prevBridge, prevDisplay := newAgentBridge, agentDisplayCommand
+	newAgentBridge = func(name string, args []string, sock, workDir string, extraEnv ...string) (*orchestrator.AgentBridge, error) {
+		// The child exits on its own after a moment, so the exit tail runs while
+		// the test still holds the row.
+		return orchestrator.NewAgentBridge(sleepBin, []string{"0.5"}, sock, workDir)
+	}
+	agentDisplayCommand = func(terminal, binPath, title string, innerArgs ...string) (string, []string) {
+		return trueBin, nil
+	}
+	t.Cleanup(func() { newAgentBridge, agentDisplayCommand = prevBridge, prevDisplay })
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "stale-exit", Project: "p", Section: "stale-exit-sec", SessionID: "sess-stale-exit",
+		Status: "pending", Backend: "opencode", OpencodeSessionID: "ses_stale",
+		SockPath: sockPath,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	go h.spawnAgentProcess("stale-exit", "sess-stale-exit", "p", "stale-exit-sec", "", sockPath,
+		t.TempDir(), "opencode", "", "", 0, 0, "", true)
+
+	var firstPID int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, err := s.AgentGet("stale-exit"); err == nil && a != nil && a.PID != 0 {
+			firstPID = a.PID
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if firstPID == 0 {
+		t.Fatal("the spawn never bound a process")
+	}
+
+	// A successor takes the row over while the first process is still winding
+	// down — the shape a resume or a restart produces.
+	const successorPID = 424242
+	if err := s.AgentUpdate("stale-exit", map[string]any{
+		"pid": successorPID, "sock_path": sockPath, "status": "running",
+	}); err != nil {
+		t.Fatalf("bind the successor: %v", err)
+	}
+
+	waitForProcessExit(t, firstPID)
+
+	a, err := s.AgentGet("stale-exit")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.PID != successorPID || a.Status != "running" || a.SockPath != sockPath {
+		t.Errorf("the stale exit tail clobbered the successor: pid=%d status=%q sock=%q, want %d/running/%q",
+			a.PID, a.Status, a.SockPath, successorPID, sockPath)
+	}
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Errorf("the stale process unlinked the successor's socket: %v", err)
+	}
+}
+
+// The exit tail is the only writer of "finished", and the heartbeat reads a
+// running row with a dead process as a crash: a clean exit has to be recorded,
+// with the pid and the socket path cleared. The field set the tail passes must be
+// exactly what AgentFinalizeExit accepts — the first version of the CAS refused
+// the caller's map (it carried pid and sock_path) and every normal exit turned
+// into a crash recovery (found in review, 5.2/5.3/5.4).
+//
+// Deterministic by construction (YM-420): the child is a sleep that is still
+// alive when the bind runs, and the identity gate accepts it through the cmdline
+// stub, so the spawn binds and no teardown signal is sent. The child then exits on
+// its own with status 0 and the tail records exactly that. The earlier version
+// used `true` and left the bind to refuse: whether the refused-bind teardown
+// SIGTERMed a still-running `true` (waitErr "signal: terminated" -> status "error")
+// or found it already gone depended on scheduling, which made this test fail under
+// load about once in 300 runs.
+func TestSpawnAgentProcess_ExitTailRecordsTheTerminalState(t *testing.T) {
+	h, s := mustHandler(t)
+	stubProcCmdline(t, agentProcCmdlineStub)
+	h.disableAgentProcesses = false
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("true not available: %v", err)
+	}
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep not available: %v", err)
+	}
+	sockPath := filepath.Join(shortSockDir(t), "exit-tail.sock")
+	prevBridge, prevDisplay := newAgentBridge, agentDisplayCommand
+	newAgentBridge = func(name string, args []string, sock, workDir string, extraEnv ...string) (*orchestrator.AgentBridge, error) {
+		// Lives past the bind, then exits 0 on its own.
+		return orchestrator.NewAgentBridge(sleepBin, []string{"0.5"}, sock, workDir)
+	}
+	agentDisplayCommand = func(terminal, binPath, title string, innerArgs ...string) (string, []string) {
+		return trueBin, nil
+	}
+	t.Cleanup(func() { newAgentBridge, agentDisplayCommand = prevBridge, prevDisplay })
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "exit-tail", Project: "p-exit-tail", Section: "exit-tail-sec",
+		SessionID: "sess-exit-tail", Status: "pending", Backend: "opencode",
+		OpencodeSessionID: "ses_exit_tail", SockPath: sockPath,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	h.spawnAgentProcess("exit-tail", "sess-exit-tail", "p-exit-tail", "exit-tail-sec", "",
+		sockPath, t.TempDir(), "opencode", "", "", 0, 0, "", true)
+
+	a, err := s.AgentGet("exit-tail")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "finished" {
+		t.Fatalf("status = %q, want finished — a clean exit was not recorded, so crashRecovery reads the row as a crash", a.Status)
+	}
+	if a.PID != 0 || a.SockPath != "" {
+		t.Errorf("pid=%d sock_path=%q, want both cleared", a.PID, a.SockPath)
+	}
+	if a.StoppedAt == "" {
+		t.Error("stopped_at missing")
+	}
+}
+
+// waitForProcessExit waits until a pid no longer exists.
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if !isPIDAlive(pid) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pid %d never exited", pid)
+}
+
+// A restart must not advertise a running agent while no process is bound: a row
+// that looks running with a stale PID is exactly the shape crashRecovery now
+// closes, so a tick inside the window would quarantine the session and spawn a
+// second agent for the same section.
+func TestAttemptRestart_DoesNotLookRunningBeforeTheBind(t *testing.T) {
+	h, s := mustHandler(t)
+	h.disableAgentProcesses = false
+	bridgePid := stubRestartSpawn(t)
+	sockPath := filepath.Join(shortSockDir(t), "restart-window.sock")
+
+	// Hold the spawn between the bridge fork and the bind — that is the window.
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("true not available: %v", err)
+	}
+	atDisplay := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	agentDisplayCommand = func(terminal, binPath, title string, innerArgs ...string) (string, []string) {
+		atDisplay <- struct{}{}
+		<-release
+		return trueBin, nil
+	}
+	// Restored by stubRestartSpawn's cleanup, which runs after this one (LIFO).
+	t.Cleanup(func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	})
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-window", Project: "p", Section: "s-win", SessionID: "sess-win",
+		Status: "error", Backend: "opencode", OpencodeSessionID: "ses_win",
+		SockPath: sockPath, RestartStrategy: "permanent",
+		PID:       deadPID, // stale PID from the failed process, as an error row carries it
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	h.attemptRestart()
+	<-atDisplay
+
+	a, err := s.AgentGet("restart-window")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "spawning" {
+		t.Errorf("status = %q during the restart window, want spawning — a running row with no process is what crashRecovery closes", a.Status)
+	}
+	if a.PID == bridgePid() {
+		t.Error("the row already holds the bridge's pid in the window; the bind should be the only writer of it")
+	}
+
+	release <- struct{}{}
+
+	var bound *storage.Agent
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if x, err := s.AgentGet("restart-window"); err == nil && x != nil && x.PID == bridgePid() {
+			bound = x
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if bound == nil {
+		got, _ := s.AgentGet("restart-window")
+		t.Fatalf("the restart never bound the bridge's pid %d (row: status=%q pid=%v)", bridgePid(), got.Status, got.PID)
+	}
+	if bound.Status != "running" {
+		t.Errorf("after the bind: status = %q, want running", bound.Status)
+	}
+}
+
+// --- E2: a restart relaunches in the directory the row recorded ---
+
+// restartSpawn is what a stubbed spawn hands to the bridge: the process it created
+// and the directory it was launched in. The fields are guarded because the spawn
+// may run in a goroutine (the production shape) while the test reads them.
+type restartSpawn struct {
+	mu      sync.Mutex
+	pid     int
+	workDir string
+	args    []string
+}
+
+func (r *restartSpawn) set(pid int, workDir string) {
+	r.mu.Lock()
+	r.pid, r.workDir = pid, workDir
+	r.mu.Unlock()
+}
+
+// setArgs records the `yesmem agent-tty` argv the spawn handed to the terminal.
+func (r *restartSpawn) setArgs(args []string) {
+	r.mu.Lock()
+	r.args = append([]string(nil), args...)
+	r.mu.Unlock()
+}
+
+func (r *restartSpawn) PID() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pid
+}
+
+func (r *restartSpawn) WorkDir() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.workDir
+}
+
+// Args returns the recorded agent-tty argv, or nil when no window was asked for.
+func (r *restartSpawn) Args() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.args...)
+}
+
+// flagValue returns the value that follows flag in args, or "" when the flag is
+// absent.
+func flagValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// stubRestartSpawnSync drives a restart synchronously: the bridge runs a child
+// that lives for childLife (the spawn waits for it, so the call returns when the
+// child is gone) and the result reports what the spawn passed on.
+func stubRestartSpawnSync(t *testing.T, childLife string) *restartSpawn {
+	t.Helper()
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep not available: %v", err)
+	}
+	trueBin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("true not available: %v", err)
+	}
+	// A restart resolves the opencode session's directory; without this stub the
+	// test would query the developer's live opencode database.
+	origDB := opencodeDBPath
+	opencodeDBPath = func() string { return filepath.Join(t.TempDir(), "no-opencode.db") }
+	t.Cleanup(func() { opencodeDBPath = origDB })
+	spawn := &restartSpawn{}
+	// The stub child is sleep, so the bind's identity gate needs a process whose
+	// command line names the backend the daemon asked for — otherwise the test
+	// passes without ever binding (cold review F4). Derived from the name the
+	// spawn passes, so it holds for every backend.
+	prevCmdline := procCmdline
+	t.Cleanup(func() { procCmdline = prevCmdline })
+	prevBridge, prevDisplay := newAgentBridge, agentDisplayCommand
+	newAgentBridge = func(name string, args []string, sock, workDir string, extraEnv ...string) (*orchestrator.AgentBridge, error) {
+		procCmdline = func(int) string { return name + "\x00" }
+		b, err := orchestrator.NewAgentBridge(sleepBin, []string{childLife}, sock, workDir)
+		if err == nil {
+			spawn.set(b.Cmd.Process.Pid, workDir)
+		}
+		return b, err
+	}
+	agentDisplayCommand = func(terminal, binPath, title string, innerArgs ...string) (string, []string) {
+		spawn.setArgs(innerArgs)
+		return trueBin, nil
+	}
+	t.Cleanup(func() { newAgentBridge, agentDisplayCommand = prevBridge, prevDisplay })
+	return spawn
+}
+
+// A restart must relaunch the agent where its row says it ran. attemptRestart
+// resolved the work dir from agents.project alone, which lands on the repository
+// root — a loop agent came back in the wrong tree, where its own skill guard
+// fails. handleResumeAgent already reads the recorded work_dir; the restart path
+// now does the same.
+func TestRestartAgentProcess_UsesTheRecordedWorkDir(t *testing.T) {
+	h, s := mustHandler(t)
+	spawn := stubRestartSpawnSync(t, "0.3")
+	workDir := t.TempDir()
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-wd", Project: "p", Section: "s-restart-wd", SessionID: "sess-restart-wd",
+		Status: "error", Backend: "claude", RestartStrategy: "permanent", WorkDir: workDir,
+		SockPath:  filepath.Join(shortSockDir(t), "restart-wd.sock"),
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	stored, err := s.AgentGet("restart-wd")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if stored.WorkDir != workDir {
+		t.Fatalf("fixture: work_dir = %q, want %q", stored.WorkDir, workDir)
+	}
+
+	h.restartAgentProcess(*stored)
+
+	if got := spawn.WorkDir(); got != workDir {
+		t.Errorf("restart launched the backend in %q, want the row's work_dir %q — a worktree agent must come back in its own tree", got, workDir)
+	}
+}
+
+// A work_dir that no longer exists must not hand the spawn a path the backend
+// cannot start in — and since YM-351 the restart is refused outright instead of
+// falling back to the project resolver or the daemon's run dir. Rationale: a row
+// whose recorded tree is gone is the shape of a finished task (a loop worktree is
+// removed after its branch is merged). Observed 18.10.2026: the replacement came
+// up in ~/.claude/yesmem-run/workdir, without a repository, and redid the phases
+// of a merged task. The row is closed with the reason instead, so the
+// orchestrator sees that nothing is running there.
+func TestRestartAgentProcess_VanishedWorkDirIsRefused(t *testing.T) {
+	h, s := mustHandler(t)
+	spawn := stubRestartSpawnSync(t, "0.3")
+	vanished := filepath.Join(t.TempDir(), "removed-worktree")
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-gone-wd", Project: "p", Section: "s-restart-gone", SessionID: "sess-restart-gone",
+		Status: "error", Backend: "claude", RestartStrategy: "permanent", WorkDir: vanished,
+		SockPath:  filepath.Join(shortSockDir(t), "restart-gone.sock"),
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	stored, err := s.AgentGet("restart-gone-wd")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	h.restartAgentProcess(*stored)
+
+	if pid := spawn.PID(); pid != 0 {
+		t.Errorf("the restart started a backend with PID %d for a tree that is gone", pid)
+	}
+	after, err := s.AgentGet("restart-gone-wd")
+	if err != nil || after == nil {
+		t.Fatalf("AgentGet after the refused restart: %v", err)
+	}
+	if after.Status != "stopped" {
+		t.Errorf("status = %q, want stopped (the refusal closes the row)", after.Status)
+	}
+	if !strings.Contains(after.Progress, "removed-worktree") {
+		t.Errorf("progress = %q, want the vanished directory named", after.Progress)
+	}
+}
+
+// --- E3: the restart window ---
+
+// TestRestartAgentProcess_PlacesTheWindowOnTheCallersDesktop (YM-458): the restart
+// path passed parentPid=0 and parentWindow="", so buildAgentTTYArgs emitted no
+// placement flags and the replacement window opened on whatever desktop happened
+// to be focused. The resume routes resolve the caller's window; a restart has no
+// request to read, only the session recorded on the row, and now resolves that one
+// the same way.
+func TestRestartAgentProcess_PlacesTheWindowOnTheCallersDesktop(t *testing.T) {
+	h, s := mustHandler(t)
+	h.agentTerminal = "ghostty"
+	spawn := stubRestartSpawnSync(t, "0.3")
+	workDir := t.TempDir()
+	register(t, h, "opencode:ses_orch", "0x06800004", 0)
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-place", Project: "p", Section: "s-restart-place", SessionID: "sess-restart-place",
+		Status: "error", Backend: "claude", RestartStrategy: "permanent", WorkDir: workDir,
+		CallerSession: "opencode:ses_orch",
+		SockPath:      filepath.Join(shortSockDir(t), "restart-place.sock"),
+		CreatedAt:     time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	stored, err := s.AgentGet("restart-place")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	h.restartAgentProcess(*stored)
+
+	args := spawn.Args()
+	if got := flagValue(args, "--parent-window"); got != "0x06800004" {
+		t.Errorf("agent-tty argv = %q, want --parent-window 0x06800004 — without it the replacement window opens on the focused desktop instead of the caller's", args)
+	}
+}
+
+// A caller that is gone must not turn into an error: the restart keeps today's
+// behaviour (no placement flags, window on the focused desktop). Losing the
+// window placement is a cosmetic degradation, losing the agent is not.
+func TestRestartAgentProcess_UnknownCallerKeepsTheDefaultPlacement(t *testing.T) {
+	h, s := mustHandler(t)
+	h.agentTerminal = "ghostty"
+	spawn := stubRestartSpawnSync(t, "0.3")
+	workDir := t.TempDir()
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-nocaller", Project: "p", Section: "s-restart-nocaller", SessionID: "sess-restart-nocaller",
+		Status: "error", Backend: "claude", RestartStrategy: "permanent", WorkDir: workDir,
+		CallerSession: "opencode:ses_long_gone",
+		SockPath:      filepath.Join(shortSockDir(t), "restart-nocaller.sock"),
+		CreatedAt:     time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	stored, err := s.AgentGet("restart-nocaller")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	h.restartAgentProcess(*stored)
+
+	if got := flagValue(spawn.Args(), "--parent-window"); got != "" {
+		t.Errorf("agent-tty argv = %q, want no --parent-window for a caller without a registered window", spawn.Args())
+	}
+	after, err := s.AgentGet("restart-nocaller")
+	if err != nil || after == nil {
+		t.Fatalf("AgentGet after the restart: %v", err)
+	}
+	if after.Status == "stopped" {
+		t.Errorf("the restart was closed (progress=%q) because the caller session is unknown", after.Progress)
+	}
+}
+
+// A stop that lands between the restart's "spawning" write and its bind must win.
+// The bind wrote status and pid unconditionally, so the stopped row came back as
+// "running" with a live backend: the orchestrator had finalized it and nothing
+// owned that process any more.
+func TestRestartWindow_StopIsNotOverwrittenByTheBind(t *testing.T) {
+	h, s := mustHandler(t)
+	// The child outlives the test by far: only the spawn's own teardown can
+	// explain a dead process, which is what the second half of the fix claims.
+	spawn := stubRestartSpawnSync(t, "60")
+	t.Cleanup(func() {
+		if p := spawn.PID(); p != 0 {
+			if proc, err := os.FindProcess(p); err == nil {
+				proc.Kill()
+			}
+		}
+	})
+	sockPath := filepath.Join(shortSockDir(t), "restart-race.sock")
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "restart-race", Project: "p", Section: "s-restart-race", SessionID: "sess-restart-race",
+		// "spawning" with a stale pid is the row attemptRestart leaves behind
+		// before the relaunch goroutine binds the new process.
+		Status: "spawning", Backend: "claude", RestartStrategy: "permanent",
+		PID: deadPID, SockPath: sockPath, CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	// The stop lands inside the window.
+	if resp := h.handleStopAgent(map[string]any{"to": "restart-race"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+	stored, err := s.AgentGet("restart-race")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	// The relaunch runs in its own goroutine in production; the same shape is
+	// needed here to observe the row while the new backend is still alive.
+	go h.restartAgentProcess(*stored)
+
+	waitFor := time.Now().Add(10 * time.Second)
+	for time.Now().Before(waitFor) && spawn.PID() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	pid := spawn.PID()
+	if pid == 0 {
+		t.Fatal("the restart created no process at all")
+	}
+
+	// Through the whole teardown the row must stay the orchestrator's (stopped,
+	// without a process), and the process must disappear — it was created after
+	// the stop and no row owns it.
+	gone := time.Now().Add(10 * time.Second)
+	for time.Now().Before(gone) && isPIDAlive(pid) && !isProcessZombie(strconv.Itoa(pid)) {
+		a, err := s.AgentGet("restart-race")
+		if err != nil {
+			t.Fatalf("AgentGet: %v", err)
+		}
+		if a.Status != "stopped" || a.PID != 0 {
+			t.Fatalf("status=%q pid=%d, want stopped/0 — the bind revived a row the orchestrator had stopped", a.Status, a.PID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if isPIDAlive(pid) && !isProcessZombie(strconv.Itoa(pid)) {
+		t.Fatalf("the process %d of a spawn stopped in the window is still running — nothing owns it (the child sleeps 60s, so it cannot have exited by itself)", pid)
+	}
+
+	a, err := s.AgentGet("restart-race")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("after the spawn: status=%q pid=%d, want stopped/0", a.Status, a.PID)
+	}
+	if _, err := os.Stat(sockPath); !os.IsNotExist(err) {
+		t.Errorf("the stopped spawn left its socket behind (stat err=%v)", err)
+	}
+}
+
+// A "spawning" row is what a daemon death inside the window leaves behind: no
+// guard touches it and nothing retries it, so stop_agent is the only way out. It
+// must close the row without signalling the stale PID it carries.
+func TestHandleStopAgent_SpawningRowLeftByADeadDaemonIsClosable(t *testing.T) {
+	h, s := mustHandler(t)
+	bystander, exited := startBystander(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "spawn-left", Project: "proj", Section: "yesloop-spawn-left",
+		Status: "spawning", Backend: "claude", PID: bystander.Process.Pid,
+		SockPath: filepath.Join(shortSockDir(t), "spawn-left.sock"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	resp := h.handleStopAgent(map[string]any{"to": "spawn-left"})
+	if resp.Error != "" {
+		t.Fatalf("a spawning row must be closable by hand: %s", resp.Error)
+	}
+	a, err := s.AgentGet("spawn-left")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("status=%q pid=%d, want stopped/0", a.Status, a.PID)
+	}
+	select {
+	case <-exited:
+		t.Error("stop signalled the stale PID of a spawning row")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// --- C6: stop signals only verified agent processes ---
+
+// startBystander spawns a process that dies when signalled, plus a channel that
+// closes when it exits — the observable that proves no signal was sent.
+func startBystander(t *testing.T) (*exec.Cmd, <-chan struct{}) {
+	t.Helper()
+	bystander := exec.Command("sleep", "30")
+	if err := bystander.Start(); err != nil {
+		t.Fatalf("start bystander: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() { bystander.Wait(); close(exited) }()
+	t.Cleanup(func() { bystander.Process.Kill(); <-exited })
+	return bystander, exited
+}
+
+// A live-status agent whose PID now belongs to an unrelated process is finalized
+// without a signal. The status is a claim about the past; signal 0 only says
+// "some process holds this PID" (Learning #101907).
+func TestHandleStopAgent_LiveAgentWithBystanderPIDNotSignalled(t *testing.T) {
+	h, s := mustHandler(t)
+	bystander, exited := startBystander(t)
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "task",
+		Status: "paused", Backend: "claude", PID: bystander.Process.Pid,
+		SockPath: filepath.Join(t.TempDir(), "gone.sock"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	if resp := h.handleStopAgent(map[string]any{"to": "agent-1"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+
+	a, _ := s.AgentGet("agent-1")
+	if a.Status != "stopped" || a.PID != 0 || a.StoppedAt == "" {
+		t.Errorf("status=%q pid=%d stopped_at=%q, want stopped/0/timestamp", a.Status, a.PID, a.StoppedAt)
+	}
+	// The withheld signal must be visible: an operator reading "stopped" expects
+	// the process to be gone.
+	if !strings.Contains(a.Progress, "pid not verified") {
+		t.Errorf("progress = %q, want it to record that no signal was sent", a.Progress)
+	}
+	select {
+	case <-exited:
+		t.Error("stop_agent signalled a PID that belongs to an unrelated process")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The positive control for the gate: a *verified* agent process is still
+// signalled. The child is a real sleep, declared to be a claude process.
+func TestHandleStopAgent_SignalsVerifiedAgentProcess(t *testing.T) {
+	requireProcTable(t)
+	h, s := mustHandler(t)
+	bystander, exited := startBystander(t)
+	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "task",
+		Status: "running", Backend: "claude", PID: bystander.Process.Pid,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	if resp := h.handleStopAgent(map[string]any{"to": "agent-1"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Error("stop_agent did not signal a verified agent process")
+	}
+}
+
+// isPIDAlive counts a zombie as alive, so neither a status check nor signal 0
+// can tell this row from a live agent. Its cmdline is empty — which is what the
+// identity check sees. The row must therefore take the dormant path: no
+// inject-socket exit, no signal, only finalization. The fake socket makes that
+// observable, because a gate that trusted signal 0 would have dialled it.
+func TestHandleStopAgent_ZombiePIDTakesDormantPath(t *testing.T) {
+	h, s := mustHandler(t)
+	sockPath := filepath.Join(shortSockDir(t), "zombie.sock")
+	rec := startFakeInjectSocket(t, sockPath+".inject")
+
+	zombie := exec.Command("sleep", "0")
+	if err := zombie.Start(); err != nil {
+		t.Fatalf("start zombie candidate: %v", err)
+	}
+	pid := zombie.Process.Pid
+	// Deliberately not reaped until cleanup: that keeps it a zombie.
+	t.Cleanup(func() { zombie.Wait() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(readProcFile(pid, "cmdline")) > 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !isPIDAlive(pid) {
+		t.Fatalf("isPIDAlive(zombie %d) = false, want true — signal 0 says alive", pid)
+	}
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "task",
+		Status: "running", Backend: "claude", PID: pid, SockPath: sockPath,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	if resp := h.handleStopAgent(map[string]any{"to": "agent-1"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+
+	a, _ := s.AgentGet("agent-1")
+	if a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("status=%q pid=%d, want stopped with pid 0", a.Status, a.PID)
+	}
+	awaitNoConnection(t, rec)
+}
+
+// The same gate on the stop-all path, which signals every PID in the project in
+// one call: without it a single stop-all reaches every recycled PID there.
+func TestHandleStopAllAgents_BystanderNotSignalled(t *testing.T) {
+	h, s := mustHandler(t)
+	bystander, exited := startBystander(t)
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "sa-bystander", Project: "proj", Section: "s1",
+		Status: "running", Backend: "claude", PID: bystander.Process.Pid,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	resp := h.handleStopAllAgents(map[string]any{"project": "proj"})
+	if resp.Error != "" {
+		t.Fatalf("stop-all: %s", resp.Error)
+	}
+	m := resultMap(t, resp)
+	if stopped, _ := m["stopped"].(float64); stopped != 1 {
+		t.Errorf("stopped = %v, want 1 (row must still be finalized)", stopped)
+	}
+	a, _ := s.AgentGet("sa-bystander")
+	if a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("status=%q pid=%d, want stopped with pid 0", a.Status, a.PID)
+	}
+	select {
+	case <-exited:
+		t.Error("stop-all signalled a PID that belongs to an unrelated process")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// A crashed agent that is stopped during the respawn cooldown must stay
+// stopped: the delayed respawn must not bring a replacement up anyway.
+// The replacement must come back as the same agent. Backend, model and theme are
+// spawn parameters that the project cannot re-derive, and the row is the only
+// place they survive a crash: respawnAgent handed none of them to spawn_agent, so
+// an opencode agent with an explicit model came back as a default-backend agent
+// with the default model (YM-64).
+func TestRespawnAgent_KeepsBackendModelAndTheme(t *testing.T) {
+	h, s := mustHandler(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "respawn-params", Project: "respawn-params-proj", Section: "respawn-params-sec",
+		Status: "crashed", Backend: "opencode", Model: "zai/glm-5.2", Theme: "tokyonight",
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	crashed, err := s.AgentGet("respawn-params")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	h.respawnAgent(*crashed)
+
+	agents, err := s.AgentList("respawn-params-proj")
+	if err != nil {
+		t.Fatalf("AgentList: %v", err)
+	}
+	var replacement *storage.Agent
+	for i := range agents {
+		if agents[i].ID != "respawn-params" {
+			replacement = &agents[i]
+		}
+	}
+	if replacement == nil {
+		t.Fatal("respawnAgent created no replacement agent")
+	}
+	if replacement.Backend != "opencode" {
+		t.Errorf("replacement backend = %q, want opencode — the replacement started with the default backend", replacement.Backend)
+	}
+	if replacement.Model != "zai/glm-5.2" {
+		t.Errorf("replacement model = %q, want zai/glm-5.2 — the explicit model was lost in the respawn", replacement.Model)
+	}
+	if replacement.Theme != "tokyonight" {
+		t.Errorf("replacement theme = %q, want tokyonight — the explicit theme was lost in the respawn", replacement.Theme)
+	}
+	// The parameters have to survive the round trip through the row, not just the
+	// in-memory struct: handleSpawnAgent persists them and the replacement is read
+	// back from the store here.
+	if replacement.ID == "" {
+		t.Error("replacement row was not read back from the store")
+	}
+}
+
+// respawnAgent must read the id out of the spawn response. handleSpawnAgent
+// returns "id"; the code read "agent_id", so the type assertion failed silently:
+// the replacement agent never inherited retry_count and the "respawned X as Y"
+// line never appeared, leaving a crash loop unbounded (retry_count stays 0).
+func TestRespawnAgent_InheritsRetryCountFromSpawnResponse(t *testing.T) {
+	h, s := mustHandler(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "respawn-1", Project: "respawn-proj", Section: "respawn-sec",
+		Status: "crashed", Backend: "opencode", RetryCount: 2,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	// AgentCreate's INSERT does not carry retry_count, so the struct field above
+	// is dropped — write it the way the daemon does.
+	if err := s.AgentUpdate("respawn-1", map[string]any{"retry_count": 2}); err != nil {
+		t.Fatalf("set retry_count: %v", err)
+	}
+	crashed, err := s.AgentGet("respawn-1")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	h.respawnAgent(*crashed)
+
+	agents, err := s.AgentList("respawn-proj")
+	if err != nil {
+		t.Fatalf("AgentList: %v", err)
+	}
+	var replacement *storage.Agent
+	for i := range agents {
+		if agents[i].ID != "respawn-1" {
+			replacement = &agents[i]
+		}
+	}
+	if replacement == nil {
+		t.Fatal("respawnAgent created no replacement agent")
+	}
+	if replacement.RetryCount != 3 {
+		t.Errorf("replacement retry_count = %d, want 3 (crashed row had 2) — the spawn response key was not read", replacement.RetryCount)
+	}
+}
+
+// A crashed agent that is stopped during the respawn cooldown must stay
+// stopped: the delayed respawn must not bring a replacement up anyway.
+func TestRespawnAgent_SkipsAgentStoppedDuringCooldown(t *testing.T) {
+	h, s := mustHandler(t)
+	s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "task",
+		Status: "crashed", Backend: "claude",
+	})
+	crashed, _ := s.AgentGet("agent-1")
+
+	if resp := h.handleStopAgent(map[string]any{"to": "agent-1"}); resp.Error != "" {
+		t.Fatalf("stop: %s", resp.Error)
+	}
+	h.respawnAgent(*crashed)
+
+	agents, _ := s.AgentList("proj")
+	if len(agents) != 1 {
+		t.Errorf("agents in project = %d, want 1 (no respawn after stop)", len(agents))
 	}
 }
 
@@ -631,6 +1722,7 @@ func TestHandleStopAllAgents_MixedStatuses(t *testing.T) {
 }
 
 func TestHandleStopAllAgents_SequentialPause(t *testing.T) {
+	requireProcTable(t)
 	// Drei Agenten mit echten Prozessen: Der Stop-Run muss nacheinander
 	// stopen (Pause zwischen den Exits), damit das Terminal jeden
 	// Surface-Teardown einzeln verarbeitet statt als Massen-Teardown
@@ -645,9 +1737,12 @@ func TestHandleStopAllAgents_SequentialPause(t *testing.T) {
 		}
 		defer func() { _ = cmd.Process.Kill() }()
 		cmds = append(cmds, cmd)
+		// The sleeps stand in for agent processes: declare them opencode so the
+		// C6 identity gate verifies them and the SIGTERM still happens.
+		stubProcCmdline(t, agentProcCmdlineStub)
 		s.AgentCreate(storage.Agent{
 			ID: id, Project: "proj", Section: id, Status: "running",
-			PID: cmd.Process.Pid, Backend: "claude",
+			PID: cmd.Process.Pid, Backend: "opencode",
 		})
 	}
 
@@ -791,6 +1886,45 @@ func TestHandleResumeAgent_PausedIsResumable(t *testing.T) {
 	}
 }
 
+// A paused row is a live process behind an open PTY bridge, not a dead one: the
+// agent is waiting for input. resume_agent used to spawn a second process for the
+// same session, and the row was rebound to it — so when the first process finally
+// exited, its exit tail cleared the successor's pid, socket path and status and
+// unlinked its sockets (YM-70). relay_agent is the way to reach a paused agent.
+func TestHandleResumeAgent_PausedWithLiveProcessIsRefused(t *testing.T) {
+	requireProcTable(t)
+	h, s := mustHandler(t)
+	pinProcessTable(t)
+	stubProcCmdline(t, agentProcCmdlineStub)
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "paused-live", Project: "p", Section: "paused-live-sec",
+		SessionID: "sess-paused-live", Status: "paused", Backend: "opencode",
+		OpencodeSessionID: "ses_pausedlive",
+		PID:               os.Getpid(), SockPath: filepath.Join(shortSockDir(t), "paused-live.sock"),
+		CreatedAt: time.Now().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	resp := h.handleResumeAgent(map[string]any{"to": "paused-live"})
+	if resp.Error == "" {
+		t.Fatal("a paused agent with a live process must not be resumed — that starts a second process")
+	}
+	if !strings.Contains(resp.Error, "relay_agent") {
+		t.Errorf("the refusal must name the way to reach a paused agent, got: %s", resp.Error)
+	}
+
+	// The refusal must not have touched the row: the live process still owns it.
+	a, err := s.AgentGet("paused-live")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "paused" || a.PID != os.Getpid() {
+		t.Errorf("status=%q pid=%d, want paused/%d — a refused resume must leave the row alone", a.Status, a.PID, os.Getpid())
+	}
+}
+
 func TestHandleResumeAgent_FinishedIsResumable(t *testing.T) {
 	h, s := mustHandler(t)
 	h.dataDir = t.TempDir()
@@ -834,7 +1968,263 @@ func TestHandleResumeAgentRejectsActiveSuccessor(t *testing.T) {
 	}
 }
 
+// TestHandleSpawnAgent_TrimsTheWorkDir: the bind compares the directory opencode
+// reports byte for byte against the stored value, so a trailing slash or a
+// redundant "." would hide the agent's own session from a late bind.
+func TestHandleSpawnAgent_TrimsTheWorkDir(t *testing.T) {
+	h, s := mustHandler(t)
+
+	resp := h.handleSpawnAgent(map[string]any{
+		"project": "proj", "section": "loop-wd2", "backend": "opencode",
+		"work_dir": "/wd/loop-wd2//./",
+	})
+	if resp.Error != "" {
+		t.Fatalf("spawn_agent: %s", resp.Error)
+	}
+	id, _ := resultMap(t, resp)["id"].(string)
+	a, err := s.AgentGet(id)
+	if err != nil || a == nil {
+		t.Fatalf("AgentGet(%s): %v", id, err)
+	}
+	if a.WorkDir != "/wd/loop-wd2" {
+		t.Errorf("WorkDir = %q, want /wd/loop-wd2", a.WorkDir)
+	}
+}
+
+// TestHandleOpenAgentTerminal_PersistsWorkDir: a terminal agent's prompt is
+// empty, so it can never match a session by marker — the persisted directory is
+// the only evidence a later bind has for it.
+func TestHandleOpenAgentTerminal_PersistsWorkDir(t *testing.T) {
+	h, s := mustHandler(t)
+
+	resp := h.handleOpenAgentTerminal(map[string]any{
+		"project": "proj", "backend": "opencode", "work_dir": "/wd/term",
+	})
+	if resp.Error != "" {
+		t.Fatalf("open_agent_terminal: %s", resp.Error)
+	}
+	id, _ := resultMap(t, resp)["agent_id"].(string)
+	if id == "" {
+		t.Fatal("open_agent_terminal did not return an agent id")
+	}
+	a, err := s.AgentGet(id)
+	if err != nil || a == nil {
+		t.Fatalf("AgentGet(%s): %v", id, err)
+	}
+	if a.WorkDir != "/wd/term" {
+		t.Errorf("WorkDir = %q, want /wd/term", a.WorkDir)
+	}
+}
+
+// TestExistingWorkDir: the resume directory is the stored one only while it
+// still exists — resuming into a removed worktree would fail the spawn, so the
+// caller falls back to the project root instead.
+func TestExistingWorkDir(t *testing.T) {
+	h, _ := mustHandler(t)
+	dir := t.TempDir()
+
+	if got := h.existingWorkDir(dir); got != dir {
+		t.Errorf("existingWorkDir(%q) = %q, want the directory", dir, got)
+	}
+	if got := h.existingWorkDir(""); got != "" {
+		t.Errorf("existingWorkDir(\"\") = %q, want empty", got)
+	}
+	if got := h.existingWorkDir(dir + "/gone"); got != "" {
+		t.Errorf("a missing directory must not be used, got %q", got)
+	}
+}
+
+// TestMarkUnresumableIfUnbound: the spawn-time capture keeps polling for up to
+// 150s, during which another path can bind the agent. A bound agent is
+// resumable, so the marker must not be written onto it.
+func TestMarkUnresumableIfUnbound(t *testing.T) {
+	h, s := mustHandler(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-unbound", Project: "p", Section: "s1", SessionID: "u1",
+		Status: "running", Backend: "opencode",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-bound", Project: "p", Section: "s2", SessionID: "u2",
+		Status: "running", Backend: "opencode", OpencodeSessionID: "ses_have",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.markUnresumableIfUnbound("agent-unbound")
+	h.markUnresumableIfUnbound("agent-bound")
+	h.markUnresumableIfUnbound("agent-missing")
+
+	if a, _ := s.AgentGet("agent-unbound"); a.Progress != opencodeUnresumableMsg {
+		t.Errorf("unbound agent progress = %q, want the unresumable marker", a.Progress)
+	}
+	if a, _ := s.AgentGet("agent-bound"); a.Progress != "" {
+		t.Errorf("bound agent progress = %q, want it untouched", a.Progress)
+	}
+}
+
+// TestOpenAgentTerminal_RefusesAnOwnedSession: adopting an existing session must
+// not create a second owner. Two rows holding one session id resolve to an
+// arbitrary one of them (whoami, relay, resume), and the real owner can never
+// bind again once the store's guard sees the duplicate.
+func TestOpenAgentTerminal_RefusesAnOwnedSession(t *testing.T) {
+	h, s := mustHandler(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-owner", Project: "proj", Section: "term-1", SessionID: "uuid-1",
+		Status: "running", Backend: "opencode", OpencodeSessionID: "ses_adopted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := h.handleOpenAgentTerminal(map[string]any{
+		"project": "proj", "backend": "opencode", "work_dir": "/wd/adopt",
+		"session_id": "ses_adopted",
+	})
+	if resp.Error == "" {
+		t.Fatal("adopting a session that another agent owns must be refused")
+	}
+	if !strings.Contains(resp.Error, "already belongs to agent agent-owner") {
+		t.Errorf("error = %q, want it to name the owner", resp.Error)
+	}
+}
+
+// TestHandleResumeAgent_ExplicitSessionCannotBeAttachedToASecondRow: an
+// explicitly passed session id is resolved through AgentGetAnyBySession, so the
+// request lands on the row that already owns it. A second agent can therefore
+// never end up holding another agent's session through the resume path.
+// resume_agent resolved no placement source at all, so the window opened on the
+// focused desktop instead of the caller's — spawn_agent has placed its window
+// since Loop E. The caller's own window wins; a caller without one (the
+// heartbeat, a rebind, an agent resuming another agent) falls back to the window
+// of the session that spawned the resumed agent (YM-193).
+func TestHandleResumeAgent_PlacesTheWindowLikeASpawn(t *testing.T) {
+	cases := []struct {
+		name   string
+		params map[string]any
+		want   string
+	}{
+		{"the caller's own window wins", map[string]any{"_session_id": "opencode:ses-caller"}, "0x04c00005"},
+		{"a caller without a window falls back to the agent's caller session", map[string]any{}, "0x04c00004"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, s := mustHandler(t)
+			h.disableAgentProcesses = false
+			h.windowMapMu.Lock()
+			h.windowMap["opencode:ses-caller"] = "0x04c00005"
+			h.windowMap["opencode:caller-193"] = "0x04c00004"
+			h.windowMapMu.Unlock()
+
+			trueBin, err := exec.LookPath("true")
+			if err != nil {
+				t.Skipf("true not available: %v", err)
+			}
+			placed := make(chan []string, 1)
+			prevBridge, prevDisplay := newAgentBridge, agentDisplayCommand
+			newAgentBridge = func(name string, args []string, sock, workDir string, extraEnv ...string) (*orchestrator.AgentBridge, error) {
+				return orchestrator.NewAgentBridge(trueBin, nil, sock, workDir)
+			}
+			agentDisplayCommand = func(terminal, binPath, title string, innerArgs ...string) (string, []string) {
+				select {
+				case placed <- innerArgs:
+				default:
+				}
+				return trueBin, nil
+			}
+			t.Cleanup(func() { newAgentBridge, agentDisplayCommand = prevBridge, prevDisplay })
+
+			if err := s.AgentCreate(storage.Agent{
+				ID: "res-193", Project: "p-193", Section: "sec-193", SessionID: "sess-193",
+				Status: "stopped", Backend: "opencode", OpencodeSessionID: "ses_193",
+				CallerSession: "opencode:caller-193",
+			}); err != nil {
+				t.Fatalf("AgentCreate: %v", err)
+			}
+
+			params := map[string]any{"to": "res-193"}
+			for k, v := range tc.params {
+				params[k] = v
+			}
+			if resp := h.handleResumeAgent(params); resp.Error != "" {
+				t.Fatalf("resume: %s", resp.Error)
+			}
+
+			var args []string
+			select {
+			case args = <-placed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the resumed agent's window was never opened")
+			}
+			got := ""
+			for i, a := range args {
+				if a == "--parent-window" && i+1 < len(args) {
+					got = args[i+1]
+				}
+			}
+			if got != tc.want {
+				t.Errorf("--parent-window = %q, want %q (args: %v)", got, tc.want, args)
+			}
+		})
+	}
+}
+
+func TestHandleResumeAgent_ExplicitSessionCannotBeAttachedToASecondRow(t *testing.T) {
+	h, s := mustHandler(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-owner", Project: "proj", Section: "loop-a", SessionID: "uuid-owner",
+		Status: "running", Backend: "opencode", OpencodeSessionID: "ses_taken",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-other", Project: "proj", Section: "loop-b", SessionID: "uuid-other",
+		Status: "paused", Backend: "opencode",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := h.handleResumeAgent(map[string]any{"to": "agent-other", "session_id": "ses_taken"})
+	if !strings.Contains(resp.Error, "agent-owner is running") {
+		t.Fatalf("the session must resolve to its owner, got error %q", resp.Error)
+	}
+	if other, _ := s.AgentGet("agent-other"); other.OpencodeSessionID != "" {
+		t.Errorf("agent-other bound %q, want it untouched", other.OpencodeSessionID)
+	}
+	if owner, _ := s.AgentGet("agent-owner"); owner.OpencodeSessionID != "ses_taken" {
+		t.Errorf("the owner's session changed to %q", owner.OpencodeSessionID)
+	}
+}
+
 // --- L4: opencode unresumable marker (empty OpencodeSessionID) ---
+
+// TestHandleSpawnAgent_PersistsWorkDir: the directory the backend starts in is
+// the only evidence that later scopes an unbound agent's session search to its
+// own tree. It has to survive the spawn on the row, because the capture runs in
+// a goroutine that may outlive this request and the late bind runs hours later
+// in the heartbeat.
+func TestHandleSpawnAgent_PersistsWorkDir(t *testing.T) {
+	h, s := mustHandler(t)
+
+	resp := h.handleSpawnAgent(map[string]any{
+		"project": "proj", "section": "loop-wd", "backend": "opencode",
+		"work_dir": "/wd/loop-wd",
+	})
+	if resp.Error != "" {
+		t.Fatalf("spawn_agent: %s", resp.Error)
+	}
+	id, _ := resultMap(t, resp)["id"].(string)
+	if id == "" {
+		t.Fatal("spawn_agent did not return an agent id")
+	}
+	a, err := s.AgentGet(id)
+	if err != nil || a == nil {
+		t.Fatalf("AgentGet(%s): %v", id, err)
+	}
+	if a.WorkDir != "/wd/loop-wd" {
+		t.Errorf("WorkDir = %q, want /wd/loop-wd", a.WorkDir)
+	}
+}
 
 // TestHandleResumeAgent_OpencodeEmptySession_Blocked: resume of an opencode
 // agent whose OpencodeSessionID was never captured must return a clear error
@@ -877,6 +2267,35 @@ func TestHandleResumeAgent_OpencodeWithSession_Ok(t *testing.T) {
 	resp := h.handleResumeAgent(map[string]any{"to": "agent-1"})
 	if resp.Error != "" {
 		t.Fatalf("opencode agent WITH OpencodeSessionID should pass the unresumable check, got: %s", resp.Error)
+	}
+}
+
+// TestHandleResumeAgent_BindsTheSessionOnDemand: an opencode agent whose session
+// appeared after the spawn-time capture window (or whose capture the daemon
+// restarted through) is resumable — rejecting it as "unresumable" throws away a
+// recoverable loop. The resume path binds on demand before deciding.
+func TestHandleResumeAgent_BindsTheSessionOnDemand(t *testing.T) {
+	h, s := mustHandler(t)
+	stubOpencodeFind(t, "ses_late")
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-1", Project: "proj", Section: "loop-late",
+		SessionID: "sess-1", Status: "paused", Backend: "opencode",
+		// The row needs a work dir that exists: a recorded tree that is gone is
+		// refused by the resume gate (YM-356), which would mask the bind this test
+		// is about.
+		WorkDir: t.TempDir(),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	resp := h.handleResumeAgent(map[string]any{"to": "agent-1"})
+	if resp.Error != "" {
+		t.Fatalf("resume must bind the late session instead of rejecting the agent, got: %s", resp.Error)
+	}
+	a, _ := s.AgentGet("agent-1")
+	if a.OpencodeSessionID != "ses_late" {
+		t.Errorf("OpencodeSessionID = %q, want ses_late", a.OpencodeSessionID)
 	}
 }
 
@@ -1177,12 +2596,8 @@ func TestHandleTrackUsage_Success(t *testing.T) {
 }
 
 func TestHandleTrackUsage_ForkSource(t *testing.T) {
-	h, s := mustHandler(t)
-	// fork columns are added via ALTER TABLE migration which runs before CREATE TABLE
-	// in in-memory DBs — manually add them so the test exercises the fork path
-	s.DB().Exec("ALTER TABLE token_usage ADD COLUMN fork_input_tokens INTEGER DEFAULT 0")
-	s.DB().Exec("ALTER TABLE token_usage ADD COLUMN fork_output_tokens INTEGER DEFAULT 0")
-	s.DB().Exec("ALTER TABLE token_usage ADD COLUMN fork_request_count INTEGER DEFAULT 0")
+	h, _ := mustHandler(t)
+	// Fork columns come from the token_usage CREATE constant; do not add them here.
 
 	resp := h.handleTrackUsage(map[string]any{
 		"thread_id": "thread-1", "input_tokens": float64(2000),
@@ -1402,7 +2817,7 @@ func TestHandleAgentDispatch_SpawnViaHandle(t *testing.T) {
 
 	resp := h.Handle(Request{
 		Method: "spawn_agent",
-		Params: map[string]any{"project": "proj", "section": "dispatch-test"},
+		Params: map[string]any{"project": "proj", "section": "dispatch-test", "work_dir": t.TempDir()},
 	})
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -1557,18 +2972,20 @@ func TestHandleTrackUsage_SessionIDMatch(t *testing.T) {
 	}
 }
 
-func TestHandleTrackUsage_LazyMapping(t *testing.T) {
+// A thread the daemon cannot identify must not be attached to whichever agent
+// happens to run in the same project: that guess bound the orchestrator's own
+// thread to a freshly spawned loop agent (2026-10-15) and fed it foreign
+// telemetry, which in turn produced false DEAD_AGENT alarms.
+func TestHandleTrackUsage_UnknownThreadIsNotGuessed(t *testing.T) {
 	h, s := mustHandler(t)
 
-	// Create a running agent WITHOUT proxy_thread_id set
 	s.AgentCreate(storage.Agent{
-		ID: "agent-lazy", Project: "proj", Section: "task",
-		SessionID: "daemon-uuid-lazy", Status: "running", Backend: "claude",
+		ID: "agent-unmapped", Project: "proj", Section: "task",
+		SessionID: "daemon-uuid-unmapped", Status: "running", Backend: "opencode",
 	})
 
-	// First _track_usage call — should lazy-map the thread_id to this agent
 	resp := h.handleTrackUsage(map[string]any{
-		"thread_id":     "new-proxy-thread-xyz",
+		"thread_id":     "opencode:ses_someone_else",
 		"project":       "proj",
 		"input_tokens":  float64(200),
 		"output_tokens": float64(80),
@@ -1577,30 +2994,38 @@ func TestHandleTrackUsage_LazyMapping(t *testing.T) {
 		t.Fatalf("error: %s", resp.Error)
 	}
 
-	agent, _ := s.AgentGet("agent-lazy")
-	if agent.TurnsUsed != 1 {
-		t.Errorf("TurnsUsed = %d, want 1 (lazy mapping should update telemetry)", agent.TurnsUsed)
+	agent, _ := s.AgentGet("agent-unmapped")
+	if agent.TurnsUsed != 0 {
+		t.Errorf("TurnsUsed = %d, want 0 (foreign thread must not count for this agent)", agent.TurnsUsed)
 	}
-	if agent.ProxyThreadID != "new-proxy-thread-xyz" {
-		t.Errorf("ProxyThreadID = %q, want new-proxy-thread-xyz (should be set by lazy mapping)", agent.ProxyThreadID)
+	if agent.ProxyThreadID != "" {
+		t.Errorf("ProxyThreadID = %q, want empty (no guessing)", agent.ProxyThreadID)
 	}
+}
 
-	// Second call with same thread_id — should match via proxy_thread_id
-	resp2 := h.handleTrackUsage(map[string]any{
-		"thread_id":     "new-proxy-thread-xyz",
-		"input_tokens":  float64(100),
-		"output_tokens": float64(20),
+// Once the backend id is captured, the agent's own thread is found directly.
+func TestHandleTrackUsage_OpencodeBackendIDMatch(t *testing.T) {
+	h, s := mustHandler(t)
+
+	s.AgentCreate(storage.Agent{
+		ID: "agent-oc", Project: "proj", Section: "task",
+		SessionID: "daemon-uuid-oc", Status: "running", Backend: "opencode",
+		OpencodeSessionID: "ses_own",
 	})
-	if resp2.Error != "" {
-		t.Fatalf("error on second call: %s", resp2.Error)
+
+	resp := h.handleTrackUsage(map[string]any{
+		"thread_id":     "opencode:ses_own",
+		"project":       "proj",
+		"input_tokens":  float64(200),
+		"output_tokens": float64(80),
+	})
+	if resp.Error != "" {
+		t.Fatalf("error: %s", resp.Error)
 	}
 
-	agent, _ = s.AgentGet("agent-lazy")
-	if agent.TurnsUsed != 2 {
-		t.Errorf("TurnsUsed = %d, want 2 (second call should accumulate)", agent.TurnsUsed)
-	}
-	if agent.InputTokens != 300 {
-		t.Errorf("InputTokens = %d, want 300 (accumulated)", agent.InputTokens)
+	agent, _ := s.AgentGet("agent-oc")
+	if agent.TurnsUsed != 1 {
+		t.Errorf("TurnsUsed = %d, want 1 (own backend thread)", agent.TurnsUsed)
 	}
 }
 
@@ -1789,14 +3214,7 @@ func TestGetAgent_RecommendedAction_Running(t *testing.T) {
 
 func TestRelayAgent_PausedAllowed(t *testing.T) {
 	h, s := mustHandler(t)
-	// Use /tmp explicitly; on macOS t.TempDir() returns /var/folders/...
-	// paths >100 chars, exceeding UNIX_PATH_MAX for .sock.inject listener.
-	sockDir, err := os.MkdirTemp("/tmp", "rl")
-	if err != nil {
-		t.Fatalf("mkdir tmp: %v", err)
-	}
-	defer os.RemoveAll(sockDir)
-	sockPath := filepath.Join(sockDir, "agent.sock")
+	sockPath := los24dAgentSock(t, h, "relay-paused")
 	injectPath := sockPath + ".inject"
 	ln, err := net.Listen("unix", injectPath)
 	if err != nil {
@@ -1848,12 +3266,7 @@ func TestRelayAgent_StoppedBlocked(t *testing.T) {
 
 func TestRelayAgent_RunningAllowed(t *testing.T) {
 	h, s := mustHandler(t)
-	sockDir, err := os.MkdirTemp("/tmp", "rl")
-	if err != nil {
-		t.Fatalf("mkdir tmp: %v", err)
-	}
-	defer os.RemoveAll(sockDir)
-	sockPath := filepath.Join(sockDir, "agent.sock")
+	sockPath := los24dAgentSock(t, h, "relay-running")
 	injectPath := sockPath + ".inject"
 	ln, err := net.Listen("unix", injectPath)
 	if err != nil {
@@ -1977,7 +3390,7 @@ func TestHandleOpenAgentTerminal_Resume(t *testing.T) {
 	h.disableAgentProcesses = true
 	resp := h.Handle(Request{Method: "open_agent_terminal", Params: map[string]any{
 		"session_id": "ses_abc123",
-		"work_dir":   "/home/chief/projects/deepseek",
+		"work_dir":   "/home/tester/projects/deepseek",
 		"project":    "deepseek",
 		"backend":    "opencode",
 	}})
@@ -2009,7 +3422,7 @@ func TestHandleOpenAgentTerminal_New(t *testing.T) {
 	h, _ := mustHandler(t)
 	h.disableAgentProcesses = true
 	resp := h.Handle(Request{Method: "open_agent_terminal", Params: map[string]any{
-		"work_dir": "/home/chief/projects/greenwebsite",
+		"work_dir": "/home/tester/projects/greenwebsite",
 		"project":  "greenwebsite",
 		"backend":  "opencode",
 	}})
@@ -2028,5 +3441,274 @@ func TestHandleOpenAgentTerminal_New(t *testing.T) {
 	}
 	if agent.OpencodeSessionID != "" {
 		t.Fatalf("OpencodeSessionID = %q, want empty for new session", agent.OpencodeSessionID)
+	}
+}
+
+// --- review fixes: the neighbouring paths of E2/E3 ---
+
+// The crash replacement must come back where the crashed agent ran — the same
+// defect as E2, one path over: spawn_agent without a work_dir resolves the project
+// root, so a loop agent's replacement starts outside its worktree and its own
+// skill guard fails there.
+func TestRespawnAgent_UsesTheRecordedWorkDir(t *testing.T) {
+	h, s := mustHandler(t)
+	h.disableAgentProcesses = true
+	workDir := t.TempDir()
+	if err := s.AgentCreate(storage.Agent{
+		ID: "crash-wd", Project: "p", Section: "s-crash-wd", SessionID: "sess-crash-wd",
+		Status: "crashed", Backend: "claude", WorkDir: workDir,
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	crashed, err := s.AgentGet("crash-wd")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	h.respawnAgent(*crashed)
+
+	agents, err := s.AgentList("p")
+	if err != nil {
+		t.Fatalf("AgentList: %v", err)
+	}
+	var replacement *storage.Agent
+	for i := range agents {
+		if agents[i].ID != "crash-wd" {
+			replacement = &agents[i]
+		}
+	}
+	if replacement == nil {
+		t.Fatal("respawnAgent created no replacement row")
+	}
+	if replacement.WorkDir != workDir {
+		t.Errorf("replacement work_dir = %q, want the crashed agent's %q", replacement.WorkDir, workDir)
+	}
+}
+
+// The "pending" twin of the row a dead daemon leaves behind: a spawn writes
+// "pending" before it binds a process, and if the daemon dies in that window no
+// guard touches the row (they all want running/spawning), resume refuses it
+// (stopped/paused/finished only) and agentGetActiveBySection still counts it as
+// the section's owner. stop_agent is the only way out — without signalling the
+// stale PID the row carries.
+func TestHandleStopAgent_PendingRowLeftByADeadDaemonIsClosable(t *testing.T) {
+	h, s := mustHandler(t)
+	bystander, exited := startBystander(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "pending-left", Project: "proj", Section: "yesloop-pending-left",
+		Status: "pending", Backend: "claude", PID: bystander.Process.Pid,
+		SockPath: filepath.Join(shortSockDir(t), "pending-left.sock"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+
+	resp := h.handleStopAgent(map[string]any{"to": "pending-left"})
+	if resp.Error != "" {
+		t.Fatalf("a pending row must be closable by hand: %s", resp.Error)
+	}
+	a, err := s.AgentGet("pending-left")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("status=%q pid=%d, want stopped/0", a.Status, a.PID)
+	}
+	select {
+	case <-exited:
+		t.Error("stop signalled the stale PID of a pending row")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The mirror of TestRestartWindow_StopIsNotOverwrittenByTheBind, at the level where
+// the race is actually decided: the relaunch bound a process after the stop had read
+// the row, so the stop's write is refused and the process the bind installed has to
+// be ended — through the same identity gate as every other signal.
+func TestFinalizeStop_SignalsTheProcessThatDisplacedTheSnapshot(t *testing.T) {
+	requireProcTable(t)
+	h, s := mustHandler(t)
+	pinProcessTable(t)
+	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
+	bystander, exited := startBystander(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "stop-mirror", Project: "p", Section: "s-mirror", Status: "spawning",
+		Backend: "claude", PID: bystander.Process.Pid,
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	// What the stop read before the bind landed: the row still carried its stale PID.
+	snapshot := storage.Agent{ID: "stop-mirror", Status: "spawning", PID: deadPID}
+
+	written, err := h.finalizeStop(snapshot, "stopped")
+	if err != nil {
+		t.Fatalf("finalizeStop: %v", err)
+	}
+	if !written {
+		t.Fatal("the stop was not finalized on the PID that displaced the snapshot")
+	}
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Error("the process the bind installed was not signalled — it keeps working on a section everybody believes is stopped")
+	}
+	a, err := s.AgentGet("stop-mirror")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("status=%q pid=%d, want stopped/0", a.Status, a.PID)
+	}
+}
+
+// The counter-direction: when the snapshot still matches the row, the write lands
+// immediately and nothing is signalled — finalizeStop only ends a process that
+// displaced the decision it was called with.
+func TestFinalizeStop_LeavesAMatchingPIDToTheCaller(t *testing.T) {
+	h, s := mustHandler(t)
+	pinProcessTable(t)
+	stubProcCmdline(t, "/usr/local/bin/claude\x00--session-id\x00x")
+	bystander, exited := startBystander(t)
+	if err := s.AgentCreate(storage.Agent{
+		ID: "stop-match", Project: "p", Section: "s-match", Status: "running",
+		Backend: "claude", PID: bystander.Process.Pid,
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	stored, err := s.AgentGet("stop-match")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+
+	written, err := h.finalizeStop(*stored, "stopped")
+	if err != nil {
+		t.Fatalf("finalizeStop: %v", err)
+	}
+	if !written {
+		t.Fatal("a snapshot that matches the row must be finalized in the first attempt")
+	}
+	select {
+	case <-exited:
+		t.Error("finalizeStop signalled a PID the caller had already decided on")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if a, _ := s.AgentGet("stop-match"); a.Status != "stopped" || a.PID != 0 {
+		t.Errorf("status=%q pid=%d, want stopped/0", a.Status, a.PID)
+	}
+}
+
+// --- YM-225: a relay lifts the idle-guard pause ---
+//
+// The idle guard pauses an agent as DEAD_AGENT, the orchestrator relays
+// approval, the agent works on — and the row stayed `paused`, where every guard
+// skips it (checkOneAgent wants running). Only the permission kick ever
+// unpaused. A relay is the orchestrator's answer to exactly this pause, so it
+// puts the row back under supervision.
+func TestRelayAgent_LiftsTheIdleGuardPause(t *testing.T) {
+	h, s := mustHandler(t)
+	sockPath := los24dAgentSock(t, h, "idle-paused")
+	ln, err := net.Listen("unix", sockPath+".inject")
+	if err != nil {
+		t.Fatalf("listen inject: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, c)
+			c.Close()
+		}
+	}()
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "idle-paused", Project: "p", Section: "yesloop-idle-paused",
+		Status: "paused", Backend: "claude", SockPath: sockPath,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	if err := s.AgentUpdate("idle-paused", map[string]any{
+		"progress": "paused: yesloop-idle escalation: no PROVEN marker in scratchpad (refireCount=3, max=2)",
+	}); err != nil {
+		t.Fatalf("AgentUpdate: %v", err)
+	}
+	// The escalation left the state machine at DONE. That rung ignores the agent
+	// until its stream becomes active again, so a relay has to drop it.
+	resetIdleState()
+	t.Cleanup(resetIdleState)
+	yesloopIdleAgentsMu.Lock()
+	yesloopIdleAgents["idle-paused"] = &yesloopIdleState{state: yesloopIdleStateDone, refireCount: 3}
+	yesloopIdleAgentsMu.Unlock()
+
+	if resp := h.handleRelayAgent(map[string]any{
+		"to": "idle-paused", "content": "approved, continue with Phase 4",
+	}); resp.Error != "" {
+		t.Fatalf("relay to the idle-paused agent failed: %s", resp.Error)
+	}
+
+	row, err := s.AgentGet("idle-paused")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if row.Status != "running" {
+		t.Errorf("a relay must lift the idle-guard pause, status = %q", row.Status)
+	}
+	yesloopIdleAgentsMu.Lock()
+	_, tracked := yesloopIdleAgents["idle-paused"]
+	yesloopIdleAgentsMu.Unlock()
+	if tracked {
+		t.Error("the answered escalation must not stay at DONE, where the guard ignores the agent")
+	}
+}
+
+// Any other pause keeps its status: the DONE-guard lifts its own pause when the
+// scratchpad becomes compliant, and a relay must not take that decision away.
+func TestRelayAgent_LeavesForeignPausesPaused(t *testing.T) {
+	h, s := mustHandler(t)
+	sockPath := los24dAgentSock(t, h, "doneguard-paused")
+	ln, err := net.Listen("unix", sockPath+".inject")
+	if err != nil {
+		t.Fatalf("listen inject: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, c)
+			c.Close()
+		}
+	}()
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "doneguard-paused", Project: "p", Section: "yesloop-doneguard-paused",
+		Status: "paused", Backend: "claude", SockPath: sockPath,
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	if err := s.AgentUpdate("doneguard-paused", map[string]any{
+		"progress": "paused: DONE-GUARD: phase validation failed — Phase 5 cold-review missing",
+	}); err != nil {
+		t.Fatalf("AgentUpdate: %v", err)
+	}
+
+	if resp := h.handleRelayAgent(map[string]any{
+		"to": "doneguard-paused", "content": "please finish Phase 5",
+	}); resp.Error != "" {
+		t.Fatalf("relay to the paused agent failed: %s", resp.Error)
+	}
+
+	row, err := s.AgentGet("doneguard-paused")
+	if err != nil {
+		t.Fatalf("AgentGet: %v", err)
+	}
+	if row.Status != "paused" {
+		t.Errorf("a DONE-GUARD pause is lifted by its own recovery, not by a relay: status = %q", row.Status)
 	}
 }

@@ -270,12 +270,27 @@ func buildToolResultSummary(text string, info toolUseInfoExtended, msgIdx int, t
 		sb.WriteString(strings.Join(hints, "; "))
 	}
 	sb.WriteString("]")
-	if threadID != "" {
+	// The hint must be the form reexpandStubsFor can resolve: it reads
+	// deep_search('...') out of the stub (YM-141). A get_session pointer is only
+	// the fallback when the tool_use is gone and no keywords exist. The keywords
+	// come from tool input, so they are quoted out and length-capped: a path can
+	// contain a quote or be arbitrarily long.
+	if info.Keywords != "" {
+		sb.WriteString(fmt.Sprintf(" → deep_search('%s')", hintKeywords(info.Keywords)))
+	} else if threadID != "" {
 		sb.WriteString(fmt.Sprintf(" → get_session('%s', mode=paginated, offset=%d, limit=1)", threadID, msgIdx))
-	} else if info.Keywords != "" {
-		sb.WriteString(fmt.Sprintf(" → deep_search('%s')", info.Keywords))
 	}
 	return sb.String()
+}
+
+// hintKeywords makes tool keywords safe to embed in a deep_search('...') hint:
+// no quote can terminate the hint early, and the length stays bounded.
+func hintKeywords(kw string) string {
+	kw = strings.ReplaceAll(kw, "'", "")
+	if len([]rune(kw)) > 120 {
+		kw = string([]rune(kw)[:120]) + "..."
+	}
+	return kw
 }
 
 // shallowCopyMap creates a shallow copy of a map.

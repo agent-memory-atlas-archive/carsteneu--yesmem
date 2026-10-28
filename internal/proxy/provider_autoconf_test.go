@@ -411,7 +411,7 @@ func TestMaybePatchOpenCodeBaseURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !modified {
+	if modified == 0 {
 		t.Fatal("expected opencode.json to be modified")
 	}
 
@@ -447,7 +447,7 @@ func TestMaybePatchOpenCodeBaseURLSkipsExisting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modified {
+	if modified != 0 {
 		t.Fatal("expected opencode.json NOT to be modified when baseURL already exists")
 	}
 }

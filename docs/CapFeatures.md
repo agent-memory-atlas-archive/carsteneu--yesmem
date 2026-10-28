@@ -20,8 +20,8 @@ Claude Code loses **learned tool knowledge** between sessions: REPL snippets, AP
 │   Name + one-liner per capability. No schemas.                    │
 │   ~80 tokens/cap → 100 caps ≈ 8k tokens (cached).                │
 │   renderCapabilitiesCatalog() in caps_inject.go.                  │
-│   Format: <capabilities-available> block as system-reminder.      │
-│   Contains bootstrapper: registerTool("activate_cap",...)   │
+│   Format: <caps-available> block as system-reminder.              │
+│   Names the activate_cap call; no registerTool bootstrapper.       │
 │                                                                     │
 │ LAYER B — Deliberative Activation (per session, on-demand)        │
 │   Bootstrapper REPL tool "activate_cap" calls internally    │
@@ -97,10 +97,10 @@ Stored in `yesmem.db`. Proxy reads which caps are active per thread ID. `auto_ac
 
 ### Cap Store (generic KV store)
 
-Separate database `capabilities.db`. Each capability gets its own namespace-prefixed tables:
+Separate database `caps.db`. Each capability gets its own namespace-prefixed tables:
 
 ```
-capabilities.db
+caps.db
 ├── cap_store_meta               — registry: which cap owns which tables
 ├── cap_{name}__{table}          — data tables (e.g. cap_reddit_search__listings)
 └── cap_{name}__blobs            — blob chunks for >30KB payloads (planned)
@@ -111,7 +111,7 @@ capabilities.db
 - Max 10 tables per capability
 - Max 10,000 rows per table
 - Max 64KB per cell
-- Blob chunking: 60KB chunks (planned)
+- Blob chunking: 20KB chunks (`capblob.DefaultChunkSize`)
 
 **Sandboxing:** Only `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`, `SELECT`. No `DROP`, `ALTER`, `ATTACH`, `PRAGMA`. All values via `?` placeholders, names via regex allowlist (`^[a-z][a-z0-9_]{0,63}$`).
 
@@ -125,13 +125,13 @@ capabilities.db
 
 | Symbol | Kind | Description |
 |--------|------|-------------|
-| `CapInjection` | struct | Fields: `Name`, `Description`, `Schema`, `HandlerBash`, `HandlerREPL` |
-| `renderCapabilitiesCatalog` | func | `func(caps []CapInjection) string` — generates `<capabilities-available>` block with bootstrapper code. Replaces the older `renderCapabilitiesBlock`. |
-| `renderCapabilitiesBlock` | func | `func(caps []CapInjection) string` — older variant, lists caps as `<capabilities-active>` block. |
-| `injectCapabilitiesTurnImpl` | func | `func(req map[string]any, threadID string, queryFn ..., capsCache *CapsCache, logger *log.Logger) bool` — appends active cap schemas to `req["tools"]`. Dedup: native tools win on name collision. |
-| `injectCapabilitiesTurn` | method | `func (s *Server) injectCapabilitiesTurn(req map[string]any, threadID string) bool` — server method wrapper around `injectCapabilitiesTurnImpl`. |
+| `CapInjection` | struct | Fields: `Name`, `Description`, `Tags`, `Project`, `Scripts` |
+| `renderCapabilitiesCatalog` | func | `func(caps []CapInjection) string` — generates the `<caps-available>` block with the activation instruction and a name/description table. |
+| `renderCapabilitiesBlock` | func | `func(caps []CapInjection) string` — older variant, renders `<caps-active>` with one registerTool() snippet per cap. |
+| `injectCapabilitiesTurnImpl` | func | `func(req map[string]any, threadID string, queryFn ..., capsCache *CapsCache, logger *log.Logger) bool` — renders the catalog block into the request. It does not write `req["tools"]`. |
+| `injectCapabilitiesTurn` | method | `func (s *Server) injectCapabilitiesTurn(req map[string]any, threadID string, profile models.PromptProfile) bool` — server method wrapper around `injectCapabilitiesTurnImpl`. |
 | `decodeCapsResponse` | func | `func(raw json.RawMessage) ([]CapInjection, error)` — unmarshals daemon response into `[]CapInjection`. |
-| `renderRegisterTool` | func | `func(c CapInjection) string` — generates a single `registerTool()` JS snippet for a cap. |
+| `renderRegisterTools` | func | `func(c CapInjection) []string` — generates the `registerTool()` JS snippets for one cap's tool scripts. |
 
 **File: `internal/proxy/caps_cache.go`**
 
@@ -215,9 +215,9 @@ Return type: `SessionCap` struct (thread ID + name + timestamps).
 
 | Function | Signature |
 |----------|-----------|
-| `OpenCapsDB` | `func (s *Store) OpenCapsDB() error` — opens separate `capabilities.db`. |
-| `CloseCapsDB` | `func (s *Store) CloseCapsDB()` — closes `capabilities.db`. |
-| `CapsReady` | `func (s *Store) CapsReady() bool` — checks whether capabilities.db is open. |
+| `OpenCapsDB` | `func (s *Store) OpenCapsDB() error` — opens separate `caps.db`. |
+| `CloseCapsDB` | `func (s *Store) CloseCapsDB()` — closes `caps.db`. |
+| `CapsReady` | `func (s *Store) CapsReady() bool` — checks whether caps.db is open. |
 | `ValidateCapName` | `func ValidateCapName(name string) error` — regex validation `^[a-z][a-z0-9_]{0,63}$`. |
 | `CapsCreateTable` | `func (s *Store) CapsCreateTable(cap, table string, columns []ColumnDef) error` — creates `cap_{name}__{table}`. |
 | `CapsUpsert` | `func (s *Store) CapsUpsert(cap, table string, data map[string]any) error` |
@@ -291,27 +291,24 @@ Incoming request
      └─ renderCapabilitiesCatalog()    ← catalog in system-reminder (caps_inject.go)
   → StripOldNarratives
   → reexpandStubsFor
-  → injectCapabilitiesTurn()           ← active caps appended to req["tools"] (caps_inject.go)
+  → injectCapabilitiesTurn()           ← <caps-available> system-reminder block (caps_inject.go)
   → UpgradeCacheTTL / EnforceCacheBreakpointLimit
 Request to Anthropic API
 ```
 
 **Catalog injection** (`renderCapabilitiesCatalog` in `caps_inject.go`):
-- Generates `<capabilities-available>` block as system-reminder
-- Contains bootstrapper: `registerTool("activate_cap", ...)` as REPL tool
-- Bootstrapper calls `mcp__yesmem__activate_cap` internally
-- Lists all available caps with name + description as a table
-- Rendered once per session
+- Generates exactly **one** `<caps-available>` block inside a `<system-reminder>` — nothing is appended to `req["tools"]`
+- The block teaches the activation call (`await mcp__yesmem__activate_cap({name})` in REPL, then `eval(result.code)`) once, then lists every available cap as a `| Capability | Description |` table
+- Rendered once per session from the caps cache
 
-**Schema injection** (`injectCapabilitiesTurn` in `caps_inject.go`):
-- Reads active caps via `cachedQueryFn` (cache + daemon fallback)
-- Appends JSON schemas to `req["tools"]` in the API request
-- Native tools take precedence on name collision (skipped with warn log)
+**Per-cap tool registration** (`renderRegisterTools` in `caps_inject.go`):
+- Produces one `registerTool(...)` line per `kind: tool` script of a cap, with the runtime-specific body (`repl` body, or `async () => sh("…")` for bash)
+- There is no separate bootstrapper: the activation instruction in the catalog *is* the mechanism, and the resulting handler registers its own tools when evaluated
 
 **Cache** (`CapsCache` in `caps_cache.go`):
 - In-memory cache keyed by thread ID
 - Invalidated via `invalidateThreadCaches()` (also invalidates frozenStubs + briefingCache)
-- `cachedQueryFn()` wraps daemon query: only caches `get_active_caps` responses
+- `cachedQueryFn()` wraps daemon query: only caches `get_active_caps` responses. `get_active_caps` is an internal daemon query, not an MCP tool
 
 ---
 
@@ -324,7 +321,7 @@ For capabilities that need HTTP fetches larger than 30KB (e.g. Reddit posts with
 ```
 Producer → curl | yesmem cap-blob-put --cap NAME --key KEY
                     ↓
-              cap_{NAME}__blobs (60KB chunks, auto-created)
+              cap_{NAME}__blobs (20KB chunks, auto-created)
                     ↓
 Consumer → cap_store({action:"query", table:"blobs", ...})
                     ↓
@@ -426,8 +423,8 @@ Schema: `repl_patterns` table (hash, normalized, raw, project, count, first_seen
 | Measure | File | Effect |
 |---------|------|--------|
 | **Deny-list extended** (+15: git, mkdir, rm, cp, mv, touch, chmod, chown, ln, export, source, exit, clear, history, wc) | `repl_pattern.go` | Trivial shell commands are not counted |
-| **Session budget max 3** — `patternBudget map[string]int` on Server struct | `proxy.go` | After 3 suggestions per thread, no more |
-| **Threshold 5→8** — pattern must repeat 8× | `handler_repl_patterns.go` | Filters short-lived repetitions |
+| **Threshold 3** — pattern must repeat 3× (`get_repl_pattern_suggestion` default; a caller may raise it) | `handler_repl_patterns.go` | Filters short-lived repetitions |
+| **Dismissal cap** — after 3 dismissals the shape is permanently suppressed | `dismiss_repl_pattern` | Removes the pattern for good |
 
 Verified: 3 suggestions instead of 40+ per REPL-intensive session.
 
@@ -450,7 +447,7 @@ Detects recurring tool-call sequences across turns and suggests cap bundling.
 - **One table** `thread_sequences` (thread_id PK, project, turn_hashes JSON max 20 FIFO, updated_at)
 - **Turn hash** = tool type names from assistant turn → remove consecutive duplicates → join with `→` → SHA256[:16]
 - **Workflow matching** = on-demand, no ticker. Extract 3-subsequences in-memory from all thread sequences of the same project, count, suggest when count ≥ 3 across different threads
-- **Budget** = shares `patternBudget` (max 3/thread) with single-command pattern suggestions
+- **Budget** = no per-thread budget field exists. The daemon returns at most one `pattern` per call, and dismissal is the only suppression mechanism
 
 ### Files
 
@@ -531,7 +528,7 @@ Capabilities registered in the system (as of 2026-04-21):
 2026-04-17  feat(storage): session_active_caps table + methods
 2026-04-17  feat(daemon): handleActivateCap/handleDeactivateCap handlers
 2026-04-17  feat(mcp): activate_cap/deactivate_cap tools
-2026-04-18  feat(storage): cap_store — separate capabilities.db + CRUD
+2026-04-18  feat(storage): cap_store — separate caps.db + CRUD
 2026-04-18  feat(daemon): handleCapStore handler + sandboxing + quotas
 2026-04-18  feat(mcp): cap_store MCP tool
 2026-04-18  feat(proxy): injectCapabilitiesTurn + CapsCache
@@ -557,12 +554,12 @@ Capabilities registered in the system (as of 2026-04-21):
 | Capabilities as learnings (category="cap"), no separate table | Reuses existing supersede/search/embed infrastructure. No schema migration overhead. |
 | Deliberative activation instead of auto-injection | Model selects more reliably than an embedding ranker. No false positives. Lower token cost. |
 | Native tools win on name collision | Safety: native MCP tools must never be shadowed by capabilities. |
-| Separate capabilities.db for cap store | Isolation from yesmem.db. No schema pollution. Independent locking. |
+| Separate caps.db for cap store | Isolation from yesmem.db. No schema pollution. Independent locking. |
 | Blob pipe instead of temp files | No Read tool permission prompt. No /tmp cleanup. More persistent than temp files. |
 | Cap store sandboxing (no DROP/ALTER) | Capabilities should write data, not destroy structure. Defensive architecture. |
-| Bootstrapper as registerTool() in catalog | Enables `activate_cap` as REPL tool without a prior MCP round-trip. Self-bootstrapping. |
+| Activation instruction in the catalog | Enables `activate_cap` without a prior MCP round-trip: the catalog names the call, `eval` registers the cap's own tools. |
 | v0.55 rename capability→cap | Consistency: shorter, uniform name prefixes. All APIs use `cap_*`. |
-| auto_active default true | New caps should be immediately available by default. Opt-out rather than opt-in — reduces friction in the cap-building flow. |
+| auto_active default true (save_cap) | New caps should be immediately available by default. Opt-out rather than opt-in — reduces friction in the cap-building flow. A `CAP.md` frontmatter without the key is false instead. |
 
 ---
 
@@ -576,7 +573,7 @@ SQLite remains the runtime store — files are synced into the DB at daemon star
 
 ### File Format
 
-```markdown
+````markdown
 ---
 name: reddit_search
 description: "Search Reddit by topic"
@@ -603,8 +600,11 @@ CREATE TABLE IF NOT EXISTS listings (
   title TEXT NOT NULL
 );
 ```
+````
 
 **Frontmatter:** `name` and `description` are required fields. `runtime` is derived from the script language (`javascript` → repl, `bash` → bash). `schema` is derived from the function signature and not stored in the frontmatter.
+
+**`auto_active` differs by entry point:** through the `save_cap` MCP tool the default is **true** (a new cap is immediately visible). In a `CAP.md` frontmatter the field is a plain Go bool, so an omitted key reads as **false**. Write `auto_active: true` explicitly if the file-installed cap should be auto-visible.
 
 **Sections:** Order is fixed: Purpose → Script → Database. Database is optional (section may be empty).
 
@@ -676,12 +676,12 @@ There are **3 adapter primitives**, each action-based:
 | `file()` | `write` | `put()` |
 | `file()` | `glob` | `gl()` |
 
-**Roundtrip:**
+**Roundtrip (direction matters):**
 
-1. **save_cap** (user/daemon → DB): `ProviderToGeneric()` normalizes handler_repl (direct mappings only: `mcp__yesmem__cap_store(` → `store(`)
-2. **Writer** (DB → CAP.md): `ProviderToGeneric()` normalizes script before render
-3. **activate_cap / register_caps** (DB → Claude): `GenericToProvider()` expands direct mappings back
-4. **GenerateAdapterJS()**: generates direct shims (`globalThis.store = async(a) => mcp__yesmem__cap_store(a)`) + dispatcher shims (`globalThis.web = async({action,...p}) => { const d = {fetch: ..., search: ...}; return d[action](p); }`)
+1. **`CAP.md` on disk carries the provider form** — bundled caps call `mcp__yesmem__cap_store({...})`, never a bare `store()`. There is no generic rewriting step when the file is written
+2. **Reader** (`capfile`): the parser keeps the body verbatim; `UsesStoreAdapter()` decides whether the body needs the adapter at all
+3. **activate_cap / register_caps** (DB → runtime): for a tool script that uses the adapter, `ProviderToGeneric()` rewrites `mcp__yesmem__cap_store(` → `store(`, then `WrapToolWithStore()` wraps it so the generic name resolves
+4. **GenerateAdapterJS()**: generates the shims that make the generic names work — `globalThis.store = async(a) => mcp__yesmem__cap_store(a)` for the direct mapping, plus the dispatcher shims (`globalThis.web = async({action,...p}) => ...`)
 
 **Design principles:**
 - `store()` is 1:1 (string replace, as before)

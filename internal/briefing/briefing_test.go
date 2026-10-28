@@ -177,14 +177,14 @@ func TestRelativeTime(t *testing.T) {
 		d    time.Duration
 		want string
 	}{
-		{30 * time.Minute, "vor 30 Min"},
-		{3 * time.Hour, "vor 3h"},
-		{36 * time.Hour, "gestern"},
-		{5 * 24 * time.Hour, "vor 5 Tagen"},
-		{14 * 24 * time.Hour, "vor 2 Wo"},
+		{30 * time.Minute, "30 min ago"},
+		{3 * time.Hour, "3h ago"},
+		{36 * time.Hour, "yesterday"},
+		{5 * 24 * time.Hour, "5 days ago"},
+		{14 * 24 * time.Hour, "2 wks ago"},
 	}
 	for _, tt := range tests {
-		got := relativeTime(time.Now().Add(-tt.d))
+		got := relativeTime(DefaultStrings(), time.Now().Add(-tt.d))
 		if got != tt.want {
 			t.Errorf("relativeTime(-%v) = %q, want %q", tt.d, got, tt.want)
 		}
@@ -735,7 +735,7 @@ func TestLoadClustersStrongWeakSplit(t *testing.T) {
 	store, _ := storage.Open(":memory:")
 	defer store.Close()
 
-	project := "test-split"
+	project := "/home/testuser/projects/test-split"
 
 	// Insert clusters with varying confidence
 	clusters := []models.LearningCluster{

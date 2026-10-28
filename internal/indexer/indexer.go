@@ -38,10 +38,7 @@ type Indexer struct {
 
 // New creates an indexer with all dependencies.
 func New(store *storage.Store, bloomMgr *bloom.Manager, arch *archive.Archiver, excludeProjects []string) *Indexer {
-	exclude := make(map[string]bool, len(excludeProjects))
-	for _, p := range excludeProjects {
-		exclude[strings.ToLower(p)] = true
-	}
+	exclude := normalizeExcludedProjects(excludeProjects)
 	return &Indexer{
 		store:          store,
 		bloom:          bloomMgr,
@@ -70,10 +67,18 @@ func (idx *Indexer) IndexSession(jsonlPath string) error {
 	unlock := idx.pathLocks.lock(filepath.Clean(jsonlPath))
 	defer unlock()
 
+	// A session file is read by path (parser.ParseAutoTail), so a symlink would
+	// index a file from outside the sessions tree. The watcher submits paths
+	// without the walk, so the rejection belongs here. An entry swapped for a
+	// link after this check is out of reach for a path-based parser (YM-277).
+	if fi, err := os.Lstat(jsonlPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlinked session file %q", jsonlPath)
+	}
+
 	// 1. Check if reindex needed
 	info, err := os.Stat(jsonlPath)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", jsonlPath, err)
+		return fmt.Errorf("stat %q: %w", jsonlPath, err)
 	}
 	if !idx.store.NeedsReindex(jsonlPath, info.Size(), info.ModTime()) {
 		return nil // already up to date
@@ -202,12 +207,12 @@ func (idx *Indexer) indexAppendedTail(jsonlPath string, info os.FileInfo, state 
 
 	existing, err := idx.store.GetSession(state.IndexedSessionID)
 	if err != nil {
-		return fmt.Errorf("%w: session %s: %v", errNotAppendable, state.IndexedSessionID, err)
+		return fmt.Errorf("%w: session %q: %v", errNotAppendable, state.IndexedSessionID, err)
 	}
 
 	// Mirrors the full path: an excluded project is not indexed at all, even when
 	// the file already carries a watermark from before it was excluded.
-	if idx.excludeProject[strings.ToLower(existing.Project)] || idx.excludeProject[existing.ProjectShort] {
+	if projectExcluded(idx.excludeProject, existing.Project, existing.ProjectShort) {
 		return nil
 	}
 
@@ -308,7 +313,7 @@ func (idx *Indexer) indexAppendedTail(jsonlPath string, info os.FileInfo, state 
 		// parse). Like there, the watermark is left untouched, so such a session
 		// stops advancing.
 		short := models.ProjectShortFromPath(existing.Project)
-		if idx.excludeProject[strings.ToLower(existing.Project)] || idx.excludeProject[short] {
+		if projectExcluded(idx.excludeProject, existing.Project, short) {
 			return nil
 		}
 	}
@@ -358,7 +363,7 @@ func (idx *Indexer) indexAppendedTail(jsonlPath string, info os.FileInfo, state 
 	assocs := buildAssociations(existing.ID, existing.ProjectShort, res.Messages)
 	if len(assocs) > 0 {
 		if err := idx.store.InsertAssociationBatch(assocs); err != nil {
-			log.Printf("warn: associations for %s: %v", existing.ID, err)
+			log.Printf("warn: associations for %q: %v", existing.ID, err)
 		}
 	}
 
@@ -366,7 +371,7 @@ func (idx *Indexer) indexAppendedTail(jsonlPath string, info os.FileInfo, state 
 
 	if idx.archiver != nil {
 		if err := idx.archiver.ArchiveFile(jsonlPath, projectDirName(jsonlPath)); err != nil {
-			log.Printf("warn: archive %s: %v", jsonlPath, err)
+			log.Printf("warn: archive %q: %v", jsonlPath, err)
 		}
 	}
 
@@ -392,7 +397,7 @@ func (idx *Indexer) indexFullSession(jsonlPath string, info os.FileInfo) error {
 	// 2. Parse JSONL
 	res, err := parser.ParseAutoTail(jsonlPath, 0, 0)
 	if err != nil {
-		return fmt.Errorf("parse %s: %w", jsonlPath, err)
+		return fmt.Errorf("parse %q: %w", jsonlPath, err)
 	}
 	messages, meta := res.Messages, res.Meta
 	if meta.SessionID == "" {
@@ -416,7 +421,7 @@ func (idx *Indexer) indexFullSession(jsonlPath string, info os.FileInfo) error {
 	projectShort := models.ProjectShortFromPath(meta.Project)
 
 	// Skip projects on the exclusion list
-	if idx.excludeProject[strings.ToLower(meta.Project)] || idx.excludeProject[projectShort] {
+	if projectExcluded(idx.excludeProject, meta.Project, projectShort) {
 		return nil
 	}
 	sess := &models.Session{
@@ -479,18 +484,19 @@ func (idx *Indexer) indexFullSession(jsonlPath string, info os.FileInfo) error {
 	assocs := buildAssociations(sess.ID, projectShort, messages)
 	if len(assocs) > 0 {
 		if err := idx.store.InsertAssociationBatch(assocs); err != nil {
-			log.Printf("warn: associations for %s: %v", sess.ID, err)
+			log.Printf("warn: associations for %q: %v", sess.ID, err)
 		}
 	}
 
 	// 8. Update file coverage
 	idx.updateCoverage(projectShort, messages)
 
-	// 9. Archive JSONL
+	// 9. Archive JSONL. The path is client input: quoted, or a name carrying a
+	// newline would end the log line and pass the rest off as its own entry.
 	if idx.archiver != nil {
 		project := projectDirName(jsonlPath)
 		if err := idx.archiver.ArchiveFile(jsonlPath, project); err != nil {
-			log.Printf("warn: archive %s: %v", jsonlPath, err)
+			log.Printf("warn: archive %q: %v", jsonlPath, err)
 		}
 	}
 
@@ -526,7 +532,7 @@ func (idx *Indexer) storePulses(sessionID, projectShort string, msgs []models.Me
 		}
 		exists, err := idx.store.HasPulseForSession(sessionID)
 		if err != nil {
-			log.Printf("warn: pulse dedup check for %s: %v", sessionID, err)
+			log.Printf("warn: pulse dedup check for %q: %v", sessionID, err)
 			continue
 		}
 		if exists {
@@ -543,7 +549,7 @@ func (idx *Indexer) storePulses(sessionID, projectShort string, msgs []models.Me
 			CreatedAt:  msg.Timestamp,
 		})
 		if err != nil {
-			log.Printf("warn: pulse learning for %s: %v", sessionID, err)
+			log.Printf("warn: pulse learning for %q: %v", sessionID, err)
 		}
 	}
 }
@@ -568,7 +574,7 @@ func (idx *Indexer) IndexAllWithProgress(projectsDir string, progressFn Progress
 	for _, jsonlPath := range jsonlFiles {
 		did, indexErr := idx.tryIndexFile(jsonlPath)
 		if indexErr != nil {
-			log.Printf("warn: index %s: %v", jsonlPath, indexErr)
+			log.Printf("warn: index %q: %v", jsonlPath, indexErr)
 		}
 		if did {
 			indexed++
@@ -589,10 +595,11 @@ func (idx *Indexer) collectSessionFiles(root string) ([]string, error) {
 		return nil, fmt.Errorf("stat sessions dir: %w", err)
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("sessions path is not a directory: %s", root)
+		return nil, fmt.Errorf("sessions path is not a directory: %q", root)
 	}
 
 	var jsonlFiles []string
+	links, firstLink := 0, ""
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -604,6 +611,17 @@ func (idx *Indexer) collectSessionFiles(root string) ([]string, error) {
 			}
 			return nil
 		}
+		// The type arrives with the directory entry, so a symlink is excluded
+		// in the same read that names it. Session files are read by path, so a
+		// link would otherwise index a file from outside the sessions tree
+		// (YM-277).
+		if d.Type()&os.ModeSymlink != 0 {
+			links++
+			if firstLink == "" {
+				firstLink = path
+			}
+			return nil
+		}
 		if filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
@@ -612,6 +630,9 @@ func (idx *Indexer) collectSessionFiles(root string) ([]string, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan sessions dir: %w", err)
+	}
+	if links > 0 {
+		log.Printf("warn: skipped %d symlink(s) in the sessions tree (first: %q)", links, firstLink)
 	}
 	sort.Strings(jsonlFiles)
 	return jsonlFiles, nil

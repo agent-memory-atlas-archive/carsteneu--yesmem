@@ -66,10 +66,30 @@ func headerTime(h http.Header, key string) time.Time {
 	return t
 }
 
+// RateLimitMaxAge bounds how long a persisted snapshot may drive a throttle
+// decision. A snapshot only refreshes through traffic that passes the proxy, so
+// an old value describes a window that has moved on: throttling on it would
+// block exactly the calls that would refresh it, and the block would never lift.
+const RateLimitMaxAge = time.Hour
+
+// Stale reports whether the snapshot is too old to describe the current window.
+// A snapshot without ParsedAt, or one dated more than RateLimitMaxAge in the
+// future (clock jump, hand-edited row), is stale by definition; the symmetric
+// tolerance keeps a small clock skew between writer and reader from discarding a
+// fresh snapshot.
+func (rl *RateLimitInfo) Stale(now time.Time) bool {
+	if rl.ParsedAt.IsZero() {
+		return true
+	}
+	age := now.Sub(rl.ParsedAt)
+	return age > RateLimitMaxAge || age < -RateLimitMaxAge
+}
+
 // ShouldThrottle returns true if current utilization exceeds the threshold.
 // Fallback chain: subscription unified-5h → API-key tokens → false (unknown).
+// A snapshot older than RateLimitMaxAge never throttles.
 func (rl *RateLimitInfo) ShouldThrottle(threshold float64) bool {
-	if rl.ParsedAt.IsZero() {
+	if rl.Stale(time.Now()) {
 		return false
 	}
 	return rl.Utilization() > threshold

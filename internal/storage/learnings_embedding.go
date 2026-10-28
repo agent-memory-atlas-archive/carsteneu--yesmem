@@ -42,7 +42,7 @@ func (s *Store) GetPendingLearningsForEmbedding(limit int) ([]models.Learning, e
 		COALESCE(attribution, ''),
 		COALESCE(staleness_score, 0.0), COALESCE(staleness_reason, ''), staleness_checked_at, COALESCE(staleness_type, ''), COALESCE(code_fingerprint, ''), COALESCE(project_source, '')
 		FROM learnings
-		WHERE (expires_at IS NULL OR expires_at > ?)
+		WHERE (expires_at IS NULL OR julianday(expires_at) > julianday(?))
 		AND embedding_vector IS NULL
 		ORDER BY created_at ASC`
 	args := []any{fmtTime(time.Now())}
@@ -113,7 +113,7 @@ func (s *Store) SaveEmbeddingVectors(results []EmbeddingResult) error {
 // LoadEmbeddingVectors returns all active learnings with stored vectors.
 // Used by the daemon to populate the in-memory VectorStore from SQLite.
 func (s *Store) LoadEmbeddingVectors() ([]EmbeddingResult, error) {
-	rows, err := s.readerDB().Query(`SELECT id, embedding_vector FROM learnings WHERE embedding_vector IS NOT NULL AND superseded_by IS NULL AND quarantined_at IS NULL`)
+	rows, err := s.readerDB().Query(`SELECT id, embedding_vector FROM learnings WHERE embedding_vector IS NOT NULL AND ` + models.RecallableLearningSQL)
 	if err != nil {
 		return nil, err
 	}

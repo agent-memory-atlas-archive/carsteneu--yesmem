@@ -2,6 +2,7 @@ package extraction
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -121,5 +122,54 @@ func TestSanitizingClient_CompleteJSON_ErrorPathSanitizesOutput(t *testing.T) {
 	}
 	if !strings.Contains(out, "[REDACTED:anthropic_api_key]") {
 		t.Fatalf("expected marker in error-path JSON output, got %q", out)
+	}
+}
+
+func TestSanitizingClient_Complete_ErrorTextIsSanitized(t *testing.T) {
+	spy := &spyLLMClient{errReturn: errors.New("cli exit 1: api_key=abc123def456ghi789jkl012mno")}
+	wrapped := NewSanitizingClient(spy, sanitize.NewSecretRedactor(nil))
+
+	_, err := wrapped.Complete("sys", "user")
+	if err == nil {
+		t.Fatal("expected error from inner client")
+	}
+	if strings.Contains(err.Error(), "abc123def456ghi789jkl012mno") {
+		t.Fatalf("error text leaked a secret: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED:generic_api_key]") {
+		t.Fatalf("expected the marker in the error text, got %v", err)
+	}
+}
+
+func TestSanitizingClient_CompleteJSON_ErrorTextIsSanitized(t *testing.T) {
+	spy := &spyLLMClient{errReturn: errors.New("cli stderr: " + leakedKey)}
+	wrapped := NewSanitizingClient(spy, sanitize.NewSecretRedactor(nil))
+
+	_, err := wrapped.CompleteJSON("sys", "user", map[string]any{"type": "object"})
+	if err == nil {
+		t.Fatal("expected error from inner client")
+	}
+	if strings.Contains(err.Error(), leakedKey) {
+		t.Fatalf("error text leaked a secret: %v", err)
+	}
+}
+
+func TestSanitizingClient_RedactedErrorKeepsChainWithoutRawText(t *testing.T) {
+	sentinel := errors.New("budget exceeded")
+	spy := &spyLLMClient{errReturn: fmt.Errorf("cli said api_key=abc123def456ghi789jkl012mno: %w", sentinel)}
+	wrapped := NewSanitizingClient(spy, sanitize.NewSecretRedactor(nil))
+
+	_, err := wrapped.Complete("sys", "user")
+	if err == nil {
+		t.Fatal("expected error from inner client")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatal("errors.Is must still reach the sentinel the inner error wraps")
+	}
+	if errors.Unwrap(err) != nil {
+		t.Fatal("errors.Unwrap must not hand out the unredacted error")
+	}
+	if strings.Contains(err.Error(), "abc123def456ghi789jkl012mno") {
+		t.Fatalf("error text leaked a secret: %v", err)
 	}
 }

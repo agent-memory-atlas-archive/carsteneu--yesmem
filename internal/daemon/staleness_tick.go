@@ -14,7 +14,7 @@ import (
 // projectsDir and evaluates whether new commits stale any learnings via the
 // existing evaluateStaleness LLM pipeline.
 func startStalenessTick(ctx context.Context, handler *Handler, projectsDir string) {
-	if handler.CommitEvalClient == nil {
+	if handler.commitEvalLLM() == nil {
 		log.Printf("[staleness-tick] no commit eval client, skipping")
 		return
 	}

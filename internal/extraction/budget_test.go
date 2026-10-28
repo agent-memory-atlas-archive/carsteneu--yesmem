@@ -3,6 +3,8 @@ package extraction
 import (
 	"strings"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/sanitize"
 )
 
 // mockLLM implements LLMClient for testing.
@@ -20,6 +22,38 @@ func (m *mockLLM) Complete(system, userMsg string, opts ...CallOption) (string, 
 func (m *mockLLM) CompleteJSON(system, userMsg string, schema map[string]any, opts ...CallOption) (string, error) {
 	m.calls++
 	return `{"ok":true}`, nil
+}
+
+// SanitizingClient is documented as the OUTERMOST decorator, so the budget
+// helpers meet it in front of the GatedClient->BudgetClient chain they assert
+// on. Without looking through it they fall through to "unlimited" and the gate
+// they exist for stops gating.
+func TestHasBudget_LooksThroughSanitizingClient(t *testing.T) {
+	tracker := NewBudgetTracker(1.00)
+	bc := NewBudgetClient(&mockLLM{model: "claude-haiku-4-5-20251001"}, tracker)
+	wrapped := NewSanitizingClient(bc, sanitize.NewSecretRedactor(nil))
+
+	tracker.mu.Lock()
+	tracker.spentUSD = 0.75 // $0.25 left, below the $0.50 reserve
+	tracker.mu.Unlock()
+
+	if HasBudget(wrapped) {
+		t.Error("HasBudget must see the budget client behind the sanitiser")
+	}
+}
+
+func TestCheckBudget_LooksThroughSanitizingClient(t *testing.T) {
+	tracker := NewBudgetTracker(1.00)
+	bc := NewBudgetClient(&mockLLM{model: "claude-haiku-4-5-20251001"}, tracker)
+	wrapped := NewSanitizingClient(bc, sanitize.NewSecretRedactor(nil))
+
+	tracker.mu.Lock()
+	tracker.spentUSD = 1.00
+	tracker.mu.Unlock()
+
+	if err := CheckBudget(wrapped); err == nil {
+		t.Error("CheckBudget must see the exhausted budget behind the sanitiser")
+	}
 }
 
 func TestBudgetClient_ThrottleBlocks(t *testing.T) {

@@ -1,4 +1,4 @@
-## MCP Tools Reference (70 tools)
+## MCP Tools Reference (73 tools)
 
 All tools registered in `internal/mcp/server.go:registerTools()`. Budget ceiling: `server_budget_test.go` enforces max 60K chars for tool descriptions (raised from 31K in 2026-07 to accommodate informative Use-Cue descriptions). No deprecated tool name forwarding exists — superseded names (e.g. `schedule_create`) were removed, not aliased.
 
@@ -135,7 +135,7 @@ Large results (>30K chars) include `_meta.anthropic/maxResultSizeChars` for trun
 ### Navigation Dismissal
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `dismiss_code_nav` | `session_id` | Dismiss a code-navigation suggestion for this session. Use when the code-nav hook blocks a shell tool but you need shell access. After 5 dismissals per session, suggestions stop until next session. |
+| `dismiss_code_nav` | `session_id` | Dismiss a code-navigation suggestion for this session. Use when the code-nav hook blocks a shell tool but you need shell access. One call lifts the block for the rest of the session. |
 | `dismiss_repl_pattern` | `project`, `shape_hash` | Dismiss a recorded REPL command pattern from future cap-suggestion analysis. Use when a suggested pattern is a false positive. Resets the pattern's count to 0. At 3 dismissals the pattern is flagged permanently ignored. |
 
 ---

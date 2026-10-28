@@ -141,11 +141,11 @@ func PersonaExtractionSchema() map[string]any {
 	newTraitItem := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"dimension":  map[string]any{"type": "string"},
-			"trait_key":  map[string]any{"type": "string"},
+			"dimension":   map[string]any{"type": "string"},
+			"trait_key":   map[string]any{"type": "string"},
 			"trait_value": map[string]any{"type": "string"},
-			"confidence": map[string]any{"type": "number"},
-			"evidence":   map[string]any{"type": "string"},
+			"confidence":  map[string]any{"type": "number"},
+			"evidence":    map[string]any{"type": "string"},
 		},
 		"required":             []string{"dimension", "trait_key", "trait_value", "confidence", "evidence"},
 		"additionalProperties": false,

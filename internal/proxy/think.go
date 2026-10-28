@@ -3,8 +3,8 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
+	"github.com/carsteneu/yesmem/internal/channeltext"
 	"github.com/carsteneu/yesmem/internal/hints"
 )
 
@@ -56,7 +56,7 @@ func (s *Server) buildThinkReminder(threadID string, sessionID string, nonClaude
 
 	reminder := "<system-reminder>\n"
 	if nonClaude {
-		reminder += "MANDATORY! YOU MUST hybrid_search() before relying on memory. " + hints.NextTimestampHint() + "\n"
+		reminder += "MANDATORY! YOU MUST hybrid_search() before relying on memory.\n"
 	} else {
 		reminder += "Before acting — do you already know something about this? Use hybrid_search() to check your memory first.\n"
 		reminder += "Do not repeat memory lookups for the same question unless a new concrete hypothesis appears.\n"
@@ -78,22 +78,27 @@ func (s *Server) buildThinkReminder(threadID string, sessionID string, nonClaude
 // infinite ACK loops (86 spurious messages observed in production).
 // msgType controls the reply behaviour: ack/status suppress replies entirely,
 // response only replies when open questions remain, command (default) replies normally.
-func buildChannelDirective(lastSender, msgType string) string {
-	if msgType == "" {
-		msgType = "command"
-	}
+//
+// The reply target is named as a placeholder, never as the address: the sender
+// is caller-supplied, and a caller-supplied string must not become part of an
+// instruction that another agent executes. The daemon's own channel text
+// (send_opencode.go channelPromptDirective) makes the same choice — a quote in
+// an interpolated label is enough to close the target and open a new
+// instruction. The header line above the directive still names the sender,
+// flattened and bounded.
+func buildChannelDirective(msgType string) string {
 	switch msgType {
 	case "ack", "status":
 		return "\n\nDIRECTIVE: Message is an acknowledgement/status update. Do NOT reply — no action needed."
 	case "response":
-		return fmt.Sprintf("\n\nDIRECTIVE: Result/response received."+
-			"\n1. Process the response."+
-			"\n2. Only reply if open questions remain: send_to(target='%s', content='...', msg_type='command')"+
-			"\n3. If no open questions: continue working, do NOT reply with ack.", lastSender)
-	default: // "command"
-		return fmt.Sprintf("\n\nDIREKTIVE: Die Nachrichten stehen DIREKT OBEN in diesem Block — NICHT in der Datenbank suchen."+
-			"\n1. Verarbeite die Nachrichten die du gerade gelesen hast."+
-			"\n2. Zum Antworten: send_to(target='%s', content='...', msg_type='response')", lastSender)
+		return "\n\nDIRECTIVE: Result/response received." +
+			"\n1. Process the response." +
+			"\n2. Only reply if open questions remain: send_to(target='<the sender of the message above>', content='...', msg_type='command')" +
+			"\n3. If no open questions: continue working, do NOT reply with ack."
+	default: // "command", and anything the caller invented
+		return "\n\nDIREKTIVE: Die Nachrichten stehen DIREKT OBEN in diesem Block — NICHT in der Datenbank suchen." +
+			"\n1. Verarbeite die Nachrichten die du gerade gelesen hast." +
+			"\n2. Zum Antworten: send_to(target='<Absender der Nachricht oben>', content='...', msg_type='response')"
 	}
 }
 
@@ -104,6 +109,40 @@ type dialogResult struct {
 	HasUnread bool   // Whether there were unread messages to mark
 }
 
+// channelMessageLine renders one channel message for injection, the way the
+// receiving agent sees it. The header carries the sender and the message type
+// because the metadata of an injected turn is not rendered by every client.
+// Sender and type are caller-supplied and go through channeltext for the
+// header; the body goes through channeltext as well, which opens escaped
+// newlines but keeps the body from adding a header line of its own.
+func channelMessageLine(sender, msgType, content string) string {
+	return fmt.Sprintf("\n📨 Von %s [%s]:\n%s", channeltext.SenderLabel(sender), channeltext.MessageType(msgType), channeltext.Body(content))
+}
+
+// broadcastEntry is one broadcast as the daemon hands it to the proxy.
+type broadcastEntry struct {
+	SenderShort string `json:"sender_short"`
+	Content     string `json:"content"`
+}
+
+// broadcastLines renders the broadcast block of an injected turn. The content
+// goes through channeltext.Neutralise: a broadcast lands in the same turn as a
+// channel message, so it must not be able to open a header line of its own —
+// but unlike a channel body it is rendered as written, so escaped sequences are
+// left alone. The sender label is bounded and flattened, the content is cut at
+// a readable width.
+func broadcastLines(msgs []broadcastEntry) string {
+	out := "\n\n📢 BROADCAST:"
+	for _, m := range msgs {
+		content := m.Content
+		if len(content) > 200 {
+			content = content[:200] + "…"
+		}
+		out += fmt.Sprintf("\n   [%s]: %s", channeltext.SenderLabel(m.SenderShort), channeltext.Neutralise(content))
+	}
+	return out
+}
+
 // checkDialogMessages uses threadID directly as session_id (they are the same now),
 // then checks for channel messages. Caller must call markDialogRead() after successful injection.
 func (s *Server) checkDialogMessages(threadID, project string) dialogResult {
@@ -112,7 +151,10 @@ func (s *Server) checkDialogMessages(threadID, project string) dialogResult {
 		return dialogResult{}
 	}
 	if s.logger != nil {
-		s.logger.Printf("[channel] sid=%s", sessionID[:8])
+		// sessionID is client text (a body-carried metadata.user_id reaches this
+		// unchanged), so the preview goes through journalToken like every other
+		// id in a journal line.
+		s.logger.Printf("[channel] sid=%.8s", journalToken(sessionID))
 	}
 
 	var extra string
@@ -129,34 +171,22 @@ func (s *Server) checkDialogMessages(threadID, project string) dialogResult {
 		}
 		if json.Unmarshal(msgResult, &msgs) == nil && len(msgs.Messages) > 0 {
 			hasUnread = true
-			var lastSender, lastMsgType string
+			var lastMsgType string
 			for _, m := range msgs.Messages {
-				lastSender = m.Sender
 				lastMsgType = m.MsgType
-				content := strings.ReplaceAll(m.Content, "\\n", "\n")
-				extra += fmt.Sprintf("\n📨 Von %s [%s]:\n%s", m.Sender, m.MsgType, content)
+				extra += channelMessageLine(m.Sender, m.MsgType, m.Content)
 			}
-			extra += buildChannelDirective(lastSender, lastMsgType)
+			extra += buildChannelDirective(lastMsgType)
 		}
 	}
 
 	// Check broadcasts (keep existing)
 	if bcResult, err := s.queryDaemon("check_broadcasts", map[string]any{"session_id": sessionID, "project": project}); err == nil {
 		var bcs struct {
-			Messages []struct {
-				SenderShort string `json:"sender_short"`
-				Content     string `json:"content"`
-			} `json:"messages"`
+			Messages []broadcastEntry `json:"messages"`
 		}
 		if json.Unmarshal(bcResult, &bcs) == nil && len(bcs.Messages) > 0 {
-			extra += "\n\n📢 BROADCAST:"
-			for _, m := range bcs.Messages {
-				content := m.Content
-				if len(content) > 200 {
-					content = content[:200] + "…"
-				}
-				extra += fmt.Sprintf("\n   [%s]: %s", m.SenderShort, content)
-			}
+			extra += broadcastLines(bcs.Messages)
 		}
 	}
 
@@ -165,6 +195,17 @@ func (s *Server) checkDialogMessages(threadID, project string) dialogResult {
 		SessionID: sessionID,
 		HasUnread: hasUnread,
 	}
+}
+
+// loadChannelContent returns the channel messages and broadcasts a session has
+// not seen. channelLoader is a test-only seam; production runs the same
+// check_channel/check_broadcasts lookup the Anthropic path performs in
+// checkDialogMessages (proxy.go, dialog injection).
+func (s *Server) loadChannelContent(threadID, project string) dialogResult {
+	if s.channelLoader != nil {
+		return s.channelLoader(threadID, project)
+	}
+	return s.checkDialogMessages(threadID, project)
 }
 
 // markDialogRead marks channel messages as read after successful injection.

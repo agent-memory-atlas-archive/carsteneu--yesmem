@@ -6,7 +6,7 @@ import (
 )
 
 func TestIncrementTurnCount_CreatesNew(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	count, err := s.IncrementTurnCount("testproject")
@@ -19,7 +19,7 @@ func TestIncrementTurnCount_CreatesNew(t *testing.T) {
 }
 
 func TestIncrementTurnCount_Increments(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	s.IncrementTurnCount("proj")
@@ -34,7 +34,7 @@ func TestIncrementTurnCount_Increments(t *testing.T) {
 }
 
 func TestGetTurnCount_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	count, err := s.GetTurnCount("nonexistent")
@@ -47,7 +47,7 @@ func TestGetTurnCount_NotFound(t *testing.T) {
 }
 
 func TestGetTurnCount_AfterIncrement(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	s.IncrementTurnCount("proj")
@@ -63,7 +63,7 @@ func TestGetTurnCount_AfterIncrement(t *testing.T) {
 }
 
 func TestGetTurnCountsBulk(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	s.IncrementTurnCount("a")
@@ -86,7 +86,7 @@ func TestGetTurnCountsBulk(t *testing.T) {
 }
 
 func TestGetTurnCountsBulk_Empty(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	counts, err := s.GetTurnCountsBulk(nil)
@@ -99,7 +99,7 @@ func TestGetTurnCountsBulk_Empty(t *testing.T) {
 }
 
 func TestIncrementTurnCount_Concurrent(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	var wg sync.WaitGroup
@@ -122,7 +122,7 @@ func TestIncrementTurnCount_Concurrent(t *testing.T) {
 }
 
 func TestIncrementTurnCount_MultipleProjects(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	s.IncrementTurnCount("proj-a")

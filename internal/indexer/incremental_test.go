@@ -1104,3 +1104,50 @@ func TestIndexSessionAppendIgnoresIndexStateOfMissingFile(t *testing.T) {
 		t.Error("the index_state row of the missing file survived, so the session keeps a claim that holds nothing")
 	}
 }
+
+// The exclusion list is stored lowercased, so every lookup against it has to
+// lowercase its operand as well. The append path compares the stored
+// session's project_short, a value the indexer does not derive itself: a row
+// written from a moved or case-insensitively created project can differ in case
+// from the configured entry, and a case-sensitive lookup would index the
+// excluded project's tail.
+func TestIndexSessionAppendMatchesShortProjectFormCaseInsensitively(t *testing.T) {
+	store, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	const excluded = "/proj/shorthit"
+	idx := New(store, bloom.New(), archive.New(filepath.Join(t.TempDir(), "archive")), []string{excluded})
+
+	dir := t.TempDir()
+	const sessionID = "s-case"
+	line1 := incLine(sessionID, "user", "first kept line", "2026-10-14T10:00:01Z")
+	line2 := incLine(sessionID, "assistant", "tail of an excluded project", "2026-10-14T10:00:02Z")
+	path := writeSessionFile(t, dir, "case.jsonl", line1)
+	if err := idx.IndexSession(path); err != nil {
+		t.Fatalf("initial index: %v", err)
+	}
+
+	// The stored row carries the excluded project only in its short form, and
+	// with the case of the configured entry flipped. Written directly:
+	// UpsertSession derives project_short from project, so a row whose two
+	// spellings disagree (a moved project, an older writer) cannot be produced
+	// through the regular path.
+	if _, err := store.DB().Exec(
+		`UPDATE sessions SET project = ?, project_short = ? WHERE id = ?`,
+		"/proj/other", "/PROJ/SHORTHIT", sessionID,
+	); err != nil {
+		t.Fatalf("reseed session: %v", err)
+	}
+
+	writeSessionFile(t, dir, "case.jsonl", line1+line2)
+	if err := idx.IndexSession(path); err != nil {
+		t.Fatalf("append index: %v", err)
+	}
+
+	if got := sessionSnapshot(t, store, sessionID); len(got) != 1 {
+		t.Errorf("append of an excluded project: got %d messages, want 1 (the excluded tail was indexed)", len(got))
+	}
+}

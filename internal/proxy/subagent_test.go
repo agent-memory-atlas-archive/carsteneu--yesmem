@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -10,7 +11,7 @@ import (
 // Helper: build a request map with thinking field (main session)
 func mainSessionReq() map[string]any {
 	return map[string]any{
-		"model":   "claude-opus-4-6",
+		"model":    "claude-opus-4-6",
 		"thinking": map[string]any{"type": "adaptive"},
 		"system": []any{
 			map[string]any{"text": "x-anthropic-billing-header: cc_version=2.1.88.cfc; cc_entrypoint=cli; cch=00000;"},
@@ -18,34 +19,26 @@ func mainSessionReq() map[string]any {
 	}
 }
 
-// Helper: build a request map without thinking (subagent)
-func subagentReq() map[string]any {
-	return map[string]any{
-		"model":       "claude-opus-4-6",
-		"temperature": 1.0,
-		"system": []any{
-			map[string]any{"text": "x-anthropic-billing-header: cc_version=2.1.88.516; cc_entrypoint=cli; cch=00000;"},
-		},
-	}
-}
+// All cases go through isSubagentRequest, the function the handlers use, so a
+// client without a billing header and without thinking is tested as what it is:
+// a main session (see sawtooth_los26b_test.go, YM-263).
 
-func TestIsSubagent_NoThinking(t *testing.T) {
+func TestIsSubagentRequest_NoThinkingNoMarker(t *testing.T) {
 	msgs := buildLargeMessages(30)
-	req := subagentReq()
-	if !isSubagent(msgs, req) {
-		t.Error("request without thinking field should be detected as subagent")
+	req := map[string]any{"model": "claude-opus-4-6", "temperature": 1.0}
+	if !isSubagentRequest(http.Header{}, msgs, req) {
+		t.Error("unmarked request without thinking should be detected as subagent")
 	}
 }
 
-func TestIsSubagent_WithThinking(t *testing.T) {
+func TestIsSubagentRequest_WithThinking(t *testing.T) {
 	msgs := buildLargeMessages(1)
-	req := mainSessionReq()
-	if isSubagent(msgs, req) {
+	if isSubagentRequest(http.Header{}, msgs, mainSessionReq()) {
 		t.Error("request with thinking field should NOT be detected as subagent")
 	}
 }
 
-func TestIsSubagent_SdkTsEntrypoint(t *testing.T) {
+func TestIsSubagentRequest_SdkTsEntrypoint(t *testing.T) {
 	msgs := buildLargeMessages(5)
 	req := map[string]any{
 		"thinking": map[string]any{"type": "adaptive"},
@@ -53,12 +46,12 @@ func TestIsSubagent_SdkTsEntrypoint(t *testing.T) {
 			map[string]any{"text": "x-anthropic-billing-header: cc_entrypoint=sdk-ts;"},
 		},
 	}
-	if !isSubagent(msgs, req) {
+	if !isSubagentRequest(http.Header{}, msgs, req) {
 		t.Error("sdk-ts entrypoint should be detected as subagent regardless of thinking")
 	}
 }
 
-func TestIsSubagent_HaikuModel(t *testing.T) {
+func TestIsSubagentRequest_HaikuModel(t *testing.T) {
 	msgs := buildLargeMessages(5)
 	req := map[string]any{
 		"model": "claude-haiku-4-5-20251001",
@@ -66,12 +59,12 @@ func TestIsSubagent_HaikuModel(t *testing.T) {
 			map[string]any{"text": "x-anthropic-billing-header: cc_entrypoint=cli;"},
 		},
 	}
-	if !isSubagent(msgs, req) {
+	if !isSubagentRequest(http.Header{}, msgs, req) {
 		t.Error("haiku model should be detected as subagent")
 	}
 }
 
-func TestIsSubagent_CLIWithThinking(t *testing.T) {
+func TestIsSubagentRequest_CLIWithThinking(t *testing.T) {
 	msgs := buildLargeMessages(200)
 	req := map[string]any{
 		"thinking": map[string]any{"type": "adaptive"},
@@ -79,16 +72,16 @@ func TestIsSubagent_CLIWithThinking(t *testing.T) {
 			map[string]any{"text": "x-anthropic-billing-header: cc_entrypoint=cli;"},
 		},
 	}
-	if isSubagent(msgs, req) {
+	if isSubagentRequest(http.Header{}, msgs, req) {
 		t.Error("CLI session with thinking should NOT be subagent")
 	}
 }
 
-func TestIsSubagent_EmptyMessages(t *testing.T) {
-	if isSubagent(nil, nil) {
+func TestIsSubagentRequest_EmptyMessages(t *testing.T) {
+	if isSubagentRequest(http.Header{}, nil, nil) {
 		t.Error("nil messages should not be subagent")
 	}
-	if isSubagent([]any{}, mainSessionReq()) {
+	if isSubagentRequest(http.Header{}, []any{}, mainSessionReq()) {
 		t.Error("empty messages should not be subagent")
 	}
 }

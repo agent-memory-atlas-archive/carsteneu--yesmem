@@ -6,21 +6,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
-	"github.com/carsteneu/yesmem/internal/storage"
 )
-
-func mustHandler(t *testing.T) (*Handler, *storage.Store) {
-	t.Helper()
-	s, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	h := NewHandler(s, nil)
-	h.dataDir = t.TempDir()
-	h.disableAgentProcesses = true
-	return h, s
-}
 
 func TestHandleSetPersona(t *testing.T) {
 	h, s := mustHandler(t)
@@ -300,5 +286,65 @@ func TestHandleGetPersonaEmpty(t *testing.T) {
 	directive, _ := result["directive"].(string)
 	if directive != "" {
 		t.Errorf("directive should be empty, got %q", directive)
+	}
+}
+
+// YM-119: set_persona must only accept the six documented dimensions.
+func TestHandleSetPersonaRejectsInvalidDimension(t *testing.T) {
+	tests := []struct {
+		name   string
+		params map[string]any
+	}{
+		{
+			name:   "unknown dimension word",
+			params: map[string]any{"trait_key": "language", "value": "de", "dimension": "general"},
+		},
+		{
+			name:   "dimension with space",
+			params: map[string]any{"trait_key": "commit_style", "value": "atomic", "dimension": "workflow preference"},
+		},
+		{
+			name:   "auto-detected unknown key falls back to general",
+			params: map[string]any{"trait_key": "totally_unknown_key", "value": "x"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, s := mustHandler(t)
+
+			resp := h.Handle(Request{Method: "set_persona", Params: tt.params})
+			if resp.Error == "" {
+				t.Fatalf("expected error for %v, got success", tt.params)
+			}
+
+			// Nothing may be stored under an undocumented dimension.
+			traitKey, _ := tt.params["trait_key"].(string)
+			dimension, _ := tt.params["dimension"].(string)
+			if dimension == "" {
+				dimension = autoDetectDimension(traitKey)
+			}
+			stored, _ := s.GetPersonaTrait("default", dimension, traitKey)
+			if stored != nil {
+				t.Errorf("trait %s.%s must not be stored with an undocumented dimension", dimension, traitKey)
+			}
+		})
+	}
+}
+
+// YM-119 boundary: all six documented dimensions are still accepted.
+func TestHandleSetPersonaAcceptsDocumentedDimensions(t *testing.T) {
+	for _, dim := range []string{"communication", "workflow", "expertise", "context", "boundaries", "learning_style"} {
+		t.Run(dim, func(t *testing.T) {
+			h, _ := mustHandler(t)
+
+			resp := h.Handle(Request{
+				Method: "set_persona",
+				Params: map[string]any{"trait_key": "custom_key", "value": "v", "dimension": dim},
+			})
+			if resp.Error != "" {
+				t.Fatalf("dimension %q should be accepted: %s", dim, resp.Error)
+			}
+		})
 	}
 }

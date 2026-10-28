@@ -103,7 +103,7 @@ func cbmOrphanedDBs(cacheDir string, now time.Time, bin string) ([]CBMGCFinding,
 		findings = append(findings, CBMGCFinding{
 			Path:      filepath.Join(cacheDir, name),
 			SizeBytes: info.Size(),
-			Reason:    "orphaned worktree index (registered root " + rootPath + " no longer exists)",
+			Reason:    "orphaned worktree index (registered root " + quoteForeignText(rootPath) + " no longer exists)",
 		})
 		findings = append(findings, suffixFindings(cacheDir, name)...)
 		// stage leftovers: <slug>.db.stage.<rand>
@@ -131,16 +131,20 @@ func cbmIndexRootPath(bin, project string) string {
 	if bin == "" {
 		return ""
 	}
+	if !cbmProjectArgOK(project) {
+		log.Printf("cbm-gc: refusing unusable project name %q (flag-shaped cache name?)", project)
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "cli", "index_status", "--project", project, "--json").Output()
 	if err != nil {
-		log.Printf("cbm-gc: index_status %s: %v", project, err)
+		log.Printf("cbm-gc: index_status %q: %v", project, err)
 		return ""
 	}
 	text, err := parseCBMResponse(out)
 	if err != nil {
-		log.Printf("cbm-gc: index_status %s: %v", project, err)
+		log.Printf("cbm-gc: index_status %q: %v", project, err)
 		return ""
 	}
 	var st struct {
@@ -204,16 +208,16 @@ func resolveExistingSlugPath(slug string) (string, bool) {
 func runCBMGCGated(findings []CBMGCFinding, dryRun bool) {
 	for _, f := range findings {
 		if dryRun {
-			log.Printf("cbm-gc: dry-run candidate: %s (%s: %s)", f.Path, fmtByteSize(f.SizeBytes), f.Reason)
+			log.Printf("cbm-gc: dry-run candidate: %q (%s: %s)", f.Path, fmtByteSize(f.SizeBytes), f.Reason)
 			continue
 		}
 		if err := os.Remove(f.Path); err != nil {
 			if !os.IsNotExist(err) {
-				log.Printf("cbm-gc: remove %s: %v", f.Path, err)
+				log.Printf("cbm-gc: remove %q: %v", f.Path, err)
 				continue
 			}
 		}
-		log.Printf("cbm-gc: removed %s (%s: %s)", f.Path, fmtByteSize(f.SizeBytes), f.Reason)
+		log.Printf("cbm-gc: removed %q (%s: %s)", f.Path, fmtByteSize(f.SizeBytes), f.Reason)
 	}
 }
 

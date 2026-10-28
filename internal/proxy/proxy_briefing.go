@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // briefingData holds both briefing text and code map from a single daemon RPC call.
@@ -128,10 +130,25 @@ func (s *Server) loadBriefing(project, projectDir, threadID string) briefingData
 		s.logger.Printf("[briefing] skipped: no project name")
 		return briefingData{}
 	}
-	result, err := s.queryDaemon("generate_briefing", map[string]any{
+	params := map[string]any{
 		"project":     daemonProject(project, projectDir),
 		"project_dir": projectDir,
-	})
+		// Same key the proxy registers in register_pid (anthropicThreadID):
+		// the daemon resolves agent rows and the source_agent profile from it.
+		"session_id": threadID,
+	}
+	// The messages path never calls register_pid (only the OpenAI paths do), so
+	// the daemon gets the agent kind here. opencode thread ids carry the
+	// "opencode:" prefix that anthropicThreadID builds; a codex client speaks the
+	// OpenAI wire but its briefing is loaded through the same helper, and a
+	// wrong label makes the briefing address the user as Claude.
+	switch {
+	case strings.HasPrefix(threadID, "opencode:"):
+		params["source_agent"] = models.SourceAgentOpencode
+	case strings.HasPrefix(threadID, "codex:"):
+		params["source_agent"] = models.SourceAgentCodex
+	}
+	result, err := s.queryDaemon("generate_briefing", params)
 	if err != nil {
 		s.logger.Printf("%s[briefing] daemon error: %v%s", colorRed, err, colorReset)
 		return briefingData{}
@@ -156,9 +173,9 @@ func (s *Server) loadBriefing(project, projectDir, threadID string) briefingData
 		composedText = composeBriefingText(resp.Text, s.getNarrative(threadID))
 	}
 	if composedText != "" {
-		s.logger.Printf("[briefing] loaded: %db composed (base %db) + %db code_map for project=%s", len(composedText), len(resp.Text), len(resp.CodeMap), project)
+		s.logger.Printf("[briefing] loaded: %db composed (base %db) + %db code_map for project=%s", len(composedText), len(resp.Text), len(resp.CodeMap), journalToken(project))
 	} else {
-		s.logger.Printf("[briefing] empty response for project=%s", project)
+		s.logger.Printf("[briefing] empty response for project=%s", journalToken(project))
 	}
 	return briefingData{Text: composedText, CodeMap: resp.CodeMap}
 }
@@ -179,7 +196,7 @@ func (s *Server) loadBriefingData(project, projectDir, threadID string) briefing
 func (s *Server) refreshBriefing(threadID, project, projectDir string) {
 	if data := s.loadBriefingData(project, projectDir, threadID); data.Text != "" {
 		s.setCachedBriefing(threadID, project, data.Text, data.CodeMap)
-		s.logger.Printf("[briefing] refreshed during stub-cycle: tid=%s %db text + %db codemap", threadID, len(data.Text), len(data.CodeMap))
+		s.logger.Printf("[briefing] refreshed during stub-cycle: tid=%s %db text + %db codemap", journalToken(threadID), len(data.Text), len(data.CodeMap))
 	}
 }
 
@@ -207,7 +224,7 @@ func (s *Server) injectBriefingTurn(req map[string]any, reqIdx int, proj, thread
 
 	if text == "" {
 		if proj != "" {
-			s.logger.Printf("%s[briefing] WARN: empty briefing for project=%s, injection skipped%s", colorOrange, proj, colorReset)
+			s.logger.Printf("%s[briefing] WARN: empty briefing for project=%s, injection skipped%s", colorOrange, journalToken(proj), colorReset)
 		}
 		return false
 	}
@@ -238,7 +255,7 @@ func (s *Server) injectBriefingTurn(req map[string]any, reqIdx int, proj, thread
 		},
 	}
 	req["messages"] = append(briefingTurns, msgs...)
-	s.logger.Printf("[briefing] injected user/assistant turn: %db for tid=%s", len(text), threadID)
+	s.logger.Printf("[briefing] injected user/assistant turn: %db for tid=%s", len(text), journalToken(threadID))
 	return true
 }
 
@@ -248,7 +265,7 @@ func (s *Server) injectCodeMapTurn(req map[string]any, reqIdx int, proj, threadI
 	_, cm, _ := s.getCachedBriefing(threadID, proj)
 
 	if cm == "" {
-		s.logger.Printf("[codemap] skip: empty for project=%s", proj)
+		s.logger.Printf("[codemap] skip: empty for project=%s", journalToken(proj))
 		return false
 	}
 
@@ -297,7 +314,7 @@ func (s *Server) injectCodeMapTurn(req map[string]any, reqIdx int, proj, threadI
 	newMsgs = append(newMsgs, codeMapTurns...)
 	newMsgs = append(newMsgs, msgs[insertAt:]...)
 	req["messages"] = newMsgs
-	s.logger.Printf("[codemap] injected user/assistant turn: %db for tid=%s", len(cm), threadID)
+	s.logger.Printf("[codemap] injected user/assistant turn: %db for tid=%s", len(cm), journalToken(threadID))
 	return true
 }
 

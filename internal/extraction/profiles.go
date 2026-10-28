@@ -100,12 +100,20 @@ func GenerateProjectProfile(client LLMClient, store *storage.Store, project stri
 		return fmt.Errorf("generate profile for %s: %w", project, err)
 	}
 
+	// The prompt shows at most the newest 20 sessions, but freshness is measured
+	// against the project's real session count. Storing the window size made the
+	// profile look current forever once a project passed 20 sessions (YM-49).
+	totalSessions := len(sessions)
+	if n, err := store.CountProjectSessions(project); err == nil && n > 0 {
+		totalSessions = n
+	}
+
 	profile := &models.ProjectProfile{
 		Project:      project,
 		ProfileText:  response,
 		GeneratedAt:  time.Now(),
 		UpdatedAt:    time.Now(),
-		SessionCount: len(sessions),
+		SessionCount: totalSessions,
 		ModelUsed:    client.Model(),
 	}
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // QueryCluster represents a cluster of semantically similar queries.
@@ -18,11 +20,11 @@ type QueryCluster struct {
 
 // ClusterScore tracks how a learning performs within a specific query cluster.
 type ClusterScore struct {
-	LearningID     int64
-	ClusterID      int64
-	InjectCount    int
-	UseCount       int
-	NoiseCount     int
+	LearningID  int64
+	ClusterID   int64
+	InjectCount int
+	UseCount    int
+	NoiseCount  int
 }
 
 // GetUnclusteredQueries returns query_log entries without a cluster assignment.
@@ -102,16 +104,23 @@ func (s *Store) AssignQueryToCluster(queryLogID, clusterID int64) error {
 	return err
 }
 
-// IncrementClusterScore bumps inject/use/noise count for a learning×cluster pair.
+// IncrementClusterScore bumps the inject/use/noise count for a learning×cluster pair.
+// Those three are the only signals with a column, and the only ones the cluster
+// affinity reads (use/inject, noise/inject). Signals without a column — match,
+// save, fail — are not counted at all rather than booked as injections.
 func (s *Store) IncrementClusterScore(learningID, clusterID int64, field string) error {
-	col := "inject_count"
+	var col string
 	switch field {
+	case "inject":
+		col = "inject_count"
 	case "use":
 		col = "use_count"
 	case "noise":
 		col = "noise_count"
+	case "match", "save", "fail":
+		return nil
 	default:
-		col = "inject_count"
+		return fmt.Errorf("unknown cluster score field %q", field)
 	}
 	_, err := s.db.Exec(`INSERT INTO learning_cluster_scores (learning_id, cluster_id, `+col+`, last_injected_at)
 		VALUES (?, ?, 1, CURRENT_TIMESTAMP)
@@ -202,9 +211,11 @@ func (s *Store) GetRecentClusterForLearnings(learningIDs []int64) map[int64]int6
 	for _, lid := range learningIDs {
 		idStr := fmt.Sprintf("%d", lid)
 		var clusterID int64
+		// The list is comma-joined, so wrap both sides in commas to match the
+		// whole ID: a plain LIKE '%12%' would also hit learning 1012.
 		err := s.readerDB().QueryRow(
-			"SELECT cluster_id FROM query_log WHERE cluster_id IS NOT NULL AND injected_learning_ids LIKE ? ORDER BY created_at DESC LIMIT 1",
-			"%"+idStr+"%").Scan(&clusterID)
+			"SELECT cluster_id FROM query_log WHERE cluster_id IS NOT NULL AND (',' || injected_learning_ids || ',') LIKE '%,' || ? || ',%' ORDER BY created_at DESC LIMIT 1",
+			idStr).Scan(&clusterID)
 		if err == nil && clusterID > 0 {
 			result[lid] = clusterID
 		}
@@ -213,13 +224,90 @@ func (s *Store) GetRecentClusterForLearnings(learningIDs []int64) map[int64]int6
 }
 
 // QuarantineSession marks all learnings from a session as quarantined.
-// Quarantined learnings are excluded from vector search and BM25 results.
+// Quarantined learnings are excluded from every recall path (briefing, hooks,
+// search, metamemory).
+//
+// Capabilities are exempt. They are tooling, not recall content: their rows are
+// only read to find and run a cap, never injected as context. Crash recovery
+// quarantines a failed agent's whole session automatically, and without this
+// exemption a cap saved from that session would silently stop being executable
+// until someone lifted the quarantine by hand. Deactivation is the lifecycle
+// switch for a cap.
 func (s *Store) QuarantineSession(sessionID string) (int64, error) {
-	res, err := s.db.Exec("UPDATE learnings SET quarantined_at = CURRENT_TIMESTAMP WHERE session_id = ? AND quarantined_at IS NULL", sessionID)
+	return s.QuarantineSessionInProject("", sessionID)
+}
+
+// QuarantineSessionInProject is QuarantineSession with the project the write is
+// meant for.
+//
+// Crash recovery quarantines a failed agent's learnings by the addresses its row
+// carries, and a session id is not unique across projects in the general case — a
+// bare id has no namespace. Matching on the id alone therefore quarantined rows of
+// another project with it (YM-244).
+//
+// An explicit absolute path is matched as a path (see quarantineScope): two
+// repositories that share a folder name are two projects, and the path is what tells
+// them apart. Rows that carry a path are never matched by name. Rows that name no
+// project at all stay in scope — either because they declare nothing (the
+// UnscopedRows contract) or because they carry only a canonical name, which is the
+// one class a path cannot attribute.
+//
+// The trade-off is deliberate: a row whose project names a different path stays
+// outside the scope. Writing a foreign project's rows is the worse error.
+func (s *Store) QuarantineSessionInProject(project, sessionID string) (int64, error) {
+	exact, root, worktrees, wtClaude, canonical, shortSuffix, shortMode := quarantineScope(project)
+	res, err := s.db.Exec(`UPDATE learnings SET quarantined_at = CURRENT_TIMESTAMP
+		WHERE session_id = ? AND quarantined_at IS NULL AND category != 'cap'
+		  AND (
+		       ? = ''
+		    OR project = ?
+		    OR project = ?
+		    OR project LIKE ? ESCAPE '\'
+		    OR project LIKE ? ESCAPE '\'
+		    OR (COALESCE(project, '') = '' AND canonical_project = ?)
+		    OR (? = 1 AND project LIKE ? ESCAPE '\')
+		    OR (COALESCE(project, '') = '' AND COALESCE(canonical_project, '') = '')
+		  )`,
+		sessionID, project, exact, root, worktrees, wtClaude, canonical, shortMode, shortSuffix)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// quarantineScopeInert matches no row: a project path never contains a NUL, and the
+// name clauses are guarded by COALESCE(project, ”) = ”.
+const quarantineScopeInert = "\x00"
+
+// quarantineScope turns the caller's project into the SQL parameters of the scope.
+//
+// An explicit absolute path is matched as a PATH: the path itself, its repository
+// root, and the two worktree layouts under that root. It is deliberately never
+// matched by basename — models.ProjectMatches exists because "suffix/basename caused
+// collisions between distinct repos sharing a folder name", and a path is exactly the
+// information that resolves them (orchestrator probe, YM-244).
+//
+// The basename still matches one class when the caller gave a path: rows that name no
+// project at all and only carry a canonical name. They cannot be attributed to a
+// repository, and dropping them would turn a legitimate quarantine into a silent
+// no-op. A caller that gives only a short name has no better information, so there the
+// last path segment is the scope (with LIKE metacharacters neutralized).
+func quarantineScope(project string) (exact, root, worktrees, wtClaude, canonical, shortSuffix string, shortMode int) {
+	if root := models.RepositoryRoot(project); root != "" {
+		return project, root,
+			likeEscaped(root) + "/.worktrees/%",
+			likeEscaped(root) + "/.claude/worktrees/%",
+			models.CanonicalProject(project), quarantineScopeInert, 0
+	}
+	return project, quarantineScopeInert, quarantineScopeInert, quarantineScopeInert,
+		project, "%/" + likeEscaped(project), 1
+}
+
+// likeEscaped neutralizes the LIKE metacharacters of a value that is matched as a
+// literal pattern part. Project names legitimately contain "_" (a LIKE wildcard),
+// and an unescaped one would match unrelated paths.
+func likeEscaped(v string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(v)
 }
 
 // UnquarantineSession removes quarantine from all learnings of a session.

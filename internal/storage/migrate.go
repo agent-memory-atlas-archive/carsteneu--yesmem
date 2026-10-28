@@ -3,6 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
+	"log"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // MigrateResult holds per-table row counts affected by a project migration.
@@ -35,6 +38,12 @@ func (r *MigrateResult) Total() int64 {
 // Sessions and session_tracking store full paths; all other tables store short names.
 // Both fromPath+toPath AND fromShort+toShort are applied to the correct tables.
 func (s *Store) MigrateProject(fromPath, toPath, fromShort, toShort string) (*MigrateResult, error) {
+	// The cluster key space is built from absolute paths only (YM-424): a target that
+	// names no path has no key, and writing its rows under the empty key would put them
+	// where no reader looks.
+	if models.ClusterProjectKey(toPath) == "" {
+		return nil, fmt.Errorf("target project %q is not an absolute path, so it has no cluster key", toPath)
+	}
 	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -102,12 +111,39 @@ func (s *Store) MigrateProject(fromPath, toPath, fromShort, toShort string) (*Mi
 	}
 	res.Briefings, _ = r.RowsAffected()
 
-	// 8. learning_clusters
-	r, err = tx.Exec(`UPDATE learning_clusters SET project = ? WHERE project = ?`, toShort, fromShort)
-	if err != nil {
-		return nil, fmt.Errorf("learning_clusters: %w", err)
+	// 8. learning_clusters — keyed by the repository root path since YM-273, so the
+	// rename has to move that key as well; the short-name form is kept for rows
+	// that still sit under the old key space. A source that names no path has no key:
+	// the empty key is not "no key at all", it is the key of the unassigned rows, so
+	// it must never be matched here (YM-424 review).
+	if fromKey := models.ClusterProjectKey(fromPath); fromKey != "" {
+		r, err = tx.Exec(`UPDATE learning_clusters SET project = ? WHERE project = ?`,
+			models.ClusterProjectKey(toPath), fromKey)
+		if err != nil {
+			return nil, fmt.Errorf("learning_clusters: %w", err)
+		}
+		res.Clusters, _ = r.RowsAffected()
 	}
-	res.Clusters, _ = r.RowsAffected()
+	if fromShort != "" && fromShort != models.ClusterProjectKey(fromPath) {
+		// The old key space (a bare name) is carried along by the rename so the user's
+		// rows follow the name they asked for. The target is only written when it carries
+		// nothing yet: merging two cluster sets would mix two groupings of one repository.
+		var occupied int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM learning_clusters WHERE project = ?`, toShort).Scan(&occupied); err != nil {
+			return nil, fmt.Errorf("learning_clusters: %w", err)
+		}
+		if occupied > 0 {
+			log.Printf("migrate-project: cluster rows under %q stay, %q already carries its own set", fromShort, toShort)
+		} else {
+			r, err = tx.Exec(`UPDATE learning_clusters SET project = ? WHERE project = ?`, toShort, fromShort)
+			if err != nil {
+				return nil, fmt.Errorf("learning_clusters: %w", err)
+			}
+			if n, err := r.RowsAffected(); err == nil {
+				res.Clusters += n
+			}
+		}
+	}
 
 	// 9. doc_sources (UNIQUE: name, project)
 	tx.Exec(`DELETE FROM doc_sources WHERE project = ? AND name IN (SELECT name FROM doc_sources WHERE project = ?)`, toShort, fromShort)
@@ -169,6 +205,9 @@ func (s *Store) MigrateProject(fromPath, toPath, fromShort, toShort string) (*Mi
 
 // MigrateProjectDryRun returns what MigrateProject would affect without making changes.
 func (s *Store) MigrateProjectDryRun(fromPath, toPath, fromShort, toShort string) (*MigrateResult, error) {
+	if models.ClusterProjectKey(toPath) == "" {
+		return nil, fmt.Errorf("target project %q is not an absolute path, so it has no cluster key", toPath)
+	}
 	var res MigrateResult
 	db := s.readerDB()
 
@@ -188,7 +227,17 @@ func (s *Store) MigrateProjectDryRun(fromPath, toPath, fromShort, toShort string
 	res.Coverage = count("SELECT COUNT(*) FROM file_coverage WHERE project = ?", fromShort)
 	res.ClaudeMD = count("SELECT COUNT(*) FROM claudemd_state WHERE project = ?", fromShort)
 	res.Briefings = count("SELECT COUNT(*) FROM refined_briefings WHERE project = ?", fromShort)
-	res.Clusters = count("SELECT COUNT(*) FROM learning_clusters WHERE project = ?", fromShort)
+	// Cluster rows are keyed by the repository root path since YM-273; rows under
+	// the old short-name key still exist and are counted too. A source that names no
+	// path has no key: counting the empty key would report the unassigned rows as if
+	// the rename would touch them.
+	rootKey := models.ClusterProjectKey(fromPath)
+	if rootKey != "" {
+		res.Clusters = count("SELECT COUNT(*) FROM learning_clusters WHERE project = ?", rootKey)
+	}
+	if fromShort != "" && fromShort != rootKey {
+		res.Clusters += count("SELECT COUNT(*) FROM learning_clusters WHERE project = ?", fromShort)
+	}
 	res.DocSources = count("SELECT COUNT(*) FROM doc_sources WHERE project = ?", fromShort)
 	res.Gaps = count("SELECT COUNT(*) FROM knowledge_gaps WHERE project = ?", fromShort)
 	res.Pins = count("SELECT COUNT(*) FROM pinned_learnings WHERE project = ?", fromShort)

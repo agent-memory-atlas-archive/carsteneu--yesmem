@@ -137,15 +137,20 @@ func TestVerifySubagentEvidence_DuplicateIDs(t *testing.T) {
 	}
 }
 
-func TestVerifySubagentEvidence_InfraErrorSkipsVerification(t *testing.T) {
+// The lookup error is not skipped any more (YM-304): an id the gate could not
+// verify must not count as verified, because the DONE claim rests on that check.
+// The old expectation here was "infra error must not fail the agent"; the closed
+// direction heals itself — the guard unpauses an agent whose scratchpad becomes
+// compliant — while the open one let an unproven review block through.
+func TestVerifySubagentEvidence_InfraErrorFailsVerification(t *testing.T) {
 	withEvidenceRows(t, evidenceFixtureRows())
 	orig := queryOpencodeSession
 	queryOpencodeSession = func(dbPath, sessionID string) (bool, string, string, error) {
 		return false, "", "", context.DeadlineExceeded
 	}
 	t.Cleanup(func() { queryOpencodeSession = orig })
-	if errs := VerifySubagentEvidence(evidenceDBPath(t), "ses_parent", evidenceFixtureEvidence()); len(errs) != 0 {
-		t.Fatalf("infra error must skip verification (not fail the agent), got: %v", errs)
+	if errs := VerifySubagentEvidence(evidenceDBPath(t), "ses_parent", evidenceFixtureEvidence()); len(errs) == 0 {
+		t.Fatal("a failed lookup was accepted as verified, want a finding per unverifiable key")
 	}
 }
 
@@ -196,5 +201,53 @@ func TestVerifySubagentEvidence_AgainstSQLite(t *testing.T) {
 	errs := VerifySubagentEvidence(dbPath, "ses_parent", evidence)
 	if len(errs) != 1 || errs[0].Field != "security" {
 		t.Fatalf("expected 1 error for security, got: %v", errs)
+	}
+}
+
+// TestVerifySubagentEvidence_AgainstSQLiteV2 is the regression guard for the
+// v2 schema drift: the production opencode.db carries BOTH tables — the legacy
+// `session` table (frozen, last written by 1.x) and `session_v2` (current) —
+// and v2 subagent sessions exist only in `session_v2`. Because evidence
+// verification only runs once the agent's own session id was captured, fixing
+// the capture without this fallback would make the DONE-guard reject every v2
+// agent's Phase 5 block with "not found in opencode.db".
+func TestVerifySubagentEvidence_AgainstSQLiteV2(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not available")
+	}
+	dbPath := filepath.Join(t.TempDir(), "opencode.db")
+	sql := "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, agent TEXT, title TEXT, time_created INTEGER);" +
+		// The legacy table holds an unrelated old session — it must not leak in.
+		"INSERT INTO session (id, parent_id, agent, title, time_created) VALUES ('ses_legacy', '', 'opencode', 'old', 1);" +
+		"CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, agent TEXT, title TEXT, time_created INTEGER);" +
+		"INSERT INTO session_v2 (id, parent_id, agent, title, time_created) VALUES ('ses_parent', '', 'build', 'loop', 1);" +
+		"INSERT INTO session_v2 (id, parent_id, agent, title, time_created) VALUES ('ses_cold', 'ses_parent', 'reviewer', 'cold', 2);" +
+		"INSERT INTO session_v2 (id, parent_id, agent, title, time_created) VALUES ('ses_cons', 'ses_parent', 'general', 'cons', 3);" +
+		"INSERT INTO session_v2 (id, parent_id, agent, title, time_created) VALUES ('ses_sec', 'ses_parent', 'reviewer', 'sec', 4);"
+	if out, err := exec.Command("sqlite3", dbPath, sql).CombinedOutput(); err != nil {
+		t.Fatalf("failed to build fixture db: %v: %s", err, out)
+	}
+
+	if errs := VerifySubagentEvidence(dbPath, "ses_parent", evidenceFixtureEvidence()); len(errs) != 0 {
+		t.Fatalf("v2 sessions must verify without errors, got: %v", errs)
+	}
+
+	// The parent check and the allowed-agent check must still bite on v2 rows.
+	evidence := evidenceFixtureEvidence()
+	evidence["security"] = "ses_unknown"
+	errs := VerifySubagentEvidence(dbPath, "ses_parent", evidence)
+	if len(errs) != 1 || errs[0].Field != "security" {
+		t.Fatalf("expected 1 error for the missing v2 session, got: %v", errs)
+	}
+	if errs := VerifySubagentEvidence(dbPath, "ses_wrong_parent", evidenceFixtureEvidence()); len(errs) != 3 {
+		t.Fatalf("expected 3 parent-mismatch errors on v2 rows, got: %v", errs)
+	}
+	// The legacy table is still consulted: ses_legacy exists there with a
+	// different parent, so it is found and rejected — not reported as missing.
+	legacy := map[string]string{"cold-review": "ses_legacy", "consequence": "ses_legacy", "security": "ses_legacy"}
+	for _, fe := range VerifySubagentEvidence(dbPath, "ses_parent", legacy) {
+		if strings.Contains(fe.Detail, "not found") {
+			t.Errorf("a legacy-table session must be found (its parent is checked), got: %s", fe.Detail)
+		}
 	}
 }

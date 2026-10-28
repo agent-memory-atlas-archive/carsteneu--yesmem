@@ -46,12 +46,13 @@ func TestHandleExecuteCap_BashHandler(t *testing.T) {
 		t.Skip("needs bash on PATH")
 	}
 	h, _ := mustHandler(t)
+	los35bUnsandboxed(t, h)
 
 	h.handleSaveCap(map[string]any{
 		"name":         "echo_cap",
 		"description":  "echos the message",
 		"handler_bash": "echo \"hello=$ARGS_message\"",
-		"project":      "test",
+		"scope":        "user",
 	})
 
 	resp := h.handleExecuteCap(map[string]any{
@@ -77,12 +78,13 @@ func TestHandleExecuteCap_ReplHandler(t *testing.T) {
 		t.Skip("needs bun on PATH")
 	}
 	h, _ := mustHandler(t)
+	los35bUnsandboxed(t, h)
 
 	h.handleSaveCap(map[string]any{
 		"name":         "js_cap",
 		"description":  "runs JavaScript",
 		"handler_repl": "globalThis.registerTool('js_cap', 'test', {type:'object',properties:{x:{type:'number'}}}, function(args) { return {doubled: args.x * 2}; })",
-		"project":      "test",
+		"scope":        "user",
 	})
 
 	resp := h.handleExecuteCap(map[string]any{
@@ -108,12 +110,13 @@ func TestHandleExecuteCap_MissingBun(t *testing.T) {
 		t.Skip("needs PATH manipulation to simulate missing bun")
 	}
 	h, _ := mustHandler(t)
+	los35bUnsandboxed(t, h)
 
 	h.handleSaveCap(map[string]any{
 		"name":         "js_cap",
 		"description":  "needs bun",
 		"handler_repl": "registerTool('x','x',{},function() {})",
-		"project":      "test",
+		"scope":        "user",
 	})
 
 	resp := h.handleExecuteCap(map[string]any{"name": "js_cap"})
@@ -127,12 +130,13 @@ func TestHandleExecuteCap_OutputTruncated(t *testing.T) {
 		t.Skip("needs bun on PATH")
 	}
 	h, _ := mustHandler(t)
+	los35bUnsandboxed(t, h)
 
 	h.handleSaveCap(map[string]any{
 		"name":         "big_cap",
 		"description":  "returns big output",
 		"handler_repl": "globalThis.registerTool('big','x',{},function() { return {data: 'x'.repeat(100000)}; })",
-		"project":      "test",
+		"scope":        "user",
 	})
 
 	resp := h.handleExecuteCap(map[string]any{"name": "big_cap", "args": "{}"})
@@ -189,6 +193,7 @@ func TestExecuteCapExplicitTimeoutReportsTimedOut(t *testing.T) {
 		t.Skip("needs bash on PATH")
 	}
 	h, _ := mustHandler(t)
+	los35bUnsandboxed(t, h)
 	insertCapWithTimeout(t, h, "slowcap", "sleep 5", 1)
 
 	resp := h.handleExecuteCap(map[string]any{"name": "slowcap", "fn": "run", "args": "{}"})

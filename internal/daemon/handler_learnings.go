@@ -20,6 +20,12 @@ import (
 	"github.com/carsteneu/yesmem/internal/textutil"
 )
 
+// maxGetLearningsLimit caps a caller supplied limit for get_learnings. The value
+// feeds an oversampling multiply and the final slice: an absurd limit wraps that
+// multiply negative (which drops the LIMIT clause and returns the whole table), and
+// a negative limit reaches learnings[:limit] and panics.
+const maxGetLearningsLimit = 200
+
 func (h *Handler) handleRemember(params map[string]any) Response {
 	text, _ := params["text"].(string)
 	category := stringOr(params, "category", "explicit_teaching")
@@ -52,6 +58,55 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 	cwd, _ := params["_cwd"].(string)
 	project, projectSource := h.attributeLearningProject(text, entities, projectParam, "", cwd)
 
+	// The supersede target is resolved once, before anything is written, so a
+	// rejected override can honestly say "nothing was saved".
+	var target *models.Learning
+	var targetErr error
+	if supersedesID > 0 {
+		if supersedesID != float64(int64(supersedesID)) {
+			return errorResponse("supersedes must be an integer learning ID; nothing was saved")
+		}
+		target, targetErr = h.store.GetLearning(int64(supersedesID))
+	}
+
+	// Explicit override of the trust gate. It is an override, not a convenience
+	// flag: without a target and a justification it would let any caller retire
+	// a high-trust learning silently, which is what the gate exists to prevent.
+	forceSupersede := false
+	if raw, ok := params["force_supersede"]; ok && raw != nil {
+		b, isBool := raw.(bool)
+		if !isBool {
+			return errorResponse("force_supersede must be a boolean; nothing was saved")
+		}
+		forceSupersede = b
+	}
+	supersedeReason, _ := params["supersede_reason"].(string)
+	// The reason is stored and later printed line by line (get_learnings history,
+	// MCP box): line breaks would forge lines there.
+	supersedeReason = strings.Join(strings.Fields(supersedeReason), " ")
+	if runes := []rune(supersedeReason); len(runes) > 500 {
+		supersedeReason = string(runes[:500]) + "..."
+	}
+	if forceSupersede {
+		if supersedesID <= 0 {
+			return errorResponse("force_supersede requires supersedes: name the learning to retire; nothing was saved")
+		}
+		if supersedeReason == "" {
+			return errorResponse("force_supersede requires supersede_reason: state why the old learning is wrong; nothing was saved")
+		}
+		if targetErr != nil {
+			return errorResponse(fmt.Sprintf("force_supersede: learning #%d could not be loaded: %v; nothing was saved", int64(supersedesID), targetErr))
+		}
+		// A forced supersede retires knowledge of one project. The two sides use
+		// different representations of the same project (short name versus path,
+		// see attributeLearningProject below), so compare the canonical form, and
+		// the repository root when both sides name one. A missing project on
+		// either side fails closed: there is nothing to prove ownership with.
+		if !sameProjectForSupersede(target.Project, project) {
+			return errorResponse(fmt.Sprintf("force_supersede refused: #%d belongs to project %q, not %q; nothing was saved", int64(supersedesID), target.Project, project))
+		}
+	}
+
 	l := &models.Learning{
 		Category: category, Content: text, Project: project,
 		Confidence: 1.0, CreatedAt: timeNow(), ModelUsed: h.rememberModel(params),
@@ -59,18 +114,22 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 		CanonicalProject: canonicalProjectFor(project),
 	}
 
-	// Session ID: try explicit param, then active session from idle_tick, then latest from DB
-	if sid, ok := params["session_id"].(string); ok && sid != "" {
+	// Session ID: the caller's own session first — explicit param, then the
+	// per-call _session_id the MCP layer injects, then PID/cwd — and only then
+	// the global active session. activeSessionID is whichever session wrote
+	// last and, under opencode v2 where one `opencode serve --service` hosts
+	// every session, it routinely belongs to a different session than the caller.
+	if proven := h.provenSessionID(params, "session_id"); proven != "" {
+		l.SessionID = proven
+		// The emotional intensity is a session rating (extraction produces one
+		// per session) and remember() has no rating of its own — it inherits the
+		// one its session carries. Only a proven caller session may lend it: the
+		// fallbacks name whichever session wrote last, not the caller's.
+		l.EmotionalIntensity = h.store.GetSessionMaxIntensity(proven)
+	} else if sid := h.resolveActiveSessionFallback(params); sid != "" {
 		l.SessionID = sid
-	} else {
-		h.activeSessionMu.Lock()
-		sid = h.activeSessionID
-		h.activeSessionMu.Unlock()
-		if sid != "" {
-			l.SessionID = sid
-		} else if latest, err := h.store.GetLatestSessionID(project); err == nil && latest != "" {
-			l.SessionID = latest
-		}
+	} else if latest, err := h.store.GetLatestSessionID(project); err == nil && latest != "" {
+		l.SessionID = latest
 	}
 
 	// Parse optional V2 params
@@ -145,14 +204,14 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 
 	// Volatile sentinel: live-derivable state snapshots are not durable knowledge.
 	// Fail-open — sentinel errors never block remembering.
-	if h.CommitEvalClient != nil && extraction.LooksLikeStateSnapshot(text) {
-		verdicts, vErr := extraction.ClassifyVolatileBatch(h.CommitEvalClient, []models.Learning{{Content: text}})
+	if evalClient := h.commitEvalLLM(); evalClient != nil && extraction.LooksLikeStateSnapshot(text) {
+		verdicts, vErr := extraction.ClassifyVolatileBatch(evalClient, []models.Learning{{Content: text}})
 		if vErr == nil && len(verdicts) == 1 {
 			switch verdicts[0].Verdict {
 			case "volatile":
 				return jsonResponse(map[string]any{
 					"rejected": true,
-					"message": fmt.Sprintf("Volatile state snapshot — not saved (%s). Live queries answer this correctly; extract the durable insight instead.", verdicts[0].Reason),
+					"message":  fmt.Sprintf("Volatile state snapshot — not saved (%s). Live queries answer this correctly; extract the durable insight instead.", verdicts[0].Reason),
 				})
 			case "bounded":
 				ttl := time.Now().AddDate(0, 0, 30)
@@ -166,11 +225,20 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 	l.ContentHash = hash
 	if existing, err := h.store.GetLearningByContentHash(hash); err == nil && existing != nil {
 		h.store.IncrementMatchCounts([]int64{existing.ID})
-		return jsonResponse(map[string]any{
+		msg := fmt.Sprintf("Exact duplicate (hash match). Bumped match_count for #%d.", existing.ID)
+		resp := map[string]any{
 			"id":           existing.ID,
-			"message":      fmt.Sprintf("Exact duplicate (hash match). Bumped match_count for #%d.", existing.ID),
 			"deduplicated": true,
-		})
+		}
+		if supersedesID > 0 {
+			// This early return happens before the supersede is applied. The
+			// caller must not assume the old learning was retired.
+			resp["supersedes_id"] = int64(supersedesID)
+			resp["supersede_outcome"] = "duplicate"
+			msg += fmt.Sprintf(" The requested supersede of #%d was NOT performed.", int64(supersedesID))
+		}
+		resp["message"] = msg
+		return jsonResponse(resp)
 	}
 
 	// Phase 1: fuzzy dedup via token similarity (Jaccard ≥ 0.5). TokenSimilarity
@@ -214,12 +282,21 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 
 	// If superseding an old learning, check trust level first
 	var supersededMsg string
+	// supersedeOutcome is the machine-readable result of the supersede attempt:
+	// replaced, blocked, forced or not_found. Prose in "message" is not enough,
+	// the MCP formatter drops it and used to render a blocked supersede as done.
+	var supersedeOutcome string
+	var supersedeTrust float64
+	var supersedeErr string
 	if supersedesID > 0 {
 		oldID := int64(supersedesID)
+		// Re-read right before the trust verdict: TrustScore depends on counts that
+		// a concurrent hit can bump between the pre-insert check and this point.
 		oldLearning, err := h.store.GetLearning(oldID)
 		if err == nil {
 			trust := storage.TrustScore(oldLearning)
 			level := storage.ClassifyTrust(trust)
+			supersedeTrust = trust
 
 			// Contradiction-Boost: superseding an injected learning is an "Unexpected Outcome"
 			// — strongest learning signal (Pearce & Hall 1980). Boost the correcting learning.
@@ -227,28 +304,74 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 				l.Importance = 4
 			}
 			h.store.SetImportance(id, l.Importance)
-			h.store.IncrementUseCounts([]int64{id})      // mark as immediately used
-			h.store.SetStability(id, 45.0)               // start at 45 days instead of 30
-			h.store.IncrementNoiseCounts([]int64{oldID}) // old learning was wrong in this context
+			h.store.IncrementUseCounts([]int64{id}) // mark as immediately used
+			h.store.SetStability(id, 45.0)          // start at 45 days instead of 30
 
-			switch level {
-			case storage.TrustLow:
-				h.store.SupersedeLearning(oldID, id, "superseded by remember()")
-				supersededMsg = fmt.Sprintf(" Supersedes #%d (trust: %.1f, low).", oldID, trust)
+			if forceSupersede {
+				// Caller confirmed the old learning is wrong. The gate's verdict
+				// stays visible; the justification becomes part of the chain.
+				if serr := h.supersedeNow(oldID, id, "forced supersede: "+supersedeReason); serr != nil {
+					supersedeOutcome = "failed"
+					supersedeErr = serr.Error()
+					supersededMsg = fmt.Sprintf(" Supersede of #%d failed (trust: %.1f, forced): %v. Old learning stays active.", oldID, trust, serr)
+				} else {
+					supersedeOutcome = "forced"
+					supersededMsg = fmt.Sprintf(" Supersedes #%d (trust: %.1f, forced: %s). Vorher galt: %s", oldID, trust, supersedeReason, truncate(oldLearning.Content, 80))
+				}
+			} else {
+				switch level {
+				case storage.TrustLow:
+					if serr := h.supersedeNow(oldID, id, "superseded by remember()"); serr != nil {
+						supersedeOutcome = "failed"
+						supersedeErr = serr.Error()
+						supersededMsg = fmt.Sprintf(" Supersede of #%d failed (trust: %.1f, low): %v.", oldID, trust, serr)
+					} else {
+						supersedeOutcome = "replaced"
+						supersededMsg = fmt.Sprintf(" Supersedes #%d (trust: %.1f, low).", oldID, trust)
+					}
 
-			case storage.TrustMedium:
-				h.store.SupersedeLearning(oldID, id, "superseded by remember()")
-				supersededMsg = fmt.Sprintf(" Supersedes #%d (trust: %.1f, medium). Vorher galt: %s", oldID, trust, truncate(oldLearning.Content, 80))
+				case storage.TrustMedium:
+					if serr := h.supersedeNow(oldID, id, "superseded by remember()"); serr != nil {
+						supersedeOutcome = "failed"
+						supersedeErr = serr.Error()
+						supersededMsg = fmt.Sprintf(" Supersede of #%d failed (trust: %.1f, medium): %v.", oldID, trust, serr)
+					} else {
+						supersedeOutcome = "replaced"
+						supersededMsg = fmt.Sprintf(" Supersedes #%d (trust: %.1f, medium). Vorher galt: %s", oldID, trust, truncate(oldLearning.Content, 80))
+					}
 
-			case storage.TrustHigh:
-				// High trust — don't supersede immediately, set pending confirmation
-				h.store.SetSupersedeStatus(oldID, "pending_confirmation")
-				supersededMsg = fmt.Sprintf(" Supersede pending confirmation (trust: %.1f, high). Old learning #%d stays active.", trust, oldID)
+				case storage.TrustHigh:
+					// High trust — the old learning stays active and the conflict is
+					// recorded as a contradicts edge. Decision D6: nothing ever read
+					// the parked pending_confirmation status, so the pair must stay
+					// visible instead of being silently marked.
+					supersedeOutcome = "blocked"
+					if err := h.store.InsertTypedAssociation(oldID, id, "contradicts"); err != nil {
+						supersededMsg = fmt.Sprintf(" Supersede blocked (trust: %.1f, high). Old learning #%d stays active; contradiction edge failed: %v.", trust, oldID, err)
+					} else {
+						supersededMsg = fmt.Sprintf(" Supersede blocked (trust: %.1f, high). Old learning #%d stays active; contradiction recorded.", trust, oldID)
+					}
+				}
+			}
+
+			// The target counts as wrong in this context only when a conflict was
+			// established; a failed write says nothing about it.
+			switch supersedeOutcome {
+			case "replaced", "forced", "blocked":
+				h.store.IncrementNoiseCounts([]int64{oldID})
 			}
 		} else {
-			// Old learning not found — supersede without trust check
-			h.store.SupersedeLearning(oldID, id, "superseded by remember()")
-			supersededMsg = fmt.Sprintf(" Supersedes #%d.", oldID)
+			// Nothing to retire: the target could not be loaded. The write is
+			// attempted anyway (the read may have failed transiently) and the
+			// outcome follows from the stored state, not from the read error.
+			if serr := h.supersedeNow(oldID, id, "superseded by remember()"); serr == nil {
+				supersedeOutcome = "replaced"
+				supersededMsg = fmt.Sprintf(" Supersedes #%d.", oldID)
+			} else {
+				supersedeOutcome = "not_found"
+				supersedeErr = serr.Error()
+				supersededMsg = fmt.Sprintf(" Supersedes #%d not applied: %v.", oldID, serr)
+			}
 		}
 	}
 
@@ -290,8 +413,35 @@ func (h *Handler) handleRemember(params map[string]any) Response {
 	}
 	if supersedesID > 0 {
 		resp["supersedes_id"] = int64(supersedesID)
+		if supersedeOutcome != "" {
+			resp["supersede_outcome"] = supersedeOutcome
+		}
+		if target != nil {
+			resp["supersede_trust"] = supersedeTrust
+		}
+		if supersedeErr != "" {
+			resp["supersede_error"] = supersedeErr
+		}
 	}
 	return jsonResponse(resp)
+}
+
+// supersedeNow links the new learning to the target and confirms the write by
+// reading the row back. SupersedeLearningBatch's UPDATE matches only an active
+// row and reports no error when it matches none (learnings.go:1146), so a nil
+// error is not evidence of a replacement.
+func (h *Handler) supersedeNow(oldID, newID int64, reason string) error {
+	if err := h.store.SupersedeLearning(oldID, newID, reason); err != nil {
+		return err
+	}
+	after, err := h.store.GetLearning(oldID)
+	if err != nil {
+		return fmt.Errorf("read back #%d: %w", oldID, err)
+	}
+	if after.SupersededBy == nil || *after.SupersededBy != newID {
+		return fmt.Errorf("#%d was not linked to #%d (already superseded?)", oldID, newID)
+	}
+	return nil
 }
 
 // rememberModel resolves the model attribution for an in-session remember() call.
@@ -352,19 +502,32 @@ func (h *Handler) handleGetLearnings(params map[string]any) Response {
 	before, _ := params["before"].(string)
 	taskType, _ := params["task_type"].(string)
 	limit := intOr(params, "limit", 30)
-	learnings, err := h.store.GetActiveLearnings(category, project, since, before, limit*5)
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > maxGetLearningsLimit {
+		limit = maxGetLearningsLimit
+	}
+	if since != "" && storage.ParseFilterTime(since).IsZero() {
+		return errorResponse(fmt.Sprintf("since is not a parseable timestamp: %q", truncate(since, 80)))
+	}
+	if before != "" && storage.ParseFilterTime(before).IsZero() {
+		return errorResponse(fmt.Sprintf("before is not a parseable timestamp: %q", truncate(before, 80)))
+	}
+	// limit=0 has always meant "nothing"; answer it without touching the table.
+	// GetActiveLearnings without a LIMIT clause would read every active row.
+	if limit == 0 {
+		return jsonResponse([]models.Learning{})
+	}
+	learnings, err := h.store.GetActiveLearningsFiltered(storage.LearningsFilter{
+		Category: category,
+		Project:  project,
+		Since:    since,
+		Before:   before,
+		TaskType: taskType,
+	}, limit*5)
 	if err != nil {
 		return errorResponse(err.Error())
-	}
-	// Filter by task_type if specified
-	if taskType != "" {
-		filtered := learnings[:0]
-		for _, l := range learnings {
-			if l.TaskType == taskType {
-				filtered = append(filtered, l)
-			}
-		}
-		learnings = filtered
 	}
 	// Enrich with session fixation ratios before scoring
 	h.store.EnrichSessionFixationScores(learnings)
@@ -435,6 +598,14 @@ func extractIDs(params map[string]any) []int64 {
 	return ids
 }
 
+// bumpClusterScore propagates a signal to the cluster scores. These rows feed the
+// cluster affinity (handler_hybrid.go), so a failed write must not pass silently.
+func (h *Handler) bumpClusterScore(learningID, clusterID int64, field string) {
+	if err := h.store.IncrementClusterScore(learningID, clusterID, field); err != nil {
+		log.Printf("cluster score %s for learning %d (cluster %d): %v", field, learningID, clusterID, err)
+	}
+}
+
 func (h *Handler) handleIncrementNoise(params map[string]any) Response {
 	ids := extractIDs(params)
 	if len(ids) == 0 {
@@ -466,7 +637,7 @@ func (h *Handler) handleIncrementNoise(params map[string]any) Response {
 	// Stufe 4: propagate noise signal to cluster scores
 	clusterMap := h.store.GetRecentClusterForLearnings(activeRefIDs)
 	for lid, cid := range clusterMap {
-		h.store.IncrementClusterScore(lid, cid, "noise")
+		h.bumpClusterScore(lid, cid, "noise")
 	}
 	return jsonResponse(map[string]any{"bumped": len(activeRefIDs), "skipped_behavioral": len(ids) - len(activeRefIDs)})
 }
@@ -485,11 +656,41 @@ func (h *Handler) handleQuarantineSession(params map[string]any) Response {
 	if sessionID == "" {
 		return errorResponse("session_id (string) required")
 	}
-	affected, err := h.store.QuarantineSession(sessionID)
+	// The session id is the caller's claim, and every row under it is quarantined.
+	// A caller that names its project scopes the write to that project; a caller
+	// that names none keeps the session-only match, which is what the crash path
+	// needs for the backend addresses a row carries.
+	project, _ := params["project"].(string)
+	var affected int64
+	var err error
+	if project == "" {
+		affected, err = h.store.QuarantineSession(sessionID)
+	} else {
+		affected, err = h.store.QuarantineSessionInProject(project, sessionID)
+	}
 	if err != nil {
 		return errorResponse(fmt.Sprintf("quarantine: %v", err))
 	}
 	return jsonResponse(map[string]any{"quarantined": affected, "session_id": sessionID})
+}
+
+// handleUnquarantineSession lifts a session quarantine. Without it, a quarantine
+// applied by mistake is a one-way door. The learnings come back immediately because
+// quarantining never deleted their vectors; a scratchpad taint written by crash
+// recovery is a separate marker and stays.
+func (h *Handler) handleUnquarantineSession(params map[string]any) Response {
+	sessionID, _ := params["session_id"].(string)
+	if sessionID == "" {
+		return errorResponse("session_id (string) required")
+	}
+	affected, err := h.store.UnquarantineSession(sessionID)
+	if err != nil {
+		return errorResponse(fmt.Sprintf("unquarantine: %v", err))
+	}
+	// Audited on purpose: lifting the quarantine is the one call that can undo the
+	// protection against a session's own poisoned learnings.
+	log.Printf("unquarantine_session: lifted quarantine for %s (%d learnings)", sessionID, affected)
+	return jsonResponse(map[string]any{"unquarantined": affected, "session_id": sessionID})
 }
 
 func (h *Handler) handleSkipIndexing(params map[string]any) Response {
@@ -515,7 +716,7 @@ func (h *Handler) handleIncrementMatch(params map[string]any) Response {
 	// Stufe 4: propagate match signal to cluster scores
 	clusterMap := h.store.GetRecentClusterForLearnings(ids)
 	for lid, cid := range clusterMap {
-		h.store.IncrementClusterScore(lid, cid, "match")
+		h.bumpClusterScore(lid, cid, "match")
 	}
 	return jsonResponse(map[string]any{"bumped": len(ids)})
 }
@@ -531,7 +732,7 @@ func (h *Handler) handleIncrementInject(params map[string]any) Response {
 	// Stufe 4: propagate inject signal to cluster scores
 	clusterMap := h.store.GetRecentClusterForLearnings(ids)
 	for lid, cid := range clusterMap {
-		h.store.IncrementClusterScore(lid, cid, "inject")
+		h.bumpClusterScore(lid, cid, "inject")
 	}
 	return jsonResponse(map[string]any{"bumped": len(ids)})
 }
@@ -547,7 +748,7 @@ func (h *Handler) handleIncrementUse(params map[string]any) Response {
 	// Stufe 4: propagate use signal to cluster scores
 	clusterMap := h.store.GetRecentClusterForLearnings(ids)
 	for lid, cid := range clusterMap {
-		h.store.IncrementClusterScore(lid, cid, "use")
+		h.bumpClusterScore(lid, cid, "use")
 	}
 	return jsonResponse(map[string]any{"bumped": len(ids)})
 }
@@ -563,7 +764,7 @@ func (h *Handler) handleIncrementSave(params map[string]any) Response {
 	// Stufe 4: propagate save signal to cluster scores
 	clusterMap := h.store.GetRecentClusterForLearnings(ids)
 	for lid, cid := range clusterMap {
-		h.store.IncrementClusterScore(lid, cid, "save")
+		h.bumpClusterScore(lid, cid, "save")
 	}
 	return jsonResponse(map[string]any{"bumped": len(ids)})
 }
@@ -579,7 +780,7 @@ func (h *Handler) handleIncrementFail(params map[string]any) Response {
 	// Stufe 4: propagate fail signal to cluster scores
 	clusterMap := h.store.GetRecentClusterForLearnings(ids)
 	for lid, cid := range clusterMap {
-		h.store.IncrementClusterScore(lid, cid, "fail")
+		h.bumpClusterScore(lid, cid, "fail")
 	}
 	return jsonResponse(map[string]any{"bumped": len(ids)})
 }
@@ -670,44 +871,129 @@ func (h *Handler) handleResolveByText(params map[string]any) Response {
 		return errorResponse("text is required")
 	}
 
-	matches, err := h.store.SearchUnfinished(text, project)
+	found, err := h.store.SearchUnfinishedRanked(text, project)
 	if err != nil {
 		return errorResponse(err.Error())
 	}
-
-	if len(matches) == 0 {
-		return jsonResponse(map[string]any{
-			"message":    "No matching unfinished items found",
-			"candidates": []any{},
-		})
-	}
-
-	best := matches[0]
-	if err := h.store.ResolveLearning(best.ID, fmt.Sprintf("resolved by text match: %s", text)); err != nil {
-		return errorResponse(err.Error())
-	}
-
-	go h.onMutation()
 
 	type candidate struct {
 		ID      int64  `json:"id"`
 		Content string `json:"content"`
 		Project string `json:"project"`
 	}
-	var candidates []candidate
-	for _, m := range matches {
+	candidates := []candidate{}
+	for _, m := range found.Items {
 		candidates = append(candidates, candidate{ID: m.ID, Content: m.Content, Project: m.Project})
 	}
 
+	best, ok := found.AutoResolveTarget()
+	if !ok {
+		return jsonResponse(map[string]any{
+			"resolved":   false,
+			"reason":     found.SkipReason(),
+			"message":    "Not resolved: " + found.SkipReason(),
+			"candidates": candidates,
+		})
+	}
+
+	reason := fmt.Sprintf("resolved by text match: %s", text)
+	if err := h.store.ResolveLearning(best.ID, reason); err != nil {
+		return errorResponse(err.Error())
+	}
+
+	go h.onMutation()
+
 	return jsonResponse(map[string]any{
 		"id":         best.ID,
+		"resolved":   true,
 		"category":   best.Category,
 		"project":    best.Project,
 		"content":    truncate(best.Content, 120),
-		"reason":     fmt.Sprintf("resolved by text match: %s", text),
-		"message":    fmt.Sprintf("Resolved #%d: %s", best.ID, best.Content),
+		"reason":     reason,
+		"message":    fmt.Sprintf("Resolved #%d: %s", best.ID, truncate(best.Content, 120)),
 		"candidates": candidates,
 	})
+}
+
+// handleResolveByCommit closes the open task a commit message names. It is the
+// commit-shaped sibling of resolve: it closes the open task the commit SUBJECT
+// names, by learning id or ticket key, and resolves nothing without such an
+// anchor.
+func (h *Handler) handleResolveByCommit(params map[string]any) Response {
+	message, _ := params["message"].(string)
+	project, _ := params["project"].(string)
+
+	if message == "" {
+		return errorResponse("message is required")
+	}
+
+	decision, err := h.store.ResolveCommit(message, project)
+	if err != nil {
+		return errorResponse(err.Error())
+	}
+
+	type candidate struct {
+		ID      int64  `json:"id"`
+		Content string `json:"content"`
+		Project string `json:"project"`
+	}
+	candidates := []candidate{}
+	for _, m := range decision.Candidates {
+		candidates = append(candidates, candidate{ID: m.ID, Content: m.Content, Project: m.Project})
+	}
+
+	if decision.Target == nil {
+		reason := decision.Reason
+		if reason == "" {
+			reason = "no learning id or ticket key in the commit subject"
+		}
+		return jsonResponse(map[string]any{
+			"resolved":   false,
+			"reason":     reason,
+			"message":    "Not resolved: " + reason,
+			"candidates": candidates,
+		})
+	}
+
+	best := decision.Target
+	go h.onMutation()
+
+	return jsonResponse(map[string]any{
+		"id":         best.ID,
+		"resolved":   true,
+		"category":   best.Category,
+		"project":    best.Project,
+		"content":    truncate(best.Content, 120),
+		"reason":     decision.Recorded,
+		"message":    fmt.Sprintf("Resolved #%d: %s", best.ID, truncate(best.Content, 120)),
+		"candidates": candidates,
+	})
+}
+
+// handleReopen undoes a resolution. It is the way back when resolve or
+// resolve_by_text closed the wrong item.
+func (h *Handler) handleReopen(params map[string]any) Response {
+	id := int64(intOr(params, "learning_id", 0))
+	if id == 0 {
+		return errorResponse("learning_id is required")
+	}
+
+	if err := h.store.ReopenLearning(id); err != nil {
+		return errorResponse(err.Error())
+	}
+
+	go h.onMutation()
+
+	resp := map[string]any{
+		"id":      id,
+		"message": fmt.Sprintf("Learning #%d reopened", id),
+	}
+	if learning, _ := h.store.GetLearning(id); learning != nil {
+		resp["category"] = learning.Category
+		resp["project"] = learning.Project
+		resp["content"] = truncate(learning.Content, 120)
+	}
+	return jsonResponse(resp)
 }
 
 // handleGetLearningsSince returns learnings created after a given timestamp.
@@ -858,6 +1144,28 @@ func canonicalProjectFor(project string) string {
 	return models.CanonicalProject(project)
 }
 
+// sameProjectForSupersede answers whether a forced supersede may retire a
+// learning of targetProject from project. It is deliberately NOT capProjectMatches:
+// reachability decides whether a caller may run someone's code, so a bare-name
+// caller must not reach a path-bound row (YM-359). Retiring a memory is the weaker
+// action, and refusing a caller that names its project the way the user speaks it
+// would only block a legitimate correction. It fails closed on a missing project: an
+// unassigned value is not a project, so it must not match another unassigned one.
+func sameProjectForSupersede(targetProject, project string) bool {
+	if project == "" || targetProject == "" {
+		return false
+	}
+	if canonicalProjectFor(targetProject) != canonicalProjectFor(project) {
+		return false
+	}
+	// Two repositories can share a basename (/a/yesmem and /b/yesmem).
+	targetRoot, projectRoot := models.RepositoryRoot(targetProject), models.RepositoryRoot(project)
+	if targetRoot != "" && projectRoot != "" && targetRoot != projectRoot {
+		return false
+	}
+	return true
+}
+
 // knownProjectPaths returns the universe of projects known to this instance.
 func (h *Handler) knownProjectPaths() []string {
 	paths, err := h.store.ListProjectPaths()
@@ -876,6 +1184,17 @@ func (h *Handler) knownProjectPaths() []string {
 // learnings.project_source (explicit|repo|session|content|ambiguous).
 func (h *Handler) attributeLearningProject(text string, entities []string, explicitProject, sessionProject, cwd string) (string, string) {
 	if explicitProject != "" {
+		// A name without a leading slash is what resolveProjectParam could not
+		// resolve to a project path; storing it verbatim produces project values
+		// no lookup matches (live: "v2-release-notes", "wal", "chief"). The
+		// caller's working directory still identifies the repository, so use its
+		// root and keep the original name in the log.
+		if !strings.HasPrefix(explicitProject, "/") && cwd != "" {
+			if base := repo.Root(cwd); base != "" {
+				log.Printf("attributeProject: unresolved project %q resolved to %q from cwd", explicitProject, base)
+				return base, "repo"
+			}
+		}
 		return explicitProject, "explicit"
 	}
 	base, baseSource := sessionProject, "session"

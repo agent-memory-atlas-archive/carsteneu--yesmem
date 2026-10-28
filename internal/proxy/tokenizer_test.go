@@ -112,12 +112,12 @@ func buildRealisticRequest(numMessages int) map[string]any {
 			"path":    map[string]any{"type": "string", "description": "The directory to search in"},
 		}, []string{"pattern"}),
 		generateRealisticTool("Agent", "Launch a new agent to handle complex, multi-step tasks autonomously. The Agent tool launches specialized agents.", map[string]any{
-			"prompt":          map[string]any{"type": "string", "description": "The task for the agent to perform"},
-			"description":     map[string]any{"type": "string", "description": "A short (3-5 word) description of the task"},
-			"subagent_type":   map[string]any{"type": "string", "description": "The type of specialized agent"},
-			"isolation":       map[string]any{"type": "string", "enum": []string{"worktree"}},
+			"prompt":            map[string]any{"type": "string", "description": "The task for the agent to perform"},
+			"description":       map[string]any{"type": "string", "description": "A short (3-5 word) description of the task"},
+			"subagent_type":     map[string]any{"type": "string", "description": "The type of specialized agent"},
+			"isolation":         map[string]any{"type": "string", "enum": []string{"worktree"}},
 			"run_in_background": map[string]any{"type": "boolean", "description": "Run in background"},
-			"resume":          map[string]any{"type": "string", "description": "Agent ID to resume from"},
+			"resume":            map[string]any{"type": "string", "description": "Agent ID to resume from"},
 		}, []string{"description", "prompt"}),
 		generateRealisticTool("WebSearch", "Allows Claude to search the web and use the results to inform responses.", map[string]any{
 			"query":           map[string]any{"type": "string", "description": "The search query to use", "minLength": 2},

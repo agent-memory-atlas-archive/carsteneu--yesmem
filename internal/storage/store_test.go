@@ -10,16 +10,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-func mustOpen(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 func TestOpenAndClose(t *testing.T) {
 	s := mustOpen(t)
 	if s.DB() == nil {
@@ -1167,7 +1157,7 @@ func TestCountPendingExtractions(t *testing.T) {
 		}
 	}
 
-	count, err := s.CountPendingExtractions(5)
+	count, err := s.CountPendingExtractions(ShortSessionMaxMessages)
 	if err != nil {
 		t.Fatalf("count pending: %v", err)
 	}

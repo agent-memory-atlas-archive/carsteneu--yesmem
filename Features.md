@@ -105,7 +105,7 @@ LLM Client  ──→  Proxy (:9099)  ──→  Upstream API
 
 | Document | Description |
 |----------|-------------|
-| [MCP Tools Reference](docs/mcp-tools-reference.md) | 70 tools — full list with descriptions |
+| [MCP Tools Reference](docs/mcp-tools-reference.md) | 73 tools — full list with descriptions |
 | [CLI Commands](docs/cli-reference.md) | 64 CLI commands |
 | [Daemon RPC](docs/daemon-rpc.md) | 130 RPC methods |
 | [Database Schema](docs/database-schema.md) | 48 tables + 4 FTS5 virtual tables |

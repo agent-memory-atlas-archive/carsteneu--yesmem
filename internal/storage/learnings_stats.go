@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/carsteneu/yesmem/internal/models"
@@ -14,6 +15,17 @@ type StatsFilter struct {
 	Before  string // ISO datetime or empty
 }
 
+// statsTimeBound renders a filter bound for a julianday comparison. An
+// unparsable value counts as absent: this API has no error path for a bound, and
+// matching nothing was the accidental behaviour of the lexical compare it
+// replaces.
+func statsTimeBound(s string) (string, bool) {
+	if ParseFilterTime(s).IsZero() {
+		return "", false
+	}
+	return SQLiteFilterTime(s), true
+}
+
 // statsWhere builds a WHERE clause fragment and args from StatsFilter.
 func statsWhere(f StatsFilter) (string, []any) {
 	clauses := []string{"superseded_by IS NULL"}
@@ -22,13 +34,15 @@ func statsWhere(f StatsFilter) (string, []any) {
 		clauses = append(clauses, "(project = ? OR project IS NULL OR project = '')")
 		args = append(args, f.Project)
 	}
-	if f.Since != "" {
-		clauses = append(clauses, "created_at >= ?")
-		args = append(args, f.Since)
+	// created_at carries the writer's zone offset, so only a parsed comparison
+	// answers "inside the window" (same class as the search filters).
+	if bound, ok := statsTimeBound(f.Since); ok {
+		clauses = append(clauses, "julianday(created_at) >= julianday(?)")
+		args = append(args, bound)
 	}
-	if f.Before != "" {
-		clauses = append(clauses, "created_at < ?")
-		args = append(args, f.Before)
+	if bound, ok := statsTimeBound(f.Before); ok {
+		clauses = append(clauses, "julianday(created_at) < julianday(?)")
+		args = append(args, bound)
 	}
 	return strings.Join(clauses, " AND "), args
 }
@@ -41,13 +55,13 @@ func statsWhereAll(f StatsFilter) (string, []any) {
 		clauses = append(clauses, "(project = ? OR project IS NULL OR project = '')")
 		args = append(args, f.Project)
 	}
-	if f.Since != "" {
-		clauses = append(clauses, "created_at >= ?")
-		args = append(args, f.Since)
+	if bound, ok := statsTimeBound(f.Since); ok {
+		clauses = append(clauses, "julianday(created_at) >= julianday(?)")
+		args = append(args, bound)
 	}
-	if f.Before != "" {
-		clauses = append(clauses, "created_at < ?")
-		args = append(args, f.Before)
+	if bound, ok := statsTimeBound(f.Before); ok {
+		clauses = append(clauses, "julianday(created_at) < julianday(?)")
+		args = append(args, bound)
 	}
 	return strings.Join(clauses, " AND "), args
 }
@@ -56,17 +70,33 @@ type LearningStats struct {
 	ActiveCount      int     `json:"active_count"`
 	SupersededCount  int     `json:"superseded_count"`
 	ArchivedCount    int     `json:"archived_count"`
-	TotalInjects7d   int     `json:"total_injects_7d"`
-	UsedInjects7d    int     `json:"used_injects_7d"`
-	TotalNoiseCount  int     `json:"total_noise_count"`
-	TotalInjectCount int     `json:"total_inject_count"`
-	TotalFailCount   int     `json:"total_fail_count"`
-	TotalSaveCount   int     `json:"total_save_count"`
-	TotalUseCount    int     `json:"total_use_count"`
-	ToxicCount       int     `json:"toxic_count"`       // fail_count >= 3
-	DeadWeightCount  int     `json:"dead_weight_count"`
-	DecayingCount    int     `json:"decaying_count"`
-	AvgPrecision     float64 `json:"avg_precision"`
+	// TotalCount is every row the filter matches, active and retired. It comes
+	// from the same statement as the retirement counts, so a surface can print
+	// them together without the two disagreeing under a concurrent write.
+	TotalCount              int     `json:"total_count"`
+	// DeletedPredecessorCount counts the rows whose successor was hard-deleted
+	// (SupersededByDeleted). They are not superseded: the edge names no
+	// learning, so the data shows a loss where the other count reports a
+	// replacement.
+	DeletedPredecessorCount int     `json:"deleted_predecessor_count"`
+	// ReplacedCount and RetiredCount partition SupersededCount: a replacement
+	// names a successor (superseded_by > 0), a retirement does not (junk,
+	// resolve, reextract, legacy cleanup, a zero edge). SupersededCount alone
+	// cannot tell the two apart, and a surface that printed it as "superseded"
+	// claimed replacements that never happened (YM-445).
+	ReplacedCount   int `json:"replaced_count"`
+	RetiredCount    int `json:"retired_count"`
+	TotalInjects7d          int     `json:"total_injects_7d"`
+	UsedInjects7d           int     `json:"used_injects_7d"`
+	TotalNoiseCount         int     `json:"total_noise_count"`
+	TotalInjectCount        int     `json:"total_inject_count"`
+	TotalFailCount          int     `json:"total_fail_count"`
+	TotalSaveCount          int     `json:"total_save_count"`
+	TotalUseCount           int     `json:"total_use_count"`
+	ToxicCount              int     `json:"toxic_count"` // fail_count >= 3
+	DeadWeightCount         int     `json:"dead_weight_count"`
+	DecayingCount           int     `json:"decaying_count"`
+	AvgPrecision            float64 `json:"avg_precision"`
 }
 
 // SourceAttribution holds per-source learning counts and effectiveness.
@@ -258,13 +288,30 @@ func (s *Store) GetLearningStatsF(f StatsFilter) (*LearningStats, error) {
 	allWhere, allArgs := statsWhereAll(f)
 
 	// Active count
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE (expires_at IS NULL OR expires_at > datetime('now')) AND `+activeWhere, activeArgs...).Scan(&st.ActiveCount)
+	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE (expires_at IS NULL OR julianday(expires_at) > julianday('now')) AND `+activeWhere, activeArgs...).Scan(&st.ActiveCount)
 
-	// Superseded count (includes superseded, so use allWhere + superseded_by IS NOT NULL)
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by IS NOT NULL AND `+allWhere, allArgs...).Scan(&st.SupersededCount)
+	// Retirement counts, all from one statement: four separate reads would see
+	// four snapshots, and the partition below would stop adding up under a
+	// concurrent write, which is exactly the property it exists to show.
+	//
+	// SupersededCount is retired-by-a-successor plus retired-by-a-sentinel. A row
+	// whose successor was hard-deleted is counted apart: it is retired too, but
+	// the edge names nothing, so reporting it as superseded claims a replacement
+	// that the data does not show (YM-443). ReplacedCount (superseded_by > 0) and
+	// RetiredCount (a sentinel, not -4) split SupersededCount so it stops reading
+	// as "replaced" (YM-445).
+	retirementCounts := `SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN superseded_by IS NOT NULL AND superseded_by <> ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN superseded_by = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN superseded_by > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN superseded_by <= 0 AND superseded_by <> ? THEN 1 ELSE 0 END), 0)
+		FROM learnings WHERE ` + allWhere
+	s.readerDB().QueryRow(retirementCounts,
+		append([]any{SupersededByDeleted, SupersededByDeleted, SupersededByDeleted}, allArgs...)...).
+		Scan(&st.TotalCount, &st.SupersededCount, &st.DeletedPredecessorCount, &st.ReplacedCount, &st.RetiredCount)
 
 	// Archived (expired)
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE expires_at IS NOT NULL AND expires_at <= datetime('now') AND `+activeWhere, activeArgs...).Scan(&st.ArchivedCount)
+	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE expires_at IS NOT NULL AND julianday(expires_at) <= julianday('now') AND `+activeWhere, activeArgs...).Scan(&st.ArchivedCount)
 
 	// Injection stats
 	s.readerDB().QueryRow(`SELECT COALESCE(SUM(noise_count), 0), COALESCE(SUM(inject_count), 0), COALESCE(SUM(fail_count), 0), COALESCE(SUM(save_count), 0), COALESCE(SUM(use_count), 0) FROM learnings WHERE `+activeWhere, activeArgs...).Scan(&st.TotalNoiseCount, &st.TotalInjectCount, &st.TotalFailCount, &st.TotalSaveCount, &st.TotalUseCount)
@@ -382,6 +429,68 @@ func (s *Store) GetCategoryPrecisionF(f StatsFilter) ([]CategoryPrecision, error
 	return out, rows.Err()
 }
 
+// statsSessionWhere builds the session-level filter of a StatsFilter. The columns
+// live in sessions, so the clause also works unqualified against the alias s.
+func statsSessionWhere(f StatsFilter) (string, []any) {
+	clauses := []string{"1=1"}
+	var args []any
+	if f.Project != "" {
+		clauses = append(clauses, "project_short = ?")
+		args = append(args, f.Project)
+	}
+	if f.Since != "" {
+		clauses = append(clauses, "started_at >= ?")
+		args = append(args, f.Since)
+	}
+	if f.Before != "" {
+		clauses = append(clauses, "started_at < ?")
+		args = append(args, f.Before)
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
+// narrativeCoverage counts the sessions the narrative workload consists of and
+// how many of them carry a recallable narrative row. Both numbers use the pending
+// set's gates: the text-message threshold (a session below it can never be
+// summarized) and the quarantine (a quarantined session must not be narrated).
+//
+// The total is open plus satisfied, not "every narratable session": the prune
+// keeps only the newest narratives of a project and its sessions keep their
+// narrative_at marker on purpose, so re-narrating them would churn the same rows
+// forever. Counting them as missing would report a gap no run may close.
+func (s *Store) narrativeCoverage(f StatsFilter) (total, done int, err error) {
+	where, args := statsSessionWhere(f)
+	candidates, err := s.sessionIDsWhere(where+` AND s.message_count >= ? AND `+notQuarantinedSessionWhere,
+		append(args, ShortSessionMaxMessages)...)
+	if err != nil {
+		return 0, 0, err
+	}
+	narratable, err := s.filterByTextMessages(candidates, ShortSessionMaxMessages)
+	if err != nil {
+		return 0, 0, err
+	}
+	ids := make([]string, 0, len(narratable))
+	for id := range narratable {
+		ids = append(ids, id)
+	}
+	withNarrative, err := s.activeNarrativeSessionIDs(ids)
+	if err != nil {
+		return 0, 0, err
+	}
+	marked, err := s.sessionIDsWithNarrativeMarker(ids)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, id := range ids {
+		_, satisfied := withNarrative[id]
+		_, hasMarker := marked[id]
+		if satisfied || !hasMarker {
+			total++
+		}
+	}
+	return total, len(withNarrative), nil
+}
+
 // CoverageStats holds system health coverage metrics.
 type CoverageStats struct {
 	EmbeddingTotal   int `json:"embedding_total"`
@@ -412,25 +521,22 @@ func (s *Store) GetCoverageStatsF(f StatsFilter) (*CoverageStats, error) {
 	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE embedding_vector IS NOT NULL AND length(embedding_vector) > 0 AND `+where, args...).Scan(&cs.EmbeddingDone)
 
 	// Session-level stats: total messages/sessions (project-filtered)
-	sessFilter := "1=1"
-	var sessArgs []any
-	if f.Project != "" {
-		sessFilter = "project_short = ?"
-		sessArgs = append(sessArgs, f.Project)
-	}
-	if f.Since != "" {
-		sessFilter += " AND started_at >= ?"
-		sessArgs = append(sessArgs, f.Since)
-	}
-	if f.Before != "" {
-		sessFilter += " AND started_at < ?"
-		sessArgs = append(sessArgs, f.Before)
-	}
+	sessFilter, sessArgs := statsSessionWhere(f)
 	s.readerDB().QueryRow(`SELECT COALESCE(SUM(message_count), 0), COUNT(*) FROM sessions WHERE `+sessFilter, sessArgs...).Scan(&cs.TotalMessages, &cs.TotalSessions)
 
-	// Narrative coverage: sessions with enough messages that have/don't have narratives
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE message_count >= 10`).Scan(&cs.NarrativeTotal)
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE message_count >= 10 AND narrative_at IS NOT NULL`).Scan(&cs.NarrativeDone)
+	// Narrative coverage: narratable sessions and how many of them carry a
+	// recallable narrative row. narrative_at is only a marker: it outlives a
+	// superseded or deleted narrative, so counting it reported sessions as
+	// narrated that recall cannot see.
+	narrativeTotal, narrativeDone, err := s.narrativeCoverage(f)
+	if err != nil {
+		// A health number is no reason to fail the whole report: the callers
+		// (stats, benchmark) print the block unconditionally, so a zero pair with
+		// a warning on stderr beats a silently wrong total.
+		log.Printf("warn: coverage narrative block: %v", err)
+	} else {
+		cs.NarrativeTotal, cs.NarrativeDone = narrativeTotal, narrativeDone
+	}
 
 	// Profile coverage: projects with enough sessions that have/don't have profiles
 	s.readerDB().QueryRow(`SELECT COUNT(*) FROM (SELECT project_short FROM sessions GROUP BY project_short HAVING COUNT(*) >= 3)`).Scan(&cs.ProfileTotal)
@@ -468,6 +574,11 @@ type EvolutionStats struct {
 	RuleBasedCount   int `json:"rule_based_count"`
 	LLMCount         int `json:"llm_count"`
 	AvgChainLength   float64 `json:"avg_chain_length"`
+
+	// DeletedPredecessorCount counts the rows whose successor was hard-deleted
+	// (SupersededByDeleted). They are retired, but no replacement happened, so
+	// they stay out of TotalSuperseded (YM-445).
+	DeletedPredecessorCount int `json:"deleted_predecessor_count"`
 }
 
 // GetEvolutionStats returns knowledge evolution metrics.
@@ -480,8 +591,15 @@ func (s *Store) GetEvolutionStatsF(f StatsFilter) (*EvolutionStats, error) {
 	es := &EvolutionStats{}
 	where, args := statsWhereAll(f)
 
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by IS NOT NULL AND `+where, args...).Scan(&es.TotalSuperseded)
-	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by IS NOT NULL AND supersede_reason LIKE 'rule-based%' AND `+where, args...).Scan(&es.RuleBasedCount)
+	// A row whose successor was hard-deleted is retired, but nothing replaced
+	// it: counting it here reported replacements that never happened, and
+	// cmd_benchmark reads this number as the evolution's output (YM-445).
+	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by IS NOT NULL AND superseded_by <> ? AND `+where,
+		append([]any{SupersededByDeleted}, args...)...).Scan(&es.TotalSuperseded)
+	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by = ? AND `+where,
+		append([]any{SupersededByDeleted}, args...)...).Scan(&es.DeletedPredecessorCount)
+	s.readerDB().QueryRow(`SELECT COUNT(*) FROM learnings WHERE superseded_by IS NOT NULL AND superseded_by <> ? AND supersede_reason LIKE 'rule-based%' AND `+where,
+		append([]any{SupersededByDeleted}, args...)...).Scan(&es.RuleBasedCount)
 	es.LLMCount = es.TotalSuperseded - es.RuleBasedCount
 
 	s.readerDB().QueryRow(`SELECT COALESCE(AVG(chain_len), 1.0) FROM (SELECT COUNT(*) AS chain_len FROM learnings WHERE supersedes IS NOT NULL GROUP BY supersedes)`).Scan(&es.AvgChainLength)
@@ -595,6 +713,23 @@ func (s *Store) UpdateSessionFlavorAndIntensity(sessionID, flavor string, intens
 		return 0, fmt.Errorf("update session flavor+intensity: %w", err)
 	}
 	return result.RowsAffected()
+}
+
+// GetSessionMaxIntensity returns the emotional intensity the session was rated
+// with, 0 if it was never rated. The extraction rates a session once and stamps
+// that value on every learning it creates, so the maximum of a session's
+// learnings is its rating — the source for learnings saved later (remember()).
+func (s *Store) GetSessionMaxIntensity(sessionID string) float64 {
+	if sessionID == "" {
+		return 0
+	}
+	var intensity float64
+	err := s.readerDB().QueryRow(`SELECT COALESCE(MAX(emotional_intensity), 0.0) FROM learnings
+		WHERE session_id = ? AND superseded_by IS NULL`, sessionID).Scan(&intensity)
+	if err != nil {
+		return 0
+	}
+	return intensity
 }
 
 // AllSessionIDs returns all distinct session IDs with active learnings, ordered by created_at DESC.

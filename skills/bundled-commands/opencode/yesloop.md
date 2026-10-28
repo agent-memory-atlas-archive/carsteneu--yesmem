@@ -38,7 +38,7 @@ When invoked from an interactive session, **do NOT execute the pipeline yourself
 - **Slash-qualified** (e.g. `zai/glm-5.2`, `zai-coding-plan/glm-5.2`) → passed through verbatim.
 - **Bare model name** (e.g. `glm-5.2`, `deepseek-v4-pro`) → resolved against the auto-discovered provider map (built from `~/.cache/opencode/models.json` + `~/.config/opencode/opencode.json`). The daemon prepends the matching providerID, e.g. `glm-5.2` becomes `zai/glm-5.2`.
 
-**Coding-optimized variants** (any provider whose ID contains "coding", e.g. `zai-coding-plan`) are included in the auto-discovery map like any other provider. When multiple providers carry the same bare modelID, the alphabetically-first ProviderID wins deterministically; resolve ambiguity explicitly via `model="provider/model"`. Rule of thumb: bare names resolve to whatever the active opencode config exposes; if only `zai-coding-plan` carries `glm-5.2`, bare `glm-5.2` resolves to `zai-coding-plan/glm-5.2`.
+**Coding-optimized variants** (any provider whose ID contains "coding", e.g. `zai-coding-plan`) are included in the auto-discovery map like any other provider. When multiple providers carry the same bare modelID, a credential-backed provider wins over a credential-free one, and only within the same credential state does the alphabetically-first ProviderID win deterministically (`sortProviders` in `internal/proxy/provider_autoconf.go`); resolve ambiguity explicitly via `model="provider/model"`. Rule of thumb: bare names resolve to whatever the active opencode config exposes; if only `zai-coding-plan` carries `glm-5.2`, bare `glm-5.2` resolves to `zai-coding-plan/glm-5.2`.
 
 Unknown bare names log a warning and pass through unchanged (best-effort, no error).
 
@@ -217,7 +217,7 @@ update_agent_status(phase="Phase 1/6 ANALYZE")
 **Open questions:** none (must be inferrable, no user questions)
 ```
 
-Information gathering is automatic — never ask the user. Code questions → search_code_index, grep, graph_traverse. API/docs → docs_search, hybrid_search. Errors → deep_search. Unknown concepts → WebFetch. NEVER guess — if you don't know, look it up (WebFetch or the indexed docs); infer only from code/context already in your turn.
+Information gathering is automatic — never ask the user. Code questions → `search_code` (contents AND call sites: `search_code("<symbol>(")` returns file, line and the enclosing function), `search_code_index` (symbols by name), `get_code_context` (who calls it, what it calls, what types it references), `get_code_snippet` (source), `get_file_symbols` (line map of a file). Shell search (`rg`, `grep`) is BLOCKED on indexed files: the code-nav hook refuses it and names the MCP tool instead; if you genuinely need the shell, run the same command again (the retry passes) or call `dismiss_code_nav(session_id)`. API/docs → docs_search, hybrid_search. Errors → deep_search. Unknown concepts → WebFetch. NEVER guess — if you don't know, look it up (WebFetch or the indexed docs); infer only from code/context already in your turn.
 
 ### Phase 2: PLAN
 ```
@@ -596,7 +596,7 @@ On startup, before ANY other action:
 2. `send_to(target=<caller_session>, content="[DONE] [DEPLOY: <status>] [COMMIT: <hash>] [BRANCH: <name>] [MERGE: <status>] <summary>. PR: <url>")` — markers leading, parsed by orchestrator; summary free-text after
 3. `set_plan(...)` mark as completed
 
-**NOTE:** `send_to` stores in DB but push delivery is unreliable for OpenCode targets. Orchestrator polls `check_messages`. Scratchpad is primary completion channel.
+**NOTE:** `send_to` to an opencode session is pushed into that session's inbox through the opencode service API, so an idle target reacts without polling. If no service is reachable, the message stays stored for the target's next request. A reply that reports `unconfirmed` means the message was claimed but the push could not be confirmed — the target may or may not have it, so do not resend it; its only trace is the daemon log line `[send_to] ... unconfirmed`. Scratchpad is primary completion channel.
 
 **Periodic polling:** Every 5 turns, `check_messages` for new instructions or cancellation.
 
@@ -629,17 +629,20 @@ Layer 2 of the yesloop guarantee: **Idle Detection** for yesloop agents with a l
 | State | Condition | Action |
 |---|---|---|
 | 0 WORKING | stream_active=true or idle <10min | No action |
-| 1 SELF_CHECK | stream_active=false for 10min, PID alive | Relay 1: ask agent to prove completion via scratchpad marker |
+| 1 SELF_CHECK | stream_active=false for 10min, PID alive | Relay 1: mid-pipeline text, or the six-phase question when the agent claims DONE or reports Phase 6 (see below) |
 | 2 REMARK_REQUEST | PROVEN marker found | Relay 2: ask agent to mark all 6 phases as done |
 | 3 COMMIT_REQUEST | 6 phases marked done | Relay 3: ask agent to commit and send_to orchestrator |
 | 4 DONE | send_to evidence in scratchpad | Terminal — notify orchestrator |
 
 ### Relay Messages
 
+Relay 1 has two wordings: the six-phase question only to an agent that claims DONE or reports Phase 6, the mid-pipeline text to every other agent.
+
 The daemon sends these exact messages (metachar-free, no markdown, no backticks):
 
-1. **State 0 → 1:** `Have you completed all 6 phases? If not do it now. For each phase prove you have done each, IF you have proven mark each phase in scratchpad with [x] showing it is done. MANDATORY: Make sure that you have also done phase 5 with all code reviews including Sub-phase 5.2 cold review, 5.3 consequence check and 5.4 security review via task subagents. REVIEW BLOCKED without subagent trace is not acceptable. Mandatory: only mark as PROVEN if it IS proven.`
-2. **State 1 → 2:** `Mark all 6 phases as done with x in scratchpad.`
+1. **State 0 → 1, six-phase wording** (the agent claims DONE or reports Phase 6): `Have you completed all 6 phases? If not do it now. For each phase prove you have done each. IF you have proven, mark each phase as done: put [x] at the end of the phase header line, or on its own line inside the phase block with just the marker and optionally the phase number or phase name, for example [x] Phase 1 or [x] ANALYZE. The Status line from the phase template with the value COMPLETE also counts. MANDATORY: Make sure that you have also done phase 5 with all code reviews including Sub-phase 5.2 cold review, 5.3 consequence check and 5.4 security review via task subagents. REVIEW BLOCKED without subagent trace is not acceptable. Mandatory: only mark as PROVEN if it IS proven.`
+   **State 0 → 1, mid-pipeline wording** (every other agent): `Your session showed no activity for a while. Continue the phase you are working on: do the remaining work, then write your progress and evidence into the scratchpad. Do not mark a phase as done that is not done.`
+2. **State 1 → 2:** `Mark all 6 phases as done in scratchpad: put [x] at the end of the phase header line, or on a dedicated marker line inside the phase block. The Status line from the phase template with the value COMPLETE also counts.`
 3. **State 2 → 3:** `If 1 through 6 are ok commit and send_to to caller.`
 
 ### Scratchpad Markers
@@ -647,6 +650,7 @@ The daemon sends these exact messages (metachar-free, no markdown, no backticks)
 The idle checker reads the agent's scratchpad section to detect progress:
 
 - **PROVEN** (case-insensitive): signals that the agent has verified all 6 phases are complete → triggers State 1 → 2
+- **Per-phase done marker**: since YM-149 the checker accepts the same three forms the relay names — `[x]` at the end of the phase header line (`### Phase 1: ANALYZE [x]`), a dedicated marker line inside the phase block (`[x]`, `- [x] Phase 1`, `- [x] ANALYZE`) or `**Status:** COMPLETE` in the block. A checklist item with its own text inside the block (`- [x] fixed the parser`) is NOT a phase mark.
 - **6x `**Status:** COMPLETE`**: when all 6 phase blocks are completed (detected by `CountCompletedPhases()`) → triggers State 2 → 3
 - **send_to orchestrator:** evidence in scratchpad → triggers State 3 → 4
 

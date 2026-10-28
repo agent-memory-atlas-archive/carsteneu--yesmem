@@ -3,6 +3,7 @@ package daemon
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/carsteneu/yesmem/internal/storage"
 )
@@ -376,4 +377,82 @@ func cleanupPlans() {
 	planStore.Lock()
 	planStore.plans = make(map[string]*Plan)
 	planStore.Unlock()
+}
+
+// YM-101: LoadPlansFromDB restored the plan body but not DocsHint, so every
+// plan reloaded after a daemon restart silently lost its docs reminder.
+func TestLoadPlansFromDB_RestoresDocsHint(t *testing.T) {
+	h, store := mustHandler(t)
+	defer cleanupPlans()
+
+	const project = "/home/me/restore-proj"
+	store.UpsertDocSource(&storage.DocSource{
+		Name: "restored-ref", Project: project, DocType: "reference", ExampleQuery: "how to",
+	})
+	now := time.Now()
+	if err := store.UpsertPlan(&storage.PlanRow{
+		ThreadID:  "thread-restore",
+		Content:   "⬜ Step 1",
+		Status:    "active",
+		Scope:     "session",
+		Project:   project,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed plan: %v", err)
+	}
+
+	LoadPlansFromDB(store)
+
+	m := resultMap(t, h.handleGetPlan(map[string]any{"thread_id": "thread-restore"}))
+	hint, _ := m["docs_hint"].(string)
+	if !strings.Contains(hint, "restored-ref") {
+		t.Fatalf("docs_hint after reload = %q, want the project's reference source", hint)
+	}
+}
+
+// The normal set_plan path carries no `project` at all: the MCP schema exposes
+// only plan and scope, so the daemon resolves the project from _cwd. If that
+// resolved value is not persisted, a reload rebuilds the hint globals-only and
+// the restore above only ever works for plans written with an explicit project.
+func TestSetPlan_PersistsResolvedProjectForReload(t *testing.T) {
+	h, store := mustHandler(t)
+	defer cleanupPlans()
+
+	store.UpsertDocSource(&storage.DocSource{
+		Name: "cwd-ref", Project: "/home/me/proj-a", DocType: "reference", ExampleQuery: "a",
+	})
+
+	if resp := h.handleSetPlan(map[string]any{
+		"plan":      "⬜ Step 1",
+		"scope":     "session",
+		"thread_id": "thread-cwd",
+		"_cwd":      "/home/me/proj-a",
+	}); resp.Error != "" {
+		t.Fatalf("set plan error: %s", resp.Error)
+	}
+
+	rows, err := store.GetActivePlans()
+	if err != nil {
+		t.Fatalf("get active plans: %v", err)
+	}
+	var persisted string
+	for _, r := range rows {
+		if r.ThreadID == "thread-cwd" {
+			persisted = r.Project
+		}
+	}
+	if persisted != "/home/me/proj-a" {
+		t.Fatalf("persisted project = %q, want the _cwd-resolved project", persisted)
+	}
+
+	// Restart simulation: drop the in-memory store, reload from the same DB.
+	cleanupPlans()
+	LoadPlansFromDB(store)
+
+	m := resultMap(t, h.handleGetPlan(map[string]any{"thread_id": "thread-cwd"}))
+	hint, _ := m["docs_hint"].(string)
+	if !strings.Contains(hint, "cwd-ref") {
+		t.Fatalf("docs_hint after reload = %q, want the cwd project's reference source", hint)
+	}
 }

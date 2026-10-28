@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -96,7 +97,7 @@ func TestCleanSettingsJSON_RemovesStatusLine(t *testing.T) {
 		},
 	}
 
-	cleanStatusLine(settings)
+	cleanStatusLine(settings, "")
 
 	if _, ok := settings["statusLine"]; ok {
 		t.Fatal("statusLine not removed")
@@ -111,7 +112,7 @@ func TestCleanSettingsJSON_PreservesNonYesmemStatusLine(t *testing.T) {
 		},
 	}
 
-	cleanStatusLine(settings)
+	cleanStatusLine(settings, "")
 
 	if _, ok := settings["statusLine"]; !ok {
 		t.Fatal("non-yesmem statusLine should be preserved")
@@ -138,7 +139,7 @@ func TestCleanSettingsJSON_RemovesSessionEndHook(t *testing.T) {
 		},
 	}
 
-	removeYesmemHook(hooks, "SessionEnd")
+	removeYesmemHook(hooks, "SessionEnd", "")
 
 	if _, ok := hooks["SessionEnd"]; ok {
 		t.Fatal("SessionEnd hook not removed")
@@ -146,6 +147,113 @@ func TestCleanSettingsJSON_RemovesSessionEndHook(t *testing.T) {
 	// SessionStart untouched
 	if _, ok := hooks["SessionStart"]; !ok {
 		t.Fatal("SessionStart should not be touched")
+	}
+}
+
+func TestCleanSettingsJSON_RemovesSessionEndHookFromFile(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"SessionEnd": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/yesmem session-end"},
+					},
+				},
+			},
+			"SessionStart": []any{
+				map[string]any{
+					"matcher": "startup",
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/yesmem briefing-hook"},
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanSettingsJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	hooks, _ := got["hooks"].(map[string]any)
+	if _, ok := hooks["SessionEnd"]; ok {
+		t.Fatalf("uninstall left a dangling SessionEnd hook: %v", hooks["SessionEnd"])
+	}
+	if _, ok := hooks["SessionStart"]; ok {
+		t.Fatalf("uninstall left a dangling SessionStart hook: %v", hooks["SessionStart"])
+	}
+}
+
+func TestCleanSettingsJSON_DropsEmptyUserPromptSubmitHandler(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "/home/user/bin/my-own-hook.sh"
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"UserPromptSubmit": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": foreign},
+					},
+				},
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/usr/local/bin/yesmem idle-tick"},
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanSettingsJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	hooks, _ := got["hooks"].(map[string]any)
+
+	cmds := hookCommands(hooks, "UserPromptSubmit")
+	for _, cmd := range cmds {
+		if strings.TrimSpace(cmd) == "" {
+			t.Fatalf("uninstall left an empty UserPromptSubmit command: %v", hooks["UserPromptSubmit"])
+		}
+		if strings.Contains(cmd, "yesmem") {
+			t.Fatalf("uninstall left a yesmem command: %q", cmd)
+		}
+	}
+	if countContaining(cmds, foreign) != 1 {
+		t.Fatalf("uninstall lost the foreign handler: %v", hooks["UserPromptSubmit"])
 	}
 }
 
@@ -398,6 +506,57 @@ func TestCleanProjectLocalSettings_NoProjectsNoPanic(t *testing.T) {
 	cleanProjectLocalSettings(home)
 }
 
+func TestRestorePrimaryApiKeyFromState_TightensExistingFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on Windows")
+	}
+	home := t.TempDir()
+	dataDir := t.TempDir()
+
+	state := map[string]any{"primaryApiKey": "sk-original"}
+	stateData, _ := json.Marshal(state)
+	if err := os.WriteFile(filepath.Join(dataDir, "install-state.json"), stateData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(path, []byte(`{"primaryApiKey":"sk-yesmem-set"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	restorePrimaryApiKeyFromState(dataDir, home)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf(".claude.json mode = %04o, want 0600 — the restore writes a key back into the file", got)
+	}
+}
+
+func TestCleanClaudeJSON_TightensExistingFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on Windows")
+	}
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(path, []byte(`{"mcpServers":{"yesmem":{"command":"yesmem"}}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanClaudeJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf(".claude.json mode = %04o, want 0600 — the file carries OAuth state", got)
+	}
+}
+
 func TestCleanClaudeJSON_RemovesYesmemSkillUsage(t *testing.T) {
 	home := t.TempDir()
 	claudeJSON := `{"mcpServers":{},"skillUsage":{"yesmem-sessions":{"usageCount":3},"yesmem-search":{"usageCount":1},"commit":{"usageCount":5}},"numStartups":10}`
@@ -491,4 +650,245 @@ func TestSavePreInstallState_SavesPrimaryApiKey(t *testing.T) {
 	if state["primaryApiKey"] != "sk-original" {
 		t.Fatalf("expected sk-original, got %v", state["primaryApiKey"])
 	}
+}
+
+func TestCleanSettingsJSON_KeepsForeignHandlerNamedLikeYesmem(t *testing.T) {
+	foreign := "/home/user/bin/my-yesmem-notes.sh"
+	home := writeSettingsForClean(t, map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{
+				map[string]any{
+					"matcher": "startup",
+					"hooks": []any{
+						map[string]any{"type": "command", "command": foreign},
+					},
+				},
+			},
+		},
+	})
+
+	if err := cleanSettingsJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks := readHooksAfterClean(t, home)
+	cmds := hookCommands(hooks, "SessionStart")
+	if countContaining(cmds, foreign) != 1 {
+		t.Fatalf("uninstall deleted a foreign handler that merely mentions yesmem: %v", cmds)
+	}
+}
+
+func TestCleanSettingsJSON_RemovesHandlerOfBinaryWithoutYesmemInPath(t *testing.T) {
+	home := writeSettingsForClean(t, map[string]any{
+		"mcpServers": map[string]any{
+			"yesmem": map[string]any{"command": "/opt/bin/ym", "args": []string{"mcp"}},
+		},
+		"hooks": map[string]any{
+			"SessionEnd": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/opt/bin/ym session-end"},
+					},
+				},
+			},
+		},
+	})
+
+	if err := cleanSettingsJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks := readHooksAfterClean(t, home)
+	if _, ok := hooks["SessionEnd"]; ok {
+		t.Fatalf("uninstall left the hook of a binary whose name lacks 'yesmem': %v", hooks["SessionEnd"])
+	}
+}
+
+func TestCleanSettingsJSON_KeepsForeignStatusLine(t *testing.T) {
+	foreign := "/home/user/bin/my-yesmem-statusline.sh"
+	home := writeSettingsForClean(t, map[string]any{
+		"statusLine": map[string]any{"type": "command", "command": foreign},
+	})
+
+	if err := cleanSettingsJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	sl, ok := got["statusLine"].(map[string]any)
+	if !ok || sl["command"] != foreign {
+		t.Fatalf("uninstall deleted a foreign statusLine that merely mentions yesmem: %v", got["statusLine"])
+	}
+}
+
+func TestRemoveProxyEnvVar_RemovesClaudeCodeRepl(t *testing.T) {
+	settings := map[string]any{
+		"env": map[string]any{
+			"ANTHROPIC_BASE_URL": claudeProxyBaseURL,
+			"CLAUDE_CODE_REPL":   "true",
+			"ANTHROPIC_API_KEY":  "sk-ant-x",
+		},
+	}
+
+	removeProxyEnvVar(settings)
+
+	env, _ := settings["env"].(map[string]any)
+	if _, ok := env["CLAUDE_CODE_REPL"]; ok {
+		t.Fatalf("uninstall left CLAUDE_CODE_REPL in the env block: %v", env)
+	}
+	if env["ANTHROPIC_BASE_URL"] != "https://api.anthropic.com" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %v, want the direct API endpoint", env["ANTHROPIC_BASE_URL"])
+	}
+}
+
+func TestCleanSettingsJSON_RemovesHandlerOfMovedUnnamedBinary(t *testing.T) {
+	home := writeSettingsForClean(t, map[string]any{
+		"mcpServers": map[string]any{
+			"yesmem": map[string]any{"command": "/old/bin/ym", "args": []string{"mcp"}},
+		},
+		"hooks": map[string]any{
+			"SessionEnd": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "/new/bin/ym session-end"},
+					},
+				},
+			},
+		},
+	})
+
+	if err := cleanSettingsJSON(home); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks := readHooksAfterClean(t, home)
+	if _, ok := hooks["SessionEnd"]; ok {
+		t.Fatalf("uninstall left the hook of a moved binary whose name lacks 'yesmem': %v", hooks["SessionEnd"])
+	}
+}
+
+// writeSettingsForClean writes a settings.json into a fresh home and returns it.
+func writeSettingsForClean(t *testing.T, settings map[string]any) string {
+	t.Helper()
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+// readHooksAfterClean returns the hooks block of the settings.json in home.
+func readHooksAfterClean(t *testing.T, home string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	hooks, _ := got["hooks"].(map[string]any)
+	return hooks
+}
+
+// A discarded os.UserHomeDir error turns every RemoveAll target into a path
+// relative to the working directory, so the guard has to refuse before the
+// first deletion.
+func TestUninstallHome_RejectsUnusableHome(t *testing.T) {
+	t.Run("empty HOME", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		if got, err := UserHome(); err == nil {
+			t.Fatalf("UserHome() = %q, nil; want an error for an empty HOME", got)
+		}
+	})
+	t.Run("root HOME", func(t *testing.T) {
+		t.Setenv("HOME", string(filepath.Separator))
+		if got, err := UserHome(); err == nil {
+			t.Fatalf("UserHome() = %q, nil; want an error for the root directory", got)
+		}
+	})
+	t.Run("relative HOME", func(t *testing.T) {
+		t.Setenv("HOME", "home/chief")
+		if got, err := UserHome(); err == nil {
+			t.Fatalf("UserHome() = %q, nil; want an error for a relative HOME", got)
+		}
+	})
+	t.Run("usable HOME", func(t *testing.T) {
+		want := t.TempDir()
+		t.Setenv("HOME", want)
+		got, err := UserHome()
+		if err != nil {
+			t.Fatalf("UserHome: %v", err)
+		}
+		if got != want {
+			t.Errorf("UserHome() = %q, want %q", got, want)
+		}
+	})
+}
+
+// skillUsage is keyed by skill name. Matching the substring "yesmem" removes a
+// user's own skill and misses yesmem's own unprefixed skills at the same time.
+func TestCleanClaudeJSON_RemovesOnlyYesmemSkills(t *testing.T) {
+	home := t.TempDir()
+	claudeJSON := `{"skillUsage":{` +
+		`"yesmem-remember":{"usageCount":3},` +
+		`"yesloop":{"usageCount":2},` +
+		`"reddit":{"usageCount":1},` +
+		`"reddit_fetch":{"usageCount":6},` +
+		`"my-yesmem-helper":{"usageCount":4},` +
+		`"commit":{"usageCount":5}}}`
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(claudeJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanClaudeJSON(home); err != nil {
+		t.Fatalf("cleanClaudeJSON: %v", err)
+	}
+
+	su := readSkillUsage(t, home)
+	// reddit_fetch is the shape a cap-backed skill writes: the tool name, not
+	// the directory name.
+	for _, gone := range []string{"yesmem-remember", "yesloop", "reddit", "reddit_fetch"} {
+		if _, has := su[gone]; has {
+			t.Errorf("%s is a yesmem skill and should be removed", gone)
+		}
+	}
+	for _, kept := range []string{"my-yesmem-helper", "commit"} {
+		if _, has := su[kept]; !has {
+			t.Errorf("%s is not a yesmem skill and must be preserved", kept)
+		}
+	}
+}
+
+func readSkillUsage(t *testing.T, home string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		t.Fatalf("read claude.json: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("claude.json is not JSON: %v", err)
+	}
+	su, ok := cfg["skillUsage"].(map[string]any)
+	if !ok {
+		t.Fatal("skillUsage was removed although foreign entries remained")
+	}
+	return su
 }

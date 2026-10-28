@@ -110,7 +110,7 @@ func TestFillSystemTemplate_UnknownModel(t *testing.T) {
 }
 
 func TestLoadSystemPromptFromPath_Missing(t *testing.T) {
-		got := loadSystemPromptFromPath("/nonexistent/path")
+	got := loadSystemPromptFromPath("/nonexistent/path")
 	if got != nil {
 		t.Error("expected nil for missing file")
 	}

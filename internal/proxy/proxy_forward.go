@@ -4,34 +4,73 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// maybeDumpRequestBody writes the request body to <dataDir>/logs/req_<idx>_body.json
-// only when YESMEM_PROXY_DEBUG=1. Mirrors the guard at proxy.go:865 and proxy.go:1789.
-// No-op when the env var is unset, set to anything other than "1", or dataDir is empty.
-func maybeDumpRequestBody(dataDir string, reqIdx int, body []byte) {
-	if os.Getenv("YESMEM_PROXY_DEBUG") != "1" || dataDir == "" {
-		return
+// oneLineForJournal renders text this proxy did not write for the journal: the
+// log is read line by line and re-read in terminals and editors, so a newline
+// would forge a second entry and a control character would corrupt every reader.
+func oneLineForJournal(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == 0x2028 || r == 0x2029 {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// journalToken renders a client-supplied identifier for the journal. An id is a
+// token: a bracket or a space would end the "[req N tid=...] " prefix early,
+// which lets the id plant a status header of its own, so everything outside the
+// id alphabet is dropped rather than replaced. The cap keeps one request from
+// writing an identifier-sized block into every line of its journal entry.
+//
+// "/" stays: provider-qualified model ids are the main content of the model slot
+// and the operator needs the prefix to act on the routing warning. It is not part
+// of the discriminator either, because the cap's counters key on "upstream 429:"
+// and friends, and the space in front of the code is what a token cannot keep.
+func journalToken(s string) string {
+	const maxJournalTokenBytes = 64
+	if len(s) > maxJournalTokenBytes {
+		s = s[:maxJournalTokenBytes]
 	}
-	debugPath := filepath.Join(dataDir, "logs", fmt.Sprintf("req_%d_body.json", reqIdx))
-	os.WriteFile(debugPath, body, 0644)
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '_' || r == '-' || r == '.' || r == ':' || r == '/':
+			return r
+		}
+		return -1
+	}, s)
+}
+
+// upstreamBodyForLog renders an upstream error body for the journal. The text is
+// capped like every other body in these lines; the cap's counters read the
+// status header only, so a body that quotes counter vocabulary cannot move them.
+func upstreamBodyForLog(body []byte) string {
+	if len(body) == 0 {
+		return "(empty body)"
+	}
+	return oneLineForJournal(truncateBytes(body, 500))
 }
 
 // forwardWithAnnotation forwards the request and extracts annotations from the SSE response.
-func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Request, body []byte, reqIdx int, toolUseIDs []string, proj string, projDir string, threadID string, msgCount int, estimatedTokens ...int) {
-	// Debug: dump request body to file for inspection (enable with YESMEM_PROXY_DEBUG=1)
-	maybeDumpRequestBody(s.cfg.DataDir, reqIdx, body)
+func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Request, body []byte, reqIdx int, toolUseIDs []string, proj string, projDir string, threadID string, msgCount int, isSubagent bool, estimatedTokens ...int) {
+	// Debug: dump forwarded request body for inspection (enable with YESMEM_PROXY_DEBUG=1)
+	if p := writeDebugDump(s.cfg.DataDir, threadID, dumpKindBody, reqIdx, body); p != "" {
+		s.logger.Printf("[req %d] body-dump %dk to %s", reqIdx, len(body)/1024, p)
+	}
 
-	targetURL := s.resolveAnthropicTarget(extractModelFromBody(body)) + origReq.URL.RequestURI()
+	target := s.resolveAnthropicTarget(extractModelFromBody(body))
+	targetURL := target + origReq.URL.RequestURI()
 
 	// Strip provider prefix before forwarding (opencode sends "providerID/modelID"
 	// but Anthropic API expects bare model names). No-op when body has no prefix.
@@ -52,10 +91,6 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 	proxyReq.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	proxyReq.Header.Del("Connection")
 	proxyReq.Header.Del("Accept-Encoding") // Force uncompressed for SSE parsing
-
-	if s.cacheTTLDetector != nil {
-		s.cacheTTLDetector.RecordRequest(threadID)
-	}
 
 	resp, err := s.httpClient.Do(proxyReq)
 	if err != nil {
@@ -98,15 +133,20 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 	isSSE := strings.Contains(ct, "text/event-stream")
 	if !isSSE {
 		// Non-SSE response — track stream start/stop
-			isSub, parentThread := s.subagentStreamInfo(origReq, body)
-			if threadID != "" {
-				go s.trackStreamState(threadID, true, 0, isSub, projDir, parentThread)
-			}
+		isSub, parentThread := s.subagentStreamInfo(origReq, body)
+		if threadID != "" {
+			go s.trackStreamState(threadID, true, 0, isSub, projDir, parentThread)
+		}
 
 		// Read body to extract usage, then write to client
 		bodyBytes, readErr := io.ReadAll(responseBody)
 		if readErr != nil {
-			s.logger.Printf("[req %d] read error: %v", reqIdx, readErr)
+			// A body that breaks off is a failed call like any other, and the
+			// wording is the marker proxy_health reads: "upstream error:" counts
+			// it as a provider failure, while a bare "read error:" with an i/o
+			// timeout lands in the daemon-timeout bucket (YM-380). Same line as
+			// the OpenAI path, which was fixed the same way in los 32f.
+			s.logger.Printf("%s[req %d] upstream error: read from upstream: %v%s", colorRed, reqIdx, readErr, colorReset)
 			if threadID != "" {
 				go s.trackStreamState(threadID, false, 0, isSub, projDir, parentThread)
 			}
@@ -114,8 +154,8 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 		}
 		w.Write(bodyBytes)
 
-		if resp.StatusCode != 200 && len(bodyBytes) > 0 {
-			s.logger.Printf("%s[req %d tid=%s] upstream %d: %s%s", colorRed, reqIdx, threadID, resp.StatusCode, truncateBytes(bodyBytes, 500), colorReset)
+		if resp.StatusCode != 200 {
+			s.logger.Printf("%s[req %d tid=%s] upstream %d: %s%s", colorRed, reqIdx, journalToken(threadID), resp.StatusCode, upstreamBodyForLog(bodyBytes), colorReset)
 		}
 
 		if threadID != "" {
@@ -134,17 +174,24 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 				} `json:"cache_creation"`
 			} `json:"usage"`
 		}
-		if err := json.Unmarshal(bodyBytes, &jsonResp); err == nil && jsonResp.Usage.InputTokens > 0 {
-			// Sawtooth: track actual tokens for trigger decisions (non-streaming path)
+		// A pure cache hit reports input_tokens=0 and the cached prefix in
+		// cache_read_input_tokens, so the gate has to look at the total. The
+		// streaming path feeds that same total into every consumer below.
+		if err := json.Unmarshal(bodyBytes, &jsonResp); err == nil &&
+			jsonResp.Usage.InputTokens+jsonResp.Usage.CacheReadInputTokens+jsonResp.Usage.CacheCreationInputTokens > 0 {
+			// Sawtooth: track actual tokens for trigger decisions (non-streaming path).
+			// Total, not InputTokens: input_tokens excludes the cached prefix, and the
+			// streaming path feeds TotalInputTokens into the same calibration sample.
+			totalInputTokens := jsonResp.Usage.InputTokens + jsonResp.Usage.CacheReadInputTokens + jsonResp.Usage.CacheCreationInputTokens
 			if s.cfg.SawtoothEnabled && threadID != "" && s.sawtoothTrigger != nil {
-				s.sawtoothTrigger.UpdateAfterResponse(threadID, jsonResp.Usage.InputTokens, msgCount)
+				s.sawtoothTrigger.UpdateAfterResponse(threadID, totalInputTokens, msgCount)
 			}
 			// Report token usage to daemon for agent budget tracking
 			if threadID != "" {
 				go s.queryDaemon("_track_usage", map[string]any{
 					"thread_id":          threadID,
 					"project":            projDir,
-					"input_tokens":       jsonResp.Usage.InputTokens,
+					"input_tokens":       totalInputTokens,
 					"output_tokens":      jsonResp.Usage.OutputTokens,
 					"cache_read_tokens":  jsonResp.Usage.CacheReadInputTokens,
 					"cache_write_tokens": jsonResp.Usage.CacheCreationInputTokens,
@@ -156,26 +203,15 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 			}
 			// Update cache status writer
 			s.cacheStatusWriter.Update(time.Now(),
-				jsonResp.Usage.InputTokens, jsonResp.Usage.CacheReadInputTokens, jsonResp.Usage.CacheCreationInputTokens, threadID)
+				totalInputTokens, jsonResp.Usage.CacheReadInputTokens, jsonResp.Usage.CacheCreationInputTokens, threadID)
 			var fwdModel struct {
 				Model string `json:"model"`
 			}
 			json.Unmarshal(body, &fwdModel)
-			s.cacheStatusWriter.UpdateThresholdForThread(threadID, s.effectiveTokenThreshold(fwdModel.Model))
+			s.cacheStatusWriter.UpdateThresholdForThread(threadID, s.effectiveTokenThreshold(threadID, fwdModel.Model))
 			// Feed TTL detector and reset keepalive (non-streaming path)
 			if s.cacheTTLDetector != nil {
-				prevState := s.cacheTTLDetector.Is1hSupported()
-				s.cacheTTLDetector.RecordResponse(jsonResp.Usage.CacheReadInputTokens, jsonResp.Usage.CacheCreationInputTokens, jsonResp.Usage.CacheCreation.Ephemeral1hInputTokens)
-				newState := s.cacheTTLDetector.Is1hSupported()
-				if prevState == nil && newState != nil {
-					s.logger.Printf("TTL detection: ephemeral_1h=%d → 1h_supported=%v", jsonResp.Usage.CacheCreation.Ephemeral1hInputTokens, *newState)
-					if *newState && s.frozenStubs != nil {
-						s.frozenStubs.UpdateTTL(sawtoothTTLForCacheTTL("1h"))
-					}
-					if s.cacheKeepalive != nil {
-						s.cacheKeepalive.Retrigger()
-					}
-				}
+				s.recordCacheResponse(threadID, jsonResp.Usage.CacheReadInputTokens, jsonResp.Usage.CacheCreationInputTokens, jsonResp.Usage.CacheCreation.Ephemeral1hInputTokens)
 			}
 			if s.cacheKeepalive != nil {
 				apiKey := origReq.Header.Get("x-api-key")
@@ -201,6 +237,10 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 	var firstTextCollected bool
 	var textAccum strings.Builder
 	const maxAnnotationLen = 120
+
+	// Deflation is a Claude Code only convenience: other Anthropic-path clients
+	// render the reported number and must see the real usage.
+	deflateClient := shouldDeflateUsage(origReq.Header, s.cfg.UsageDeflationFactor)
 
 	// Task #3: Usage tracking from SSE stream
 	usage := &UsageTracker{}
@@ -249,7 +289,7 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 				// Deflate input_tokens in message_start so CC sees lower context usage.
 				// This prevents the "Context low" warning since our proxy manages context.
 				// Real values are already captured in usage tracker above.
-				if s.cfg.UsageDeflationFactor > 0 && bytes.Contains(data, []byte(`"message_start"`)) {
+				if deflateClient && bytes.Contains(data, []byte(`"message_start"`)) {
 					if deflated := deflateUsage(data, s.cfg.UsageDeflationFactor); deflated != nil {
 						deflatedLine := append([]byte("data: "), deflated...)
 						deflatedLine = append(deflatedLine, '\n')
@@ -329,24 +369,11 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 			Model string `json:"model"`
 		}
 		json.Unmarshal(body, &fwdModel)
-		s.cacheStatusWriter.UpdateThresholdForThread(threadID, s.effectiveTokenThreshold(fwdModel.Model))
+		s.cacheStatusWriter.UpdateThresholdForThread(threadID, s.effectiveTokenThreshold(threadID, fwdModel.Model))
 
 		// Feed TTL detector and reset keepalive timer
 		if s.cacheTTLDetector != nil {
-			prevState := s.cacheTTLDetector.Is1hSupported()
-			s.cacheTTLDetector.RecordResponse(usage.CacheReadInputTokens, usage.CacheCreationInputTokens, usage.Ephemeral1hInputTokens)
-			newState := s.cacheTTLDetector.Is1hSupported()
-			if prevState == nil && newState != nil {
-				s.logger.Printf("TTL detection: ephemeral_1h=%d → 1h_supported=%v", usage.Ephemeral1hInputTokens, *newState)
-				if *newState && s.frozenStubs != nil {
-					s.frozenStubs.UpdateTTL(sawtoothTTLForCacheTTL("1h"))
-					s.logger.Printf("TTL detection: frozen stubs TTL → %v", sawtoothTTLForCacheTTL("1h"))
-				}
-				if s.cacheKeepalive != nil {
-					s.cacheKeepalive.Retrigger()
-					s.logger.Printf("TTL detection: keepalive retriggered (interval=%ds)", s.cacheKeepalive.Status().IntervalS)
-				}
-			}
+			s.recordCacheResponse(threadID, usage.CacheReadInputTokens, usage.CacheCreationInputTokens, usage.Ephemeral1hInputTokens)
 		}
 		if s.cacheKeepalive != nil {
 			apiKey := origReq.Header.Get("x-api-key")
@@ -373,11 +400,12 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 			})
 		}(usage)
 
-		// Fire forked agents (async, fire-and-forget)
+		// Fire forked agents (async, fire-and-forget). A subagent shares the
+		// parent's thread ID, so its response must not spend the parent's budget.
 		if usage.Complete && usage.CacheReadInputTokens > 0 && !s.forkState.IsDisabled(threadID) && isRealUserSession(threadID) {
 			totalTokens := usage.TotalInputTokens()
 			hasCache := usage.CacheReadInputTokens > 0
-			if s.forkState.ShouldFork(threadID, totalTokens, hasCache) {
+			if s.forkState.ShouldFork(threadID, totalTokens, hasCache, isSubagent) {
 				// Snapshot injected IDs for fork context
 				s.lastInjectedIDsMu.Lock()
 				injectedCopy := make(map[int64]string)
@@ -388,6 +416,7 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 
 				go s.fireForkedAgents(ForkContext{
 					OriginalBody:      body,
+					SourceFormat:      "anthropic",
 					AssistantResponse: fullResponseText.String(),
 					ThreadID:          threadID,
 					Project:           proj,
@@ -399,6 +428,7 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 					LastExtractedIdx:  reqIdx - 2, // previous turn
 					SessionID:         threadID,
 					AuthHeader:        origReq.Header,
+					SourceTarget:      target,
 				}, s.forkConfigs)
 			}
 		}
@@ -425,7 +455,7 @@ func (s *Server) forwardWithAnnotation(w http.ResponseWriter, origReq *http.Requ
 }
 
 // forwardRaw forwards a request to the upstream API without any annotation extraction.
-func (s *Server) forwardRaw(w http.ResponseWriter, origReq *http.Request, body []byte) {
+func (s *Server) forwardRaw(w http.ResponseWriter, origReq *http.Request, body []byte, reqIdx int) {
 	targetURL := s.resolveAnthropicTarget(extractModelFromBody(body)) + origReq.URL.RequestURI()
 
 	// Strip provider prefix before forwarding (opencode sends "providerID/modelID"
@@ -465,9 +495,27 @@ func (s *Server) forwardRaw(w http.ResponseWriter, origReq *http.Request, body [
 
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 4096)
+	// This path streams the answer through, so a non-200 body cannot be read
+	// after the fact. The first bytes are captured while they pass: without a
+	// status line a bypassed or unparsable request left no trace of a failed
+	// upstream answer in the journal (YM-380). The body is only reported when the
+	// read completed, because a broken body already has its own error line and
+	// proxy_health would count both as a separate failure.
+	var bodyPrefix []byte
+	var readFailed bool
+	if resp.StatusCode != 200 {
+		bodyPrefix = make([]byte, 0, 500)
+	}
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			if len(bodyPrefix) < cap(bodyPrefix) {
+				room := cap(bodyPrefix) - len(bodyPrefix)
+				if n < room {
+					room = n
+				}
+				bodyPrefix = append(bodyPrefix, buf[:room]...)
+			}
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				s.logger.Printf("write error: %v", writeErr)
 				return
@@ -477,11 +525,29 @@ func (s *Server) forwardRaw(w http.ResponseWriter, origReq *http.Request, body [
 			}
 		}
 		if readErr != nil {
+			// io.EOF is the ordinary end of the body. A cancelled request is the
+			// caller leaving, not the provider failing, so it stays out of the
+			// journal for the same reason as on the OpenAI path (los 32f).
+			// The status rides in this line instead of a second one: "upstream
+			// error:" and "upstream 5xx:" are two API errors for the health cap,
+			// and the status must not get lost with the suppressed status line.
+			if readErr != io.EOF && !errors.Is(readErr, context.Canceled) {
+				readFailed = true
+				s.logger.Printf("%s[req %d] upstream error: read from upstream (HTTP %d): %v%s", colorRed, reqIdx, resp.StatusCode, readErr, colorReset)
+			}
 			break
 		}
 	}
+
+	// The "] upstream NNN: " shape is what the health cap truncates the line at
+	// before it reads its structural counters, so an upstream body cannot move
+	// them (YM-380).
+	if resp.StatusCode != 200 && !readFailed {
+		s.logger.Printf("%s[req %d] upstream %d: %s%s", colorRed, reqIdx, resp.StatusCode, upstreamBodyForLog(bodyPrefix), colorReset)
+	}
 }
 
+// passthrough has no request counter, so the journal names it with index 0.
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	r.Body.Close()
@@ -489,7 +555,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to read request body", http.StatusBadGateway)
 		return
 	}
-	s.forwardRaw(w, r, body)
+	s.forwardRaw(w, r, body, 0)
 }
 
 // parseSSEForAnnotation extracts text from SSE content_block_delta events.

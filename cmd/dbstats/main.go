@@ -107,7 +107,8 @@ func main() {
 				fmt.Printf("Superseded %d learnings by #%d\n", len(oldIDs), newID)
 			}
 		case "--update-memory":
-			daemon.GenerateAllMemoryMDs(store)
+			cfg, _ := config.Load(filepath.Join(home, ".claude", "yesmem", "config.yaml"))
+			daemon.GenerateAllMemoryMDs(store, cfg.ClaudeProjectsDir())
 		case "--set-profile":
 			// Usage: --set-profile <project> <profile-text>
 			if len(os.Args) < 4 {
@@ -118,12 +119,12 @@ func main() {
 			text := os.Args[3]
 			now := time.Now()
 			p := &models.ProjectProfile{
-				Project:     proj,
-				ProfileText: text,
-				GeneratedAt: now,
-				UpdatedAt:   now,
+				Project:      proj,
+				ProfileText:  text,
+				GeneratedAt:  now,
+				UpdatedAt:    now,
 				SessionCount: 0,
-				ModelUsed:   "manual",
+				ModelUsed:    "manual",
 			}
 			if err := store.UpsertProjectProfile(p); err != nil {
 				fmt.Printf("Error: %v\n", err)

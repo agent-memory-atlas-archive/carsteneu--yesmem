@@ -10,11 +10,23 @@
 // (WINDOWID, set by ghostty). Modelled after the sibling plugins in
 // ~/.config/opencode/plugins (export default Plugin.define).
 import { Plugin } from "@opencode/plugin/tui"
-import { appendFileSync, readFileSync } from "node:fs"
+import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs"
 
 const LOG_FILE = `${process.env.HOME || "/home/chief"}/.claude/yesmem/logs/plugin.log`
+// The file is appended to by every TUI window for the life of the session and nothing rotated it, so it grew
+// without bound (YM-460). Same cap and rename-instead-of-truncate as the v2 plugin log. The size is checked
+// on every write on purpose: this plugin writes a handful of lines per window session, and a counter-based
+// check (every Nth write) would leave a file above the cap growing for as long as no window reached N. Two
+// windows may rotate at the same moment; the second rename then replaces the first segment, which costs the
+// older lines of a log file and nothing else.
+const MAX_LOG_BYTES = 5 * 1024 * 1024
 function dbgLog(tag: string, msg: string) {
   try {
+    if ((statSync(LOG_FILE, { throwIfNoEntry: false })?.size ?? 0) > MAX_LOG_BYTES) {
+      try {
+        renameSync(LOG_FILE, `${LOG_FILE}.1`)
+      } catch {}
+    }
     appendFileSync(LOG_FILE, `[${new Date().toISOString()}] [yesmem-window] ${tag} ${msg}\n`)
   } catch {}
 }

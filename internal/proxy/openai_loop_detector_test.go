@@ -68,9 +68,13 @@ func TestOpenAIPipeline_LoopDetectionFires(t *testing.T) {
 	}
 
 	ctx := openAIRequestContext{
-		ReqIdx:   1,
-		ThreadID: "opencode:test-session",
-		Project:  "test",
+		ReqIdx: 1,
+		// A production opencode request carries its session header, so its
+		// thread id names a session and the frozen per-message state is
+		// allowed to carry per-session content (see annotateOpenAIMessageMetadata).
+		ThreadID:        "opencode:test-session",
+		Project:         "test",
+		ThreadIsSession: true,
 	}
 
 	s.runOpenAIParityPipeline(anthReq, &ctx)

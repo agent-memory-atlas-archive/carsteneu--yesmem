@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,30 +10,64 @@ import (
 	"github.com/carsteneu/yesmem/internal/codescan"
 )
 
-// codeGraphEntry holds a cached CodeGraph with the git HEAD it was built from.
+// codeGraphEntry holds a cached CodeGraph together with the git HEAD and CBM
+// index mtime it was built from. Both are re-checked on every access, so the
+// code tools stop serving symbols from before a commit (DT26 / YM-5).
 type codeGraphEntry struct {
-	graph   *codescan.CodeGraph
-	head    string
-	scanner *codescan.CachedScanner
+	graph    *codescan.CodeGraph
+	head     string
+	cbmMtime int64
+}
+
+// codeGraphFresh reports whether the cached graph still matches the project's
+// git HEAD and CBM index.
+func codeGraphFresh(entry *codeGraphEntry, projectDir string) bool {
+	if entry.graph == nil {
+		return false
+	}
+	// Entries recorded without a key — graphs injected by tests — have nothing
+	// to compare against. Real entries always carry both values, so this
+	// shortcut never applies to them.
+	if entry.head == "" && entry.cbmMtime == 0 {
+		return true
+	}
+	// No directory to compare against: a keyed entry cannot be verified, so it
+	// does not count as fresh.
+	if projectDir == "" {
+		return false
+	}
+	return entry.head == codescan.ReadGitHead(projectDir) &&
+		entry.cbmMtime == codescan.CBMIndexMtime(projectDir).Unix()
 }
 
 // getCodeGraph returns the CodeGraph for a project, building it on first access.
 // Thread-safe. Returns nil if project directory cannot be resolved.
 // Cache is keyed by resolved project directory (or project name as fallback) so
-// worktrees get separate graphs.
+// worktrees get separate graphs. A cached graph whose git HEAD or CBM index
+// mtime moved is rebuilt on the next access.
 func (h *Handler) getCodeGraph(project string, params ...map[string]any) *codescan.CodeGraph {
 	projectDir := h.resolveProjectDir(project, params...)
+	// project_dir comes from the client, and real callers send a subdirectory.
+	// It has to hit the project's index instead of building, and re-scanning on
+	// every process start, a subtree graph of its own (DEV-DT73). CheckoutRoot is
+	// the ascent to that index root — the same ascent ScanCacheKey makes, after
+	// resolving symlinks — so the graph cache and the scan row name the same
+	// tree (YM-453).
+	if projectDir != "" {
+		projectDir = codescan.CheckoutRoot(projectDir)
+	}
 	cacheKey := projectDir
 	if cacheKey == "" {
 		cacheKey = project
 	}
 
 	h.codeGraphMu.RLock()
-	if entry, ok := h.codeGraphs[cacheKey]; ok {
-		h.codeGraphMu.RUnlock()
+	entry, ok := h.codeGraphs[cacheKey]
+	h.codeGraphMu.RUnlock()
+
+	if ok && codeGraphFresh(entry, projectDir) {
 		return entry.graph
 	}
-	h.codeGraphMu.RUnlock()
 
 	if projectDir == "" {
 		return nil
@@ -42,19 +77,30 @@ func (h *Handler) getCodeGraph(project string, params ...map[string]any) *codesc
 	defer h.codeGraphMu.Unlock()
 
 	// Double-check after acquiring write lock
-	if entry, ok := h.codeGraphs[cacheKey]; ok {
+	if entry, ok := h.codeGraphs[cacheKey]; ok && codeGraphFresh(entry, projectDir) {
 		return entry.graph
 	}
 
 	var inner codescan.Scanner
-	if codescan.FindCBMBinary() != "" {
+	switch {
+	case h.codeScanner != nil:
+		inner = h.codeScanner()
+	case codescan.FindCBMBinary() != "":
 		inner = codescan.NewCBMScanner()
-	} else {
+	default:
 		inner = &codescan.DirectoryScanner{}
 	}
 	scanner := codescan.NewCachedScanner(inner).WithStore(h.store)
 	result, err := scanner.Scan(projectDir)
 	if err != nil {
+		// A rebuild can fail for a transient reason (CBM busy or timing out, a
+		// scan cooldown from an earlier failure). Serving nothing would turn one
+		// hiccup into an outage of every code tool, so an already built graph is
+		// preferred over none — freshness is best-effort, availability is not.
+		log.Printf("[codescan] scan %q failed: %v", projectDir, err)
+		if stale, ok := h.codeGraphs[cacheKey]; ok && stale.graph != nil {
+			return stale.graph
+		}
 		return nil
 	}
 
@@ -67,8 +113,9 @@ func (h *Handler) getCodeGraph(project string, params ...map[string]any) *codesc
 		h.codeGraphs = make(map[string]*codeGraphEntry)
 	}
 	h.codeGraphs[cacheKey] = &codeGraphEntry{
-		graph:   graph,
-		scanner: scanner,
+		graph:    graph,
+		head:     codescan.ReadGitHead(projectDir),
+		cbmMtime: codescan.CBMIndexMtime(projectDir).Unix(),
 	}
 	return graph
 }
@@ -76,7 +123,13 @@ func (h *Handler) getCodeGraph(project string, params ...map[string]any) *codesc
 // resolveProjectDir returns the filesystem path for a project name.
 // Prefers explicit project_dir, then the project parameter, then _cwd from params (worktree-aware).
 // If project is already a valid absolute directory path, returns it directly.
+// The result is canonicalized: every code tool walks it, and filepath.Walk
+// never enters a root that is itself a symlink (YM-232).
 func (h *Handler) resolveProjectDir(project string, params ...map[string]any) string {
+	return codescan.ResolveScanRoot(h.lookupProjectDir(project, params...))
+}
+
+func (h *Handler) lookupProjectDir(project string, params ...map[string]any) string {
 	if len(params) > 0 && params[0] != nil {
 		if dir, _ := params[0]["project_dir"].(string); dir != "" {
 			return dir
@@ -167,12 +220,20 @@ func (h *Handler) handleSearchCode(params map[string]any) Response {
 
 	// Grep source files for the pattern
 	type grepMatch struct {
-		file    string
-		line    int
-		content string
+		file      string
+		graphFile string
+		line      int
+		content   string
 	}
 	var matches []grepMatch
 	patternLower := strings.ToLower(pattern)
+	var skippedLinks int
+	var firstSkipped string
+
+	// The graph speaks in paths relative to the checkout root, while the walk
+	// stays inside the caller's directory. The two differ when the client names a
+	// subdirectory, and then the walk-relative path finds no node (DEV-DT73).
+	graphRoot := codescan.CheckoutRoot(projectDir)
 
 	filepath.Walk(projectDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -185,6 +246,35 @@ func (h *Handler) handleSearchCode(params map[string]any) Response {
 			return nil
 		}
 		rel, _ := filepath.Rel(projectDir, path)
+		graphFile := rel
+		if graphRoot != projectDir {
+			if grel, err := filepath.Rel(graphRoot, path); err == nil && !strings.HasPrefix(grel, "..") {
+				graphFile = grel
+			}
+		}
+
+		// The walk reports a symlink as its own entry, and the ReadFile below
+		// then follows it — a link whose target lies outside the project would
+		// hand the caller a foreign file. Same containment rule as for the
+		// client-supplied paths (YM-199), applied to the walk side (YM-224).
+		// Checked against rel: a relative project root arrives with its own
+		// name already prefixed to the walk path, and joining that onto the
+		// resolved root again leaves a path that does not exist, which hides
+		// the symlink from the check. The read then uses the resolved path so
+		// the check stays bound to the bytes that are read.
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, ok := codescan.ResolveWithinRoot(projectDir, rel)
+			if !ok {
+				// Counted, not logged per path: the name is repository content
+				// and one line per link would let a repository flood the log.
+				skippedLinks++
+				if firstSkipped == "" {
+					firstSkipped = rel
+				}
+				return nil
+			}
+			path = resolved
+		}
 
 		if filePattern != "" {
 			isGlob := strings.ContainsAny(filePattern, "*?[")
@@ -206,7 +296,7 @@ func (h *Handler) handleSearchCode(params map[string]any) Response {
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
 			if strings.Contains(strings.ToLower(line), patternLower) {
-				matches = append(matches, grepMatch{file: rel, line: i + 1, content: strings.TrimSpace(line)})
+				matches = append(matches, grepMatch{file: rel, graphFile: graphFile, line: i + 1, content: strings.TrimSpace(line)})
 				if len(matches) >= limit*3 {
 					return filepath.SkipAll
 				}
@@ -214,6 +304,10 @@ func (h *Handler) handleSearchCode(params map[string]any) Response {
 		}
 		return nil
 	})
+
+	if skippedLinks > 0 {
+		log.Printf("[codescan] search_code: skipped %d symlinked source file(s) that resolve outside %q or not at all (first: %q)", skippedLinks, projectDir, firstSkipped)
+	}
 
 	// Deduplicate into containing graph nodes
 	type enrichedMatch struct {
@@ -226,7 +320,7 @@ func (h *Handler) handleSearchCode(params map[string]any) Response {
 
 	for _, m := range matches {
 		// Find containing graph node for this file
-		node := graph.FindNodeByFile(m.file)
+		node := graph.FindNodeByFile(m.graphFile)
 		key := m.file
 		if node != nil {
 			key = node.QualifiedName
@@ -505,7 +599,10 @@ func (h *Handler) handleGetCodeSnippet(params map[string]any) Response {
 		if projectDir == "" {
 			return errorResponse("cannot resolve project directory for: " + project)
 		}
-		filePath := filepath.Join(projectDir, file)
+		filePath, ok := codescan.ResolveWithinRoot(projectDir, file)
+		if !ok {
+			return errorResponse(fmt.Sprintf("file %s is outside the project directory", file))
+		}
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return errorResponse(fmt.Sprintf("cannot read file %s: %v", file, err))
@@ -545,7 +642,14 @@ func (h *Handler) handleGetCodeSnippet(params map[string]any) Response {
 		return errorResponse("cannot resolve project directory for: " + project)
 	}
 
-	filePath := filepath.Join(projectDir, node.File)
+	// node.File is relative to the checkout root, so a subdirectory call has to
+	// resolve it against that root instead of against its own directory
+	// (DEV-DT73).
+	root := codescan.CheckoutRoot(projectDir)
+	filePath, ok := codescan.ResolveWithinRoot(root, node.File)
+	if !ok {
+		return errorResponse(fmt.Sprintf("file %s is outside the project directory", node.File))
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return errorResponse(fmt.Sprintf("cannot read file %s: %v", node.File, err))
@@ -581,7 +685,11 @@ func (h *Handler) handleGetFileIndex(params map[string]any) Response {
 
 	targetDir := projectDir
 	if dir != "" {
-		targetDir = filepath.Join(projectDir, dir)
+		resolved, ok := codescan.ResolveWithinRoot(projectDir, dir)
+		if !ok {
+			return errorResponse(fmt.Sprintf("directory %s is outside the project directory", dir))
+		}
+		targetDir = resolved
 	}
 
 	// Collect source files
@@ -590,11 +698,14 @@ func (h *Handler) handleGetFileIndex(params map[string]any) Response {
 		size    int64
 	}
 	var files []fileEntry
+	var skippedLinks int
+	var firstSkipped string
 
 	filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
+		rel, _ := filepath.Rel(targetDir, path)
 		if info.IsDir() {
 			if codescan.ShouldSkipDir(path, info, targetDir) {
 				return filepath.SkipDir
@@ -604,10 +715,25 @@ func (h *Handler) handleGetFileIndex(params map[string]any) Response {
 		if !codescan.IsSourceFile(path) {
 			return nil
 		}
-		rel, _ := filepath.Rel(targetDir, path)
+		// A link that leaves the project is not a file of this project; listing
+		// it would report foreign paths as index entries (YM-232). Counted, not
+		// logged per path: the name is repository content.
+		if info.Mode()&os.ModeSymlink != 0 {
+			if _, ok := codescan.ResolveWithinRoot(targetDir, rel); !ok {
+				skippedLinks++
+				if firstSkipped == "" {
+					firstSkipped = rel
+				}
+				return nil
+			}
+		}
 		files = append(files, fileEntry{relPath: rel, size: info.Size()})
 		return nil
 	})
+
+	if skippedLinks > 0 {
+		log.Printf("[codescan] get_file_index: skipped %d symlinked source file(s) that resolve outside %q or not at all (first: %q)", skippedLinks, targetDir, firstSkipped)
+	}
 
 	// Get learning counts for annotations
 	counts, _ := h.store.GetLearningCountsByEntity(project)
@@ -670,7 +796,10 @@ func (h *Handler) handleGetFileSymbols(params map[string]any) Response {
 		return errorResponse("cannot resolve project directory for: " + project)
 	}
 
-	filePath := filepath.Join(projectDir, file)
+	filePath, ok := codescan.ResolveWithinRoot(projectDir, file)
+	if !ok {
+		return errorResponse(fmt.Sprintf("file %s is outside the project directory", file))
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return errorResponse(fmt.Sprintf("cannot read file %s: %v", file, err))

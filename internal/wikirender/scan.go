@@ -32,10 +32,18 @@ type scanData struct {
 
 func (s *renderState) loadScan() error {
 	if len(s.cfg.ScanJSON) == 0 {
+		// project_scan rows are keyed by the checkout root (codescan
+		// .ScanCacheKey), never by a display name. A named project is resolved
+		// to its directory first, because the name alone names no path to look
+		// up; a project without a directory has no scan row (YM-277).
+		dir := s.projectPath
+		if dir == "" {
+			return nil
+		}
 		var raw []byte
 		err := s.cfg.Store.DB().QueryRow(
 			`SELECT scan_json FROM project_scan WHERE project = ?`,
-			s.cfg.Project,
+			codescan.ScanCacheKey(dir),
 		).Scan(&raw)
 		if err == sql.ErrNoRows {
 			return nil

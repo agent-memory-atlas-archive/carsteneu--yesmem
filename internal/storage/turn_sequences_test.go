@@ -6,7 +6,7 @@ import (
 )
 
 func TestRecordTurnHash_NewThread(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.RecordTurnHash("thread-1", "proj", "a1b2", "sh→cap_store→haiku"); err != nil {
 		t.Fatalf("RecordTurnHash: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestRecordTurnHash_NewThread(t *testing.T) {
 }
 
 func TestRecordTurnHash_AppendsToExisting(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for i, h := range []string{"h1", "h2", "h3"} {
 		if err := s.RecordTurnHash("t1", "proj", h, "example"); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
@@ -53,7 +53,7 @@ func TestRecordTurnHash_AppendsToExisting(t *testing.T) {
 }
 
 func TestRecordTurnHash_FIFOat20(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for i := 0; i < 25; i++ {
 		h := "h" + string(rune('A'+i))
 		if err := s.RecordTurnHash("t1", "proj", h, "ex"); err != nil {
@@ -80,7 +80,7 @@ func TestRecordTurnHash_FIFOat20(t *testing.T) {
 }
 
 func TestRecordTurnHash_ProjectScope(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	s.RecordTurnHash("t1", "proj-a", "ha", "ex")
 	s.RecordTurnHash("t1", "proj-a", "hb", "ex")
 
@@ -94,7 +94,7 @@ func TestRecordTurnHash_ProjectScope(t *testing.T) {
 }
 
 func TestGetWorkflowSuggestions_FindsRepeatedSubsequences(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	pattern := []string{"aa", "bb", "cc"}
 	for _, tid := range []string{"t1", "t2", "t3"} {
 		for _, h := range pattern {
@@ -120,7 +120,7 @@ func TestGetWorkflowSuggestions_FindsRepeatedSubsequences(t *testing.T) {
 }
 
 func TestGetWorkflowSuggestions_RespectsProjectScope(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	pattern := []string{"aa", "bb", "cc"}
 	for _, tid := range []string{"t1", "t2", "t3"} {
 		for _, h := range pattern {
@@ -137,7 +137,7 @@ func TestGetWorkflowSuggestions_RespectsProjectScope(t *testing.T) {
 }
 
 func TestGetWorkflowSuggestions_NoFalsePositiveFromSingleThread(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	for _, h := range []string{"aa", "bb", "cc"} {
 		s.RecordTurnHash("t1", "proj", h, "ex")
 	}

@@ -1,7 +1,5 @@
 package proxy
 
-import "strings"
-
 // estimateIntensity estimates the emotional intensity of the current conversation
 // from structural signals. Returns 0.0-1.0. Language-agnostic.
 func estimateIntensity(messages []any) float64 {
@@ -47,12 +45,12 @@ func countErrors(messages []any) int {
 				continue
 			}
 			if b["type"] == "tool_result" {
-				if isErr, ok := b["is_error"].(bool); ok && isErr {
+				if toolResultIsError(b) {
 					count++
 					continue
 				}
 				if content, ok := b["content"].(string); ok {
-					if strings.Contains(content, "exit code") && !strings.Contains(content, "exit code 0") {
+					if toolResultExitCodeFailure(content) {
 						count++
 					}
 				}

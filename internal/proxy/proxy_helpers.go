@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/logrotate"
+	"github.com/carsteneu/yesmem/internal/wikidir"
 )
 
 // extractSessionID extracts the session ID from headers and request metadata.
@@ -244,6 +245,22 @@ func daemonProject(short, dir string) string {
 	return short
 }
 
+// wikiDir resolves the wiki directory named in the [yesmem-wiki-first]
+// directive. The daemon renders one directory per project below the data dir
+// (see wikidir); without a data dir the documented tilde path is named instead.
+// Empty project or no usable name yields "" — the directive then keeps its
+// placeholder form.
+func (s *Server) wikiDir(project string) string {
+	if project == "" {
+		return ""
+	}
+	if s.cfg.DataDir == "" {
+		return wikidir.DisplayDir(project)
+	}
+	root := wikidir.Root(s.cfg.DataDir)
+	return wikidir.Dir(root, project)
+}
+
 // extractWorkingDirectory extracts the full working directory path from the request.
 // Supports two formats:
 // - Claude Code: "Primary working directory: /path/to/project" in system prompt
@@ -335,13 +352,21 @@ func extractWorkingDirectoryFromText(text string) string {
 	}
 
 	// Codex format: <cwd>/path</cwd>
+	// The value is client text, and it ends up in a journal line, so a newline
+	// ends it here as well — the two markers above already do that.
 	const cwdOpen = "<cwd>"
 	const cwdClose = "</cwd>"
 	if idx := strings.Index(text, cwdOpen); idx >= 0 {
 		rest := text[idx+len(cwdOpen):]
 		if end := strings.Index(rest, cwdClose); end >= 0 {
-			return strings.TrimSpace(rest[:end])
+			rest = rest[:end]
 		}
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			rest = rest[:nl]
+		} else if nl := strings.Index(rest, `\n`); nl >= 0 {
+			rest = rest[:nl]
+		}
+		return strings.TrimSpace(rest)
 	}
 	return ""
 }
@@ -452,6 +477,23 @@ func extractToolUseIDs(messages []any) []string {
 	return ids
 }
 
+// isToolContinuation reports whether the trailing user message carries tool
+// results: the turn those calls belong to is still running, so the last
+// assistant message in the history is an intermediate step, not an answer.
+func isToolContinuation(messages []any) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["role"] != "user" {
+			continue
+		}
+		return hasToolResult(m)
+	}
+	return false
+}
+
 // isUserInputTurn checks if the last user message contains real user text,
 // not just tool_result blocks or system-reminder injections.
 // Returns false for continuation requests (tool results only).
@@ -551,6 +593,8 @@ func (s *Server) countMessageTokens(messages []any) int {
 // The actual-based path does NOT add overhead because lastActual (from API input_tokens)
 // already includes system prompt and tool schema tokens.
 // Otherwise falls back to full countMessageTokens + overhead.
+// The raw count is scaled by the thread's measured actual/estimate ratio so a
+// systematic under- or overcount does not translate into a wrong trigger.
 func (s *Server) estimateTotalTokens(threadID string, messages []any, overhead int) int {
 	if s.sawtoothTrigger == nil {
 		return s.countMessageTokens(messages) + overhead
@@ -561,38 +605,23 @@ func (s *Server) estimateTotalTokens(threadID string, messages []any, overhead i
 
 	// No previous data or message count shrank (new session?) → full count
 	if lastActual == 0 || lastMsgCount == 0 || lastMsgCount > len(messages) {
-		return s.countMessageTokens(messages) + overhead
+		return s.calibratedEstimate(threadID, s.countMessageTokens(messages)+overhead)
 	}
 
 	// Count only new messages (tail since last response)
 	newMessages := messages[lastMsgCount:]
-	deltaTokens := s.countMessageTokens(newMessages)
+	deltaTokens := s.calibratedEstimate(threadID, s.countMessageTokens(newMessages))
 
 	return lastActual + deltaTokens
 }
 
-// persistCompactedBlocks sends compacted blocks to the daemon for DB storage.
-func (s *Server) persistCompactedBlocks(threadID string, blocks []CompactedBlock) {
-	for _, b := range blocks {
-		_, err := s.queryDaemon("store_compacted_block", map[string]any{
-			"thread_id": threadID,
-			"start_idx": b.StartIdx,
-			"end_idx":   b.EndIdx,
-			"content":   b.Content,
-		})
-		if err != nil {
-			s.logger.Printf("persist compacted block %d-%d: %v", b.StartIdx, b.EndIdx, err)
-		}
+// calibratedEstimate scales a raw token count by the thread's measured
+// actual/estimate ratio (identity when no calibration data exists).
+func (s *Server) calibratedEstimate(threadID string, raw int) int {
+	if s.sawtoothTrigger == nil {
+		return raw
 	}
-}
-
-// countCompactedMsgs returns the total number of messages replaced by compacted blocks.
-func countCompactedMsgs(blocks []CompactedBlock) int {
-	total := 0
-	for _, b := range blocks {
-		total += b.EndIdx - b.StartIdx + 1
-	}
-	return total
+	return s.sawtoothTrigger.applyEstimateFactor(threadID, raw)
 }
 
 // prependMeta prepends a metadata string to a message's first text content.
@@ -789,9 +818,36 @@ func (s *Server) getRawEstimate(threadID string) int {
 	return s.rawSavings[threadID]
 }
 
-// isRealUserSession returns true for session IDs that represent real user sessions
-// (opencode:ses_* or claude:ses_* prefixed). Internal/automated threads use plain
-// UUIDs or other formats and should not trigger forked agent extraction.
+// isRealUserSession returns true for session IDs that represent real user sessions:
+// opencode:ses_* / claude:ses_* prefixed IDs and the bare session UUID that
+// Claude Code sends in X-Claude-Code-Session-Id (or metadata.user_id).
+// Derived thread IDs (16 hex chars) and other formats are internal/automated
+// threads and must not trigger keepalive or forked agent extraction.
 func isRealUserSession(threadID string) bool {
-	return strings.HasPrefix(threadID, "opencode:ses_") || strings.HasPrefix(threadID, "claude:ses_")
+	if strings.HasPrefix(threadID, "opencode:ses_") || strings.HasPrefix(threadID, "claude:ses_") {
+		return true
+	}
+	return isSessionUUID(threadID)
+}
+
+// isSessionUUID reports whether s is a canonical 8-4-4-4-12 hex UUID, the form
+// Claude Code uses for its session ID.
+func isSessionUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if s[i] != '-' {
+				return false
+			}
+		default:
+			c := s[i]
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }

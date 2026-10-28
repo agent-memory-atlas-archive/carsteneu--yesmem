@@ -23,3 +23,15 @@ func ContentHash(text string) string {
 	h := sha256.Sum256([]byte(normalized))
 	return fmt.Sprintf("%x", h)
 }
+
+// BodyDigest is the provenance digest of a CAP.md body. Unlike ContentHash it does
+// not fold case or whitespace: inside a bash or python body "$URL" and "$url",
+// "True" and "true", are different programs, and a re-indented body is a different
+// program too. Only what no parser sees is normalized away — the line endings and
+// the trailing newlines an editor leaves behind.
+func BodyDigest(body []byte) string {
+	normalized := strings.ReplaceAll(string(body), "\r\n", "\n")
+	normalized = strings.TrimRight(normalized, "\n")
+	h := sha256.Sum256([]byte(normalized))
+	return fmt.Sprintf("%x", h)
+}

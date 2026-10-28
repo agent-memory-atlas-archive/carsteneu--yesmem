@@ -4,8 +4,11 @@ import "time"
 
 // PlanRow represents a persisted plan.
 type PlanRow struct {
-	ThreadID  string
-	Content   string
+	ThreadID string
+	Content  string
+	// Items is the structured outline as a JSON array. Empty means the plan has
+	// no structure and renders from Content alone.
+	Items     string
 	Status    string
 	Scope     string
 	Project   string
@@ -15,12 +18,12 @@ type PlanRow struct {
 
 // UpsertPlan creates or updates a plan for a thread.
 func (s *Store) UpsertPlan(p *PlanRow) error {
-	_, err := s.db.Exec(`INSERT INTO plans (thread_id, content, status, scope, project, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(thread_id) DO UPDATE SET content=?, status=?, scope=?, project=?, updated_at=?`,
-		p.ThreadID, p.Content, p.Status, p.Scope, p.Project,
+	_, err := s.db.Exec(`INSERT INTO plans (thread_id, content, items, status, scope, project, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(thread_id) DO UPDATE SET content=?, items=?, status=?, scope=?, project=?, updated_at=?`,
+		p.ThreadID, p.Content, p.Items, p.Status, p.Scope, p.Project,
 		p.CreatedAt.Format(time.RFC3339), p.UpdatedAt.Format(time.RFC3339),
-		p.Content, p.Status, p.Scope, p.Project, p.UpdatedAt.Format(time.RFC3339))
+		p.Content, p.Items, p.Status, p.Scope, p.Project, p.UpdatedAt.Format(time.RFC3339))
 	return err
 }
 
@@ -28,8 +31,8 @@ func (s *Store) UpsertPlan(p *PlanRow) error {
 func (s *Store) GetPlan(threadID string) (*PlanRow, error) {
 	var p PlanRow
 	var createdAt, updatedAt string
-	err := s.readerDB().QueryRow("SELECT thread_id, content, status, scope, COALESCE(project,''), created_at, updated_at FROM plans WHERE thread_id = ?", threadID).
-		Scan(&p.ThreadID, &p.Content, &p.Status, &p.Scope, &p.Project, &createdAt, &updatedAt)
+	err := s.readerDB().QueryRow("SELECT thread_id, content, COALESCE(items,''), status, scope, COALESCE(project,''), created_at, updated_at FROM plans WHERE thread_id = ?", threadID).
+		Scan(&p.ThreadID, &p.Content, &p.Items, &p.Status, &p.Scope, &p.Project, &createdAt, &updatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +43,7 @@ func (s *Store) GetPlan(threadID string) (*PlanRow, error) {
 
 // GetActivePlans returns all active plans (for loading into memory on startup).
 func (s *Store) GetActivePlans() ([]*PlanRow, error) {
-	rows, err := s.readerDB().Query("SELECT thread_id, content, status, scope, COALESCE(project,''), created_at, updated_at FROM plans WHERE status = 'active'")
+	rows, err := s.readerDB().Query("SELECT thread_id, content, COALESCE(items,''), status, scope, COALESCE(project,''), created_at, updated_at FROM plans WHERE status = 'active'")
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +52,7 @@ func (s *Store) GetActivePlans() ([]*PlanRow, error) {
 	for rows.Next() {
 		var p PlanRow
 		var createdAt, updatedAt string
-		if err := rows.Scan(&p.ThreadID, &p.Content, &p.Status, &p.Scope, &p.Project, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&p.ThreadID, &p.Content, &p.Items, &p.Status, &p.Scope, &p.Project, &createdAt, &updatedAt); err != nil {
 			continue
 		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)

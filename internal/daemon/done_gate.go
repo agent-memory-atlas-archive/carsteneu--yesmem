@@ -12,7 +12,7 @@ type PhaseValidation struct {
 	Name   string
 	// RequiredFields are compiled regex patterns, each must match somewhere within the
 	// phase block (between its header and the next phase header or EOF).
-	RequiredFields []*regexp.Regexp
+	RequiredFields []requiredField
 	// IsStatusField is true for the pattern that checks **Status:** — this field is
 	// always required and all others are only checked when status is found.
 	IsStatusField bool
@@ -20,7 +20,19 @@ type PhaseValidation struct {
 	// when the Phase 1 **Task type:** value equals this string (e.g. "debug" gates
 	// the Depth-lock line in Phase 2). Empty means TaskTypeFields are never checked.
 	IfTaskType     string
-	TaskTypeFields []*regexp.Regexp
+	TaskTypeFields []requiredField
+}
+
+// requiredField pairs a validation pattern with the name the agent is told about.
+// The field name is what reaches the DONE-guard relay — a regex there is
+// un-actionable (YM-150).
+type requiredField struct {
+	re    *regexp.Regexp
+	label string
+}
+
+func mustField(label, pattern string) requiredField {
+	return requiredField{re: regexp.MustCompile(pattern), label: label}
 }
 
 // phaseValidations defines the v3 contract: what each phase MUST contain.
@@ -31,76 +43,76 @@ func compileValidations() []PhaseValidation {
 		{
 			Number: 1, Name: "ANALYZE",
 			IsStatusField: true,
-			RequiredFields: []*regexp.Regexp{
-				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
-				regexp.MustCompile(`(?m)^\*\*Goal understood:\*\*`),
-				regexp.MustCompile(`(?m)^\*\*Task type:\*\*\s+(debug|feature|chore|docs)`),
-				regexp.MustCompile(`(?m)^\*\*Codebase explored:\*\*`),
-				regexp.MustCompile(`(?m)^\*\*Session id:\*\*\s+\S`),
+			RequiredFields: []requiredField{
+				mustField("Status", `(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
+				mustField("Goal understood", `(?m)^\*\*Goal understood:\*\*`),
+				mustField("Task type", `(?m)^\*\*Task type:\*\*\s+(debug|feature|chore|docs)`),
+				mustField("Codebase explored", `(?m)^\*\*Codebase explored:\*\*`),
+				mustField("Session id", `(?m)^\*\*Session id:\*\*\s+\S`),
 			},
 		},
 		{
 			Number: 2, Name: "PLAN",
 			IsStatusField: true,
-			RequiredFields: []*regexp.Regexp{
-				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
-				regexp.MustCompile(`(?m)^\*\*Plan stored via set_plan:\*\*`),
-				regexp.MustCompile(`(?m)^\*\*Files in scope:\*\*`),
+			RequiredFields: []requiredField{
+				mustField("Status", `(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
+				mustField("Plan stored via set_plan", `(?m)^\*\*Plan stored via set_plan:\*\*`),
+				mustField("Files in scope", `(?m)^\*\*Files in scope:\*\*`),
 			},
 			// Debug tasks must lock their fix layer before implementation; the
 			// Depth-lock discipline is only enforced when Task type == debug.
 			IfTaskType:     "debug",
-			TaskTypeFields: []*regexp.Regexp{depthLockRe},
+			TaskTypeFields: []requiredField{{re: depthLockRe, label: "Depth-lock"}},
 		},
 		{
 			Number: 3, Name: "EXECUTE",
-			RequiredFields: []*regexp.Regexp{
-				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
+			RequiredFields: []requiredField{
+				mustField("Status", `(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
 			},
 		},
 		{
 			Number: 4, Name: "VERIFY",
 			IsStatusField: true,
-			RequiredFields: []*regexp.Regexp{
-				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
+			RequiredFields: []requiredField{
+				mustField("Status", `(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
 				// L1.B fix: accept any of these as verification evidence.
 				// Pure-build tasks (binary patching, frontend) often have no
 				// test suite; **Build:** or **Verification:** is equally valid.
-				regexp.MustCompile(`(?m)^\*\*(Tests run|Build|Verification):\*\*`),
+				mustField("Tests run / Build / Verification", `(?m)^\*\*(Tests run|Build|Verification):\*\*`),
 				// Autoprompt-Härtung: every task must record what new test was
 				// proven RED before the fix — or explicitly say "none — docs-only".
-				redProofRe,
+				{re: redProofRe, label: "RED proof"},
 				// Deterministic regression discipline: Phase 4 must diff the test-suite
 				// results between merge-base and HEAD (see SKILL.md procedure). Value
 				// must sit on the same line — [ \t] blocks the \s+\S newline bypass.
-				regexp.MustCompile(`(?m)^\*\*Regression baseline:\*\*[ \t]+\S`),
+				mustField("Regression baseline", `(?m)^\*\*Regression baseline:\*\*[ \t]+\S`),
 			},
 		},
 		{
 			Number: 5, Name: "REVIEW",
 			IsStatusField: true,
-			RequiredFields: []*regexp.Regexp{
-				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
-			regexp.MustCompile(`(?m)^\*{0,2}self-review:\*{0,2}[ \t]+done\b`),
-			// One task() subagent per review sub-phase; the ses_ id is
-			// verified against opencode's session DB by VerifySubagentEvidence.
-			regexp.MustCompile(`(?m)^\*{0,2}cold-review:\*{0,2}[ \t]+ses_\S+`),
-			regexp.MustCompile(`(?m)^\*{0,2}consequence:\*{0,2}[ \t]+ses_\S+`),
-			regexp.MustCompile(`(?m)^\*{0,2}security:\*{0,2}[ \t]+ses_\S+`),
-			// risk-based-code-review classification from the 5.2 cold reviewer:
-			// Stufe 1-3 with a same-line rationale, plus the active module
-			// selection (value on the same line, as with Regression baseline).
-			regexp.MustCompile(`(?m)^\*\*Stufe:\*\*[ \t]+[123][ \t]+\S`),
-			regexp.MustCompile(`(?m)^\*\*Modules:\*\*[ \t]+\S`),
+			RequiredFields: []requiredField{
+				mustField("Status", `(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED|IN PROGRESS)`),
+				mustField("self-review: done", `(?m)^\*{0,2}self-review:\*{0,2}[ \t]+done\b`),
+				// One task() subagent per review sub-phase; the ses_ id is
+				// verified against opencode's session DB by VerifySubagentEvidence.
+				mustField("cold-review: ses_<id>", `(?m)^\*{0,2}cold-review:\*{0,2}[ \t]+ses_\S+`),
+				mustField("consequence: ses_<id>", `(?m)^\*{0,2}consequence:\*{0,2}[ \t]+ses_\S+`),
+				mustField("security: ses_<id>", `(?m)^\*{0,2}security:\*{0,2}[ \t]+ses_\S+`),
+				// risk-based-code-review classification from the 5.2 cold reviewer:
+				// Stufe 1-3 with a same-line rationale, plus the active module
+				// selection (value on the same line, as with Regression baseline).
+				mustField("Stufe 1-3 with rationale", `(?m)^\*\*Stufe:\*\*[ \t]+[123][ \t]+\S`),
+				mustField("Modules", `(?m)^\*\*Modules:\*\*[ \t]+\S`),
 			},
 		},
 		{
 			Number: 6, Name: "FINISH",
 			IsStatusField: true,
-			RequiredFields: []*regexp.Regexp{
-				regexp.MustCompile(`(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED)`),
-				regexp.MustCompile(`\*\*Deploy executed:\*{0,2}\s+(yes|no)|Deploy required:\*{0,2}\s+(yes|no)`),
-				regexp.MustCompile(`send_to orchestrator:`),
+			RequiredFields: []requiredField{
+				mustField("Status", `(?m)^\*\*Status:\*\*\s+(COMPLETE|BLOCKED)`),
+				mustField("Deploy executed / Deploy required", `\*\*Deploy executed:\*{0,2}\s+(yes|no)|Deploy required:\*{0,2}\s+(yes|no)`),
+				mustField("send_to orchestrator", `send_to orchestrator:`),
 			},
 		},
 	}
@@ -163,7 +175,7 @@ func parseIntOrZero(s string) int {
 // FieldError describes a single validation failure in a phase block.
 type FieldError struct {
 	Phase  int    // phase number (1-6)
-	Field  string // what was expected (the pattern string)
+	Field  string // what was expected, as the agent must write it (never the regex)
 	Detail string // why it failed
 }
 
@@ -218,16 +230,21 @@ func ValidatePhaseBlocks(content string) ValidationResult {
 		}
 
 		statusMatched := false
-		for _, re := range pv.RequiredFields {
-			if re.MatchString(block) {
-				if pv.IsStatusField && re.String() == pv.RequiredFields[0].String() {
+		for _, rf := range pv.RequiredFields {
+			isStatusField := pv.IsStatusField && rf.label == "Status"
+			if rf.re.MatchString(block) {
+				if isStatusField {
 					statusMatched = true
 				}
 				continue
 			}
+			if isStatusField {
+				// Reported once below, with the reason a bare "not found" lacks.
+				continue
+			}
 			errors = append(errors, FieldError{
 				Phase:  pv.Number,
-				Field:  re.String(),
+				Field:  rf.label,
 				Detail: "required field not found in phase block",
 			})
 		}
@@ -235,20 +252,20 @@ func ValidatePhaseBlocks(content string) ValidationResult {
 		if pv.IsStatusField && !statusMatched {
 			errors = append(errors, FieldError{
 				Phase:  pv.Number,
-				Field:  "**Status:**",
+				Field:  "Status",
 				Detail: "missing or invalid status line (must be on its own line)",
 			})
 		}
 
 		// Task-type-conditional fields: e.g. Depth-lock only for debug tasks.
 		if pv.IfTaskType != "" && pv.IfTaskType == taskType {
-			for _, re := range pv.TaskTypeFields {
-				if re.MatchString(block) {
+			for _, rf := range pv.TaskTypeFields {
+				if rf.re.MatchString(block) {
 					continue
 				}
 				errors = append(errors, FieldError{
 					Phase:  pv.Number,
-					Field:  re.String(),
+					Field:  rf.label,
 					Detail: "required field not found in phase block (conditional on task type " + pv.IfTaskType + ")",
 				})
 			}

@@ -137,7 +137,11 @@ yesmem() {
     shift
     local LC_ALL=C
     local _ystdin _yslen _yargs _yfirst _ae _yh _yex _yol _yout
-    if [ -t 0 ]; then
+    if [ -t 0 ] || [ -S /dev/stdin ] || [ ! -e /dev/stdin ]; then
+      # A terminal and a socket both never reach EOF, and a closed fd 0 makes
+      # bash hand the command-substitution pipe to cat: reading any of the
+      # three blocks the job until its timeout (YM-439). Everything else
+      # (pipe, heredoc, regular file, /dev/null) keeps the reading behaviour.
       _ystdin=""
     else
       _ystdin=$(cat; printf .)

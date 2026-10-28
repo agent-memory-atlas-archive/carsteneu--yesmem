@@ -1,7 +1,7 @@
 ---
 name: cap_save_analysis
 description: "Append-only persist of an analysis result to cap_<cap>__analyses table (auto-created on first call). Records source-meta (table, where, args, row_count), the instruction asked, the summary text, the model that produced it, optional comma-separated tags. cap_store auto-adds id (PK), created_at (DATETIME), updated_at. Used after cap_collect→in-chat-summary OR cap_collect mode='haiku' to keep a queryable history of analyses. Later retrieval via cap_search({cap, table:'analyses', where:...}) lets you find/aggregate past analyses by topic, time, model, or source-filter — and recursively cap_collect over the analyses themselves for meta-analysis."
-version: 96
+version: 97
 tags: [cap_store, analysis, persist, append-only, history]
 requires: [store]
 scope: user
@@ -18,6 +18,7 @@ Append-only persist of an analysis result to cap_<cap>__analyses table (auto-cre
 ### cap_save_analysis
 kind: tool
 schema: {"type":"object","properties":{"cap":{"type":"string","description":"Source capability name (e.g. 'reddit')"},"source_table":{"type":"string","description":"Table that was analyzed (e.g. 'posts')"},"filter_where":{"type":"string","description":"WHERE clause used to scope the source rows"},"filter_args":{"description":"Args bound to filter_where (array or scalar)"},"instruction":{"type":"string","description":"What was asked of the model"},"summary":{"type":"string","description":"The analysis result text"},"row_count":{"type":"integer","description":"Number of source rows analyzed"},"model":{"type":"string","description":"Model that produced the summary (default claude-opus-4-7)"},"tags":{"type":"string","description":"Comma-separated tags for later filtering"}},"required":["cap","source_table","instruction","summary"]}
+sandbox: standard
 
 ```javascript
 async ({cap, source_table, filter_where, filter_args, instruction, summary, row_count, model, tags}) => {

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/carsteneu/yesmem/internal/embedding"
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // IVFIndex is an Inverted File Index for approximate nearest neighbor search.
@@ -227,15 +228,24 @@ func (idx *IVFIndex) NeedsRebuild() bool {
 	return false
 }
 
-// IsStale returns true if the index covers significantly fewer vectors than dbCount.
-// Threshold: >2% gap triggers rebuild.
+// IsStale reports whether the index population no longer matches dbCount, in
+// either direction: a build that missed rows and a build that still holds rows
+// the database no longer offers as recallable (a quarantine after startup) are
+// both reasons to rebuild. Threshold: >2% of the larger set.
 func (idx *IVFIndex) IsStale(dbCount int) bool {
 	total := idx.TotalVectors()
-	if total >= dbCount {
+	gap := dbCount - total
+	if gap < 0 {
+		gap = -gap
+	}
+	if gap == 0 {
 		return false
 	}
-	gap := dbCount - total
-	return gap*100 > dbCount*2
+	base := dbCount
+	if total > base {
+		base = total
+	}
+	return gap*100 > base*2
 }
 
 // TotalVectors returns the total number of indexed vectors.
@@ -267,7 +277,7 @@ type vectorRow struct {
 
 func loadAllVectors(db *sql.DB, dim int) ([]uint64, [][]float32, error) {
 	rows, err := db.Query(
-		`SELECT id, embedding_vector FROM learnings WHERE embedding_vector IS NOT NULL AND superseded_by IS NULL`)
+		`SELECT id, embedding_vector FROM learnings WHERE embedding_vector IS NOT NULL AND ` + models.RecallableLearningSQL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -305,7 +315,7 @@ func loadVectorsByIDs(ctx context.Context, db *sql.DB, ids []uint64) ([]vectorRo
 		query += "?"
 		args[i] = id
 	}
-	query += ") AND embedding_vector IS NOT NULL"
+	query += ") AND embedding_vector IS NOT NULL AND quarantined_at IS NULL"
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {

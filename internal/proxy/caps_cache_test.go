@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/config"
 )
 
 func TestCapsCache_GetSetRoundTrip(t *testing.T) {
@@ -122,7 +124,7 @@ func TestInvalidateThreadCaches_InvalidatesBothCapsCacheAndFrozenStubs(t *testin
 		t.Fatal("precondition: frozenStubs must have thread-A entry")
 	}
 
-	s.invalidateThreadCaches("thread-A", "", "")
+	s.invalidateThreadCaches("thread-A", "", "", "")
 
 	if _, ok := s.capsCache.Get("thread-A"); ok {
 		t.Error("capsCache entry for thread-A must be invalidated")
@@ -142,7 +144,7 @@ func TestInvalidateThreadCaches_OnlyAffectsTargetThread(t *testing.T) {
 	s.frozenStubs.Store("thread-A", []any{}, 0, nil, 0, 0)
 	s.frozenStubs.Store("thread-B", []any{}, 0, nil, 0, 0)
 
-	s.invalidateThreadCaches("thread-A", "", "")
+	s.invalidateThreadCaches("thread-A", "", "", "")
 
 	if _, ok := s.capsCache.Get("thread-B"); !ok {
 		t.Error("thread-B capsCache must survive invalidation of thread-A")
@@ -154,6 +156,7 @@ func TestInvalidateThreadCaches_OnlyAffectsTargetThread(t *testing.T) {
 
 func TestInvalidateThreadCaches_RefreshesBriefingWhenProjectSet(t *testing.T) {
 	s := &Server{
+		cfg:       Config{FeatureDefaults: &config.FeatureGates{Briefing: true}},
 		logger:    log.New(io.Discard, "", 0),
 		capsCache: NewCapsCache(),
 	}
@@ -167,7 +170,7 @@ func TestInvalidateThreadCaches_RefreshesBriefingWhenProjectSet(t *testing.T) {
 		return briefingData{Text: "NEW-text", CodeMap: "NEW-cm"}
 	}
 
-	s.invalidateThreadCaches("t-1", "yesmem", "/home/user/memory/yesmem")
+	s.invalidateThreadCaches("t-1", "yesmem", "/home/user/memory/yesmem", "claude-opus-4-6")
 
 	if calls != 1 {
 		t.Errorf("expected briefingLoader called once, got %d", calls)
@@ -193,7 +196,7 @@ func TestInvalidateThreadCaches_SkipsBriefingWhenProjectEmpty(t *testing.T) {
 		return briefingData{}
 	}
 
-	s.invalidateThreadCaches("t-2", "", "")
+	s.invalidateThreadCaches("t-2", "", "", "")
 
 	if calls != 0 {
 		t.Errorf("empty project must not trigger briefing loader, got %d calls", calls)
@@ -202,6 +205,7 @@ func TestInvalidateThreadCaches_SkipsBriefingWhenProjectEmpty(t *testing.T) {
 
 func TestInvalidateThreadCaches_PreservesBriefingOnEmptyLoaderResult(t *testing.T) {
 	s := &Server{
+		cfg:       Config{FeatureDefaults: &config.FeatureGates{Briefing: true}},
 		logger:    log.New(io.Discard, "", 0),
 		capsCache: NewCapsCache(),
 	}
@@ -211,10 +215,33 @@ func TestInvalidateThreadCaches_PreservesBriefingOnEmptyLoaderResult(t *testing.
 		return briefingData{}
 	}
 
-	s.invalidateThreadCaches("t-3", "yesmem", "/home/user/memory/yesmem")
+	s.invalidateThreadCaches("t-3", "yesmem", "/home/user/memory/yesmem", "claude-opus-4-6")
 
 	text, cm, ok := s.getCachedBriefing("t-3", "yesmem")
 	if !ok || text != "OLD-text" || cm != "OLD-cm" {
 		t.Errorf("transient loader failure must preserve existing cache: ok=%v text=%q cm=%q", ok, text, cm)
+	}
+}
+
+// A model whose briefing gate is off must not pay for briefing generation: the
+// refresh is the only remaining path that builds one outside the injection.
+func TestLos33InvalidateThreadCachesSkipsBriefingWhenGateOff(t *testing.T) {
+	s := &Server{
+		cfg:       Config{FeatureDefaults: &config.FeatureGates{Briefing: false}},
+		logger:    log.New(io.Discard, "", 0),
+		capsCache: NewCapsCache(),
+	}
+	s.setCachedBriefing("t-4", "yesmem", "OLD-text", "OLD-cm")
+
+	calls := 0
+	s.briefingLoader = func(proj, projectDir, threadID string) briefingData {
+		calls++
+		return briefingData{Text: "NEW-text"}
+	}
+
+	s.invalidateThreadCaches("t-4", "yesmem", "/home/user/memory/yesmem", "claude-opus-4-6")
+
+	if calls != 0 {
+		t.Errorf("briefing gate off must skip generation, got %d loader calls", calls)
 	}
 }

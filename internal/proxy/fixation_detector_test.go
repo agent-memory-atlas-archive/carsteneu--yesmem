@@ -250,13 +250,13 @@ func assistantWithToolUse(toolName, input string) any {
 
 func toolResult(isError bool, content string) any {
 	return map[string]any{
-		"role":    "user",
+		"role": "user",
 		"content": []any{
 			map[string]any{
-				"type":       "tool_result",
+				"type":        "tool_result",
 				"tool_use_id": "tool_id",
-				"is_error":   isError,
-				"content":    content,
+				"is_error":    isError,
+				"content":     content,
 			},
 		},
 	}

@@ -10,7 +10,9 @@ import (
 
 // runStubCycle executes the full stub pipeline: strip reminders, compress context,
 // stubify, compact, collapse, narrative, re-expand. Used by both sawtooth and legacy paths.
-func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, proj string, projDir string, threadID string, overhead int, totalTokens int, userQuery string, isRetryReq bool) StubResult {
+// decayIdx is this thread's own request clock (DecayTracker.Tick), the unit the
+// decay ages are measured in; reqIdx stays the proxy-wide counter for logging.
+func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx, decayIdx int, proj string, projDir string, threadID string, overhead int, totalTokens int, userQuery string, isRetryReq bool) StubResult {
 	// Get annotations snapshot
 	s.mu.RLock()
 	annSnapshot := make(map[string]string, len(s.annotations))
@@ -32,7 +34,7 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 	}
 
 	// Strip redundant system-reminders from older messages (biggest token saver)
-	messages = StripReminders(messages, reqIdx)
+	messages = StripReminders(messages)
 
 	// Strip old skill hints from previous turns (before cache calculation)
 	messages = stripSkillHints(messages)
@@ -42,7 +44,7 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 		return s.countTokens(jsonText)
 	})
 	model, _ := req["model"].(string)
-	stubThreshold := s.effectiveTokenThreshold(model) - overhead
+	stubThreshold := s.effectiveTokenThreshold(threadID, model) - overhead
 	if stubThreshold < 30000 {
 		stubThreshold = 30000
 	}
@@ -55,27 +57,30 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 	}
 
 	// === Phase 1: Budget-based cutoff ===
-	// Calculate how many tokens we have for message content
+	// Calculate how many tokens we have for message content.
+	// The target must stay below the trigger threshold of this model: a floor
+	// above it (e.g. global floor 400k with a sonnet threshold of 180k) makes
+	// every next request invalidate the prefix it just froze and re-collapse.
 	tokenFloor := s.cfg.TokenMinimumThreshold
-	if tokenFloor == 0 {
-		tokenFloor = stubThreshold * 80 / 100
+	maxFloor := stubThreshold * 80 / 100
+	if tokenFloor == 0 || tokenFloor > maxFloor {
+		tokenFloor = maxFloor
 	}
-	// Subtract injection overhead so the API-actual after collapse ≈ tokenFloor.
-	// Uses stored overhead from previous cycle (computed at FINAL point).
-	s.injectionOverheadMu.RLock()
-	injectionDelta := s.injectionOverhead[threadID]
-	s.injectionOverheadMu.RUnlock()
-	contentBudget := tokenFloor - overhead - injectionDelta
-	if contentBudget < 10000 {
-		contentBudget = 10000
-	}
-	s.logger.Printf("[req %d] FLOOR: tokenFloor=%dk, overhead=%dk, injectionDelta=%dk, contentBudget=%dk",
-		reqIdx, tokenFloor/1000, overhead/1000, injectionDelta/1000, contentBudget/1000)
+	// Budget so the API-actual after the collapse lands near tokenFloor.
+	// The measured actual/estimate ratio of the thread corrects a systematic
+	// undercount; it replaces the old stored "injection delta", which in fact
+	// held the previous cycle's collapse saving.
+	contentBudget := s.collapseContentBudget(threadID, tokenFloor, overhead)
+	s.logger.Printf("[req %d] FLOOR: tokenFloor=%dk, overhead=%dk, estimateFactor=%.2f, contentBudget=%dk",
+		reqIdx, tokenFloor/1000, overhead/1000, s.estimateFactor(threadID), contentBudget/1000)
 
-	// Calculate cutoff: walk from recent→old until budget exhausted
-	cutoff := CalcCollapseCutoff(messages, s.cfg.KeepRecent, contentBudget, estimateFn)
-	s.logger.Printf("[req %d] BUDGET-SPLIT: len(msgs)=%d, budget=%dk, cutoff=%d",
-		reqIdx, len(messages), contentBudget/1000, cutoff)
+	// Calculate cutoff: walk from recent→old until budget exhausted.
+	// On the sawtooth path the decision is held per thread (YM-411): the budget
+	// moves with the measured estimate factor, and a boundary that walks
+	// backwards re-opens a tool pair the previous request had collapsed.
+	cutoff, cutoffHeld := s.collapseCutoffFor(threadID, messages, contentBudget, estimateFn)
+	s.logger.Printf("[req %d] BUDGET-SPLIT: len(msgs)=%d, budget=%dk, cutoff=%d held=%t",
+		reqIdx, len(messages), contentBudget/1000, cutoff, cutoffHeld)
 
 	// === Phase 2: Collapse everything before cutoff into archive ===
 	finalMessages := messages
@@ -229,7 +234,7 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 	if cutoff > 0 {
 		beforeLen := len(finalMessages)
 		finalMessages = CollapseOldMessages(finalMessages, messages, cutoff, sessionStart, time.Now(), archiveLearnings, archiveFlavors, threadID)
-		s.logger.Printf("[req %d] COLLAPSE: %d -> %d messages (learnings=%d flavors=%d proj=%s since=%s)", reqIdx, beforeLen, len(finalMessages), len(archiveLearnings), len(archiveFlavors), proj, sessionStart.Format(time.RFC3339))
+		s.logger.Printf("[req %d] COLLAPSE: %d -> %d messages (learnings=%d flavors=%d proj=%s since=%s)", reqIdx, beforeLen, len(finalMessages), len(archiveLearnings), len(archiveFlavors), journalToken(proj), sessionStart.Format(time.RFC3339))
 
 		// Re-inject active skills after archive block (Option B)
 		skillBlocks := s.buildSkillBlocksForThread(daemonProject(proj, projDir), threadID)
@@ -239,9 +244,12 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 		}
 
 		// Re-inject rules after collapse (counter reset, immediate injection)
-		if rulesBlock := s.rulesInjectAfterCollapse(threadID, daemonProject(proj, projDir)); rulesBlock != "" {
-			finalMessages = injectAssociativeContext(finalMessages, s.formatRulesReminder(rulesBlock, daemonProject(proj, projDir), false), s.cfg.SawtoothEnabled)
-			s.logger.Printf("%s[req %d] COLLAPSE: re-injected rules reminder%s", colorBlue, reqIdx, colorReset)
+		model, _ := req["model"].(string)
+		if isFeatureEnabled(&s.cfg, model, "rules_reminder") {
+			if rulesBlock := s.rulesInjectAfterCollapse(threadID, daemonProject(proj, projDir)); rulesBlock != "" {
+				finalMessages = injectAssociativeContext(finalMessages, s.formatRulesReminder(rulesBlock, daemonProject(proj, projDir), false), s.cfg.SawtoothEnabled)
+				s.logger.Printf("%s[req %d] COLLAPSE: re-injected rules reminder%s", colorBlue, reqIdx, colorReset)
+			}
 		}
 
 		// Analyze fixation in collapsed messages and persist ratio
@@ -272,8 +280,9 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 		// Fallback: if no collapse needed but still over threshold, use StubifyWithTotal
 		// Use actual-based totalTokens for threshold check instead of re-counting
 		if totalTokens > stubThreshold {
-			s.decay.SetPinnedPaths(s.getNarrative(threadID).ActivePaths())
-			stubResult = StubifyWithTotal(messages, stubThreshold, s.cfg.KeepRecent, reqIdx, annSnapshot, pivotTexts, estimateFn, totalTokens, s.decay)
+			dt := s.decayFor(threadID)
+			dt.SetPinnedPaths(s.getNarrative(threadID).ActivePaths())
+			stubResult = StubifyWithTotal(messages, stubThreshold, s.cfg.KeepRecent, decayIdx, annSnapshot, pivotTexts, estimateFn, totalTokens, dt)
 			finalMessages = stubResult.Messages
 			s.logger.Printf("[req %d] STUBIFY fallback: %d stubs, %dk→%dk",
 				reqIdx, stubResult.StubCount, stubResult.TokensBefore/1000, stubResult.TokensAfter/1000)
@@ -292,17 +301,17 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 	// narrative-as-user-message content that may still live in older sessions).
 	finalMessages = StripOldNarratives(finalMessages)
 
-	// Smart re-expansion: temporarily restore stubs matching user's query
-	finalMessages = s.reexpandStubsFor(finalMessages, s.effectiveTokenThreshold(model), userQuery)
+	// Smart re-expansion: restore stubs matching user's query
+	finalMessages = s.reexpandStubsFor(finalMessages, s.effectiveTokenThreshold(threadID, model), userQuery, daemonProject(proj, projDir))
 
 	req["messages"] = finalMessages
 
 	// Final TTL upgrade: catch blocks injected after the early-path upgrade (narrative, metamemory)
 	if n := NormalizeCacheTTL(req, s.cfg.CacheTTL); n > 0 {
-		s.logger.Printf("[req %d %s] cache TTL final pass: %d blocks", reqIdx, proj, n)
+		s.logger.Printf("[req %d %s] cache TTL final pass: %d blocks", reqIdx, journalToken(proj), n)
 	}
 	if n := EnforceCacheBreakpointLimit(req, maxCacheBreakpoints); n > 0 {
-		s.logger.Printf("[req %d %s] prompt cache: trimmed %d surplus breakpoints (final)", reqIdx, proj, n)
+		s.logger.Printf("[req %d %s] prompt cache: trimmed %d surplus breakpoints (final)", reqIdx, journalToken(proj), n)
 	}
 
 	// Recalculate actual tokens after all transformations
@@ -313,15 +322,14 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 		finalColor = colorGreen
 	}
 	s.logger.Printf("%s[req %d %s tid=%s] FINAL: %d msgs, %dk msg-tokens, %dk total, compress=-%dk, stubs=%d%s",
-		finalColor, reqIdx, proj, threadID, len(finalMessages),
+		finalColor, reqIdx, journalToken(proj), journalToken(threadID), len(finalMessages),
 		actualMsgTokens/1000, actualTotalTokens/1000,
 		compressResult.TokensSaved/1000, stubResult.StubCount, colorReset)
 
-	// Store injection overhead for next cycle's FLOOR calculation
-	if totalTokens > actualTotalTokens {
-		s.injectionOverheadMu.Lock()
-		s.injectionOverhead[threadID] = totalTokens - actualTotalTokens
-		s.injectionOverheadMu.Unlock()
+	// Record the estimate of the payload we are about to send: the next API
+	// response turns it into this thread's actual/estimate ratio.
+	if s.sawtoothTrigger != nil {
+		s.sawtoothTrigger.SetSentEstimate(threadID, actualTotalTokens)
 	}
 
 	// Track archived topics in narrative (skip on retry)
@@ -336,4 +344,29 @@ func (s *Server) runStubCycle(messages []any, req map[string]any, reqIdx int, pr
 	s.stats.RecordRequest(stubResult.StubCount, stubResult.TokensBefore, stubResult.TokensAfter)
 
 	return stubResult
+}
+
+// minContentBudget is the lower bound for the collapse budget: below it the
+// fresh tail would be too small to keep working at all.
+const minContentBudget = 10000
+
+// estimateFactor returns the measured actual/estimate ratio for a thread
+// (1.0 when no sample exists yet).
+func (s *Server) estimateFactor(threadID string) float64 {
+	if s.sawtoothTrigger == nil {
+		return 1
+	}
+	return s.sawtoothTrigger.estimateFactorFor(threadID)
+}
+
+// collapseContentBudget returns how many message tokens the collapse may keep
+// so that the API-actual after the collapse lands near tokenFloor. The budget
+// is expressed in our own estimate units, so a thread whose count runs below
+// the API's must get a proportionally smaller budget.
+func (s *Server) collapseContentBudget(threadID string, tokenFloor, overhead int) int {
+	budget := int(float64(tokenFloor)/s.estimateFactor(threadID)) - overhead
+	if budget < minContentBudget {
+		budget = minContentBudget
+	}
+	return budget
 }

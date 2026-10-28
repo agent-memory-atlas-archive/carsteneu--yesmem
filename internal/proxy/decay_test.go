@@ -355,9 +355,9 @@ func TestEstimateIntensity(t *testing.T) {
 			"role": "user",
 			"content": []any{
 				map[string]any{
-					"type":    "tool_result",
+					"type":     "tool_result",
 					"is_error": true,
-					"content": "command failed",
+					"content":  "command failed",
 				},
 			},
 		},

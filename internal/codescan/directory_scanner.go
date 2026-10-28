@@ -20,21 +20,40 @@ func (d *DirectoryScanner) Scan(rootDir string) (*ScanResult, error) {
 
 	pkgMap := make(map[string]*PackageInfo)
 	var stats ProjectStats
+	walkRoot := ResolveScanRoot(rootDir)
+	var skippedLinks int
+	var firstSkipped string
 
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		rel, _ := filepath.Rel(rootDir, path)
+		rel, _ := filepath.Rel(walkRoot, path)
 		if shouldSkipDir(rel, info) {
 			return filepath.SkipDir
 		}
 		if info.IsDir() || !isSourceFile(path) {
 			return nil
 		}
+		// The walk reports a symlink as its own file entry and the read below
+		// follows it, so a link pointing out of the root would put a foreign
+		// file's content and signatures into the index (YM-232). Containment is
+		// checked on the walk-relative path, the read uses the resolved target.
+		readPath := path
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, ok := ResolveWithinRoot(walkRoot, rel)
+			if !ok {
+				skippedLinks++
+				if firstSkipped == "" {
+					firstSkipped = rel
+				}
+				return nil
+			}
+			readPath = resolved
+		}
 		stats.FileCount++
 
-		fi := d.scanFile(rootDir, path)
+		fi := d.scanFile(rel, readPath)
 		stats.TotalLOC += fi.LOC
 		result.Files = append(result.Files, fi)
 
@@ -57,6 +76,10 @@ func (d *DirectoryScanner) Scan(rootDir string) (*ScanResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// A file that is silently absent from the index is the expensive kind of
+	// surprise: one aggregate line names the project and the first link.
+	logSkippedLinks("scan", walkRoot, skippedLinks, firstSkipped)
 
 	tier := classifyTier(stats)
 	result.Tier = tier
@@ -86,9 +109,8 @@ func (d *DirectoryScanner) Scan(rootDir string) (*ScanResult, error) {
 	return result, nil
 }
 
-func (d *DirectoryScanner) scanFile(rootDir, path string) FileInfo {
-	rel, _ := filepath.Rel(rootDir, path)
-	lang := detectLanguage(path)
+func (d *DirectoryScanner) scanFile(rel, path string) FileInfo {
+	lang := detectLanguage(rel)
 
 	content, err := os.ReadFile(path)
 	if err != nil {

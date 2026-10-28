@@ -99,7 +99,7 @@ func TestMessagesSessionSequenceIndexExists(t *testing.T) {
 // DeleteMessagesFromSequence trims the tail of a session: it removes messages
 // with sequence >= fromSeq and their FTS rows, leaving earlier messages intact.
 func TestDeleteMessagesFromSequence(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 	seedSessionMessages(t, s, "sess-trim", "alpha_trim", "beta_trim", "gamma_trim", "delta_trim")
 
 	if err := s.DeleteMessagesFromSequence("sess-trim", 2); err != nil {
@@ -142,7 +142,7 @@ func TestDeleteMessagesFromSequence(t *testing.T) {
 
 // Deleting from sequence 0 must equal a full session wipe.
 func TestDeleteMessagesFromSequenceZero(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 	seedSessionMessages(t, s, "sess-wipe", "one_wipe", "two_wipe")
 
 	if err := s.DeleteMessagesFromSequence("sess-wipe", 0); err != nil {
@@ -285,7 +285,7 @@ func TestMessagesSequenceIndexIsUniqueAndLegacyDuplicatesPurged(t *testing.T) {
 // one transaction, so a partially inserted tail must not survive a rejected
 // run — the append path relies on the failure to fall back to a full reindex.
 func TestInsertMessagesRejectsDuplicateSequence(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 	seedSessionMessages(t, s, "sess-unique", "first_unique", "second_unique")
 
 	err := s.InsertMessages([]models.Message{
@@ -503,7 +503,7 @@ func TestEnsureUniqueMessageSequenceRollsBackWhenTheIndexCannotBeCreated(t *test
 // previous messages untouched instead of an empty session — the indexer's full
 // pass relies on that when the unique index turns an interleaved write away.
 func TestReplaceMessagesBySessionIsAtomic(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 	seedSessionMessages(t, s, "sess-replace", "old_one_replace", "old_two_replace")
 
 	err := s.ReplaceMessagesBySession("sess-replace", []models.Message{
@@ -540,7 +540,7 @@ func TestReplaceMessagesBySessionIsAtomic(t *testing.T) {
 // A trim with no matching rows must be a silent no-op (crash-recovery path
 // runs it unconditionally before every append insert).
 func TestDeleteMessagesFromSequenceNoop(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 	seedSessionMessages(t, s, "sess-noop", "keep_noop")
 
 	if err := s.DeleteMessagesFromSequence("sess-noop", 5); err != nil {

@@ -39,45 +39,52 @@ func extractMatchedCap(cmd string) string {
 	return m[1]
 }
 
+// extractShellCommandsFromMessages returns the sh() command literals of the
+// newest assistant message. Only that turn is read: each turn is already seen
+// by the request that follows it, so re-reading the whole history recorded the
+// same command again on every later request and fired one synchronous daemon
+// RPC per historical command (YM-147).
 func extractShellCommandsFromMessages(messages []any) []string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg, ok := messages[i].(map[string]any)
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		return shCommandsInMessage(msg)
+	}
+	return nil
+}
+
+func shCommandsInMessage(msg map[string]any) []string {
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return nil
+	}
 	var out []string
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
+	for _, c := range content {
+		block, ok := c.(map[string]any)
 		if !ok {
 			continue
 		}
-		if msg["role"] != "assistant" {
+		if block["type"] != "tool_use" {
 			continue
 		}
-		content, ok := msg["content"].([]any)
+		if block["name"] != "REPL" {
+			continue
+		}
+		input, ok := block["input"].(map[string]any)
 		if !ok {
 			continue
 		}
-		for _, c := range content {
-			block, ok := c.(map[string]any)
-			if !ok {
+		code, ok := input["code"].(string)
+		if !ok {
+			continue
+		}
+		for _, match := range reShCallInJS.FindAllStringSubmatch(code, -1) {
+			if len(match) < 2 || len(match[1]) < 2 {
 				continue
 			}
-			if block["type"] != "tool_use" {
-				continue
-			}
-			if block["name"] != "REPL" {
-				continue
-			}
-			input, ok := block["input"].(map[string]any)
-			if !ok {
-				continue
-			}
-			code, ok := input["code"].(string)
-			if !ok {
-				continue
-			}
-			for _, match := range reShCallInJS.FindAllStringSubmatch(code, -1) {
-				if len(match) < 2 || len(match[1]) < 2 {
-					continue
-				}
-				out = append(out, match[1][1:len(match[1])-1])
-			}
+			out = append(out, match[1][1:len(match[1])-1])
 		}
 	}
 	return out

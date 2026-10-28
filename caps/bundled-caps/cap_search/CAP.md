@@ -1,7 +1,7 @@
 ---
 name: cap_search
 description: "Generic search over any cap_store table. Wraps cap_store query with sane defaults + optional auto-pagination. Returns {error} when daemon response exceeds MCP token limit."
-version: 96
+version: 549
 tags: [cap_store, query, reusable]
 requires: [store]
 scope: user
@@ -18,6 +18,7 @@ Generic search over any cap_store table. Wraps cap_store query with sane default
 ### cap_search
 kind: tool
 schema: {"type":"object","properties":{"cap":{"type":"string"},"table":{"type":"string"},"where":{"type":"string"},"args":{},"limit":{"type":"number"},"offset":{"type":"number"},"all":{"type":"boolean"},"max_rows":{"type":"number"}},"required":["cap","table"]}
+sandbox: standard
 
 ```javascript
 async ({cap, table, where, args, limit, offset, all, max_rows}) => {

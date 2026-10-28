@@ -73,7 +73,7 @@ func (s *Store) SessionIndexedByOtherPath(sessionID, jsonlPath string) (bool, er
 		`SELECT jsonl_path FROM index_state WHERE indexed_session_id = ? AND jsonl_path <> ?`,
 		sessionID, jsonlPath)
 	if err != nil {
-		return false, fmt.Errorf("check session ownership of %s: %w", sessionID, err)
+		return false, fmt.Errorf("check session ownership of %q: %w", sessionID, err)
 	}
 
 	// Collect first: the deletion below must not run while the cursor over the
@@ -83,7 +83,7 @@ func (s *Store) SessionIndexedByOtherPath(sessionID, jsonlPath string) (bool, er
 		var other string
 		if err := rows.Scan(&other); err != nil {
 			rows.Close()
-			return false, fmt.Errorf("check session ownership of %s: %w", sessionID, err)
+			return false, fmt.Errorf("check session ownership of %q: %w", sessionID, err)
 		}
 		if _, err := os.Stat(other); err == nil {
 			rows.Close()
@@ -93,7 +93,7 @@ func (s *Store) SessionIndexedByOtherPath(sessionID, jsonlPath string) (bool, er
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return false, fmt.Errorf("check session ownership of %s: %w", sessionID, err)
+		return false, fmt.Errorf("check session ownership of %q: %w", sessionID, err)
 	}
 	rows.Close()
 
@@ -101,9 +101,9 @@ func (s *Store) SessionIndexedByOtherPath(sessionID, jsonlPath string) (bool, er
 		if _, err := s.db.Exec(
 			`DELETE FROM index_state WHERE jsonl_path = ? AND indexed_session_id = ?`,
 			other, sessionID); err != nil {
-			return false, fmt.Errorf("drop stale index state for %s: %w", other, err)
+			return false, fmt.Errorf("drop stale index state for %q: %w", other, err)
 		}
-		log.Printf("index_state: dropped the row for %s (file no longer exists), session %s", other, sessionID)
+		log.Printf("index_state: dropped the row for %q (file no longer exists), session %q", other, sessionID)
 	}
 	return false, nil
 }

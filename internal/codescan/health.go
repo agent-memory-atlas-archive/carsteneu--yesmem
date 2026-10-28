@@ -21,24 +21,41 @@ func ScanHealth(rootDir string) CodeHealth {
 	// Track Go files and their test counterparts per directory
 	goFiles := make(map[string]map[string]bool) // dir -> set of base names (without .go)
 	testFiles := make(map[string]map[string]bool)
+	walkRoot := ResolveScanRoot(rootDir)
+	var skippedLinks int
+	var firstSkipped string
 
-	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		rel, _ := filepath.Rel(rootDir, path)
+		rel, _ := filepath.Rel(walkRoot, path)
 		if shouldSkipDir(rel, info) {
 			return filepath.SkipDir
 		}
 		if info.IsDir() || !isSourceFile(path) {
 			return nil
 		}
+		// Same walk-side rule as the scanners: a link leaving the root is not
+		// read, a link staying inside is read through its resolved target.
+		readPath := path
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, ok := ResolveWithinRoot(walkRoot, rel)
+			if !ok {
+				skippedLinks++
+				if firstSkipped == "" {
+					firstSkipped = rel
+				}
+				return nil
+			}
+			readPath = resolved
+		}
 
 		// Count TODOs
-		health.TodoCount += countTodos(path)
+		health.TodoCount += countTodos(readPath)
 
 		// Track Go test coverage
-		if strings.HasSuffix(path, ".go") {
+		if strings.HasSuffix(rel, ".go") {
 			dir := filepath.Dir(rel)
 			base := filepath.Base(rel)
 
@@ -60,6 +77,8 @@ func ScanHealth(rootDir string) CodeHealth {
 
 		return nil
 	})
+
+	logSkippedLinks("health", walkRoot, skippedLinks, firstSkipped)
 
 	// Count Go files without tests
 	for dir, files := range goFiles {

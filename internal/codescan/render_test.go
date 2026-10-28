@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/wikidir"
 )
 
 func TestRenderCodeMap_Tiny_FullContent(t *testing.T) {
@@ -662,7 +664,24 @@ func TestRenderLarge_NoKeyFilesNoChangeCouplingNoActiveZones(t *testing.T) {
 	}
 }
 
+// hermeticWikiHome points HOME at a fresh temp dir so the wiki-link header
+// resolves its project name against an empty wiki root. Without it the render
+// reads the developer's real ~/.claude/yesmem/wiki, and a project whose basename
+// is already claimed there renders into the collision directory instead — which
+// is how these tests went red on a machine whose deploy had written
+// wiki/yesmem/.project (YM-208).
+func hermeticWikiHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	if got, err := os.UserHomeDir(); err != nil || got != dir {
+		t.Fatalf("HOME override did not take effect (got %q, err %v); render tests must not read the real wiki root", got, err)
+	}
+	return dir
+}
+
 func TestRenderLarge_IncludesWikiLink(t *testing.T) {
+	hermeticWikiHome(t)
 	result := &ScanResult{
 		RootDir: "/tmp/yesmem",
 		Stats:   ProjectStats{FileCount: 700},
@@ -687,6 +706,7 @@ func TestRenderLarge_IncludesWikiLink(t *testing.T) {
 }
 
 func TestRenderMedium_IncludesWikiLink(t *testing.T) {
+	hermeticWikiHome(t)
 	result := &ScanResult{
 		Tier:    TierMedium,
 		RootDir: "/tmp/yesmem",
@@ -712,6 +732,7 @@ func TestRenderMedium_IncludesWikiLink(t *testing.T) {
 }
 
 func TestRenderSmall_IncludesWikiLink(t *testing.T) {
+	hermeticWikiHome(t)
 	result := &ScanResult{
 		Tier:    TierSmall,
 		RootDir: "/tmp/yessmall",
@@ -736,6 +757,7 @@ func TestRenderSmall_IncludesWikiLink(t *testing.T) {
 }
 
 func TestRenderTiny_IncludesWikiLink(t *testing.T) {
+	hermeticWikiHome(t)
 	result := &ScanResult{
 		Tier:    TierTiny,
 		RootDir: "/tmp/yestiny",
@@ -759,5 +781,45 @@ func TestRenderTiny_IncludesWikiLink(t *testing.T) {
 		if !strings.Contains(out, expect) {
 			t.Errorf("missing %q in renderTiny output:\n%s", expect, out)
 		}
+	}
+}
+
+// YM-208 proof: the wiki-link header resolves against the HOME the test set, not
+// the developer's real wiki root. The temp root claims the same basename, so a
+// render reading the real root — where that name belongs to another project —
+// would emit the collision name instead.
+func TestRenderWikiLink_ResolvesAgainstTheTestHome(t *testing.T) {
+	home := hermeticWikiHome(t)
+	root := filepath.Join(home, ".claude", "yesmem", "wiki")
+	if err := wikidir.WriteMarker(filepath.Join(root, "yesmem"), "/tmp/yesmem"); err != nil {
+		t.Fatal(err)
+	}
+
+	out := renderWikiLink("/tmp/yesmem")
+	if !strings.Contains(out, "wiki/yesmem/") {
+		t.Errorf("render must follow the HOME wiki root, got: %q", out)
+	}
+	if strings.Contains(out, "wiki/yesmem-") {
+		t.Errorf("render fell back to a foreign wiki root, got: %q", out)
+	}
+}
+
+// The other half of the same rule, and the case that made the suite red: when
+// the HOME root records a *different* project for the basename, the render has
+// to say so instead of reusing the plain directory name.
+func TestRenderWikiLink_CollidingHomeYieldsTheCollisionName(t *testing.T) {
+	home := hermeticWikiHome(t)
+	root := filepath.Join(home, ".claude", "yesmem", "wiki")
+	if err := wikidir.WriteMarker(filepath.Join(root, "yesmem"), "/somewhere/else/yesmem"); err != nil {
+		t.Fatal(err)
+	}
+
+	out := renderWikiLink("/tmp/yesmem")
+	want := "wiki/" + filepath.Base(wikidir.Dir(root, "/tmp/yesmem")) + "/"
+	if want == "wiki/yesmem/" {
+		t.Fatalf("test setup did not produce a collision directory: %q", want)
+	}
+	if !strings.Contains(out, want) {
+		t.Errorf("render must use the collision directory %q for a foreign marker, got: %q", want, out)
 	}
 }

@@ -5,21 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/carsteneu/yesmem/internal/storage"
 )
-
-func mustHandlerWithCapStore(t *testing.T) *Handler {
-	t.Helper()
-	s, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	if err := s.OpenCapsDB(t.TempDir()); err != nil {
-		t.Fatalf("open cap_store: %v", err)
-	}
-	t.Cleanup(func() { s.CloseCapsDB(); s.Close() })
-	return NewHandler(s, nil)
-}
 
 func TestHandleCapStore_CreateTable(t *testing.T) {
 	h := mustHandlerWithCapStore(t)

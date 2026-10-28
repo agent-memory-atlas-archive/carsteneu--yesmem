@@ -16,9 +16,12 @@ import (
 )
 
 // parseTimeArg parses a time argument: ISO date (2026-03-18), relative (7d, 30d), or empty.
-func parseTimeArg(s string) string {
+// An unparsable value is an error, not a pass-through: StatsFilter treats a bound it
+// cannot parse as absent, so a typo would otherwise report all-time numbers as
+// filtered ones.
+func parseTimeArg(s string) (string, error) {
 	if s == "" {
-		return ""
+		return "", nil
 	}
 	s = strings.TrimSpace(s)
 	// Relative: "7d", "30d", "24h"
@@ -28,21 +31,25 @@ func parseTimeArg(s string) string {
 		if n, err := strconv.Atoi(numStr); err == nil {
 			switch unit {
 			case 'd':
-				return time.Now().AddDate(0, 0, -n).Format(time.RFC3339)
+				return time.Now().AddDate(0, 0, -n).Format(time.RFC3339), nil
 			case 'h':
-				return time.Now().Add(-time.Duration(n) * time.Hour).Format(time.RFC3339)
+				return time.Now().Add(-time.Duration(n) * time.Hour).Format(time.RFC3339), nil
 			}
 		}
 	}
 	// Try ISO date
 	if t, err := time.Parse("2006-01-02", s); err == nil {
-		return t.Format(time.RFC3339)
+		return t.Format(time.RFC3339), nil
 	}
 	// Try full ISO datetime
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t.Format(time.RFC3339)
+		return t.Format(time.RFC3339), nil
 	}
-	return s
+	// Try the SQLite form storage.ParseFilterTime also accepts
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t.Format(time.RFC3339), nil
+	}
+	return "", fmt.Errorf("not a time value: %q (use YYYY-MM-DD, RFC3339, or 7d/30d)", s)
 }
 
 func runStats() {
@@ -54,10 +61,18 @@ func runStats() {
 	jsonOut := fs.Bool("json", false, "output as JSON")
 	fs.Parse(os.Args[2:])
 
+	sinceArg, err := parseTimeArg(*since)
+	if err != nil {
+		log.Fatalf("--since: %v", err)
+	}
+	beforeArg, err := parseTimeArg(*before)
+	if err != nil {
+		log.Fatalf("--before: %v", err)
+	}
 	f := storage.StatsFilter{
 		Project: *project,
-		Since:   parseTimeArg(*since),
-		Before:  parseTimeArg(*before),
+		Since:   sinceArg,
+		Before:  beforeArg,
 	}
 
 	dataDir := yesmemDataDir()
@@ -72,7 +87,7 @@ func runStats() {
 	toxicLearnings, _ := store.GetToxicLearnings(3, *project)
 	persona, _ := store.GetPersonaConfidenceStats()
 	counts, _ := store.GetLearningCounts(*project)
-	coverage, _ := store.GetCoverageStats()
+	coverage, _ := store.GetCoverageStatsF(f)
 
 	if *jsonOut {
 		out := map[string]any{
@@ -109,8 +124,8 @@ func runStats() {
 	header += " ==="
 	fmt.Fprintf(os.Stderr, "%s\n", header)
 
-	fmt.Fprintf(os.Stderr, "Learnings:     %d active | %d archived | %d superseded\n",
-		stats.ActiveCount, stats.ArchivedCount, stats.SupersededCount)
+	fmt.Fprintf(os.Stderr, "Learnings:     %d active | %d archived | %d superseded (%d replaced, %d retired) | %d deleted predecessor\n",
+		stats.ActiveCount, stats.ArchivedCount, stats.SupersededCount, stats.ReplacedCount, stats.RetiredCount, stats.DeletedPredecessorCount)
 
 	signalRate := 0.0
 	if stats.TotalInjectCount > 0 {

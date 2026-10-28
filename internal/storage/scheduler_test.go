@@ -6,7 +6,7 @@ import (
 )
 
 func TestScheduledJobCapName(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	job := ScheduledJobRow{
@@ -48,7 +48,7 @@ func TestScheduledJobCapName(t *testing.T) {
 }
 
 func TestBashJobRunStorage(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	run := BashJobRun{
@@ -98,7 +98,7 @@ func TestBashJobRunStorage(t *testing.T) {
 }
 
 func TestPurgeBashJobRunsRetention(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	now := time.Now()
@@ -161,8 +161,142 @@ func TestPurgeBashJobRunsRetention(t *testing.T) {
 	}
 }
 
+// YM-170: last_run went into SQLite as the driver's own representation of a
+// time.Time and came back unparseable, because ListScheduledJobs reads RFC3339.
+// The value silently ended up as the zero time, so a reloaded job lost its last
+// run and any "when did this fire" answer was wrong.
+func TestUpdateJobLastRun_IsReadableAfterAReload(t *testing.T) {
+	s := mustOpen(t)
+	defer s.Close()
+
+	job := ScheduledJobRow{
+		ID: "test-last-run", Name: "last-run", Cron: "* * * * *",
+		Mode: "bash", Enabled: true, Recurring: true,
+	}
+	if err := s.SaveScheduledJob(job); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	when := time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC)
+	if err := s.UpdateJobLastRun(job.ID, when); err != nil {
+		t.Fatalf("update last run: %v", err)
+	}
+
+	var raw string
+	if err := s.DB().QueryRow(`SELECT last_run FROM scheduled_jobs WHERE id = ?`, job.ID).Scan(&raw); err != nil {
+		t.Fatalf("read raw last_run: %v", err)
+	}
+	if _, err := time.Parse(time.RFC3339, raw); err != nil {
+		t.Fatalf("stored last_run %q is not RFC3339: %v", raw, err)
+	}
+
+	jobs, err := s.ListScheduledJobs()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var found bool
+	for _, j := range jobs {
+		if j.ID != job.ID {
+			continue
+		}
+		found = true
+		if j.LastRun.IsZero() {
+			t.Fatalf("last_run did not survive the reload (stored %q)", raw)
+		}
+		if !j.LastRun.Equal(when) {
+			t.Errorf("last_run = %v, want %v", j.LastRun, when)
+		}
+	}
+	if !found {
+		t.Fatal("job not found after save")
+	}
+}
+
+// A job that never ran must not carry a fabricated timestamp: the zero time was
+// written verbatim, and after a restart it read back as year 1.
+func TestSaveScheduledJob_ZeroLastRunStaysNull(t *testing.T) {
+	s := mustOpen(t)
+	defer s.Close()
+
+	job := ScheduledJobRow{
+		ID: "test-never-ran", Name: "never-ran", Cron: "* * * * *",
+		Mode: "bash", Enabled: true, Recurring: true,
+	}
+	if err := s.SaveScheduledJob(job); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	var isNull bool
+	if err := s.DB().QueryRow(`SELECT last_run IS NULL FROM scheduled_jobs WHERE id = ?`, job.ID).Scan(&isNull); err != nil {
+		t.Fatalf("read last_run: %v", err)
+	}
+	if !isNull {
+		t.Fatal("a job that never ran must store last_run as NULL, not as the zero time")
+	}
+
+	jobs, err := s.ListScheduledJobs()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, j := range jobs {
+		if j.ID == job.ID && !j.LastRun.IsZero() {
+			t.Errorf("last_run = %v, want zero", j.LastRun)
+		}
+	}
+}
+
+// A one-shot that fired before YM-169 is still in the table and would fire a
+// second time on the next start. A one-shot that never ran must survive: the old
+// write path gave it the zero time as last_run.
+func TestDeleteFiredOneShotJobs_KeepsPendingOnes(t *testing.T) {
+	s := mustOpen(t)
+	defer s.Close()
+
+	rows := []struct {
+		id      string
+		recur   int
+		lastRun string
+	}{
+		{"fired", 0, "2026-10-17 09:30:00 +0000 UTC"},
+		{"pending", 0, "0001-01-01 00:00:00 +0000 UTC"},
+		{"repeat", 1, "2026-10-17 09:30:00 +0000 UTC"},
+	}
+	for _, r := range rows {
+		if _, err := s.DB().Exec(`INSERT INTO scheduled_jobs (id, name, cron, prompt, enabled, recurring, mode, last_run)
+			VALUES (?, ?, '* * * * *', '', 1, ?, 'bash', ?)`, r.id, r.id, r.recur, r.lastRun); err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+	}
+
+	deleted, err := s.DeleteFiredOneShotJobs()
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1 (only the fired one-shot)", deleted)
+	}
+
+	jobs, err := s.ListScheduledJobs()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	remaining := map[string]bool{}
+	for _, j := range jobs {
+		remaining[j.ID] = true
+	}
+	if remaining["fired"] {
+		t.Error("the already fired one-shot survived")
+	}
+	if !remaining["pending"] {
+		t.Error("the pending one-shot was deleted")
+	}
+	if !remaining["repeat"] {
+		t.Error("the recurring job was deleted")
+	}
+}
+
 func TestScheduledJobScriptName(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	job := ScheduledJobRow{
@@ -201,7 +335,7 @@ func TestScheduledJobScriptName(t *testing.T) {
 }
 
 func TestBashJobRunScriptName(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	run := BashJobRun{

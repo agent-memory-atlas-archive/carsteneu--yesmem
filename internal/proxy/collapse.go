@@ -26,16 +26,52 @@ func CalcCollapseCutoff(messages []any, keepRecent int, tokenFloor int, estimate
 	// separate top-level field, so messages[0] is in fact a user message).
 	// Skipped here so its bytes stay stable for the frozen-prefix cache;
 	// CollapseOldMessages does the one-time content blanking on collapse.
-	cutoff := -1
+	// A recent plain user message marks the start of the current turn: it is the
+	// instruction the model is working on, and the oversized rule must not
+	// collapse it. An older prompt does not define a current turn: in an agentic
+	// session every later user message is a tool_result, and from that prompt on
+	// there is nothing left to protect — the rule has to be able to reach a huge
+	// tool_result there, otherwise the collapse never gets below the budget.
+	recentWindowStart := n - keepRecent
+	currentTurnStart := n - 1
 	for i := n - 1; i >= 1; i-- {
 		msg, ok := messages[i].(map[string]any)
 		if !ok {
-			kept += perMessageOverhead
+			continue
+		}
+		if msg["role"] == "user" && !hasToolResultContent(msg["content"]) {
+			if i >= recentWindowStart {
+				currentTurnStart = i
+			}
+			break
+		}
+	}
+
+	cutoff := -1
+	oversizedAt := -1
+	for i := n - 1; i >= 1; i-- {
+		msg, ok := messages[i].(map[string]any)
+		var msgTokens int
+		if !ok {
+			msgTokens = perMessageOverhead
 		} else {
-			kept += estimateMessageContentTokens(msg, func(text string) int {
+			msgTokens = estimateMessageContentTokens(msg, func(text string) int {
 				return estimate(text)
 			})
 		}
+		// A single message that alone exceeds the whole budget must not define
+		// the kept window: keeping it would leave the payload above the floor no
+		// matter how much older history is collapsed, so the stub cycle repeats
+		// on every following request without ever reaching the floor. Collapse
+		// past it (the archive keeps a deep_search hint) and stop. Everything
+		// from currentTurnStart on stays exempt: it is what the model is
+		// answering right now, and a cutoff at n would collapse it as well.
+		if msgTokens >= tokenFloor && i < currentTurnStart {
+			oversizedAt = i
+			cutoff = i + 1
+			break
+		}
+		kept += msgTokens
 		if kept >= tokenFloor {
 			cutoff = i
 			break
@@ -50,6 +86,8 @@ func CalcCollapseCutoff(messages []any, keepRecent int, tokenFloor int, estimate
 	// message containing tool_result blocks, its matching tool_use sits at
 	// cutoff-1 and would be collapsed — leaving an orphan tool_result.
 	// Advance cutoff to include the orphan in the collapse.
+	// Keeping the pair costs one message; collapsing it costs the content,
+	// because validateToolPairs repairs the orphan by removing the block.
 	for cutoff < n {
 		msg, ok := messages[cutoff].(map[string]any)
 		if !ok {
@@ -61,10 +99,35 @@ func CalcCollapseCutoff(messages []any, keepRecent int, tokenFloor int, estimate
 		cutoff++
 	}
 
+	// Collapsing an oversized message overrides keepRecent by design: keeping it
+	// guarantees a payload above the budget, which is the state this function
+	// exists to leave behind.
+	if oversizedAt >= 0 {
+		if cutoff >= n {
+			return -1
+		}
+		return cutoff
+	}
+
 	// Also respect keepRecent: never collapse into the recent window
 	maxCutoff := n - keepRecent
 	if cutoff > maxCutoff {
 		cutoff = maxCutoff
+
+		// The clamp can pull the boundary back onto a tool_result whose
+		// tool_use sits at cutoff-1 and would be collapsed (YM-140). Retreat
+		// to the pairing tool_use message so both halves stay kept; advancing
+		// is impossible here, it would cross into the protected window.
+		for cutoff > minCollapseMessages {
+			msg, ok := messages[cutoff].(map[string]any)
+			if !ok {
+				break
+			}
+			if msg["role"] != "user" || !hasToolResultContent(msg["content"]) {
+				break
+			}
+			cutoff--
+		}
 	}
 	if cutoff < minCollapseMessages {
 		return -1
@@ -525,11 +588,11 @@ func extractGitCommitMessage(cmd string) string {
 		rest = strings.TrimSpace(rest)
 		// Strip outer quotes
 		if len(rest) > 1 {
-			if (rest[0] == '"' && strings.Contains(rest[1:], "\"")) {
+			if rest[0] == '"' && strings.Contains(rest[1:], "\"") {
 				end := strings.Index(rest[1:], "\"")
 				return rest[1 : end+1]
 			}
-			if (rest[0] == '\'' && strings.Contains(rest[1:], "'")) {
+			if rest[0] == '\'' && strings.Contains(rest[1:], "'") {
 				end := strings.Index(rest[1:], "'")
 				return rest[1 : end+1]
 			}

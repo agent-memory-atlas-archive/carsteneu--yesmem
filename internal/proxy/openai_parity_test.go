@@ -1,8 +1,46 @@
 package proxy
 
 import (
+	"io"
+	"log"
+	"net/http"
+	"strings"
 	"testing"
 )
+
+// The OpenAI-format path (opencode on a non-Anthropic provider, codex) had no
+// channel consumer at all: the injection block was disabled as
+// cache-incompatible, so a session was pinged for content that then never
+// arrived (YM-59/AGT-MA02). The content now rides the same per-message store the
+// other injects use, which is cache-stable because it is frozen once per msg:N.
+func TestAnnotateOpenAIMessageMetadata_StashesChannelContent(t *testing.T) {
+	s := &Server{
+		timestampStore:     NewTimestampStore(),
+		logger:             log.New(io.Discard, "", 0),
+		channelInjectCount: map[string]int{},
+	}
+	s.channelLoader = func(threadID, project string) dialogResult {
+		return dialogResult{
+			Extra:     "📨 Von orchestrator [command]:\nrun the tests",
+			SessionID: threadID,
+			HasUnread: true,
+		}
+	}
+
+	msgs := []any{map[string]any{"role": "user", "content": "hello"}}
+	req := map[string]any{"messages": msgs}
+	ctx := &openAIRequestContext{ThreadID: "ses_channel_test", Project: "proj", ReqIdx: 1, RawMsgCount: 1}
+
+	s.annotateOpenAIMessageMetadata(req, ctx, msgs, "glm-5.2", 1000)
+
+	got, _ := msgs[0].(map[string]any)["content"].(string)
+	if !strings.Contains(got, "run the tests") {
+		t.Errorf("channel content was not injected into the message: %q", got)
+	}
+	if !strings.Contains(got, "SESSION_ID: ses_channel_test") {
+		t.Errorf("the reply target is missing from the injection: %q", got)
+	}
+}
 
 // --- extractWorkingDirectory ---
 
@@ -244,7 +282,7 @@ func TestIsOpenAIProxySubagent_SDKEntrypoint(t *testing.T) {
 		},
 	}
 	msgs := []any{map[string]any{"role": "user", "content": "hello"}}
-	if !isOpenAIProxySubagent(msgs, req) {
+	if !isOpenAIProxySubagent(http.Header{}, msgs, req) {
 		t.Error("sdk-ts entrypoint should be detected as subagent")
 	}
 }
@@ -256,7 +294,7 @@ func TestIsOpenAIProxySubagent_CLIEntrypoint(t *testing.T) {
 		},
 	}
 	msgs := []any{map[string]any{"role": "user", "content": "hello"}}
-	if isOpenAIProxySubagent(msgs, req) {
+	if isOpenAIProxySubagent(http.Header{}, msgs, req) {
 		t.Error("cli entrypoint should NOT be detected as subagent")
 	}
 }
@@ -266,7 +304,7 @@ func TestIsOpenAIProxySubagent_HaikuModel(t *testing.T) {
 		"model": "claude-haiku-4-5-20251001",
 	}
 	msgs := []any{map[string]any{"role": "user", "content": "hello"}}
-	if !isOpenAIProxySubagent(msgs, req) {
+	if !isOpenAIProxySubagent(http.Header{}, msgs, req) {
 		t.Error("haiku model should be detected as subagent")
 	}
 }
@@ -276,16 +314,16 @@ func TestIsOpenAIProxySubagent_NormalRequest(t *testing.T) {
 		"model": "gpt-5.4",
 	}
 	msgs := []any{map[string]any{"role": "user", "content": "hello"}}
-	if isOpenAIProxySubagent(msgs, req) {
+	if isOpenAIProxySubagent(http.Header{}, msgs, req) {
 		t.Error("normal gpt-5.4 request should NOT be subagent")
 	}
 }
 
 func TestIsOpenAIProxySubagent_EmptyMessages(t *testing.T) {
-	if isOpenAIProxySubagent(nil, nil) {
+	if isOpenAIProxySubagent(http.Header{}, nil, nil) {
 		t.Error("nil messages should not be subagent")
 	}
-	if isOpenAIProxySubagent([]any{}, nil) {
+	if isOpenAIProxySubagent(http.Header{}, []any{}, nil) {
 		t.Error("empty messages should not be subagent")
 	}
 }
@@ -299,7 +337,7 @@ func TestIsOpenAIProxySubagent_NoSystem(t *testing.T) {
 		},
 	}
 	msgs := []any{map[string]any{"role": "user", "content": "hello"}}
-	if isOpenAIProxySubagent(msgs, req) {
+	if isOpenAIProxySubagent(http.Header{}, msgs, req) {
 		t.Error("Codex request without system should NOT be subagent")
 	}
 }
@@ -318,12 +356,12 @@ func TestTranslateResponses_CollapsedArchiveBlock(t *testing.T) {
 		"messages": []any{
 			// Collapsed archive block (produced by CollapseOldMessages)
 			map[string]any{
-				"role": "user",
+				"role":    "user",
 				"content": "[Archiv: Messages 1-50 (50 msgs) — collapsed]\nTools: Bash(12), Read(8)\nFiles: proxy.go(5), handler.go(3)",
 			},
 			// Assistant acknowledgment
 			map[string]any{
-				"role": "assistant",
+				"role":    "assistant",
 				"content": "Understood, I have the context from the archived messages.",
 			},
 			// Current conversation

@@ -530,4 +530,3 @@ func TestTranslateAnthropicToOpenAI_PreservesTrailingImageMessage(t *testing.T) 
 	}
 	t.Errorf("no image_url part survived in %+v", parts)
 }
-

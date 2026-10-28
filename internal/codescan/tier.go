@@ -46,12 +46,15 @@ type ProjectStats struct {
 // (e.g. CLI diagnostics) outside the scan path.
 func DetectTier(rootDir string) (Tier, ProjectStats) {
 	stats := ProjectStats{RootDir: rootDir}
+	walkRoot := ResolveScanRoot(rootDir)
+	var skippedLinks int
+	var firstSkipped string
 
-	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		rel, _ := filepath.Rel(rootDir, path)
+		rel, _ := filepath.Rel(walkRoot, path)
 		if shouldSkipDir(rel, info) {
 			return filepath.SkipDir
 		}
@@ -61,10 +64,24 @@ func DetectTier(rootDir string) (Tier, ProjectStats) {
 		if !isSourceFile(path) {
 			return nil
 		}
+		readPath := path
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, ok := ResolveWithinRoot(walkRoot, rel)
+			if !ok {
+				skippedLinks++
+				if firstSkipped == "" {
+					firstSkipped = rel
+				}
+				return nil
+			}
+			readPath = resolved
+		}
 		stats.FileCount++
-		stats.TotalLOC += countLOC(path)
+		stats.TotalLOC += countLOC(readPath)
 		return nil
 	})
+
+	logSkippedLinks("tier", walkRoot, skippedLinks, firstSkipped)
 
 	tier := classifyTier(stats)
 	return tier, stats
@@ -99,6 +116,15 @@ func IsSourceFile(path string) bool {
 }
 func shouldSkipDir(rel string, info os.FileInfo) bool {
 	if !info.IsDir() {
+		return false
+	}
+	// The walk root is never a skip candidate. filepath.Rel reports it as ".",
+	// and info.Name() of a root given as "." or "proj/." is ".", so the dot
+	// rule below would prune the whole tree at its root (Learning #102155).
+	// This also means an explicitly requested directory (get_file_index dir=…)
+	// is listed even when its name is in the skip list: the explicit request
+	// wins over the default pruning.
+	if rel == "." || rel == "" {
 		return false
 	}
 	name := info.Name()

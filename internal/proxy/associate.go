@@ -16,13 +16,13 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-const associativeScoreThreshold = 38     // 0-100 scale: primary threshold for strong matches (was 45)
-const associativeScoreFallback = 25      // 0-100 scale: adaptive fallback when no strong matches found (was 28)
-const associativeScoreStrong = 65        // strong hybrid match (was 75)
-const associativeMaxWeak = 1             // single-source matches that pass threshold
-const associativeMaxStrong = 1           // strong hybrid matches (reduced from 2)
-const associativeMaxTotal = 1            // absolute cap on injected results (reduced from 2)
-const associativeProjectBoost = 2.0   // bonus for matching project (0-100 scale)
+const associativeScoreThreshold = 38 // 0-100 scale: primary threshold for strong matches (was 45)
+const associativeScoreFallback = 25  // 0-100 scale: adaptive fallback when no strong matches found (was 28)
+const associativeScoreStrong = 65    // strong hybrid match (was 75)
+const associativeMaxWeak = 1         // single-source matches that pass threshold
+const associativeMaxStrong = 1       // strong hybrid matches (reduced from 2)
+const associativeMaxTotal = 1        // absolute cap on injected results (reduced from 2)
+const associativeProjectBoost = 2.0  // bonus for matching project (0-100 scale)
 
 // findAssociativeContextFor queries the daemon for learnings relevant to the user query.
 // Uses hybrid search (BM25 keyword + vector semantic) for better recall on exact terms.
@@ -39,7 +39,9 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 	projectDir := currentProject
 	if currentProject != "" {
 		if resolved, err := s.queryDaemon("resolve_project", map[string]any{"project_dir": currentProject}); err == nil && resolved != nil {
-			var rp struct{ ProjectShort string `json:"project_short"` }
+			var rp struct {
+				ProjectShort string `json:"project_short"`
+			}
 			if json.Unmarshal(resolved, &rp) == nil && rp.ProjectShort != "" {
 				currentProject = rp.ProjectShort
 			}
@@ -72,6 +74,11 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 		"limit":       float64(6),
 		"skip_recent": float64(3),
 	}
+	// The daemon scopes skip_recent to this session when it gets the id, so the
+	// just-extracted learning stays skipped even after another session writes.
+	if threadID != "" {
+		params["session_id"] = threadID
+	}
 	if currentProject != "" {
 		params["project"] = daemonProject(currentProject, projectDir)
 	}
@@ -83,15 +90,14 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 
 	// Parse hybrid_search results — daemon returns {"results": [...], ...}
 	type hybridResult struct {
-		ID             string  `json:"id"`
-		Content        string  `json:"content"`
-		Snippet        string  `json:"snippet"`
-		Score          float64 `json:"score"`
-		Source         string  `json:"source"`
-		LearningSource string  `json:"learning_source"`
-		OriginTool     string  `json:"origin_tool"`
-		Project        string  `json:"project"`
-		AgentRole      string  `json:"agent_role"`
+		ID         string  `json:"id"`
+		Content    string  `json:"content"`
+		Snippet    string  `json:"snippet"`
+		Score      float64 `json:"score"`
+		Source     string  `json:"source"`
+		OriginTool string  `json:"origin_tool"`
+		Project    string  `json:"project"`
+		AgentRole  string  `json:"agent_role"`
 	}
 	var wrapped struct {
 		Results []hybridResult `json:"results"`
@@ -119,15 +125,9 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 		}
 		score := r.Score
 
-		// Source-boost: user-stated learnings are epistemically more valuable
-		switch r.LearningSource {
-		case "user_stated":
-			score *= 1.25
-		case "agreed_upon":
-			score *= 1.15
-		case "hook_auto_learned":
-			score *= 1.10
-		}
+		// No source boost here: the daemon's hybrid_search score already carries it
+		// (handler_hybrid.go multiplies user_stated/agreed_upon/hook_auto_learned).
+		// Re-applying it weighted user_stated at 1.25 × 1.25.
 
 		// Origin granularity: supplements source-class with provenance-level trust weight
 		score *= models.OriginMultiplier(r.OriginTool)
@@ -138,7 +138,7 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 		if currentProject != "" && r.Project != "" && !models.ProjectMatches(r.Project, currentProject) {
 			if s.logger != nil {
 				s.logger.Printf("  %sassociative: [SKIP-project] project=%s score=%.3f %s%s",
-					colorOrange, r.Project, score, truncateStr(text, 80), colorReset)
+					colorOrange, journalToken(r.Project), score, truncateStr(text, 80), colorReset)
 			}
 			continue
 		}
@@ -152,7 +152,7 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 			score *= 0.5
 			if s.logger != nil {
 				s.logger.Printf("  %sassociative: [PROJ-PENALTY] score=%.3f→%.3f project=%s %s%s",
-					colorOrange, score/0.5, score, r.Project, truncateStr(text, 60), colorReset)
+					colorOrange, score/0.5, score, journalToken(r.Project), truncateStr(text, 60), colorReset)
 			}
 			if score < associativeScoreFallback {
 				continue
@@ -368,14 +368,18 @@ func (s *Server) findAssociativeContextFor(userQuery, currentProject, threadID s
 	if len(matchIDs) > 0 {
 		go func() {
 			idsAny := make([]any, len(matchIDs))
-			for i, id := range matchIDs { idsAny[i] = id }
+			for i, id := range matchIDs {
+				idsAny[i] = id
+			}
 			s.queryDaemon("increment_match", map[string]any{"ids": idsAny})
 		}()
 	}
 	if len(injectIDs) > 0 {
 		go func() {
 			idsAny := make([]any, len(injectIDs))
-			for i, id := range injectIDs { idsAny[i] = id }
+			for i, id := range injectIDs {
+				idsAny[i] = id
+			}
 			s.queryDaemon("increment_inject", map[string]any{"ids": idsAny})
 		}()
 	}
@@ -675,7 +679,7 @@ func lastToolError(messages []any) string {
 			if !ok {
 				continue
 			}
-			if b["type"] == "tool_result" && b["is_error"] == true {
+			if b["type"] == "tool_result" && toolResultIsError(b) {
 				if text, ok := b["content"].(string); ok && text != "" {
 					// Extract first meaningful line, cap at 150 chars
 					lines := strings.SplitN(text, "\n", 2)
@@ -802,12 +806,19 @@ func formatDocResult(source, version, heading, content string) string {
 	return sb.String()
 }
 
-// fileToolNames maps tool names to their file path input key.
-var fileToolNames = map[string]string{
-	"Read":         "file_path",
-	"Edit":         "file_path",
-	"Write":        "file_path",
-	"NotebookEdit": "notebook_path",
+// fileToolNames lists the tools that carry a file path, lowercased so one entry
+// matches every dialect: Claude Code sends Read/Edit/Write, opencode sends
+// read/edit/write. The path key differs per client (notebook_path, file_path,
+// filePath, path) and is read by toolFilePath.
+//
+// The only caller, findDocsByFileExtensions, is currently switched off (see the
+// three commented-out call sites below): this dialect handling is correctness
+// for the day the extension fallback is re-enabled, not a live behaviour change.
+var fileToolNames = map[string]bool{
+	"read":         true,
+	"edit":         true,
+	"write":        true,
+	"notebookedit": true,
 }
 
 // extractFileExtensionsFromMessages scans the last 10 messages for file-related
@@ -840,15 +851,14 @@ func extractFileExtensionsFromMessages(messages []any, registeredExts []string) 
 				continue
 			}
 			name, _ := b["name"].(string)
-			pathKey, ok := fileToolNames[name]
-			if !ok {
+			if !fileToolNames[strings.ToLower(name)] {
 				continue
 			}
 			input, ok := b["input"].(map[string]any)
 			if !ok {
 				continue
 			}
-			filePath, _ := input[pathKey].(string)
+			filePath := toolFilePath(input)
 			if filePath == "" {
 				continue
 			}

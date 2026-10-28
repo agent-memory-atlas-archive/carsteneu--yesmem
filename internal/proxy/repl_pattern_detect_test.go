@@ -102,6 +102,9 @@ func TestExtractShellCommandsFromMessages_IgnoresNonREPLTools(t *testing.T) {
 	}
 }
 
+// YM-147: only the newest assistant turn is read. The older turns were already
+// recorded by the requests that followed them; reading them again on every
+// request is what fired one RPC per historical command.
 func TestExtractShellCommandsFromMessages_MultiMessage(t *testing.T) {
 	messages := []any{
 		makeAssistantRepl("await sh('echo one')"),
@@ -109,8 +112,11 @@ func TestExtractShellCommandsFromMessages_MultiMessage(t *testing.T) {
 		makeAssistantRepl("await sh('echo two'); await sh('echo three')"),
 	}
 	cmds := extractShellCommandsFromMessages(messages)
-	if len(cmds) != 3 {
-		t.Fatalf("expected 3 total, got %d: %v", len(cmds), cmds)
+	if len(cmds) != 2 {
+		t.Fatalf("expected the 2 commands of the newest turn, got %d: %v", len(cmds), cmds)
+	}
+	if cmds[0] != "echo two" || cmds[1] != "echo three" {
+		t.Errorf("expected the newest turn's commands, got %v", cmds)
 	}
 }
 
@@ -339,7 +345,6 @@ func TestDetectReplPatternSuggestion_MixedTrivialAndRealRecordsOnlyReal(t *testi
 	}
 }
 
-
 func TestInjectReminderIntoLastUserMessage_StringContent(t *testing.T) {
 	req := map[string]any{"messages": []any{
 		map[string]any{"role": "user", "content": "hello"},
@@ -426,4 +431,3 @@ func TestFormatReplPatternSuggestion_MentionsCapAndDismiss(t *testing.T) {
 		}
 	}
 }
-

@@ -91,7 +91,7 @@ func TestScanCooldown_BlocksRetryAfterFailure(t *testing.T) {
 func TestScanCooldown_ExpiresAfterCooldown(t *testing.T) {
 	dir := gitWorktreeDir(t)
 	fs := &memFailureStore{failures: map[string]time.Time{
-		projectKey(dir): time.Now().Add(-11 * time.Minute),
+		scanCooldownKey(dir): time.Now().Add(-11 * time.Minute),
 	}}
 	inner := &countingScanner{}
 	cs := NewCachedScanner(inner).WithStore(fs)
@@ -111,12 +111,12 @@ func TestScanCooldown_ExpiresAfterCooldown(t *testing.T) {
 func TestScanCooldown_ClearedOnSuccess(t *testing.T) {
 	dir := gitWorktreeDir(t)
 	fs := &memFailureStore{failures: map[string]time.Time{
-		projectKey(dir): time.Now().Add(-11 * time.Minute),
+		scanCooldownKey(dir): time.Now().Add(-11 * time.Minute),
 	}}
 	inner := &countingScanner{}
 	cs := NewCachedScanner(inner).WithStore(fs)
 
-	failedAt, _, _ := fs.GetScanFailure(projectKey(dir))
+	failedAt, _, _ := fs.GetScanFailure(scanCooldownKey(dir))
 	if failedAt.IsZero() {
 		t.Fatal("expected seeded failure record")
 	}
@@ -125,7 +125,7 @@ func TestScanCooldown_ClearedOnSuccess(t *testing.T) {
 		t.Fatalf("scan: %v", err)
 	}
 
-	failedAt, _, err := fs.GetScanFailure(projectKey(dir))
+	failedAt, _, err := fs.GetScanFailure(scanCooldownKey(dir))
 	if err != nil {
 		t.Fatalf("GetScanFailure: %v", err)
 	}

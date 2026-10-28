@@ -40,11 +40,12 @@ var yesmemCodexToolNames = []string{
 	"list_agents", "list_cap_proposals", "list_docs", "list_projects",
 	"pin", "project_summary", "quarantine_session", "query_facts",
 	"register_caps", "related_to_file", "relate_learnings", "relay_agent",
-	"remember", "remove_docs", "resolve", "resolve_by_text", "resume_agent",
+	"remember", "remove_docs", "reopen", "resolve", "resolve_by_text", "resume_agent",
 	"save_cap", "schedule", "scratchpad_delete", "scratchpad_list",
 	"scratchpad_read", "scratchpad_write", "search", "search_code",
 	"search_code_index", "send_to", "set_config", "set_persona", "set_plan",
 	"skip_indexing", "spawn_agent", "stop_agent", "stop_all_agents", "unpin",
+	"unquarantine_session",
 	"update_agent_status", "update_plan", "whoami",
 }
 

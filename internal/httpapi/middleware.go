@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"log"
 	"net"
 	"net/http"
@@ -20,23 +21,25 @@ func LocalhostOnly(next http.Handler) http.Handler {
 	})
 }
 
-// BearerAuth validates Authorization: Bearer <token>.
+// BearerAuth validates Authorization: Bearer <token>. One implementation only:
+// this delegates to BearerAuthFunc so the two wrappers cannot drift apart.
 func BearerAuth(token string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || auth[7:] != token {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return http.HandlerFunc(BearerAuthFunc(token, next.ServeHTTP))
 }
 
 // BearerAuthFunc wraps a HandlerFunc with bearer token validation.
 func BearerAuthFunc(token string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Without this an empty configured token authenticates "Bearer ": the
+		// prefix matches and the remainder equals the empty token.
+		if token == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		auth := r.Header.Get("Authorization")
-		if len(auth) < 8 || auth[7:] != token {
+		const prefix = "bearer "
+		if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) ||
+			subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), []byte(token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

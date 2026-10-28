@@ -24,7 +24,7 @@ Orchestrator (this session, light)
   ├─ INTEGRATE cross-links + INDEX.md + citation audit
   └─ DELIVER commit + DONE
             │
-            ▼ yesmem_spawn_agent (TUI, max 12h, ≤6 concurrent)
+            ▼ yesmem_spawn_agent (TUI; 12h and 6 concurrent are orchestrator conventions, not daemon limits)
             │
    Bereichs-Agent (full TUI, autonomous)
      ├─ CONTEXT read master plan + cluster files
@@ -108,7 +108,7 @@ model: zai/deepseek-chat
 
 | Parameter | Default | Override via |
 |---|---|---|
-| `max_runtime` per Bereichs-Agent | `2h` | master plan `default_max_runtime` or scratchpad |
+| `max_runtime` per Bereichs-Agent | `2h` (orchestrator convention) | master plan `default_max_runtime`; the daemon's `max_runtime` is a GLOBAL config value (`set_config`), not a spawn parameter |
 | `max_concurrent_agents` | `6` (cap: 8) | master plan `max_concurrent_agents` |
 | `min_sources_per_file` | `2` | master plan `min_sources_per_file` |
 | `update_age_days` (UPDATE MODE) | `90` | master plan `update_age_days` |
@@ -118,7 +118,9 @@ Master plan frontmatter is the single source of truth for per-topic configuratio
 
 ## max_runtime
 
-Default `2h` pro Bereichs-Agent. Override via master plan frontmatter or `yesmem_spawn_agent(max_runtime="<duration>")`. **Absolute cap: `12h`** — no agent runs longer. For multi-day research, the orchestrator dispatches fresh batches.
+The daemon's `max_runtime` is a **global config value**, not a spawn parameter: `yesmem_spawn_agent` does not accept it, and a call that passes it is silently ignored. It bounds every agent equally (`config.yaml`, or `set_config("agents.max_runtime", "2h")`; a new value takes effect on the next daemon start, there is no hot reload). Empty means the daemon default of 48h. For a per-agent ceiling at spawn time use `token_budget` or `max_turns`. To end one research agent early, relay it to wrap up and stop it.
+
+The `2h` per Bereichs-Agent below is an **orchestrator convention**, not an enforced limit: it defines when the orchestrator expects a cluster to be done and how long it waits before intervening. An agent that needs longer gets a relay to continue. The absolute ceiling this skill asks the orchestrator to enforce is `12h` per agent (dispatch a fresh batch beyond that), independent of the daemon's global limit.
 
 ## Orchestrator Contract (what to prescribe vs. delegate)
 
@@ -323,7 +325,7 @@ Bereichs-Agent DONE-claims fail the gate when ANY of these deterministic checks 
 | W6 | Bibliography in UPDATE MODE preserves existing entries | git diff old vs new bibliography — old entries must all be present | Re-do read-merge-write |
 | W7 | No broken git index.lock files in worktree | `ls .yesmem/locks/*.lock` empty after DELIVER | Manual cleanup |
 | W8 | Frontmatter Union applied (UPDATE MODE) | spot-check: tags from prior version preserved in ≥80% of files | Re-do INTEGRATE frontmatter-merge |
-| W9 | No concurrent Bereichs-Agents exceeded cap | `list_agents(status=running)` historical max ≤ cap | Log warning |
+| W9 | No concurrent Bereichs-Agents exceeded cap | `list_agents(project)` and count the rows with `status == "running"` client-side (the tool takes only `project`); historical max ≤ cap | Log warning |
 | W10 | All Bereichs-Agent scratchpad DONE blocks complete | Each has `### Phase 1` through `### Phase 6` + all `**Status:** COMPLETE` | Re-dispatch incomplete Bereichs-Agents |
 
 ### Orchestrator Self-Checks (before DELIVER complete)
@@ -457,7 +459,7 @@ update_agent_status(phase="Phase 2/6 DECOMPOSE")
 - For each cluster section, write:
   - **Both modes:** cluster name, file list (or delta-task list in UPDATE MODE), source hints, language, min-sources-per-file, special constraints, **mode flag (FRESH or UPDATE)**, resolved model, **session title (one line, cluster topic — agents rename their session to `[<agent-id>] <session title>` at Phase 1 start)**
   - **UPDATE MODE additional:** per-file action, existing frontmatter state, existing content path
-- Decide `max_runtime` per agent (default `2h`, longer for source-heavy clusters; UPDATE typically shorter since not all files need work).
+- Decide the runtime budget per agent (default `2h`, longer for source-heavy clusters; UPDATE typically shorter since not all files need work). This is an orchestrator convention: the daemon's hard ceiling is the global `max_runtime` config, so stopping an overrunning agent is a relay plus `stop_agent`, not a spawn parameter.
 
 ### Phase 3/6: DISPATCH
 ```
@@ -482,7 +484,7 @@ update_agent_status(phase="Phase 4/6 MONITOR")
 **PATIENCE IS THE JOB.** Research agents work slower than coding agents — often by an order of magnitude. A single file may take 10-15 minutes: webfetch roundtrips, PDF download+pdftotext, draft writing, citation verification via task(explore), revision. A 5-file cluster typically takes 30-90 minutes; a large cluster 2-4 hours. This is normal, not a stall.
 
 **Monitoring cadence (DO NOT over-poll):**
-- `list_agents` every 5 minutes (not every 60s) — checks status + last_activity_at + turns_used + stream_active
+- `list_agents` every 5 minutes (not every 60s) — checks status + progress + last_activity_at + turns_used. `list_agents` returns the stored agent rows only; `stream_active` and `subagent_streams` are not part of that response, use `get_agent` when you need them
 - `scratchpad_read` every 15 minutes per Bereichs-Agent — more often just burns context
 - Trust the agents to work. Polling faster does not make them faster.
 - **Prefer `get_agent` over `list_agents` for single-agent checks** — it returns the full field set including `stream_active` and `subagent_streams`.
@@ -505,13 +507,13 @@ update_agent_status(phase="Phase 4/6 MONITOR")
 **stream_active is the primary liveness signal** . It's set true by the proxy at SSE-stream start and false at stream end, via `track_stream_state` RPC . `last_activity_at` alone is unreliable — agents that block on long tool calls may not update it for 10+ min while still working.
 
 **What counts as stalled (recovery needed):**
-- `stream_active == false` AND no activity (last_activity_at, turns, commits) for 20+ minutes AND `subagent_streams == 0`
-- `stopped: max_runtime exceeded` with PID alive → rare (stopAgent only fires on dead PID); if seen with alive PID, treat as false positive, extend runtime or relay to continue
+- `stream_active == false` (per agent, from `get_agent` — `list_agents` does not carry it) AND no activity (last_activity_at, turns, commits) for 20+ minutes AND `subagent_streams == 0`
+- `stopped: max_runtime exceeded` with PID alive → rare (the limit only stops a row whose PID holds no verified process); if seen with a live PID, treat it as a false positive and relay to continue. `max_runtime` is global, so it cannot be extended for one agent
 - PID dead → crashed, respawn
 - `BLOCKED — <reason>` in scratchpad → orchestrator resolves
 
 **Recovery actions:**
-  - `stopped: max_runtime exceeded` but PID alive → rare false positive, extend `max_runtime` via respawn, or relay to continue
+  - `stopped: max_runtime exceeded` but PID alive → rare false positive; relay to continue. Raising `max_runtime` is a global config (`agents.max_runtime`, effective after a daemon restart) and affects every agent; a respawn inherits the same limit
   - Crashed (PID dead) → respawn with identical task, note "respawn attempt N"
   - Stalled (no activity >20min, not paused/stopped) → `relay_agent` kick: "Status check — current phase? Any blockers?" Wait 10 min for response. If still flat, respawn.
   - `BLOCKED — <reason>` in scratchpad → orchestrator resolves or aborts that cluster
@@ -566,7 +568,7 @@ When you are spawned as a yesresearch Bereichs-Agent, you receive via scratchpad
 - Min sources per file, language, constraints
 - Reference to master plan (or full plan inline)
 
-**SESSION TITLE (MANDATORY at Phase 1 start, opencode backend):** `session_rename(title="[<agent-id>] <session title>")` — omit `sessionID` (renames the current session). `<agent-id>` comes from the relay kick; the session title from your briefing (or derive it from the cluster name). Record `**Session title set:** <final title>` in the Phase 1 block. Rename failure or non-opencode backend: non-blocking — note it and continue.
+**SESSION TITLE (MANDATORY at Phase 1 start, opencode backend):** `opencode_session_rename(title="[<agent-id>] <session title>")` (Code Mode: `tools.opencode.session_rename`) — omit `sessionID` (renames the current session); the bare `session_rename` does not exist. `<agent-id>` comes from the relay kick; the session title from your briefing (or derive it from the cluster name). Record `**Session title set:** <final title>` in the Phase 1 block. Rename failure or non-opencode backend: non-blocking — note it and continue.
 
 ### Phase 1/6: CONTEXT
 ```
@@ -1032,8 +1034,8 @@ Frontmatter is the single source of truth for status, navigation, and searchabil
 |---|---|
 | Bereichs-Agent crashed (PID dead) | Orchestrator respawns with identical task, scratchpad section preserved. Max 3 respawns. |
 | Socket collision on spawn | `rm -f ~/.claude/yesmem/agent-<id>.sock` before respawn  |
-| Stalled agent (`stream_active==false` AND no activity >20min AND `subagent_streams==0`) | `relay_agent` kick: "Status check — current phase? Blockers?" Wait 10 min. If still flat, respawn. |
-| `stopped: max_runtime exceeded` but PID alive | Rare false positive (stopAgent only fires on dead PID). Extend `max_runtime` via respawn, or relay to continue. |
+| Stalled agent (`stream_active==false` from `get_agent` AND no activity >20min AND `subagent_streams==0`) | `relay_agent` kick: "Status check — current phase? Blockers?" Wait 10 min. If still flat, respawn. |
+| `stopped: max_runtime exceeded` but PID alive | Rare false positive: the limit only stops a row whose PID holds no verified process. Relay to continue; `max_runtime` is a global config, so raising it affects every agent. |
 | webfetch 403 / timeout | Subagent documents, tries Wayback/Google cache. If all fail: file marked `partial`, proceed. |
 | Master plan ambiguous | Orchestrator resolves via inline decomposition. If unresolvable: `send_to caller_session: "AMBIGUITY: <description>"` and wait. |
 | All Bereichs-Agents fail | Orchestrator documents, aborts, escalates: `send_to caller_session: "ABORT: all agents failed. <details>"` |
@@ -1049,8 +1051,8 @@ Each violation triggers DONE-Gate failure: Orchestrator rejects DONE-claim, disp
 | 3 | Skipping Persona Review (Phase 4 VERIFY) | Frontmatter must contain `persona_review` block with `personas_tested` |
 | 4 | Resolving conflicts unilaterally | Content audit must show both positions for every conflict point |
 | 5 | Claims without sources | Every factual claim must have inline citation (grep pattern) |
-| 6 | Bereichs-Agent running >12h | max_runtime cap enforced at spawn-time |
-| 7 | More than 6 concurrent Bereichs-Agents | `list_agents(status=running)` count check |
+| 6 | Bereichs-Agent running >12h | Orchestrator aborts and redispatches; the daemon's global `max_runtime` (48h default) is the hard stop, the 12h here is an orchestrator convention |
+| 7 | More than 6 concurrent Bereichs-Agents | `list_agents(project)` and count `status == "running"` rows client-side |
 | 8 | Push or merge without user approval | `git log origin/<branch>` must be empty in DELIVER |
 | 9 | Reporting DONE with missing phase sections | Section 11 validation regex |
 | 10 | Using Write on existing files (instead of Edit+Lock) | Worktree git log must NOT show wholesale file replacements >100% line change |
@@ -1096,7 +1098,7 @@ If the Orchestrator agent itself crashes (daemon restart, OOM, manual kill), the
 **On Orchestrator respawn (via `yesmem_resume_agent`):**
 1. `get_plan()` — restore phase + cluster list + mode flag
 2. `scratchpad_read(project, "yesresearch-<topic-slug>-orchestrator")` — restore detailed state
-3. `list_agents(project, status="running")` — check which Bereichs-Agents are still alive
+3. `list_agents(project)` and keep the rows with `status == "running"`; the tool takes only `project` — check which Bereichs-Agents are still alive
 4. Reconstruct: which phase was I in? Which batches dispatched? Which agents completed?
 5. `update_agent_status(phase="Phase N/6 NAME (recovered)")` — re-assert state
 6. Continue from the right point:

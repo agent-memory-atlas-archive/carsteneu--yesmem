@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/carsteneu/yesmem/internal/config"
+	"github.com/carsteneu/yesmem/internal/daemon"
 	"gopkg.in/yaml.v3"
 )
 
@@ -70,7 +72,7 @@ func runConfig(args []string) {
 		}
 		key := args[1]
 		value := strings.Join(args[2:], " ")
-		if err := config.SetValue(cfgPath, key, config.CoerceValue(value)); err != nil {
+		if err := setConfigValue(dataDir, cfgPath, key, value); err != nil {
 			fmt.Fprintf(os.Stderr, "config set: %v\n", err)
 			os.Exit(1)
 		}
@@ -97,4 +99,60 @@ func runConfig(args []string) {
 		fmt.Fprintln(os.Stderr, "  yesmem config set <key> <value>  Set a config value by dot-path")
 		os.Exit(1)
 	}
+}
+
+// setConfigValue writes one key into config.yaml and, for a proxy key, into the
+// daemon's runtime slot. The path is normalized onto its schema location and the
+// value is coerced to the field type first, the same two steps the daemon's
+// set_config takes: a value that does not fit the field makes Load reject the
+// whole file.
+func setConfigValue(dataDir, cfgPath, key, rawValue string) error {
+	normKey, err := config.NormalizeSetPath(key)
+	if err != nil {
+		return err
+	}
+	coerced, err := config.CoerceValueForPath(normKey, config.CoerceValue(rawValue))
+	if err != nil {
+		return err
+	}
+	if err := config.SetValue(cfgPath, normKey, coerced); err != nil {
+		return err
+	}
+	// The running proxy re-reads only the token-threshold family from
+	// proxy_state. Mirroring any other proxy key would write a slot that no proxy
+	// code consumes while get_config starts reporting it as the effective value.
+	// The daemon's own set_config still dual-writes broadly (pre-existing); this
+	// path stays honest about what the proxy applies.
+	stateKey, hasRuntimeReader := config.ProxyRuntimeStateKey(normKey)
+	if !hasRuntimeReader {
+		if _, isProxyKey := config.ProxyStateKey(normKey); isProxyKey {
+			fmt.Fprintf(os.Stderr, "config set: %q written; the proxy applies it on its next start.\n", normKey)
+		}
+		return nil
+	}
+	if err := mirrorProxyState(dataDir, stateKey, coerced); err != nil {
+		// The file is the primary store, and the proxy re-reads this family from
+		// it. A slot that could not be written is worth a warning, not a failed
+		// write.
+		fmt.Fprintf(os.Stderr, "config set: %q written; the runtime slot was not updated (%v). The value applies within one proxy refresh window or at the next start.\n", normKey, err)
+	}
+	return nil
+}
+
+// mirrorProxyState writes one runtime slot through the daemon's socket.
+func mirrorProxyState(dataDir, stateKey string, value any) error {
+	client, err := daemon.DialTimeout(dataDir, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	// DialTimeout bounds the dial only; without a deadline on the connection a
+	// daemon that accepts and then stalls would hang the CLI.
+	if err := client.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return err
+	}
+	if _, err := client.Call("set_proxy_state", map[string]any{"key": stateKey, "value": fmt.Sprintf("%v", value)}); err != nil {
+		return err
+	}
+	return nil
 }

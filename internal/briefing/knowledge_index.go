@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/carsteneu/yesmem/internal/codescan"
 )
@@ -81,7 +82,7 @@ func (g *Generator) buildCodeMap(projectDir, projectShort string) string {
 	scanner := g.getCodeScanner()
 	result, err := scanner.Scan(projectDir)
 	if err != nil {
-		return ""
+		return codeMapFailureNote(err)
 	}
 
 	priority := g.buildPriority(projectShort, result)
@@ -98,6 +99,29 @@ func (g *Generator) buildCodeMap(projectDir, projectShort string) string {
 	healthSection := codescan.RenderCodeHealth(health)
 
 	return codeMap + healthSection
+}
+
+// maxCodeMapNote bounds the diagnostic that goes into the briefing prompt.
+const maxCodeMapNote = 300
+
+// codeMapFailureNote renders a scan failure as a single line. The text reaches
+// the briefing prompt, so control characters are dropped, newlines flattened
+// and the length bounded.
+func codeMapFailureNote(err error) string {
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	msg = strings.Map(func(r rune) rune {
+		if r == ' ' || unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, msg)
+	if msg == "" {
+		msg = "scan failed"
+	}
+	if r := []rune(msg); len(r) > maxCodeMapNote {
+		msg = string(r[:maxCodeMapNote]) + "..."
+	}
+	return "_Code map unavailable: " + msg + "_"
 }
 
 // getCodeScanner returns a cached scanner, creating one if needed.
@@ -218,29 +242,6 @@ func renderDocIndex(sources []DocSourceSummary, s Strings) string {
 			b.WriteString(fmt.Sprintf(", auto-inject: %s", src.TriggerExts))
 		}
 		b.WriteString(fmt.Sprintf(", %d chunks)\n", src.ChunkCount))
-	}
-	return b.String()
-}
-
-// renderKnowledgeTopology renders knowledge depth per cluster area.
-func renderKnowledgeTopology(strong, weak []ClusterSummary, s Strings) string {
-	if len(strong) == 0 && len(weak) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("\n### Knowledge Topology\n")
-
-	if len(strong) > 0 {
-		b.WriteString("**Strong coverage:**\n")
-		for _, c := range strong {
-			b.WriteString(fmt.Sprintf("- %s (%d learnings)\n", c.Label, c.Count))
-		}
-	}
-	if len(weak) > 0 {
-		b.WriteString("**Thin coverage:**\n")
-		for _, c := range weak {
-			b.WriteString(fmt.Sprintf("- %s (%d learnings)\n", c.Label, c.Count))
-		}
 	}
 	return b.String()
 }

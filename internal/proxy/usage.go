@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"strings"
 )
 
 // UsageTracker extracts real token counts from the SSE response stream.
@@ -80,7 +82,7 @@ func (u *UsageTracker) LogLine(reqIdx, stubCount, estimatedTokens int, threadID 
 
 	tidPart := ""
 	if threadID != "" {
-		tidPart = fmt.Sprintf(" tid=%s", threadID)
+		tidPart = fmt.Sprintf(" tid=%s", journalToken(threadID))
 	}
 	line := fmt.Sprintf("[req %d%s] in=%d out=%d", reqIdx, tidPart, total, u.OutputTokens)
 
@@ -113,6 +115,23 @@ func (u *UsageTracker) LogLine(reqIdx, stubCount, estimatedTokens int, threadID 
 	}
 
 	return line
+}
+
+// shouldDeflateUsage reports whether the usage deflation may be applied to this
+// client. Deflation exists to keep Claude Code's own "Context low" warning quiet;
+// every other Anthropic-path client (opencode via its anthropic provider, SDK
+// calls) shows the reported number to the user and must see the real one.
+func shouldDeflateUsage(h http.Header, factor float64) bool {
+	if factor <= 0 {
+		return false
+	}
+	if opencodeSessionID(h) != "" {
+		return false
+	}
+	if h.Get("X-Claude-Code-Session-Id") != "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(h.Get("User-Agent")), "claude")
 }
 
 // deflateUsage scales down input_tokens in a message_start SSE event.

@@ -268,7 +268,7 @@ func TestStubify_DecisionProtected(t *testing.T) {
 func TestStubify_ShortUserTextPreserved(t *testing.T) {
 	msgs := []any{
 		map[string]any{"role": "user", "content": "start"},
-		map[string]any{"role": "user", "content": "kurze Frage"},       // < 800 chars
+		map[string]any{"role": "user", "content": "kurze Frage"},         // < 800 chars
 		map[string]any{"role": "assistant", "content": longString(8000)}, // big
 		map[string]any{"role": "assistant", "content": "last"},
 		map[string]any{"role": "user", "content": "end"},

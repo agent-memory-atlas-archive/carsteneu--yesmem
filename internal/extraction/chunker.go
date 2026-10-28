@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/carsteneu/yesmem/internal/models"
 )
@@ -151,6 +152,22 @@ func ChunkMessages(msgs []models.Message, maxTokens int) []Chunk {
 	return chunks
 }
 
+// truncateBytes cuts s to at most n bytes without splitting a rune. A byte
+// offset that lands inside a multi-byte character would put invalid UTF-8 into
+// the extraction prompt.
+func truncateBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
 func formatMessage(m models.Message) string {
 	// Prefix with date if timestamp is set (enables temporal reasoning in extraction)
 	datePrefix := ""
@@ -166,17 +183,14 @@ func formatMessage(m models.Message) string {
 		return fmt.Sprintf("[%s%s] %s", datePrefix, m.Role, content)
 	case "tool_use":
 		if m.ToolName != "" {
-			content := m.Content
-			if len(content) > 100 {
-				content = content[:100]
-			}
+			content := truncateBytes(m.Content, 100)
 			return fmt.Sprintf("[%s%s:tool_use:%s] %s", datePrefix, "assistant", m.ToolName, content)
 		}
 		return ""
 	case "tool_result":
 		content := m.Content
 		if len(content) > 200 {
-			content = content[:200] + "..."
+			content = truncateBytes(content, 200) + "..."
 		}
 		return fmt.Sprintf("[%s%s:tool_result] %s", datePrefix, "user", content)
 	case "thinking":
@@ -184,7 +198,7 @@ func formatMessage(m models.Message) string {
 	case "bash_output":
 		content := m.Content
 		if len(content) > 200 {
-			content = content[:200] + "..."
+			content = truncateBytes(content, 200) + "..."
 		}
 		return fmt.Sprintf("[bash_output] %s", content)
 	default:
@@ -193,9 +207,9 @@ func formatMessage(m models.Message) string {
 }
 
 func summarizeChunk(content string) string {
-	// Take first 200 chars as a rough summary
+	// Take first 200 bytes as a rough summary
 	if len(content) > 200 {
-		return content[:200] + "..."
+		return truncateBytes(content, 200) + "..."
 	}
 	return content
 }
@@ -232,13 +246,31 @@ func PreFilterMessages(msgs []models.Message) []models.Message {
 	return filtered
 }
 
-// isDialogInjection detects dialog/broadcast system-reminder injections from think.go.
+// isDialogInjection detects dialog/broadcast system-reminder injections from think.go
+// and the channel transports. The current format wraps the injected turn in
+// <channel source="yesmem-dialog"> (proxy.go, openai_parity.go) and renders each
+// message as "📨 Von <sender> [<type>]:" (think.go, send_opencode.go); the older
+// markers below it predate that and are kept for transcripts written before it.
+//
+// The message marker is matched at the start of a line only: as a free substring it
+// also hit a user who quotes a channel line, and dropping that turn plus the reply
+// to it loses real context.
 func isDialogInjection(content string) bool {
-	return strings.Contains(content, "send_to(") ||
+	if strings.Contains(content, `<channel source="yesmem-dialog">`) ||
+		strings.Contains(content, "send_to(") ||
 		strings.Contains(content, "start_dialog(") ||
 		strings.Contains(content, "Dialog-Partner") ||
 		strings.Contains(content, "BROADCAST von") ||
-		strings.Contains(content, "check_messages")
+		strings.Contains(content, "check_messages") {
+		return true
+	}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(line, "📨 Von ") || strings.HasPrefix(line, "📨 DIALOG") {
+			return true
+		}
+	}
+	return false
 }
 
 // EstimateTokens gives a rough token count for a string.

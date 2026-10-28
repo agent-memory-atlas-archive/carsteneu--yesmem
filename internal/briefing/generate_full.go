@@ -16,6 +16,30 @@ type BriefingResult struct {
 	CodeMap string // Code Map (separate, for independent injection)
 }
 
+// RecoveryMaxAge bounds how long an unconsumed session-end handoff stays usable.
+// It is not the recovery window itself (that one is one-shot); it only keeps a
+// /clear from surfacing as context when the follow-up session never happened.
+const RecoveryMaxAge = 24 * time.Hour
+
+// NewFromConfig builds a briefing generator from the configured selection
+// knobs. Three call sites generate briefings (the hook/RPC path, the CLI and
+// the daemon's background refresh); wiring the setters by hand let the
+// background path drop max_per_category, the dedup threshold and the
+// unfinished TTL for as long as it existed.
+func NewFromConfig(store *storage.Store, cfg *config.Config) *Generator {
+	if cfg == nil {
+		return New(store, 0)
+	}
+	gen := New(store, cfg.Briefing.DetailedSessions)
+	gen.SetMaxPerCategory(cfg.Briefing.MaxPerCategory)
+	gen.SetDedupThreshold(cfg.Briefing.DedupThreshold)
+	gen.SetUnfinishedTTL(cfg.Evolution.UnfinishedTTL)
+	gen.SetUserProfile(cfg.Briefing.UserProfile)
+	gen.SetMaxTokens(cfg.Briefing.MaxTokens)
+	gen.SetOtherProjectsDays(cfg.Briefing.OtherProjectsDays)
+	return gen
+}
+
 // GenerateFullBriefing produces the complete briefing text with all config,
 // refinement, recovery, pins, and open work. Single source of truth for both
 // the briefing-hook CLI and the daemon RPC.
@@ -38,18 +62,26 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 		}
 	}
 
-	gen := New(store, cfg.Briefing.DetailedSessions)
-	gen.SetMaxPerCategory(cfg.Briefing.MaxPerCategory)
-	gen.SetDedupThreshold(cfg.Briefing.DedupThreshold)
-	gen.SetUnfinishedTTL(cfg.Evolution.UnfinishedTTL)
-	gen.SetUserProfile(cfg.Briefing.UserProfile)
+	// Source agent drives the wording profile (Claude vs neutral "Agent").
+	// Written by register_pid for opencode/codex sessions.
+	sourceAgent := ""
+	if sessionID != "" {
+		sourceAgent, _ = store.GetProxyState("source_agent:" + sessionID)
+	}
+
+	gen := NewFromConfig(store, cfg)
 	if isAgentSession {
 		gen.SetSkipUnfinished(true)
 	}
 	gen.SetStrings(ResolveStrings(filepath.Join(dataDir, "strings.yaml")))
+	// After SetStrings: SetSourceAgent overrides the AgentName it just loaded.
+	if sourceAgent != "" {
+		gen.SetSourceAgent(sourceAgent)
+	}
 
-	// Recovery: auto-detect clear/compact via recent session_tracking entry (30s window).
-	if sid, reason, err := store.GetRecentEndedSession(project, 30*time.Second); err == nil && sid != "" {
+	// Recovery: the session-end handoff a /clear leaves behind. One-shot — the
+	// first briefing consumes it, however long the user takes to type.
+	if sid, reason, err := store.GetPendingRecovery(project, RecoveryMaxAge); err == nil && sid != "" {
 		gen.SetRecovery(sid, reason)
 	}
 
@@ -83,10 +115,7 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 
 	// Open work reminder — only for Claude Code, not codex/opencode.
 	// Non-Claude agents misinterpret task hints as instructions to start working.
-	isNonClaudeAgent := false
-	if sa, _ := store.GetProxyState("source_agent:" + sessionID); sa != "" && sa != "claude" {
-		isNonClaudeAgent = true
-	}
+	isNonClaudeAgent := sourceAgent != "" && sourceAgent != "claude"
 	if cfg.Briefing.RemindOpenWork && !isAgentSession && !isNonClaudeAgent {
 		if count, _ := store.CountActiveUnfinished(projectID); count > 0 {
 			s := ResolveStrings(filepath.Join(dataDir, "strings.yaml"))
@@ -108,6 +137,10 @@ func GenerateFullBriefing(store *storage.Store, dataDir, project, sessionID stri
 			}
 		}
 	}
+
+	// Delivery path: start the 12h deadline cooldown for the deadlines that
+	// survived into the delivered text (refinement may drop the open-work block).
+	gen.MarkDeadlineHits(text)
 
 	return BriefingResult{Text: text, CodeMap: codeMap}
 }

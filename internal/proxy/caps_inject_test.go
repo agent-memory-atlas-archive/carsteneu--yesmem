@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/carsteneu/yesmem/internal/models"
 )
 
 func TestDecodeCapabilitiesResponse_ConvertsToInjection(t *testing.T) {
@@ -87,60 +89,6 @@ func TestDecodeCapabilitiesResponse_ConvertsToInjection(t *testing.T) {
 	}
 }
 
-func TestRenderCapabilitiesBlock_WrapsInSystemReminder(t *testing.T) {
-	caps := []CapInjection{
-		{Name: "git_log", Description: "Show git log", Scripts: []ScriptInjection{
-			{Name: "git_log", Kind: "tool", Runtime: "bash", Body: "git log", Schema: "{}"},
-		}},
-	}
-	block := renderCapabilitiesBlock(caps)
-	if !strings.Contains(block, "<system-reminder>") {
-		t.Errorf("want <system-reminder>, got: %q", block)
-	}
-	if !strings.Contains(block, "<caps-active>") && !strings.Contains(block, "<caps-available>") {
-		t.Errorf("want <caps-active> or <caps-available>, got: %q", block)
-	}
-	if !strings.Contains(block, `registerTool("git_log"`) {
-		t.Errorf("want registerTool for git_log, got: %q", block)
-	}
-	if !strings.Contains(block, "MANDATORY") {
-		t.Errorf("want MANDATORY directive to assert tool preference, got: %q", block)
-	}
-}
-
-func TestRenderCapabilitiesBlock_EmptyReturnsEmpty(t *testing.T) {
-	if block := renderCapabilitiesBlock(nil); block != "" {
-		t.Errorf("empty caps: want empty block, got %q", block)
-	}
-}
-
-func TestRenderCapabilitiesBlock_IncludesAdapterJS(t *testing.T) {
-	caps := []CapInjection{
-		{Name: "my_tool", Description: "Uses store", Scripts: []ScriptInjection{
-			{Name: "my_tool", Kind: "tool", Runtime: "repl", Body: "async (a) => { let r = await store({action:'query',table:'t'}); return r; }", Schema: "{}"},
-		}},
-	}
-	block := renderCapabilitiesBlock(caps)
-	if !strings.Contains(block, `((store)=>`) {
-		t.Errorf("want store-closure wrapper in registerTool line, got: %s", block[:min(len(block), 300)])
-	}
-	if !strings.Contains(block, `"my_tool"`) {
-		t.Errorf("want capability name in store closure, got: %s", block[:min(len(block), 300)])
-	}
-}
-
-func TestRenderCapabilitiesBlock_NoAdapterForBashOnly(t *testing.T) {
-	caps := []CapInjection{
-		{Name: "deploy", Description: "Deploy", Scripts: []ScriptInjection{
-			{Name: "deploy", Kind: "tool", Runtime: "bash", Body: "make deploy", Schema: "{}"},
-		}},
-	}
-	block := renderCapabilitiesBlock(caps)
-	if strings.Contains(block, "globalThis.store") {
-		t.Errorf("bash-only cap should NOT include adapter JS")
-	}
-}
-
 // TestInjectCapabilitiesTurnImpl_PassesProjectScope verifies the proxy sends
 // the request's project so the daemon can filter out foreign projects' caps.
 func TestInjectCapabilitiesTurnImpl_PassesProjectScope(t *testing.T) {
@@ -159,7 +107,7 @@ func TestInjectCapabilitiesTurnImpl_PassesProjectScope(t *testing.T) {
 			map[string]any{"role": "user", "content": "hi"},
 		},
 	}
-	injectCapabilitiesTurnImpl(req, "tid", "", queryFn, nil, nil)
+	injectCapabilitiesTurnImpl(req, "tid", "", models.ProfileClaude, queryFn, nil, nil)
 	if gotProject != "/home/me/proj-a" {
 		t.Errorf("expected project scope /home/me/proj-a, got %v", gotProject)
 	}
@@ -179,7 +127,7 @@ func TestInjectCapabilitiesTurnImpl_InsertsAfterBriefingAndCodeMap(t *testing.T)
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 	if !injected {
 		t.Fatal("expected injected=true")
 	}
@@ -217,7 +165,7 @@ func TestInjectCapabilitiesTurnImpl_InsertsAfterBriefingWithoutCodeMap(t *testin
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 	if !injected {
 		t.Fatal("expected injected=true")
 	}
@@ -245,7 +193,7 @@ func TestInjectCapabilitiesTurnImpl_InsertsAtZeroWithoutHeaders(t *testing.T) {
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 	if !injected {
 		t.Fatal("expected injected=true")
 	}
@@ -280,7 +228,7 @@ func TestInjectCapabilitiesTurnImpl_PreservesToolUseAdjacency(t *testing.T) {
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 	if !injected {
 		t.Fatal("expected injected=true")
 	}
@@ -345,7 +293,7 @@ func TestInjectCapabilitiesTurnImpl_InsertsAfterHeaderInLongSession(t *testing.T
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 	if !injected {
 		t.Fatal("expected injected=true")
 	}
@@ -395,7 +343,7 @@ func TestInjectCapabilitiesTurnImpl_InjectsEvenWhenMarkerInPriorContent(t *testi
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 
 	if !injected {
 		t.Fatal("expected injected=true; marker in prior free text must not suppress injection")
@@ -416,7 +364,7 @@ func TestInjectCapabilitiesTurnImpl_NoCapsReturnsFalse(t *testing.T) {
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 
 	if injected {
 		t.Error("expected injected=false when no caps active")
@@ -441,7 +389,7 @@ func TestInjectCapabilitiesTurnImpl_NoUserMessageReturnsFalse(t *testing.T) {
 		},
 	}
 
-	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", queryFn, nil, nil)
+	injected := injectCapabilitiesTurnImpl(req, "thread-xyz", "", models.ProfileClaude, queryFn, nil, nil)
 
 	if injected {
 		t.Error("expected injected=false when no user message present")
@@ -449,40 +397,6 @@ func TestInjectCapabilitiesTurnImpl_NoUserMessageReturnsFalse(t *testing.T) {
 	msgs := req["messages"].([]any)
 	if len(msgs) != 1 {
 		t.Fatalf("messages must be unchanged, got %d", len(msgs))
-	}
-}
-
-func TestRenderCapabilitiesBlock_SortsCapsByNameForByteEquality(t *testing.T) {
-	// Two renders with the same caps in different order must yield byte-identical
-	// output. Without this invariant Anthropic's byte-equality prompt cache
-	// misses on every turn even though the active set is unchanged.
-	capsAZ := []CapInjection{
-		{Name: "alpha", Description: "a", Scripts: []ScriptInjection{{Name: "alpha", Kind: "tool", Runtime: "bash", Body: "echo a", Schema: "{}"}}},
-		{Name: "bravo", Description: "b", Scripts: []ScriptInjection{{Name: "bravo", Kind: "tool", Runtime: "bash", Body: "echo b", Schema: "{}"}}},
-		{Name: "charlie", Description: "c", Scripts: []ScriptInjection{{Name: "charlie", Kind: "tool", Runtime: "bash", Body: "echo c", Schema: "{}"}}},
-	}
-	capsZA := []CapInjection{
-		{Name: "charlie", Description: "c", Scripts: []ScriptInjection{{Name: "charlie", Kind: "tool", Runtime: "bash", Body: "echo c", Schema: "{}"}}},
-		{Name: "bravo", Description: "b", Scripts: []ScriptInjection{{Name: "bravo", Kind: "tool", Runtime: "bash", Body: "echo b", Schema: "{}"}}},
-		{Name: "alpha", Description: "a", Scripts: []ScriptInjection{{Name: "alpha", Kind: "tool", Runtime: "bash", Body: "echo a", Schema: "{}"}}},
-	}
-
-	outAZ := renderCapabilitiesBlock(capsAZ)
-	outZA := renderCapabilitiesBlock(capsZA)
-
-	if outAZ != outZA {
-		t.Errorf("renderCapabilitiesBlock must be order-independent for byte-equality caching\nAZ: %q\nZA: %q", outAZ, outZA)
-	}
-
-	// And the canonical order is alphabetical by name: alpha < bravo < charlie.
-	idxAlpha := strings.Index(outAZ, `"alpha"`)
-	idxBravo := strings.Index(outAZ, `"bravo"`)
-	idxCharlie := strings.Index(outAZ, `"charlie"`)
-	if idxAlpha < 0 || idxBravo < 0 || idxCharlie < 0 {
-		t.Fatalf("rendered block missing one of the cap names: %q", outAZ)
-	}
-	if !(idxAlpha < idxBravo && idxBravo < idxCharlie) {
-		t.Errorf("caps must be rendered in alphabetical order; got alpha@%d bravo@%d charlie@%d", idxAlpha, idxBravo, idxCharlie)
 	}
 }
 
@@ -496,7 +410,7 @@ func TestInjectCaps_DaemonError_UsesCachedCaps(t *testing.T) {
 	queryFn := func(method string, params map[string]any) (json.RawMessage, error) {
 		return nil, errors.New("daemon unreachable")
 	}
-	injected := injectCapabilitiesTurnImpl(req, "tid-1", "", queryFn, cache, nil)
+	injected := injectCapabilitiesTurnImpl(req, "tid-1", "", models.ProfileClaude, queryFn, cache, nil)
 	if !injected {
 		t.Fatalf("expected inject=true via cache fallback, got false")
 	}
@@ -525,7 +439,7 @@ func TestInjectCaps_DecodeError_UsesCachedCaps(t *testing.T) {
 	queryFn := func(method string, params map[string]any) (json.RawMessage, error) {
 		return json.RawMessage(`{not valid json`), nil
 	}
-	injected := injectCapabilitiesTurnImpl(req, "tid-2", "", queryFn, cache, nil)
+	injected := injectCapabilitiesTurnImpl(req, "tid-2", "", models.ProfileClaude, queryFn, cache, nil)
 	if !injected {
 		t.Fatalf("expected inject=true via cache fallback on decode error, got false")
 	}
@@ -540,7 +454,7 @@ func TestInjectCaps_DaemonSuccess_UpdatesCache(t *testing.T) {
 	queryFn := func(method string, params map[string]any) (json.RawMessage, error) {
 		return validRaw, nil
 	}
-	injected := injectCapabilitiesTurnImpl(req, "tid-3", "", queryFn, cache, nil)
+	injected := injectCapabilitiesTurnImpl(req, "tid-3", "", models.ProfileClaude, queryFn, cache, nil)
 	if !injected {
 		t.Fatalf("expected inject=true on daemon success")
 	}
@@ -557,7 +471,7 @@ func TestInjectCaps_ErrorAndEmptyCache_ReturnsFalse(t *testing.T) {
 	queryFn := func(method string, params map[string]any) (json.RawMessage, error) {
 		return nil, errors.New("daemon down")
 	}
-	injected := injectCapabilitiesTurnImpl(req, "tid-4", "", queryFn, cache, nil)
+	injected := injectCapabilitiesTurnImpl(req, "tid-4", "", models.ProfileClaude, queryFn, cache, nil)
 	if injected {
 		t.Fatalf("expected inject=false when both daemon fails and cache empty")
 	}
@@ -600,12 +514,10 @@ func TestRenderCapabilitiesCatalog_ShortOutput(t *testing.T) {
 		},
 	}
 
-	full := renderCapabilitiesBlock(caps)
 	catalog := renderCapabilitiesCatalog(caps)
 
-	if len(catalog) >= len(full) {
-		t.Errorf("catalog (%d bytes) should be much smaller than full block (%d bytes)", len(catalog), len(full))
-	}
+	// The catalog names names and descriptions, not bodies: the handler code of
+	// three caps would dwarf any catalog budget.
 	if len(catalog) > 3000 {
 		t.Errorf("catalog too large: %d bytes, expected < 3000", len(catalog))
 	}
@@ -650,7 +562,7 @@ func TestInjectCaps_SuccessAfterError_RecoversFromCache(t *testing.T) {
 	queryOK := func(method string, params map[string]any) (json.RawMessage, error) {
 		return validRaw, nil
 	}
-	if !injectCapabilitiesTurnImpl(reqA, "tid-5", "", queryOK, cache, nil) {
+	if !injectCapabilitiesTurnImpl(reqA, "tid-5", "", models.ProfileClaude, queryOK, cache, nil) {
 		t.Fatalf("first call with daemon success should inject")
 	}
 	if _, ok := cache.Get("tid-5"); !ok {
@@ -662,7 +574,7 @@ func TestInjectCaps_SuccessAfterError_RecoversFromCache(t *testing.T) {
 	queryFail := func(method string, params map[string]any) (json.RawMessage, error) {
 		return nil, errors.New("transient")
 	}
-	if !injectCapabilitiesTurnImpl(reqB, "tid-5", "", queryFail, cache, nil) {
+	if !injectCapabilitiesTurnImpl(reqB, "tid-5", "", models.ProfileClaude, queryFail, cache, nil) {
 		t.Fatalf("second call with daemon error should inject via cache fallback")
 	}
 }
@@ -676,7 +588,7 @@ func TestInjectCaps_ParentThreadIDPassedToQuery(t *testing.T) {
 	req := map[string]any{"messages": []any{
 		map[string]any{"role": "user", "content": "hi"},
 	}}
-	injectCapabilitiesTurnImpl(req, "sub-thread", "parent-thread", queryFn, nil, nil)
+	injectCapabilitiesTurnImpl(req, "sub-thread", "parent-thread", models.ProfileClaude, queryFn, nil, nil)
 	if capturedParams["parent_thread_id"] != "parent-thread" {
 		t.Errorf("expected parent_thread_id=parent-thread, got %v", capturedParams["parent_thread_id"])
 	}
@@ -694,7 +606,7 @@ func TestInjectCaps_EmptyParentOmitted(t *testing.T) {
 	req := map[string]any{"messages": []any{
 		map[string]any{"role": "user", "content": "hi"},
 	}}
-	injectCapabilitiesTurnImpl(req, "my-thread", "", queryFn, nil, nil)
+	injectCapabilitiesTurnImpl(req, "my-thread", "", models.ProfileClaude, queryFn, nil, nil)
 	if _, exists := capturedParams["parent_thread_id"]; exists {
 		t.Errorf("parent_thread_id should not be present when empty, got %v", capturedParams["parent_thread_id"])
 	}
@@ -737,7 +649,7 @@ func TestInjectCapabilitiesTurnImpl_AppendsReplPatternSuggestionToLastUser(t *te
 		},
 	}
 
-	if !injectCapabilitiesTurnImpl(req, "thread-1", "", queryFn, nil, nil) {
+	if !injectCapabilitiesTurnImpl(req, "thread-1", "", models.ProfileClaude, queryFn, nil, nil) {
 		t.Fatalf("inject returned false")
 	}
 
@@ -784,7 +696,7 @@ func TestInjectCapabilitiesTurnImpl_NoReplSuggestionLeavesLastUserUnchanged(t *t
 		},
 	}
 
-	if !injectCapabilitiesTurnImpl(req, "tid", "", queryFn, nil, nil) {
+	if !injectCapabilitiesTurnImpl(req, "tid", "", models.ProfileClaude, queryFn, nil, nil) {
 		t.Fatalf("inject returned false")
 	}
 
@@ -817,7 +729,7 @@ func TestInjectCapabilitiesTurnImpl_FiltersActiveCapsByProject(t *testing.T) {
 	req := map[string]any{
 		"messages": []any{map[string]any{"role": "user", "content": "x"}},
 	}
-	if !injectCapabilitiesTurnImpl(req, "tid", "", queryFn, nil, nil) {
+	if !injectCapabilitiesTurnImpl(req, "tid", "", models.ProfileClaude, queryFn, nil, nil) {
 		t.Fatalf("inject returned false")
 	}
 	if lastSuggParams == nil {
@@ -854,7 +766,7 @@ func TestInjectCapabilitiesTurnImpl_GlobalCapsIncludedInActiveCaps(t *testing.T)
 	req := map[string]any{
 		"messages": []any{map[string]any{"role": "user", "content": "x"}},
 	}
-	if !injectCapabilitiesTurnImpl(req, "tid", "", queryFn, nil, nil) {
+	if !injectCapabilitiesTurnImpl(req, "tid", "", models.ProfileClaude, queryFn, nil, nil) {
 		t.Fatalf("inject returned false")
 	}
 	if lastSuggParams == nil {
@@ -898,7 +810,7 @@ func TestInjectCapabilitiesTurnImpl_EmptyMatchedCapSkipsInject(t *testing.T) {
 	req := map[string]any{
 		"messages": []any{map[string]any{"role": "user", "content": "untouched"}},
 	}
-	if !injectCapabilitiesTurnImpl(req, "tid", "", queryFn, nil, nil) {
+	if !injectCapabilitiesTurnImpl(req, "tid", "", models.ProfileClaude, queryFn, nil, nil) {
 		t.Fatalf("inject returned false")
 	}
 	msgs := req["messages"].([]any)
@@ -935,11 +847,11 @@ func TestInjectCapabilitiesTurnImpl_CapsBlockUnchangedWithSuggestion(t *testing.
 	}
 
 	reqWith := mkReq()
-	if !injectCapabilitiesTurnImpl(reqWith, "tid", "", makeQueryFn(suggRaw), nil, nil) {
+	if !injectCapabilitiesTurnImpl(reqWith, "tid", "", models.ProfileClaude, makeQueryFn(suggRaw), nil, nil) {
 		t.Fatalf("inject(with) returned false")
 	}
 	reqWithout := mkReq()
-	if !injectCapabilitiesTurnImpl(reqWithout, "tid", "", makeQueryFn(json.RawMessage(`null`)), nil, nil) {
+	if !injectCapabilitiesTurnImpl(reqWithout, "tid", "", models.ProfileClaude, makeQueryFn(json.RawMessage(`null`)), nil, nil) {
 		t.Fatalf("inject(without) returned false")
 	}
 

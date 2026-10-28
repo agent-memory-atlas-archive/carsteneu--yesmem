@@ -3,9 +3,38 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/carsteneu/yesmem/internal/proxy"
 )
+
+// signalProcessingEnabled asks the daemon for signals.enabled. The proxy gates its
+// own inline reflection on that key; this endpoint writes the same counters and
+// must not keep writing while the proxy path stays silent. An unreadable value
+// counts as enabled — the config default is true.
+func (s *Server) signalProcessingEnabled() bool {
+	if s.handler == nil {
+		return true
+	}
+	resp := s.handler.Handle(RPCRequest{Method: "get_config", Params: map[string]any{"key": "signals.enabled"}})
+	if resp.Error != "" {
+		return true
+	}
+	var out struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return true
+	}
+	// Unreadable or unparsable counts as enabled: the config default is true and a
+	// gate that fails closed would silently stop every signal write.
+	enabled, err := strconv.ParseBool(strings.TrimSpace(out.Value))
+	if err != nil {
+		return true
+	}
+	return enabled
+}
 
 // AnalyzeTurnRequest is the input for POST /api/analyze-turn.
 type AnalyzeTurnRequest struct {
@@ -21,6 +50,9 @@ type AnalyzeTurnResponse struct {
 	NoiseIDs       []int64  `json:"noise_ids"`
 	GapTopics      []string `json:"gap_topics"`
 	Contradictions []string `json:"contradictions"`
+	// Skipped names the reason the turn was not analysed at all (signals
+	// disabled) — otherwise indistinguishable from "no signals found".
+	Skipped string `json:"skipped,omitempty"`
 }
 
 // handleAnalyzeTurn scans the last assistant turn for inline reflection signals,
@@ -30,6 +62,14 @@ func (s *Server) handleAnalyzeTurn(w http.ResponseWriter, r *http.Request) {
 	var req AnalyzeTurnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	// signals.enabled gates the whole signal path — an explicit request for an
+	// analysis must not write counters that the disabled proxy path leaves alone.
+	if !s.signalProcessingEnabled() {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(AnalyzeTurnResponse{Skipped: "signals disabled"})
 		return
 	}
 
@@ -52,7 +92,9 @@ func (s *Server) handleAnalyzeTurn(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
-		if len(noiseIDs) > 0 {
+		// Only a scanned assistant answer can prove an injected learning went
+		// unused — without one there was nothing to reference.
+		if signals.Scanned && len(noiseIDs) > 0 {
 			ids := make([]any, len(noiseIDs))
 			for i, id := range noiseIDs {
 				ids[i] = id

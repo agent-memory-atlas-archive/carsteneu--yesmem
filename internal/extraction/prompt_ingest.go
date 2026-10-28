@@ -73,6 +73,7 @@ For EACH learning:
   "keywords": ["search terms incl. version:X tags"],
   "trigger": "When should this knowledge be surfaced?"
 }`
+
 func DocFilterSchema() map[string]any {
 	return map[string]any{
 		"type": "object",

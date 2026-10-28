@@ -33,6 +33,31 @@ func startInjectSocketListener(t *testing.T, injectPath string) *int64 {
 	return &relays
 }
 
+// los07dWaitForRelayCount waits until the accept counter reached want, or fails
+// after 5s. The relay dial itself is synchronous, but the counter is bumped by
+// the listener goroutine, so a fixed sleep races the scheduler: under load the
+// assertion read 0 although the connection had been made (flake class #102238).
+func los07dWaitForRelayCount(t *testing.T, relays *int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := atomic.LoadInt64(relays); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("relay count = %d after 5s, want %d", atomic.LoadInt64(relays), want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// los07dSettleRelays gives a relay that must NOT have been sent a chance to be
+// counted, so a negative assertion cannot pass merely because the listener
+// goroutine has not run yet.
+func los07dSettleRelays() {
+	time.Sleep(50 * time.Millisecond)
+}
+
 // getSkillCheckLastRelayAt reads an agent's lastRelayAt (test helper).
 func getSkillCheckLastRelayAt(agentID string) time.Time {
 	yesloopSkillCheckAgentsMu.Lock()
@@ -56,13 +81,11 @@ func TestSkillCheck_Freeze_WhileSubagentActive(t *testing.T) {
 
 	h, s := mustHandler(t)
 	dir := shortSockDir(t)
+	h.dataDir = dir
 	sockPath := filepath.Join(dir, "sc-freeze.sock")
 	relays := startInjectSocketListener(t, sockPath+".inject")
 
 	makeSkillCheckAgent(t, h, s, "sc-freeze", "sess-sc-freeze", "")
-	if err := s.AgentUpdate("sc-freeze", map[string]any{"sock_path": sockPath}); err != nil {
-		t.Fatalf("AgentUpdate sock_path: %v", err)
-	}
 
 	h.checkYesloopSkillCheck() // TRACKING, baseline 0
 	jumpSkillCheckCounters(t, s, "sc-freeze", skillCheckOutputTokenThreshold, 0)
@@ -70,7 +93,8 @@ func TestSkillCheck_Freeze_WhileSubagentActive(t *testing.T) {
 	if !hasSkillCheckState("sc-freeze", yesloopSkillCheckStateRemind) {
 		t.Fatalf("precondition: agent should be in REMIND")
 	}
-	time.Sleep(30 * time.Millisecond) // let the listener accept
+	los07dWaitForRelayCount(t, relays, 1)
+	los07dSettleRelays()
 	if got := atomic.LoadInt64(relays); got != 1 {
 		t.Fatalf("precondition: expected 1 transition relay, got %d", got)
 	}
@@ -90,7 +114,7 @@ func TestSkillCheck_Freeze_WhileSubagentActive(t *testing.T) {
 	// Unfreeze: interval restarts from the last frozen tick — no refire burst.
 	childActive = false
 	h.checkYesloopSkillCheck()
-	time.Sleep(20 * time.Millisecond)
+	los07dSettleRelays()
 	if rc := getSkillCheckRefireCount("sc-freeze"); rc != 0 {
 		t.Errorf("interval clock was not frozen during subagent: refireCount=%d", rc)
 	}
@@ -111,13 +135,11 @@ func TestSkillCheck_Freeze_BlocksTransitionAndRelay(t *testing.T) {
 
 	h, s := mustHandler(t)
 	dir := shortSockDir(t)
+	h.dataDir = dir
 	sockPath := filepath.Join(dir, "sc-blocked.sock")
 	relays := startInjectSocketListener(t, sockPath+".inject")
 
 	makeSkillCheckAgent(t, h, s, "sc-blocked", "sess-sc-blocked", "")
-	if err := s.AgentUpdate("sc-blocked", map[string]any{"sock_path": sockPath}); err != nil {
-		t.Fatalf("AgentUpdate sock_path: %v", err)
-	}
 
 	childActive = true
 	h.checkYesloopSkillCheck() // TRACKING, baseline 0
@@ -126,13 +148,15 @@ func TestSkillCheck_Freeze_BlocksTransitionAndRelay(t *testing.T) {
 	if !hasSkillCheckState("sc-blocked", yesloopSkillCheckStateTracking) {
 		t.Errorf("subagent-active must block transition to REMIND, got state %d", stateOfSkillCheck("sc-blocked"))
 	}
+	los07dSettleRelays()
 	if got := atomic.LoadInt64(relays); got != 0 {
 		t.Errorf("subagent-active must not relay, got %d", got)
 	}
 
 	childActive = false
 	h.checkYesloopSkillCheck() // catch-up: -> REMIND + relay
-	time.Sleep(20 * time.Millisecond)
+	los07dWaitForRelayCount(t, relays, 1)
+	los07dSettleRelays()
 	if !hasSkillCheckState("sc-blocked", yesloopSkillCheckStateRemind) {
 		t.Errorf("after subagent returns, threshold crossing should fire, got state %d", stateOfSkillCheck("sc-blocked"))
 	}
@@ -148,13 +172,11 @@ func TestSkillCheck_NoRelayWithinInterval(t *testing.T) {
 	resetYesloopSkillCheckState()
 	h, s := mustHandler(t)
 	dir := shortSockDir(t)
+	h.dataDir = dir
 	sockPath := filepath.Join(dir, "sc-flood.sock")
 	relays := startInjectSocketListener(t, sockPath+".inject")
 
 	makeSkillCheckAgent(t, h, s, "sc-flood", "sess-sc-flood", "")
-	if err := s.AgentUpdate("sc-flood", map[string]any{"sock_path": sockPath}); err != nil {
-		t.Fatalf("AgentUpdate sock_path: %v", err)
-	}
 
 	h.checkYesloopSkillCheck() // TRACKING, baseline 0
 	jumpSkillCheckCounters(t, s, "sc-flood", skillCheckOutputTokenThreshold, 0)
@@ -165,7 +187,8 @@ func TestSkillCheck_NoRelayWithinInterval(t *testing.T) {
 		h.checkYesloopSkillCheck()
 		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(50 * time.Millisecond) // let the listener drain
+	los07dWaitForRelayCount(t, relays, 1)
+	los07dSettleRelays()
 
 	if got := atomic.LoadInt64(relays); got != 1 {
 		t.Errorf("expected exactly 1 relay (transition) within one refire interval, got %d", got)

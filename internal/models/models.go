@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -436,4 +437,41 @@ var validCategories = map[string]bool{
 // IsValidCategory checks if a learning category string is valid.
 func IsValidCategory(cat string) bool {
 	return validCategories[cat]
+}
+
+// ValidCategoryNames returns the accepted learning categories in a stable order,
+// for schemas that need to constrain a category field to the valid set.
+func ValidCategoryNames() []string {
+	names := make([]string, 0, len(validCategories))
+	for cat := range validCategories {
+		names = append(names, cat)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// nonDistillableCategories are valid categories a distilled cluster must never
+// carry: unfinished rows are tasks, strategic rows never enter a cluster, and cap
+// rows describe a capability the user installed.
+var nonDistillableCategories = map[string]bool{
+	"unfinished": true, "strategic": true, "cap": true,
+}
+
+// IsDistillableCategory reports whether cluster distillation may file a row under
+// this category.
+func IsDistillableCategory(cat string) bool {
+	return IsValidCategory(cat) && !nonDistillableCategories[cat]
+}
+
+// DistillableCategoryNames returns the categories a distilled row may carry, in a
+// stable order.
+func DistillableCategoryNames() []string {
+	names := make([]string, 0, len(validCategories))
+	for cat := range validCategories {
+		if !nonDistillableCategories[cat] {
+			names = append(names, cat)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

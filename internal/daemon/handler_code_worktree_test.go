@@ -1,33 +1,46 @@
 package daemon
 
 import (
+	"path/filepath"
 	"testing"
 )
 
 func TestResolveProjectDir_UsesCWDWhenProvided(t *testing.T) {
 	h, _ := mustHandler(t)
 
+	// A resolved base keeps the expectation platform-neutral: resolveProjectDir
+	// answers with the path as the OS reports it, and macOS resolves /tmp.
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	cwd := filepath.Join(base, "worktree-path")
 	params := map[string]any{
-		"_cwd": "/tmp/worktree-path",
+		"_cwd": cwd,
 	}
 
 	got := h.resolveProjectDir("yesmem", params)
-	if got != "/tmp/worktree-path" {
-		t.Errorf("expected /tmp/worktree-path, got %q", got)
+	if got != cwd {
+		t.Errorf("expected %s, got %q", cwd, got)
 	}
 }
 
 func TestResolveProjectDir_PrefersProjectDirOverCWD(t *testing.T) {
 	h, _ := mustHandler(t)
 
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	explicit := filepath.Join(base, "explicit-path")
 	params := map[string]any{
-		"_cwd":        "/tmp/cwd-path",
-		"project_dir": "/tmp/explicit-path",
+		"_cwd":        filepath.Join(base, "cwd-path"),
+		"project_dir": explicit,
 	}
 
 	got := h.resolveProjectDir("yesmem", params)
-	if got != "/tmp/explicit-path" {
-		t.Errorf("expected /tmp/explicit-path, got %q", got)
+	if got != explicit {
+		t.Errorf("expected %s, got %q", explicit, got)
 	}
 }
 

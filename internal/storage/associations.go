@@ -125,6 +125,24 @@ func (s *Store) InsertTypedAssociation(sourceID, targetID int64, relType string)
 	return err
 }
 
+// EnsureTypedAssociation writes a semantic edge that describes a stable fact
+// rather than an observation count: repeated writes keep weight at 1.0 instead
+// of accumulating. Use it for edges a background job rewrites on every run —
+// an increasing weight would strengthen the graph promotion of that edge run
+// after run (handler_hybrid augmentWithGraphNeighbors scales the derived score
+// by weight/3.0).
+func (s *Store) EnsureTypedAssociation(sourceID, targetID int64, relType string) error {
+	src := fmt.Sprintf("%d", sourceID)
+	tgt := fmt.Sprintf("%d", targetID)
+	_, err := s.db.Exec(`
+		INSERT INTO associations (source_type, source_id, target_type, target_id, weight, relation_type)
+		VALUES ('learning', ?, 'learning', ?, 1.0, ?)
+		ON CONFLICT(source_type, source_id, target_type, target_id)
+		DO UPDATE SET relation_type = excluded.relation_type`,
+		src, tgt, relType)
+	return err
+}
+
 // GetAssociationsByRelationType returns all edges from a node with a specific relation type.
 func (s *Store) GetAssociationsByRelationType(sourceType, sourceID, relType string) ([]models.Association, error) {
 	rows, err := s.readerDB().Query(`
@@ -174,14 +192,14 @@ func (s *Store) GetAssociationNeighbors(ids []string, limitPerSource int) (map[s
 			INNER JOIN learnings l ON CAST(a.target_id AS INTEGER) = l.id
 			WHERE a.source_type = 'learning' AND a.target_type = 'learning'
 			AND a.source_id IN (%s)
-			AND l.superseded_by IS NULL AND l.quarantined_at IS NULL
+			AND `+models.RecallableLearningSQLAlias+`
 			UNION ALL
 			SELECT a.target_type, a.target_id, a.source_type, a.source_id, a.weight, COALESCE(a.relation_type, 'related') AS relation_type
 			FROM associations a
 			INNER JOIN learnings l ON CAST(a.source_id AS INTEGER) = l.id
 			WHERE a.source_type = 'learning' AND a.target_type = 'learning'
 			AND a.target_id IN (%s)
-			AND l.superseded_by IS NULL AND l.quarantined_at IS NULL
+			AND `+models.RecallableLearningSQLAlias+`
 		)
 		ORDER BY weight DESC
 	`, ph, ph)
@@ -305,8 +323,7 @@ func (s *Store) GetLearningsWithEntityOverlap(entities []string, excludeID int64
 		INNER JOIN learnings l ON l.id = le.learning_id
 		WHERE le.value IN (%s)
 		AND le.learning_id != ?
-		AND l.superseded_by IS NULL
-		AND l.quarantined_at IS NULL
+		AND `+models.RecallableLearningSQLAlias+`
 		LIMIT %d
 	`, placeholders, limit), args...)
 	if err != nil {

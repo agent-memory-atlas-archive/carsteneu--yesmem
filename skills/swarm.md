@@ -380,7 +380,7 @@ Stops ALL running, frozen, and spawning agents in the project. Sends `/exit` to 
 | `max_runtime` | 30m | Max runtime per agent |
 | `max_turns` | 300 | Max interactions per agent |
 | `max_depth` | 3 | Max spawn depth (A→B→C) |
-| `token_budget` | 500000 | Max tokens (input+output) per agent |
+| `token_budget` | (none) | Max output tokens per agent; unset means no limit |
 | `model` | (inherit) | Model per agent (see model selection) |
 
 Overridable via `spawn_agent(token_budget=..., model=...)` or config.

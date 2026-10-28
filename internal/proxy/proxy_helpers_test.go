@@ -14,7 +14,13 @@ func TestIsRealUserSession(t *testing.T) {
 	}{
 		{"opencode session", "opencode:ses_abc123def456", true},
 		{"claude session", "claude:ses_abc123def456", true},
-		{"uuid internal", "503485dc-b636-4c53-909a-00ed1374a31b", false},
+		// Claude Code sends the bare session UUID in X-Claude-Code-Session-Id
+		// (and in metadata.user_id), so these are real user sessions.
+		{"claude code header uuid", "a542b034-d69d-4e10-9553-a549eefa4d77", true},
+		{"claude code metadata uuid", "b1234567-aaaa-bbbb-cccc-dddddddddddd", true},
+		{"derived hex thread", "0123456789abcdef", false},
+		{"uuid without dashes", "503485dcb6364c53909a00ed1374a31b", false},
+		{"truncated uuid", "503485dc-b636-4c53-909a-00ed1374a31", false},
 		{"empty string", "", false},
 		{"wrong prefix", "custom:ses_abc123", false},
 	}
@@ -262,5 +268,35 @@ func TestEstimateTotalTokens_FallbackOnMessageShrink(t *testing.T) {
 	expected := s.countMessageTokens(msgs) + 1000
 	if total != expected {
 		t.Fatalf("shrink case: expected %d (full count fallback), got %d", expected, total)
+	}
+}
+
+// The noise paths rely on this: a tool result in the trailing user message means
+// the turn is still running, so the assistant message read is not an answer.
+func TestIsToolContinuation(t *testing.T) {
+	userText := map[string]any{"role": "user", "content": "plain question"}
+	toolResult := map[string]any{"role": "user", "content": []any{
+		map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+	}}
+	textPlusToolResult := map[string]any{"role": "user", "content": []any{
+		map[string]any{"type": "text", "text": "and also..."},
+		map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+	}}
+
+	if isToolContinuation([]any{userText}) {
+		t.Error("plain user turn reported as tool continuation")
+	}
+	if !isToolContinuation([]any{toolResult}) {
+		t.Error("tool result turn not reported as continuation")
+	}
+	if !isToolContinuation([]any{textPlusToolResult}) {
+		t.Error("turn with text and tool result not reported as continuation")
+	}
+	// Only the trailing user message counts.
+	if isToolContinuation([]any{toolResult, map[string]any{"role": "assistant", "content": "done"}, userText}) {
+		t.Error("an earlier tool result must not mark the current turn as a continuation")
+	}
+	if isToolContinuation(nil) {
+		t.Error("empty history reported as tool continuation")
 	}
 }

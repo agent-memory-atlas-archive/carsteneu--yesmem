@@ -9,10 +9,13 @@ import (
 
 func TestFadeFilter_RemovesLowScoreLearnings(t *testing.T) {
 	now := time.Now()
+	// The fade cut uses the intrinsic score, so a learning is only faded when it
+	// carries noise evidence, not merely because it is old or ranked low.
 	learnings := []models.Learning{
-		{ID: 1, Category: "pattern", Content: "fresh", CreatedAt: now, Score: 1.5},
-		{ID: 2, Category: "pattern", Content: "faded", CreatedAt: now.AddDate(0, -6, 0), Score: 0.05},
-		{ID: 3, Category: "gotcha", Content: "important", CreatedAt: now, Score: 2.0},
+		{ID: 1, Category: "pattern", Content: "fresh", CreatedAt: now},
+		{ID: 2, Category: "relationship", Content: "faded", CreatedAt: now.AddDate(0, -6, 0),
+			Importance: 1, NoiseCount: 20, InjectCount: 12, UseCount: 0},
+		{ID: 3, Category: "gotcha", Content: "important", CreatedAt: now},
 	}
 
 	filtered := filterFaded(learnings, 0.1)

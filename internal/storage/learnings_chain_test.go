@@ -325,3 +325,106 @@ func TestMigration_ReactivatesCrossProjectRuleBasedSupersede(t *testing.T) {
 		t.Fatalf("winner kept stale backlink to restored learning: %d", *supersedes)
 	}
 }
+
+// TestResolveSupersededIDs_NoInactiveTarget covers a chain whose end is itself
+// inactive: X was superseded by Y, and Y was later resolved (superseded_by = -2).
+// Redirecting to Y would surface an inactive learning as if it were the active
+// successor. A chain without an active end must yield no entry or a
+// non-positive sentinel.
+func TestResolveSupersededIDs_NoInactiveTarget(t *testing.T) {
+	s := mustOpen(t)
+
+	x, err := s.InsertLearning(&models.Learning{Category: "decision", Content: "old X", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	if err != nil {
+		t.Fatalf("insert X: %v", err)
+	}
+	y, err := s.InsertLearning(&models.Learning{Category: "decision", Content: "middle Y", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	if err != nil {
+		t.Fatalf("insert Y: %v", err)
+	}
+
+	if err := s.SupersedeLearning(x, y, "newer approach"); err != nil {
+		t.Fatalf("supersede X by Y: %v", err)
+	}
+	if err := s.ResolveLearning(y, "resolved later"); err != nil {
+		t.Fatalf("resolve Y: %v", err)
+	}
+
+	redirects, err := s.ResolveSupersededIDs([]int64{x})
+	if err != nil {
+		t.Fatalf("resolve superseded: %v", err)
+	}
+	target, ok := redirects[x]
+	if !ok {
+		return // no redirect at all is fine — the caller keeps nothing
+	}
+	if target == y {
+		t.Fatalf("redirect for #%d points at inactive learning #%d", x, y)
+	}
+	if target > 0 {
+		t.Fatalf("redirect for #%d points at #%d, which is not an active learning", x, target)
+	}
+}
+
+// TestResolveSupersededIDs_ActiveSuccessorStillResolves is the positive control
+// for the guard above: a chain ending in an active learning still redirects to
+// the end of the chain.
+func TestResolveSupersededIDs_ActiveSuccessorStillResolves(t *testing.T) {
+	s := mustOpen(t)
+
+	x, _ := s.InsertLearning(&models.Learning{Category: "decision", Content: "chain X", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	y, _ := s.InsertLearning(&models.Learning{Category: "decision", Content: "chain Y", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	z, _ := s.InsertLearning(&models.Learning{Category: "decision", Content: "chain Z", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+
+	if err := s.SupersedeLearning(x, y, "step 1"); err != nil {
+		t.Fatalf("supersede X by Y: %v", err)
+	}
+	if err := s.SupersedeLearning(y, z, "step 2"); err != nil {
+		t.Fatalf("supersede Y by Z: %v", err)
+	}
+
+	redirects, err := s.ResolveSupersededIDs([]int64{x})
+	if err != nil {
+		t.Fatalf("resolve superseded: %v", err)
+	}
+	if redirects[x] != z {
+		t.Fatalf("expected redirect %d -> %d, got %d", x, z, redirects[x])
+	}
+}
+
+// TestResolveSupersededIDs_OtherInactiveChainEnds covers the two remaining
+// shapes the final SELECT must reject: a chain ending on a row superseded with
+// superseded_by = 0 (the rule-based "substance-free" write) and a chain whose
+// last hop points at an ID that no longer exists.
+func TestResolveSupersededIDs_OtherInactiveChainEnds(t *testing.T) {
+	s := mustOpen(t)
+
+	assertNoActiveRedirect := func(from int64) {
+		t.Helper()
+		redirects, err := s.ResolveSupersededIDs([]int64{from})
+		if err != nil {
+			t.Fatalf("resolve superseded: %v", err)
+		}
+		if target, ok := redirects[from]; ok && target > 0 {
+			t.Fatalf("redirect for #%d points at #%d, which is not an active learning", from, target)
+		}
+	}
+
+	// X -> Y, and Y superseded with no successor (superseded_by = 0).
+	x, _ := s.InsertLearning(&models.Learning{Category: "decision", Content: "zero-chain X", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	y, _ := s.InsertLearning(&models.Learning{Category: "decision", Content: "zero-chain Y", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	if err := s.SupersedeLearning(x, y, "newer"); err != nil {
+		t.Fatalf("supersede X by Y: %v", err)
+	}
+	if err := s.SupersedeLearning(y, 0, "rule-based: substanzlos"); err != nil {
+		t.Fatalf("supersede Y with no successor: %v", err)
+	}
+	assertNoActiveRedirect(x)
+
+	// Z -> dangling target.
+	z, _ := s.InsertLearning(&models.Learning{Category: "decision", Content: "dangling-chain Z", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "test"})
+	if _, err := s.DB().Exec("UPDATE learnings SET superseded_by = 999999 WHERE id = ?", z); err != nil {
+		t.Fatalf("seed dangling target: %v", err)
+	}
+	assertNoActiveRedirect(z)
+}

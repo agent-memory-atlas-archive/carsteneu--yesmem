@@ -12,14 +12,52 @@ import (
 
 const sockName = "daemon.sock"
 
+// jobSockName is the socket a sandboxed run is allowed to see. It serves a
+// restricted method set (see handleJobSocket), so a job can reach cap_store and
+// the LLM bridge without reaching the RPCs that start processes.
+const jobSockName = "job.sock"
+
+// chmodSocket is a seam for the tests: a filesystem without chmod support cannot
+// be produced on demand, and the degraded start path still has to be proven.
+var chmodSocket = os.Chmod
+
+// socketMode reports the mode the socket actually has, for the warning after a
+// refused chmod: the error alone does not say whether other accounts can write.
+func socketMode(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%04o", info.Mode().Perm())
+}
+
 // SocketPath returns the path to the daemon's Unix socket.
 func SocketPath(dataDir string) string {
 	return filepath.Join(dataDir, sockName)
 }
 
+// JobSocketPath returns the path to the socket a sandboxed run may mount. It sits
+// in the runtime dir beside the data dir: the sandbox masks the data dir as a
+// whole (YM-276), so a socket inside it would be hidden from the runs that need it.
+func JobSocketPath(dataDir string) string {
+	return filepath.Join(RuntimeDir(dataDir), jobSockName)
+}
+
+// clientSocketPath resolves the socket a CLI client dials. YESMEM_SOCK
+// redirects it: a sandboxed run only has the restricted socket mounted, so the
+// yesmem binary it calls has to be pointed at that one. The variable can only
+// narrow what its own process reaches — the value never grants a path the
+// caller could not already use.
+func clientSocketPath(dataDir string) string {
+	if path := os.Getenv("YESMEM_SOCK"); path != "" {
+		return path
+	}
+	return SocketPath(dataDir)
+}
+
 // IsDaemonRunning checks if the daemon socket is reachable.
 func IsDaemonRunning(dataDir string) bool {
-	conn, err := net.Dial("unix", SocketPath(dataDir))
+	conn, err := net.Dial("unix", clientSocketPath(dataDir))
 	if err != nil {
 		return false
 	}
@@ -47,14 +85,29 @@ type SocketServer struct {
 
 // NewSocketServer creates a Unix socket server.
 func NewSocketServer(dataDir string, handler func(req Request) Response) (*SocketServer, error) {
-	sockPath := SocketPath(dataDir)
+	return NewSocketServerAt(SocketPath(dataDir), handler)
+}
 
+// NewSocketServerAt creates a Unix socket server on an explicit path. The daemon
+// runs two: the full one at daemon.sock and the restricted one a sandboxed run
+// may mount.
+func NewSocketServerAt(sockPath string, handler func(req Request) Response) (*SocketServer, error) {
 	// Remove stale socket
 	os.Remove(sockPath)
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", sockPath, err)
+	}
+	// net.Listen applies the umask, so on a host with umask 002 the socket is
+	// group- and world-writable. The client runs as the same user, and a
+	// sandboxed job reaches the daemon through its own socket, so owner-only
+	// mode costs no reachability and closes the full RPC set to other accounts.
+	// A mode that cannot be set is reported, not fatal: filesystems without chmod
+	// support would otherwise make the daemon unstartable, and the socket lives in
+	// a 0700 data directory (audit 16.10.2026, YM-338).
+	if err := chmodSocket(sockPath, 0o600); err != nil {
+		log.Printf("cannot restrict socket %s to owner-only: %v (mode stays %s; the data directory is 0700)", sockPath, err, socketMode(sockPath))
 	}
 
 	log.Printf("Socket server listening on %s", sockPath)
@@ -87,11 +140,22 @@ func (s *SocketServer) handleConn(conn net.Conn) {
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 
+	// The peer is read once per connection and attached to every request from
+	// it, as an int and unconditionally — overwriting whatever the client sent
+	// under that key, and writing the "unknown" answer (-1) too: handlers that
+	// need to know who is calling (the channel endpoints, see
+	// channelInboxSession) must never read a value the caller could choose.
+	peer := peerPID(conn)
+
 	for {
 		var req Request
 		if err := decoder.Decode(&req); err != nil {
 			return // client disconnected
 		}
+		if req.Params == nil {
+			req.Params = make(map[string]any, 1)
+		}
+		req.Params["_peer_pid"] = peer
 		resp := s.handler(req)
 		if err := encoder.Encode(resp); err != nil {
 			return
@@ -108,7 +172,7 @@ type SocketClient struct {
 
 // Dial connects to the daemon socket.
 func Dial(dataDir string) (*SocketClient, error) {
-	conn, err := net.Dial("unix", SocketPath(dataDir))
+	conn, err := net.Dial("unix", clientSocketPath(dataDir))
 	if err != nil {
 		return nil, fmt.Errorf("dial daemon: %w", err)
 	}
@@ -121,7 +185,7 @@ func Dial(dataDir string) (*SocketClient, error) {
 
 // DialTimeout connects to the daemon socket with a timeout.
 func DialTimeout(dataDir string, timeout time.Duration) (*SocketClient, error) {
-	conn, err := net.DialTimeout("unix", SocketPath(dataDir), timeout)
+	conn, err := net.DialTimeout("unix", clientSocketPath(dataDir), timeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial daemon: %w", err)
 	}

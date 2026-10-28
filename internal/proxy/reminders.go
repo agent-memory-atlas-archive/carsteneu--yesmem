@@ -17,12 +17,14 @@ var fileChangeLinePattern = regexp.MustCompile(`(?m)^\s+(\d+)→`)
 
 // StripReminders replaces redundant <system-reminder> blocks in older messages with compact keywords.
 // The last user message keeps all reminders intact. Older messages get progressively stripped
-// based on reminder type and age (requestIdx - message position).
+// based on reminder type and age. Age is measured in turns from the current tail
+// ((len-1-i)/2), never from a proxy-wide request counter: a process-global index made the
+// age grow with other threads' traffic and reset to zero on restart (YM-139).
 //
 // Protected (never stripped): SessionStart blocks only.
 // Narrative and briefing now live in system block and are actively stripped from messages.
 // Immediately stripped: skill-check, task-reminder, local-command-caveat, yesmem-context.
-// Age-based: file-change diffs (full < 3 req, summary 3-10, minimal > 10).
+// Age-based: file-change diffs (full < 3 turns, summary 3-10, minimal > 10).
 // FilterSystemRoleMessages removes messages with role:system from the array.
 // These are not valid in Anthropic's native messages API and cause 400 errors
 // when Claude Code stores SessionStart hook output as standalone system turns.
@@ -40,7 +42,7 @@ func FilterSystemRoleMessages(messages []any) []any {
 	return filtered
 }
 
-func StripReminders(messages []any, requestIdx int) []any {
+func StripReminders(messages []any) []any {
 	// Strip role:system messages — not valid in Anthropic's messages array.
 	filtered := make([]any, 0, len(messages))
 	for _, m := range messages {
@@ -80,8 +82,10 @@ func StripReminders(messages []any, requestIdx int) []any {
 			continue
 		}
 
-		// Estimate message age based on position (rough: 2 messages per request)
-		msgAge := requestIdx - (i / 2)
+		// Age in turns, measured from the current tail of THIS thread's messages.
+		// A proxy-wide request counter must not feed this: it grows with other
+		// threads' traffic and resets on restart (YM-139).
+		msgAge := (len(result) - 1 - i) / 2
 		if msgAge < 0 {
 			msgAge = 0
 		}
@@ -298,4 +302,3 @@ func formatLineRanges(lines []int) string {
 	}
 	return fmt.Sprintf("%d-%d", min, max)
 }
-

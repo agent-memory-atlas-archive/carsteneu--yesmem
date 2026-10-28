@@ -16,6 +16,79 @@ import (
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
+// resultCooldown keeps freshly written learnings out of search results: one written
+// minutes ago has not proven any retrieval value yet.
+const resultCooldown = 30 * time.Minute
+
+// maxSkipRecent bounds the skip_recent parameter. Callers ask for a handful of
+// just-extracted rows; the cap only keeps a malformed value from loading the
+// whole ID set.
+const maxSkipRecent = 1000
+
+// maxHybridSearchLimit caps the caller-supplied hybrid_search limit. It mirrors
+// maxVectorSearchLimit: the value bounds slices and a LIMIT clause in both lanes.
+const maxHybridSearchLimit = 200
+
+// vectorSearchOversample is how many extra hits vector_search asks the store for
+// so the quarantine gate can drop the in-memory anticipated-query hits (the only
+// ones it can reach) without returning a short result set.
+const vectorSearchOversample = 8
+
+// maxVectorSearchLimit caps the caller-supplied limit. The IDs it produces are
+// bound into the quarantine lookup, so an unbounded value would hit SQLite's
+// variable ceiling and disable the gate.
+const maxVectorSearchLimit = 200
+
+// unfinishedCategoryDampening is the score factor for an unfinished learning.
+// One thread is worth noting, but it is not a settled fact, so it competes with
+// the settled rows at a discount.
+const unfinishedCategoryDampening = 0.7
+
+// sourceBoostFor returns the trust multiplier for a learning source. Search hits get
+// it from the metadata stage; graph neighbours need it for their derived score.
+func sourceBoostFor(source string) float64 {
+	switch source {
+	case "user_stated":
+		return 1.25
+	case "agreed_upon":
+		return 1.15
+	case "hook_auto_learned":
+		return 1.10
+	}
+	return 1.0
+}
+
+// learningGates carries the per-learning attributes a result is judged on, in one
+// value so a direct hit and a graph neighbour can be judged by the same function.
+// A neighbour that skipped a gate smuggled content past a filter its own parent
+// had to pass (YM-462).
+type learningGates struct {
+	category    string
+	source      string
+	createdAt   time.Time
+	quarantined bool
+}
+
+// applyLearningGates applies the gates every result must pass to stay in the
+// result set: quarantine and narrative drop, the result cooldown, and for the
+// survivors the unfinished dampening and the source boost. relation is the
+// association edge that produced the hit, "" for a direct hit. A contradiction is
+// surfaced as an explicit warning (proxy), never as supporting context, so a
+// contradicts edge is dropped here rather than scored.
+func applyLearningGates(r embedding.RankedResult, g learningGates, relation string) (embedding.RankedResult, bool) {
+	if g.quarantined || g.category == "narrative" || relation == "contradicts" {
+		return r, false
+	}
+	if !g.createdAt.IsZero() && time.Since(g.createdAt) < resultCooldown {
+		return r, false
+	}
+	if g.category == "unfinished" {
+		r.Score *= unfinishedCategoryDampening
+	}
+	r.Score *= sourceBoostFor(g.source)
+	return r, true
+}
+
 // embedJob represents a learning to be embedded asynchronously.
 type embedJob struct {
 	id       int64
@@ -26,28 +99,57 @@ type embedJob struct {
 
 // VectorStore returns the handler's vector store (may be nil if not configured).
 func (h *Handler) VectorStore() *embedding.VectorStore {
-	return h.vectorStore
+	h.embedMu.RLock()
+	defer h.embedMu.RUnlock()
+	return h.embed.vectorStore
 }
 
 // SetEmbedding configures the handler with vector search capabilities.
 // If not called, hybrid_search falls back to BM25-only.
+//
+// Each field is set on its own: the dedicated query provider is published before
+// this call (daemon.go), so republishing the whole set would clear it again.
 func (h *Handler) SetEmbedding(indexer *embedding.Indexer, store *embedding.VectorStore, provider embedding.Provider) {
-	h.indexer = indexer
-	h.vectorStore = store
-	h.embedProvider = provider
+	h.embedMu.Lock()
+	h.embed.indexer = indexer
+	h.embed.vectorStore = store
+	h.embed.embedProvider = provider
+	h.embedMu.Unlock()
 }
 
 // SetSearchEmbeddingProvider configures a dedicated provider for query embeddings.
 func (h *Handler) SetSearchEmbeddingProvider(provider embedding.Provider) {
-	h.searchEmbedProvider = provider
+	h.embedMu.Lock()
+	h.embed.searchProvider = provider
+	h.embedMu.Unlock()
+}
+
+// SetIVFPath publishes where the IVF index is persisted. SaveIVF reads the path
+// on daemon shutdown, long after the startup goroutine that publishes it.
+func (h *Handler) SetIVFPath(path string) {
+	h.embedMu.Lock()
+	h.embed.ivfPath = path
+	h.embedMu.Unlock()
+}
+
+// embedSnapshot returns a copy of the currently published wiring, taken under
+// the lock. A reader therefore sees each field either before or after a publish,
+// never a torn value; the setters publish field by field, so a snapshot between
+// two of them is a valid mix (for example a vector store without an IVF path
+// yet) and every caller must handle each field's nil/empty case on its own.
+func (h *Handler) embedSnapshot() embedWiring {
+	h.embedMu.RLock()
+	defer h.embedMu.RUnlock()
+	return h.embed
 }
 
 // SaveIVF persists the IVF index to disk if configured.
 func (h *Handler) SaveIVF() {
-	if h.vectorStore == nil || h.ivfPath == "" {
+	w := h.embedSnapshot()
+	if w.vectorStore == nil || w.ivfPath == "" {
 		return
 	}
-	if err := h.vectorStore.SaveIVF(h.ivfPath); err != nil {
+	if err := w.vectorStore.SaveIVF(w.ivfPath); err != nil {
 		log.Printf("SaveIVF: %v", err)
 	}
 }
@@ -74,23 +176,31 @@ func (h *Handler) StopEmbedProcess() {
 
 // EmbedProvider returns the handler's embedding provider (may be nil).
 func (h *Handler) EmbedProvider() embedding.Provider {
-	return h.embedProvider
+	h.embedMu.RLock()
+	defer h.embedMu.RUnlock()
+	return h.embed.embedProvider
 }
 
-func (h *Handler) queryEmbedProvider() embedding.Provider {
-	if h.searchEmbedProvider != nil {
-		return h.searchEmbedProvider
+// queryProvider returns the provider for query embeddings, preferring the
+// dedicated one published through SetSearchEmbeddingProvider.
+func (w embedWiring) queryProvider() embedding.Provider {
+	if w.searchProvider != nil {
+		return w.searchProvider
 	}
-	return h.embedProvider
+	return w.embedProvider
 }
 
 // StartEmbedWorker starts a background goroutine that processes embed jobs.
 // Call this after SetEmbedding. The worker stops when ctx is cancelled.
 func (h *Handler) StartEmbedWorker(ctx context.Context) {
-	if h.indexer == nil {
+	h.embedMu.Lock()
+	if h.embed.indexer == nil {
+		h.embedMu.Unlock()
 		return
 	}
-	h.embedQueue = make(chan embedJob, 100)
+	queue := make(chan embedJob, 100)
+	h.embed.queue = queue
+	h.embedMu.Unlock()
 	go func() {
 		for {
 			select {
@@ -98,13 +208,13 @@ func (h *Handler) StartEmbedWorker(ctx context.Context) {
 				// Drain remaining jobs before exit
 				for {
 					select {
-					case job := <-h.embedQueue:
+					case job := <-queue:
 						h.processEmbedJob(context.Background(), job)
 					default:
 						return
 					}
 				}
-			case job := <-h.embedQueue:
+			case job := <-queue:
 				h.processEmbedJob(ctx, job)
 			}
 		}
@@ -112,7 +222,8 @@ func (h *Handler) StartEmbedWorker(ctx context.Context) {
 }
 
 func (h *Handler) processEmbedJob(ctx context.Context, job embedJob) {
-	err := h.indexer.Index(ctx, fmt.Sprintf("%d", job.id), job.content, map[string]string{
+	w := h.embedSnapshot()
+	err := w.indexer.Index(ctx, fmt.Sprintf("%d", job.id), job.content, map[string]string{
 		"category": job.category,
 		"project":  job.project,
 	})
@@ -131,11 +242,12 @@ func (h *Handler) processEmbedJob(ctx context.Context, job embedJob) {
 // RemoveEmbedding removes a learning's embedding from the vector store.
 // Safe to call even when embedding is not configured (no-op).
 func (h *Handler) RemoveEmbedding(id int64) {
-	if h.vectorStore == nil {
+	vecStore := h.VectorStore()
+	if vecStore == nil {
 		return
 	}
 	ctx := context.Background()
-	if err := h.vectorStore.Delete(ctx, fmt.Sprintf("%d", id)); err != nil {
+	if err := vecStore.Delete(ctx, fmt.Sprintf("%d", id)); err != nil {
 		log.Printf("remove embedding #%d: %v", id, err)
 	}
 }
@@ -143,14 +255,68 @@ func (h *Handler) RemoveEmbedding(id int64) {
 // EmbedLearning queues a learning for async embedding.
 // Safe to call even when embedding is not configured (no-op).
 func (h *Handler) EmbedLearning(id int64, content, category, project string) {
-	if h.embedQueue == nil {
+	h.embedMu.RLock()
+	queue := h.embed.queue
+	h.embedMu.RUnlock()
+	if queue == nil {
 		return
 	}
 	select {
-	case h.embedQueue <- embedJob{id: id, content: content, category: category, project: project}:
+	case queue <- embedJob{id: id, content: content, category: category, project: project}:
 	default:
 		log.Printf("auto-embed: queue full, dropping learning #%d", id)
 	}
+}
+
+// recentLearningIDs returns the IDs of the n most recently created learnings, or
+// nil when n asks for nothing. With a session id the window covers only that
+// session's own rows, so inserts from any other session cannot push the caller's
+// just-extracted learning out of it. A thread that is not a session id (a
+// content-hash thread) has no rows of its own; there the global window still
+// applies.
+func (h *Handler) recentLearningIDs(n int, sessionID string) map[string]bool {
+	if n <= 0 || h.store == nil {
+		return nil
+	}
+	if n > maxSkipRecent {
+		n = maxSkipRecent
+	}
+	ids, err := h.store.GetRecentLearningIDs(n, sessionID)
+	if err != nil {
+		log.Printf("hybrid_search: skip_recent lookup failed: %v", err)
+		return nil
+	}
+	if len(ids) == 0 && sessionID != "" {
+		ids, err = h.store.GetRecentLearningIDs(n, "")
+		if err != nil {
+			log.Printf("hybrid_search: skip_recent fallback lookup failed: %v", err)
+			return nil
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	skip := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		skip[strconv.FormatInt(id, 10)] = true
+	}
+	return skip
+}
+
+// dropSkippedResults removes results whose learning ID is in skip. It returns a
+// fresh slice: callers keep their lane slices, so an in-place rewrite of the
+// caller's backing array would be a trap for the next reader.
+func dropSkippedResults(results []embedding.RankedResult, skip map[string]bool) []embedding.RankedResult {
+	if len(skip) == 0 || len(results) == 0 {
+		return results
+	}
+	out := make([]embedding.RankedResult, 0, len(results))
+	for _, r := range results {
+		if !skip[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func (h *Handler) handleHybridSearch(params map[string]any) Response {
@@ -160,10 +326,48 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 	since, _ := params["since"].(string)
 	before, _ := params["before"].(string)
 	limit := intOr(params, "limit", 10)
+	// The limit reaches two slices and one LIMIT clause, plus the AQ lane's
+	// limit*3. A negative value panics on the slice, an absurd value wraps the
+	// multiply negative and SQLite then reads it as "no limit".
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > maxHybridSearchLimit {
+		limit = maxHybridSearchLimit
+	}
 
 	if query == "" {
 		return errorResponse("query is required")
 	}
+	if since != "" && storage.ParseFilterTime(since).IsZero() {
+		return errorResponse(fmt.Sprintf("since is not a parseable timestamp: %q", truncate(since, 80)))
+	}
+	if before != "" && storage.ParseFilterTime(before).IsZero() {
+		return errorResponse(fmt.Sprintf("before is not a parseable timestamp: %q", truncate(before, 80)))
+	}
+
+	if limit == 0 {
+		// Same meaning as in get_learnings: nothing requested. Without this the
+		// bm25_only branch and RRFMerge skip truncation for a non-positive limit and
+		// return the whole lane, whose size comes from the corpus.
+		return jsonResponse(map[string]any{
+			"results":       []any{},
+			"bm25_count":    0,
+			"vector_count":  0,
+			"merged_count":  0,
+			"fusion_method": "none",
+			"fusion_k":      60,
+			"message":       "Hybrid search: limit is 0, no results requested",
+		})
+	}
+
+	// skip_recent keeps the newest N learnings out of the result set. The proxy's
+	// associative context uses it so a learning cannot be injected into the turn
+	// that just extracted it (echo injection). The skip window follows the
+	// caller's own session when it names one: a global window over the newest IDs
+	// is one insert from any other session away from dropping the target.
+	skipSession, _ := params["session_id"].(string)
+	skipIDs := h.recentLearningIDs(intOr(params, "skip_recent", 0), skipSession)
 
 	const searchTimeout = 5 * time.Second
 
@@ -221,8 +425,9 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 
 	// Vector goroutine
 	go func() {
-		queryProvider := h.queryEmbedProvider()
-		if queryProvider == nil || !queryProvider.Enabled() || h.vectorStore == nil {
+		w := h.embedSnapshot()
+		queryProvider := w.queryProvider()
+		if queryProvider == nil || !queryProvider.Enabled() || w.vectorStore == nil {
 			vectorCh <- vectorResult{}
 			return
 		}
@@ -246,9 +451,9 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 				vectorCh <- vectorResult{err: idErr}
 				return
 			}
-			searchResults, err = h.vectorStore.SearchAllowed(ctx, vectors[0], laneLimit, allowedIDs)
+			searchResults, err = w.vectorStore.SearchAllowed(ctx, vectors[0], laneLimit, allowedIDs)
 		} else {
-			searchResults, err = h.vectorStore.SearchWithProject(ctx, vectors[0], laneLimit, project)
+			searchResults, err = w.vectorStore.SearchWithProject(ctx, vectors[0], laneLimit, project)
 		}
 		if err != nil {
 			vectorCh <- vectorResult{err: err}
@@ -260,6 +465,7 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 				ID: r.ID, Content: r.Content,
 				Score:         float64(r.Similarity),
 				OriginalScore: float64(r.Similarity),
+				Project:       r.Metadata["project"],
 			})
 		}
 		vectorCh <- vectorResult{results: ranked, queryVec: vectors[0]}
@@ -297,6 +503,13 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 	bm25Results := bm25Res.results
 	vectorResults := vectorRes.results
 	aqResults := aqRes.results
+
+	// Drop skipped learnings before fusion. The lane fetch is already capped at
+	// laneLimit, so this cannot pull replacements in; it keeps the skipped rows
+	// out of the RRF ranks and out of the merged set.
+	bm25Results = dropSkippedResults(bm25Results, skipIDs)
+	vectorResults = dropSkippedResults(vectorResults, skipIDs)
+	aqResults = dropSkippedResults(aqResults, skipIDs)
 
 	// Merge AQ-FTS results into BM25 (dedup by ID, boost existing entries)
 	if len(aqResults) > 0 {
@@ -338,9 +551,6 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 		for i := range bm25Results {
 			bm25Results[i].Source = "keyword"
 		}
-		if len(bm25Results) > limit {
-			bm25Results = bm25Results[:limit]
-		}
 		// Scores already pre-normalized by tier in SearchLearningsBM25Ctx (0-100).
 		// Just assign source and cap to limit.
 		if len(bm25Results) > limit {
@@ -360,8 +570,9 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 	merged = h.resolveSupersededResults(merged)
 	tSupersede := time.Since(t0)
 
-	// Bulk metadata lookup: category, source, created_at in a single round-trip.
-	// Replaces the old GetCategoriesBulk + separate source + separate cooldown queries.
+	// Bulk metadata lookup: category, source, created_at, quarantine in a single
+	// round-trip. Replaces the old GetCategoriesBulk + separate source + separate
+	// cooldown queries.
 	if len(merged) > 0 {
 		ids := make([]string, len(merged))
 		for i, r := range merged {
@@ -374,67 +585,49 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 			args[i] = id
 		}
 		type bulkMeta struct {
-			category      string
-			source        string
-			createdAt     string
+			category    string
+			source      string
+			createdAt   string
+			quarantined bool
 		}
 		bulk := make(map[string]bulkMeta, len(ids))
-		rows, err := h.store.ReaderDB().Query("SELECT CAST(id AS TEXT), COALESCE(category, ''), COALESCE(source, ''), created_at FROM learnings WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
-		if err == nil {
+		rows, err := h.store.ReaderDB().Query("SELECT CAST(id AS TEXT), COALESCE(category, ''), COALESCE(source, ''), created_at, COALESCE(quarantined_at, '') FROM learnings WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			// Fail-open by construction: without rows there is no metadata, so the
+			// quarantine branch below cannot fire. Make the degradation visible.
+			log.Printf("hybrid_search: metadata lookup failed, quarantine filter degraded: %v", err)
+		} else {
 			defer rows.Close()
 			for rows.Next() {
-				var id, cat, src, created string
-				if rows.Scan(&id, &cat, &src, &created) == nil {
-					bulk[id] = bulkMeta{category: cat, source: src, createdAt: created}
+				var id, cat, src, created, quarantinedAt string
+				if rows.Scan(&id, &cat, &src, &created, &quarantinedAt) == nil {
+					bulk[id] = bulkMeta{category: cat, source: src, createdAt: created, quarantined: quarantinedAt != ""}
 				}
 			}
 		}
 
-		// Category filter/down-rank (was GetCategoriesBulk)
+		// Every result passes the per-learning gates, whichever lane produced it.
+		// A hit without a metadata row cannot be judged and passes unchanged, as it
+		// always has (fail-open: no metadata, no gate).
 		{
 			filtered := merged[:0]
 			for _, r := range merged {
 				bm, ok := bulk[r.ID]
-				switch {
-				case !ok:
+				if !ok {
 					filtered = append(filtered, r)
-				case bm.category == "narrative":
 					continue
-				case bm.category == "unfinished":
-					r.Score *= 0.7
-					filtered = append(filtered, r)
-				default:
-					filtered = append(filtered, r)
+				}
+				gated, keep := applyLearningGates(r, learningGates{
+					category:    bm.category,
+					source:      bm.source,
+					createdAt:   storage.ParseTimestamp(bm.createdAt),
+					quarantined: bm.quarantined,
+				}, "")
+				if keep {
+					filtered = append(filtered, gated)
 				}
 			}
 			merged = filtered
-		}
-
-		// Cooldown filter: skip learnings created less than 30 minutes ago
-		{
-			cooldownCutoff := time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339)
-			filtered := merged[:0]
-			for _, r := range merged {
-				if bm, ok := bulk[r.ID]; ok && bm.createdAt >= cooldownCutoff {
-					continue
-				}
-				filtered = append(filtered, r)
-			}
-			merged = filtered
-		}
-
-		// Source-boost: user-stated learnings are epistemically more valuable
-		for i, r := range merged {
-			if bm, ok := bulk[r.ID]; ok {
-				switch bm.source {
-				case "user_stated":
-					merged[i].Score *= 1.25
-				case "agreed_upon":
-					merged[i].Score *= 1.15
-				case "hook_auto_learned":
-					merged[i].Score *= 1.10
-				}
-			}
 		}
 	}
 
@@ -514,8 +707,14 @@ func (h *Handler) handleHybridSearch(params map[string]any) Response {
 	// Apply project-recency boost: fresh same-project results rank higher
 	merged = h.applyTurnBasedDecay(merged, project)
 
-	// Graph augmentation: expand results with association neighbors
+	// Graph augmentation: expand results with association neighbors. Runs after the
+	// metadata stage on purpose — only hits that survived the filters may expand,
+	// and neighbours pass the same category and cooldown gates inside.
 	merged = h.augmentWithGraphNeighbors(merged)
+
+	// Graph neighbours are added after the lane filters, so the skip gate has to
+	// run once more to keep a freshly written neighbour out as well.
+	merged = dropSkippedResults(merged, skipIDs)
 
 	// Enrich with subagent metadata
 	enrichedResults := h.enrichRankedResults(merged)
@@ -559,9 +758,16 @@ func (h *Handler) handleVectorSearch(params map[string]any) Response {
 	if l, ok := params["limit"].(float64); ok && l > 0 {
 		limit = int(l)
 	}
+	// The limit is caller-controlled and becomes an ID list in the quarantine
+	// gate, so it needs a ceiling: an unbounded value overflows SQLite's variable
+	// cap and would degrade that gate.
+	if limit > maxVectorSearchLimit {
+		limit = maxVectorSearchLimit
+	}
 
-	queryProvider := h.queryEmbedProvider()
-	if queryProvider == nil || !queryProvider.Enabled() || h.vectorStore == nil {
+	w := h.embedSnapshot()
+	queryProvider := w.queryProvider()
+	if queryProvider == nil || !queryProvider.Enabled() || w.vectorStore == nil {
 		return errorResponse("vector search not enabled")
 	}
 
@@ -575,7 +781,7 @@ func (h *Handler) handleVectorSearch(params map[string]any) Response {
 		return errorResponse("no embedding produced")
 	}
 
-	searchResults, err := h.vectorStore.Search(ctx, vectors[0], limit)
+	searchResults, err := w.vectorStore.Search(ctx, vectors[0], limit+vectorSearchOversample)
 	if err != nil {
 		log.Printf("vector_search: search failed: %v", err)
 		return errorResponse("vector search failed")
@@ -600,9 +806,25 @@ func (h *Handler) handleVectorSearch(params map[string]any) Response {
 		}
 	}
 	meta, _ := h.store.GetSessionMetaBulk(ids)
+	// Quarantine gate: the vector store filters quarantined rows on its SQL
+	// paths, but anticipated-query vectors live in memory and resolve to their
+	// parent through metadata only. Ask for the quarantined subset once instead
+	// of trusting the lane that produced the hit. Fail closed: a lookup that
+	// cannot run must not return quarantined content.
+	quarantined, err := h.store.QuarantinedIDs(ids)
+	if err != nil {
+		log.Printf("vector_search: quarantine lookup failed: %v", err)
+		return errorResponse("quarantine check failed")
+	}
 
 	results := make([]vectorResult, 0, len(searchResults))
 	for _, r := range searchResults {
+		if len(results) >= limit {
+			break
+		}
+		if quarantined[r.ID] {
+			continue
+		}
 		vr := vectorResult{
 			ID:         r.ID,
 			Content:    r.Content,
@@ -643,7 +865,7 @@ func (h *Handler) resolveSupersededResults(results []embedding.RankedResult) []e
 		id, _ := strconv.ParseInt(r.ID, 10, 64)
 		if target, ok := redirects[id]; ok {
 			if target <= 0 {
-				continue // negative supersede ID = bulk-resolved, no valid successor
+				continue // chain end has no active learning — drop the hit
 			}
 			active, err := h.store.GetLearning(target)
 			if err != nil {
@@ -778,19 +1000,31 @@ func (h *Handler) augmentWithGraphNeighbors(merged []embedding.RankedResult) []e
 				baseMultiplier = 0.6
 				source = "graph"
 			}
-			derivedScore := r.Score * baseMultiplier * weight / 3.0
 
-			merged = append(merged, embedding.RankedResult{
+			// The gates run after the derived score and through the same function the
+			// direct hits use, so a neighbour and a direct hit of the same learning
+			// come out with the same adjustments: unfinished dampening, cooldown,
+			// source boost, and a contradicts edge dropped instead of scored.
+			gated, keep := applyLearningGates(embedding.RankedResult{
 				ID:      edge.TargetID,
 				Content: learning.Content,
-				Score:   derivedScore,
+				Score:   r.Score * baseMultiplier * weight / 3.0,
 				Source:  source,
 				Project: learning.Project,
-			})
+			}, learningGates{
+				category:  learning.Category,
+				source:    learning.Source,
+				createdAt: learning.CreatedAt,
+			}, edge.RelationType)
+			if !keep {
+				continue
+			}
+
+			merged = append(merged, gated)
 			existingIDs[edge.TargetID] = true
 			added++
 			log.Printf("graph augment: added [ID:%s] via %s edge from [ID:%s] (score=%.2f, weight=%.1f)",
-				edge.TargetID, edge.RelationType, r.ID, derivedScore, edge.Weight)
+				edge.TargetID, edge.RelationType, r.ID, gated.Score, edge.Weight)
 		}
 	}
 
@@ -815,7 +1049,7 @@ func (h *Handler) applyTurnBasedDecay(results []embedding.RankedResult, project 
 		placeholders[i] = "?"
 		args[i] = r.ID
 	}
-	rows, err := h.store.DB().Query("SELECT CAST(id AS TEXT), COALESCE(project, ''), COALESCE(source, ''), COALESCE(use_count, 0), COALESCE(save_count, 0), COALESCE(stability, 30.0), COALESCE(turns_at_creation, 0) FROM learnings WHERE id IN ("+strings.Join(placeholders, ",")+") AND valid_until IS NULL", args...)
+	rows, err := h.store.DB().Query("SELECT CAST(id AS TEXT), COALESCE(project, ''), COALESCE(source, ''), COALESCE(use_count, 0), COALESCE(save_count, 0), COALESCE(stability, 30.0), COALESCE(turns_at_creation, 0) FROM learnings WHERE id IN ("+strings.Join(placeholders, ",")+") AND (valid_until IS NULL OR julianday(valid_until) > julianday('now'))", args...)
 	if err != nil {
 		log.Printf("applyTurnBasedDecay: query failed: %v", err)
 		return results
@@ -881,60 +1115,20 @@ func (h *Handler) applyTurnBasedDecay(results []embedding.RankedResult, project 
 	return results
 }
 
-// filterResultsByTime filters RankedResults by created_at using a bulk SQLite lookup.
-// Same pattern as BM25 post-filter in SearchLearningsBM25Ctx.
-func (h *Handler) filterResultsByTime(results []embedding.RankedResult, since, before string) []embedding.RankedResult {
-	if len(results) == 0 {
-		return results
-	}
-	placeholders := make([]string, len(results))
-	args := make([]any, len(results))
-	for i, r := range results {
-		placeholders[i] = "?"
-		args[i] = r.ID
-	}
-	rows, err := h.store.DB().Query("SELECT CAST(id AS TEXT), created_at FROM learnings WHERE id IN ("+strings.Join(placeholders, ",")+") AND valid_until IS NULL", args...)
-	if err != nil {
-		log.Printf("filterResultsByTime: query failed: %v", err)
-		return results
-	}
-	defer rows.Close()
-	timeMap := make(map[string]string, len(results))
-	for rows.Next() {
-		var id, created string
-		if rows.Scan(&id, &created) == nil {
-			timeMap[id] = created
-		}
-	}
-	var filtered []embedding.RankedResult
-	for _, r := range results {
-		created, ok := timeMap[r.ID]
-		if !ok {
-			continue
-		}
-		if since != "" && created < since {
-			continue
-		}
-		if before != "" && created >= before {
-			continue
-		}
-		filtered = append(filtered, r)
-	}
-	return filtered
-}
-
 // getDateFilteredIDs returns the set of learning IDs that pass the date and project filters.
 // Used as pre-filter for the vector lane to restrict brute-force scan to a small ID set.
 func (h *Handler) getDateFilteredIDs(since, before, project string) (map[string]bool, error) {
-	where := `WHERE superseded_by IS NULL AND embedding_vector IS NOT NULL`
+	where := `WHERE ` + models.RecallableLearningSQL + ` AND embedding_vector IS NOT NULL`
 	args := make([]any, 0, 3)
+	// julianday() on the column is what makes the mixed offsets in created_at
+	// comparable; the bound is normalized so its spelling never matters.
 	if since != "" {
-		where += ` AND created_at >= ?`
-		args = append(args, since)
+		where += ` AND julianday(created_at) >= julianday(?)`
+		args = append(args, storage.SQLiteFilterTime(since))
 	}
 	if before != "" {
-		where += ` AND created_at < ?`
-		args = append(args, before)
+		where += ` AND julianday(created_at) < julianday(?)`
+		args = append(args, storage.SQLiteFilterTime(before))
 	}
 	if project != "" {
 		where += ` AND project = ?`

@@ -16,11 +16,11 @@ var decisionMarkers = []string{
 
 // StubResult holds the outcome of a stubify pass.
 type StubResult struct {
-	Messages      []any // modified messages array
-	Archived      []any // original messages that were stubbed
-	TokensBefore  int
-	TokensAfter   int
-	StubCount     int
+	Messages     []any // modified messages array
+	Archived     []any // original messages that were stubbed
+	TokensBefore int
+	TokensAfter  int
+	StubCount    int
 }
 
 // Stubify inspects the messages array and replaces older messages with reference stubs

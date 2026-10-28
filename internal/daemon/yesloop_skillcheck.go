@@ -74,13 +74,33 @@ func skillCheckRelayMessage(round int) string {
 var skillReloadMarkerRe = regexp.MustCompile(`(?m)^\s*\**SKILL-RELOAD-(\d+)\s*:\s*\**\s*yes\b`)
 
 // hasSkillReloadMarker reports whether the agent's scratchpad carries a
-// SKILL-RELOAD confirmation for exactly the given round.
+// SKILL-RELOAD confirmation for exactly the given round. Every marker line is
+// checked: an earlier round's confirmation usually sits above the current one in
+// the same section, and matching only the first line made every round after the
+// first look unconfirmed, which escalated agents that had in fact reloaded.
 func hasSkillReloadMarker(content string, round int) bool {
-	m := skillReloadMarkerRe.FindStringSubmatch(content)
-	if len(m) < 2 {
-		return false
+	want := strconv.Itoa(round)
+	for _, m := range skillReloadMarkerRe.FindAllStringSubmatch(content, -1) {
+		if len(m) > 1 && m[1] == want {
+			return true
+		}
 	}
-	return m[1] == strconv.Itoa(round)
+	return false
+}
+
+// highestSkillReloadRound returns the largest SKILL-RELOAD round token present in
+// content (0 when there is none).
+func highestSkillReloadRound(content string) int {
+	highest := 0
+	for _, m := range skillReloadMarkerRe.FindAllStringSubmatch(content, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		if n, err := strconv.Atoi(m[1]); err == nil && n > highest {
+			highest = n
+		}
+	}
+	return highest
 }
 
 // yesloopSkillCheckState tracks the skill-check state machine for one agent.
@@ -152,8 +172,10 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 	if agent.SessionID == "" || agent.Project == "" {
 		return
 	}
-	// PID must be alive (otherwise crashRecovery handles it).
-	if !isPIDAlive(agent.PID) {
+	// The guard relays into the agent's socket and pauses on escalation, so it
+	// needs the agent's own process — not just "somebody holds this PID"
+	// (Learning #101907). Dead rows are crashRecovery's case.
+	if agentProcessGone(agent) {
 		return
 	}
 
@@ -200,6 +222,13 @@ func (h *Handler) checkOneSkillCheck(agent storage.Agent) {
 		outDelta := agent.OutputTokens - state.baselineOut
 		turnDelta := agent.TurnsUsed - state.baselineTurns
 		if outDelta >= skillCheckOutputTokenThreshold || turnDelta >= skillCheckTurnThreshold {
+			// Start above any marker already in the section. The counter is
+			// in-memory — it resets on daemon restart and whenever the row leaves
+			// "running" — so a reused low token would let a marker from an earlier
+			// window confirm this one without the agent having reloaded anything.
+			if highest := highestSkillReloadRound(content); highest > state.round {
+				state.round = highest
+			}
 			state.round++ // fresh token for this window
 			h.transitionSkillCheckLocked(agent, state, yesloopSkillCheckStateRemind)
 			state.lastRelayAt = time.Now()
@@ -289,12 +318,12 @@ func (h *Handler) maybeSkillCheckRefireLocked(agent storage.Agent, state *yesloo
 // sendSkillCheckRelay sends the skill-check relay for the current round to a
 // yesloop agent via the inject socket. Single metachar-free write.
 func (h *Handler) sendSkillCheckRelay(agent storage.Agent, round int) {
-	if agent.SockPath == "" {
-		log.Printf("[yesloop-skillcheck] relay to agent %s skipped: no sock_path", agent.ID)
+	injectPath := h.agentInjectPath(agent.ID)
+	if injectPath == "" {
+		log.Printf("[yesloop-skillcheck] relay to agent %s skipped: no derivable socket path", safeAgentText(agent.ID))
 		return
 	}
 
-	injectPath := agent.SockPath + ".inject"
 	wrapped := fmt.Sprintf("[RELAY from=yesloop-skillcheck] %s", skillCheckRelayMessage(round))
 
 	conn, err := net.DialTimeout("unix", injectPath, 3*time.Second)

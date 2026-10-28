@@ -5,7 +5,6 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,15 +21,11 @@ type BudgetTracker struct {
 	bucket   string // "extract" or "quality"
 
 	mu       sync.Mutex
-	day      string  // "2006-01-02"
+	day      string // "2006-01-02"
 	spentUSD float64
 	calls    int
 
 	persist SpendPersister // optional: persist to DB
-
-	// realUsageTracked is set by TrackTokens (real data from API/CLI response).
-	// When set, Track() (char-estimation) skips to avoid double-counting.
-	realUsageTracked int32 // atomic: 1 = real usage already tracked for current call
 }
 
 // NewBudgetTracker creates a shared daily budget tracker.
@@ -78,14 +73,10 @@ func (t *BudgetTracker) Check() error {
 	return nil
 }
 
-// Track records estimated cost for a completed call.
-// Skips if TrackTokens already recorded real usage for this call (avoids double-counting).
+// Track records estimated cost for a completed call. The caller decides whether
+// to estimate: BudgetClient calls it only when the transport reported no
+// measured usage for that call.
 func (t *BudgetTracker) Track(inputPerM, outputPerM float64, system, userMsg, result string) {
-	// If real usage was already reported via TrackTokens, skip char estimation
-	if atomic.CompareAndSwapInt32(&t.realUsageTracked, 1, 0) {
-		return
-	}
-
 	inputTokens := (len(system) + len(userMsg)) / 4
 	outputTokens := len(result) / 4
 
@@ -136,15 +127,28 @@ func (t *BudgetTracker) resetIfNewDay() {
 	}
 }
 
+// unwrapMetering peels the decorators that can sit in front of the metering
+// chain. SanitizingClient is documented as the OUTERMOST decorator
+// (sanitizing_client.go), so it is the one a caller meets first, and without
+// looking through it the assertions below fall through to "unlimited".
+func unwrapMetering(client LLMClient) LLMClient {
+	for {
+		switch c := client.(type) {
+		case *SanitizingClient:
+			client = c.inner
+		case *GatedClient:
+			client = c.Unwrap()
+		default:
+			return client
+		}
+	}
+}
+
 // CheckBudget tests if the client has remaining budget.
 // Returns nil if unlimited or budget available, error if exceeded.
 // Works on any LLMClient — returns nil for non-budget clients.
 func CheckBudget(client LLMClient) error {
-	// Unwrap GatedClient to reach BudgetClient
-	if gc, ok := client.(*GatedClient); ok {
-		client = gc.Unwrap()
-	}
-	if bc, ok := client.(*BudgetClient); ok {
+	if bc, ok := unwrapMetering(client).(*BudgetClient); ok {
 		return bc.tracker.Check()
 	}
 	return nil
@@ -153,11 +157,7 @@ func CheckBudget(client LLMClient) error {
 // HasBudget returns true if the client has remaining budget (with $0.50 reserve).
 // Returns true for non-budget clients (unlimited).
 func HasBudget(client LLMClient) bool {
-	// Unwrap GatedClient to reach BudgetClient
-	if gc, ok := client.(*GatedClient); ok {
-		client = gc.Unwrap()
-	}
-	if bc, ok := client.(*BudgetClient); ok {
+	if bc, ok := unwrapMetering(client).(*BudgetClient); ok {
 		if bc.ThrottleFn != nil && bc.ThrottleFn() {
 			return false
 		}
@@ -199,6 +199,17 @@ func NewBudgetClient(inner LLMClient, tracker *BudgetTracker) *BudgetClient {
 func (b *BudgetClient) Name() string  { return b.inner.Name() }
 func (b *BudgetClient) Model() string { return b.inner.Model() }
 
+// SetPricing overrides the per-million prices this client meters with. A caller
+// holding a config-aware price table (config.PricingForModel knows provider
+// entries and user overrides the builtin table does not) passes its prices here,
+// so measured usage is billed at the same rate as the estimate and the daily
+// spend stays comparable. Without it the builtin fallback would price an unknown
+// model as sonnet.
+func (b *BudgetClient) SetPricing(inputPerM, outputPerM float64) {
+	b.inputPerM = inputPerM
+	b.outputPerM = outputPerM
+}
+
 var errThrottled = fmt.Errorf("LLM call throttled: API utilization above threshold")
 
 func (b *BudgetClient) Complete(system, userMsg string, opts ...CallOption) (string, error) {
@@ -208,9 +219,22 @@ func (b *BudgetClient) Complete(system, userMsg string, opts ...CallOption) (str
 	if err := b.tracker.Check(); err != nil {
 		return "", err
 	}
-	result, err := b.inner.Complete(system, userMsg, opts...)
-	if err == nil {
-		b.tracker.Track(b.inputPerM, b.outputPerM, system, userMsg, result)
+	var (
+		realIn, realOut int
+		reported        bool
+	)
+	callOpts := appendMeteredSink(opts, func(in, out int) {
+		// A transport may report several steps for one call (opencode emits one
+		// step_finish per tool roundtrip), so the sink accumulates.
+		realIn += in
+		realOut += out
+		reported = true
+	})
+	result, err := b.inner.Complete(system, userMsg, callOpts...)
+	if err == nil || reported {
+		// A failed call that already reported its token counts is still billed by
+		// the provider, so it is still booked.
+		b.book(reported, realIn, realOut, system, userMsg, result)
 	}
 	return result, err
 }
@@ -222,19 +246,48 @@ func (b *BudgetClient) CompleteJSON(system, userMsg string, schema map[string]an
 	if err := b.tracker.Check(); err != nil {
 		return "", err
 	}
-	result, err := b.inner.CompleteJSON(system, userMsg, schema, opts...)
-	if err == nil {
-		b.tracker.Track(b.inputPerM, b.outputPerM, system, userMsg, result)
+	var (
+		realIn, realOut int
+		reported        bool
+	)
+	callOpts := appendMeteredSink(opts, func(in, out int) {
+		realIn += in
+		realOut += out
+		reported = true
+	})
+	result, err := b.inner.CompleteJSON(system, userMsg, schema, callOpts...)
+	if err == nil || reported {
+		b.book(reported, realIn, realOut, system, userMsg, result)
 	}
 	return result, err
 }
 
-// TrackTokens records actual token usage from the API response.
-// More accurate than Track() which estimates from char counts.
-// Sets realUsageTracked flag so Track() skips for this call.
-func (t *BudgetTracker) TrackTokens(inputTokens, outputTokens int, inputPerM, outputPerM float64) {
-	atomic.StoreInt32(&t.realUsageTracked, 1)
+// appendMeteredSink returns the caller's options plus this call's usage sink.
+// The slice is copied: appending to the caller's variadic slice could write into
+// the backing array a caller still holds.
+func appendMeteredSink(opts []CallOption, sink usageSink) []CallOption {
+	out := make([]CallOption, 0, len(opts)+1)
+	out = append(out, opts...)
+	out = append(out, withUsageSink(sink))
+	return out
+}
 
+// book records exactly one cost for this call: the measured token counts when
+// the transport reported them, the char estimate otherwise. The decision lives in
+// the call frame, so concurrent calls through one client cannot consume each
+// other's signal — the old per-tracker realUsageTracked flag did exactly that,
+// booking one call twice and the next one not at all.
+func (b *BudgetClient) book(reported bool, inputTokens, outputTokens int, system, userMsg, result string) {
+	if reported {
+		b.tracker.TrackTokens(inputTokens, outputTokens, b.inputPerM, b.outputPerM)
+		return
+	}
+	b.tracker.Track(b.inputPerM, b.outputPerM, system, userMsg, result)
+}
+
+// TrackTokens records actual token usage from the API response, which is more
+// accurate than the char estimate in Track.
+func (t *BudgetTracker) TrackTokens(inputTokens, outputTokens int, inputPerM, outputPerM float64) {
 	cost := float64(inputTokens)/1_000_000*inputPerM + float64(outputTokens)/1_000_000*outputPerM
 
 	t.mu.Lock()

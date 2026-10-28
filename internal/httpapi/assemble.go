@@ -57,9 +57,6 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 	messages := make([]any, len(req.Messages))
 	copy(messages, req.Messages)
 
-	originalMessages := make([]any, len(messages))
-	copy(originalMessages, messages)
-
 	var allInjectedIDs []int64
 
 	// Step 1: Generate briefing via daemon RPC
@@ -67,7 +64,7 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 	if s.handler != nil {
 		resp := s.handler.Handle(RPCRequest{
 			Method: "generate_briefing",
-			Params: map[string]any{"project": req.Project},
+			Params: map[string]any{"project": req.Project, "session_id": req.SessionID},
 		})
 		if resp.Error == "" && len(resp.Result) > 0 {
 			var br struct {
@@ -82,13 +79,24 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 2: Inject briefing as system message with mandatory marker
+	// Step 2: Strip redundant system-reminders first. The briefing is injected
+	// afterwards: it used to be a role:system message, and this step drops every
+	// one of those (the messages array does not accept the role), so the briefing
+	// never reached an assembled request (YM-275).
+	messages = proxy.StripReminders(messages)
+
+	// Step 3: Inject the briefing. The proxy puts the briefing into the first user
+	// message of a Claude Code session; the assembled array has to carry it the
+	// same way, as the first thing the model reads.
 	if briefingText != "" {
 		messages = injectBriefingMsg(messages, briefingText)
 	}
 
-	// Step 3: Strip redundant system-reminders
-	messages = proxy.StripReminders(messages, len(messages)-1)
+	// The collapse reads stats from `original` with an index into `modified`, so
+	// both arrays have to be index-identical: the snapshot is taken after the
+	// strip and the briefing merge, not before them.
+	originalMessages := make([]any, len(messages))
+	copy(originalMessages, messages)
 
 	// Step 4: Compress old thinking/tool_results
 	compressResult := proxy.CompressContext(messages, keepRecent, req.SessionID, estimateFn)
@@ -102,6 +110,13 @@ func (s *Server) handleAssemble(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Time{} // no session start time in stateless handler
 		endTime := time.Time{}
 		messages = proxy.CollapseOldMessages(messages, originalMessages, cutoff, startTime, endTime, nil, nil, req.SessionID)
+		// The collapse blanks messages[0], and that is where the briefing rides
+		// (it must: a message of its own in front would shift the first user turn
+		// the collapse protects). Re-merge it into the now blanked slot, otherwise
+		// every request above the budget arrives without its memory context.
+		if briefingText != "" {
+			messages = remergeBriefingAfterCollapse(messages, briefingText)
+		}
 	}
 
 	// Step 7: Associative context — hybrid_search on last user message
@@ -378,25 +393,171 @@ func injectReflectionHint(messages *[]any) {
 	*messages = appendToLastUserMessage(*messages, proxy.InlineReflectionHint)
 }
 
-// injectBriefingMsg prepends the briefing text as a system-role message wrapped in
-// a <MANDATORY_BRIEFING> tag. If the first message is already a system message,
-// the briefing is inserted after it (index 1). Otherwise it goes at index 0.
+// briefingOpen and briefingClose wrap the injected memory context. The markers
+// are what makes the injection idempotent: a client that feeds the assembled
+// array back as its own history must not accumulate one copy per turn.
+const (
+	briefingOpen  = "<MANDATORY_BRIEFING>"
+	briefingClose = "</MANDATORY_BRIEFING>"
+)
+
+// injectBriefingMsg merges the briefing into the FIRST USER message. It must not
+// be a message of its own: the collapse keeps messages[0] as the slot of the
+// first user turn and blanks its content, so a separate briefing in front of it
+// would be blanked on the first collapse (YM-275). The proxy carries the briefing
+// the same way for Claude Code: the first user message contains it.
 func injectBriefingMsg(messages []any, briefingText string) []any {
-	insertIdx := 0
-	if len(messages) > 0 {
-		if first, ok := messages[0].(map[string]any); ok {
-			if role, _ := first["role"].(string); role == "system" {
-				insertIdx = 1
+	for i, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role == "user" {
+			return mergeBriefingAt(messages, briefingText, i)
+		}
+	}
+	// No user message to merge into: the briefing opens the request.
+	result := make([]any, 0, len(messages)+1)
+	result = append(result, map[string]any{"role": "user", "content": briefingBlock(briefingText)})
+	return append(result, messages...)
+}
+
+// remergeBriefingAfterCollapse puts the briefing back into the slot the collapse
+// blanked. It must address messages[0] and not "the first user message": after a
+// collapse that message is the freshly built archive block, and merging there
+// would deliver the briefing twice (once in the slot, once in the archive).
+func remergeBriefingAfterCollapse(messages []any, briefingText string) []any {
+	if len(messages) == 0 {
+		return messages
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if carriesBriefing(msg["content"]) {
+			// The briefing rode in a message the collapse kept: nothing to do, a
+			// second copy would only spend tokens.
+			return messages
+		}
+	}
+	return mergeBriefingAt(messages, briefingText, 0)
+}
+
+// mergeBriefingAt prefixes the briefing to message idx, replacing a briefing that
+// is already there.
+func mergeBriefingAt(messages []any, briefingText string, idx int) []any {
+	if idx < 0 || idx >= len(messages) {
+		return messages
+	}
+	msg, ok := messages[idx].(map[string]any)
+	if !ok {
+		return messages
+	}
+	block := briefingBlock(briefingText)
+
+	out := make(map[string]any, len(msg))
+	for k, v := range msg {
+		out[k] = v
+	}
+	switch c := msg["content"].(type) {
+	case string:
+		out["content"] = block + stripBriefing(c)
+	case []any:
+		blocks := make([]any, 0, len(c)+1)
+		blocks = append(blocks, map[string]any{"type": "text", "text": block})
+		for _, raw := range c {
+			if b, ok := raw.(map[string]any); ok && isBriefingBlock(b) {
+				continue // the previous briefing is replaced, not duplicated
+			}
+			blocks = append(blocks, raw)
+		}
+		out["content"] = reorderBriefingBlock(blocks)
+	default:
+		// Foreign content shape: keep it and add the briefing beside it, never
+		// replace what the caller sent.
+		out["content"] = []any{
+			map[string]any{"type": "text", "text": block},
+			c,
+		}
+	}
+
+	result := make([]any, len(messages))
+	copy(result, messages)
+	result[idx] = out
+	return result
+}
+
+// briefingBlock renders the wrapper. It ends with a blank line so the briefing
+// stays a block of its own in front of the message text.
+func briefingBlock(briefingText string) string {
+	return briefingOpen + "\n" + briefingText + "\n" + briefingClose + "\n\n"
+}
+
+// carriesBriefing reports whether content opens with a complete briefing block.
+// Both markers are required and the open one has to start the content: a message
+// that merely MENTIONS the marker is text the caller wrote, and it must neither
+// suppress the injection (that would let a message body switch the memory
+// context off) nor be deleted.
+func carriesBriefing(content any) bool {
+	switch c := content.(type) {
+	case string:
+		return strings.HasPrefix(c, briefingOpen) && strings.Contains(c, briefingClose)
+	case []any:
+		for _, raw := range c {
+			if b, ok := raw.(map[string]any); ok && isBriefingBlock(b) {
+				return true
 			}
 		}
 	}
-	briefingMsg := map[string]any{
-		"role":    "system",
-		"content": "<MANDATORY_BRIEFING>\n" + briefingText + "\n</MANDATORY_BRIEFING>",
+	return false
+}
+
+// isBriefingBlock reports whether a content block is the injected briefing: it
+// has to START with the marker and carry the closing one.
+func isBriefingBlock(b map[string]any) bool {
+	text, _ := b["text"].(string)
+	return strings.HasPrefix(text, briefingOpen) && strings.Contains(text, briefingClose)
+}
+
+// stripBriefing removes a complete briefing block from content. A marker without
+// its closing tag is a quotation, not a briefing, and is left alone.
+func stripBriefing(content string) string {
+	for {
+		start := strings.Index(content, briefingOpen)
+		if start < 0 {
+			return content
+		}
+		if start != 0 {
+			// A briefing only ever starts the content it was merged into.
+			return content
+		}
+		end := strings.Index(content[start:], briefingClose)
+		if end < 0 {
+			return content
+		}
+		content = content[start+end+len(briefingClose):]
+		content = strings.TrimLeft(content, "\n")
 	}
-	newMessages := make([]any, 0, len(messages)+1)
-	newMessages = append(newMessages, messages[:insertIdx]...)
-	newMessages = append(newMessages, briefingMsg)
-	newMessages = append(newMessages, messages[insertIdx:]...)
-	return newMessages
+}
+
+// reorderBriefingBlock keeps a tool_result block first. The messages array
+// requires a tool_result to answer its tool_use immediately, so a text block
+// prepended in front of it is rejected upstream; the briefing then follows it.
+func reorderBriefingBlock(blocks []any) []any {
+	if len(blocks) < 2 {
+		return blocks
+	}
+	first, ok := blocks[1].(map[string]any)
+	if !ok {
+		return blocks
+	}
+	if first["type"] != "tool_result" {
+		return blocks
+	}
+	reordered := make([]any, 0, len(blocks))
+	reordered = append(reordered, blocks[1])
+	reordered = append(reordered, blocks[0])
+	reordered = append(reordered, blocks[2:]...)
+	return reordered
 }

@@ -78,8 +78,8 @@ func TestIsFeatureEnabled_ModelOverridesDefaults(t *testing.T) {
 func TestIsFeatureEnabled_MoreSpecificPrefix(t *testing.T) {
 	cfg := &Config{
 		ModelFeatures: map[string]*config.FeatureGates{
-			"deepseek":       {SkillEval: true},
-			"deepseek-v4":    {SkillEval: false},
+			"deepseek":        {SkillEval: true},
+			"deepseek-v4":     {SkillEval: false},
 			"deepseek-v4-pro": {SkillEval: true},
 		},
 	}

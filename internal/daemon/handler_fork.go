@@ -139,17 +139,27 @@ func (h *Handler) handleForkExtractLearnings(params map[string]any) Response {
 	}
 
 	// Record fork coverage for post-session dedup
-	if sourceMsgFrom >= 0 && sourceMsgTo >= 0 && sessionID != "" {
-		forkIdx := 0
-		if row := h.store.DB().QueryRow(`SELECT COALESCE(MAX(fork_index), 0) + 1 FROM fork_coverage WHERE session_id = ?`, sessionID); row != nil {
-			row.Scan(&forkIdx)
+	hasRange := sourceMsgFrom >= 0 && sourceMsgTo >= 0 && sessionID != ""
+	if hasRange {
+		// Fork rows start at 1; fork_index 0 marks a full extraction pass.
+		forkIdx := 1
+		if err := h.store.DB().QueryRow(`SELECT COALESCE(MAX(fork_index), 0) + 1 FROM fork_coverage WHERE session_id = ?`, sessionID).Scan(&forkIdx); err != nil {
+			log.Printf("fork extract: coverage index for %s: %v", truncID(sessionID), err)
+			forkIdx = 1
 		}
-		h.store.InsertForkCoverage(sessionID, sourceMsgFrom, sourceMsgTo, forkIdx)
+		if err := h.store.InsertForkCoverage(sessionID, sourceMsgFrom, sourceMsgTo, forkIdx); err != nil {
+			// Without a coverage row the tail is unproven, so the session must
+			// stay for the batch pass rather than be marked as fully extracted.
+			log.Printf("fork extract: record coverage for %s: %v", truncID(sessionID), err)
+			hasRange = false
+		}
 	}
 
 	// Mark session as extracted so post-indexing extraction skips it.
 	// The fork handled real-time extraction with full context and higher-quality metadata.
-	if saved > 0 && sessionID != "" {
+	// Without a message range there is no coverage record, and a session without
+	// coverage cannot prove its tail was seen, so it stays for the batch pass.
+	if saved > 0 && sessionID != "" && hasRange {
 		if err := h.store.MarkSessionExtracted(sessionID); err != nil {
 			log.Printf("fork extract: mark session extracted: %v", err)
 		}

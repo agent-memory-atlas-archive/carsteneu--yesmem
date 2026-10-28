@@ -5,16 +5,36 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
+// personaDimensionNames lists the key prefixes that normalizeTraitKey may strip:
+// the six dimension names plus the shorthand prefixes the daemon's
+// autoDetectDimension recognises ("boundary." → boundaries, "learning." → learning_style).
+// Kept in sync with the daemon's validDimensions and prefixDimensionMap sets.
+var personaDimensionNames = map[string]bool{
+	"communication": true, "workflow": true, "expertise": true,
+	"context": true, "boundaries": true, "learning_style": true,
+	"boundary": true, "learning": true,
+}
+
 // normalizeTraitKey strips dimension prefixes from trait keys and trims whitespace.
 // "communication.directness" → "directness", "context.context.context.yesmem_depth" → "yesmem_depth"
+// Only leading segments that name a known dimension are stripped, so dotted key names
+// ("node.js", "next.js") survive intact.
 func normalizeTraitKey(dimension, key string) (string, string) {
 	dimension = strings.TrimSpace(dimension)
 	key = strings.TrimSpace(key)
-	if i := strings.LastIndex(key, "."); i >= 0 {
+	for {
+		i := strings.Index(key, ".")
+		if i <= 0 {
+			break
+		}
+		if !personaDimensionNames[key[:i]] {
+			break
+		}
 		key = key[i+1:]
 	}
 	return dimension, key
@@ -22,10 +42,26 @@ func normalizeTraitKey(dimension, key string) (string, string) {
 
 // UpsertPersonaTrait inserts or updates a persona trait.
 // Uses the UNIQUE(user_id, dimension, trait_key) constraint for upsert.
+// A user_override trait is only replaced by another user_override write — automatic
+// sources (auto_extracted, bootstrapped, learning_scan) must not change value,
+// confidence or source of an explicit user statement.
 func (s *Store) UpsertPersonaTrait(t *models.PersonaTrait) error {
+	_, err := s.UpsertPersonaTraitAffected(t)
+	return err
+}
+
+// UpsertPersonaTraitAffected is UpsertPersonaTrait and reports how many rows the
+// write touched. A write the user_override guard blocks is not an error — it
+// simply changes nothing, and RowsAffected is 0. Callers that count or log
+// "created"/"updated" must use this variant so a silent no-op is not reported
+// as success.
+func (s *Store) UpsertPersonaTraitAffected(t *models.PersonaTrait) (int64, error) {
 	t.Dimension, t.TraitKey = normalizeTraitKey(t.Dimension, t.TraitKey)
+	if err := validateTraitText(t.Dimension, t.TraitKey, t.TraitValue); err != nil {
+		return 0, err
+	}
 	now := fmtTime(time.Now())
-	_, err := s.db.Exec(`INSERT INTO persona_traits
+	res, err := s.db.Exec(`INSERT INTO persona_traits
 		(user_id, dimension, trait_key, trait_value, confidence, source, evidence_count, first_seen, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(user_id, dimension, trait_key) DO UPDATE SET
@@ -34,13 +70,51 @@ func (s *Store) UpsertPersonaTrait(t *models.PersonaTrait) error {
 			source = excluded.source,
 			evidence_count = excluded.evidence_count,
 			updated_at = excluded.updated_at,
-			superseded = FALSE`,
+			superseded = FALSE
+		WHERE excluded.source = 'user_override' OR persona_traits.source != 'user_override'`,
 		t.UserID, t.Dimension, t.TraitKey, t.TraitValue, t.Confidence,
 		t.Source, t.EvidenceCount, now, now)
 	if err != nil {
-		return fmt.Errorf("upsert persona trait: %w", err)
+		return 0, fmt.Errorf("upsert persona trait: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// validateTraitText rejects line separators and invisible reordering characters
+// in a persona field. The prompt builders quote values with %q, so this is
+// defense in depth for text that arrives from a file the daemon did not author:
+// a line separator in a field that a future builder prints unquoted would forge
+// prompt lines, a bidi override reorders text invisibly. Zero-width joiners stay
+// allowed — they are part of ordinary emoji sequences — and a tab cannot break a line.
+func validateTraitText(dimension, key, value string) error {
+	for _, field := range []struct{ name, text string }{
+		{"dimension", dimension},
+		{"trait_key", key},
+		{"trait_value", value},
+	} {
+		for _, r := range field.text {
+			if r == '\t' {
+				continue
+			}
+			if unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp) || isBidiControl(r) {
+				return fmt.Errorf("persona %s contains a line separator or control character", field.name)
+			}
+		}
 	}
 	return nil
+}
+
+// isBidiControl reports the format characters that reorder or hide text.
+func isBidiControl(r rune) bool {
+	switch {
+	case r >= 0x202a && r <= 0x202e: // LRE, RLE, PDF, LRO, RLO
+		return true
+	case r >= 0x2066 && r <= 0x2069: // LRI, RLI, FSI, PDI
+		return true
+	case r == 0xfeff: // zero width no-break space / BOM
+		return true
+	}
+	return false
 }
 
 // GetPersonaTrait returns a single trait by user/dimension/key.
@@ -124,22 +198,28 @@ func (s *Store) GetWellEvidencedTraits(userID string, minConfidence float64, min
 	return traits, rows.Err()
 }
 
-// SupersedePersonaTrait marks a trait as superseded.
-func (s *Store) SupersedePersonaTrait(userID, dimension, traitKey string) error {
-	_, err := s.db.Exec(`UPDATE persona_traits SET superseded = TRUE
-		WHERE user_id = ? AND dimension = ? AND trait_key = ?`,
+// SupersedePersonaTrait marks a trait as superseded and reports the affected row
+// count (0 when the trait is protected or absent). user_override traits are
+// user-owned and are never superseded by an automatic path (decay, dedup, cleanup).
+func (s *Store) SupersedePersonaTrait(userID, dimension, traitKey string) (int64, error) {
+	res, err := s.db.Exec(`UPDATE persona_traits SET superseded = TRUE
+		WHERE user_id = ? AND dimension = ? AND trait_key = ? AND source != 'user_override'`,
 		userID, dimension, traitKey)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ApplyConfidenceDelta adjusts confidence for an existing trait and increments evidence_count.
-// Clamps result to [0.0, 1.0].
+// Clamps result to [0.0, 1.0]. user_override traits keep their confidence and evidence count.
 func (s *Store) ApplyConfidenceDelta(userID, dimension, traitKey string, delta float64) error {
 	_, err := s.db.Exec(`UPDATE persona_traits SET
 		confidence = MIN(1.0, MAX(0.0, confidence + ?)),
 		evidence_count = evidence_count + 1,
 		updated_at = ?
-		WHERE user_id = ? AND dimension = ? AND trait_key = ? AND superseded = FALSE`,
+		WHERE user_id = ? AND dimension = ? AND trait_key = ? AND superseded = FALSE
+		  AND source != 'user_override'`,
 		delta, fmtTime(time.Now()), userID, dimension, traitKey)
 	return err
 }

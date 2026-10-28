@@ -171,3 +171,31 @@ func TestUtilization_APIKey(t *testing.T) {
 		t.Errorf("Utilization() = %f, want ~0.60", u)
 	}
 }
+
+// A stale snapshot never throttles. A snapshot from the future is bogus (clock
+// jump, hand-edited row) and must not throttle forever either.
+func TestShouldThrottle_DoesNotThrottleOnAFutureSnapshot(t *testing.T) {
+	rl := &RateLimitInfo{
+		Unified5hUtilization: 0.90,
+		IsSubscription:       true,
+		ParsedAt:             time.Now().Add(2 * time.Hour),
+	}
+	if rl.ShouldThrottle(0.5) {
+		t.Error("a snapshot from the future must not throttle")
+	}
+}
+
+// The daemon reads the last snapshot the proxy persisted and blocks LLM work
+// above the threshold. Such a snapshot only refreshes through traffic: if it is
+// old, the load it describes is over and blocking on it would never unblock
+// itself, because the calls it blocks are what would refresh it.
+func TestShouldThrottle_DoesNotThrottleOnAnOldSnapshot(t *testing.T) {
+	rl := &RateLimitInfo{
+		Unified5hUtilization: 0.90,
+		IsSubscription:       true,
+		ParsedAt:             time.Now().Add(-24 * time.Hour),
+	}
+	if rl.ShouldThrottle(0.5) {
+		t.Error("a 24h old snapshot must not throttle: the window it describes has passed")
+	}
+}

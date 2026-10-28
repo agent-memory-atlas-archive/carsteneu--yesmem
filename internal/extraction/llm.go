@@ -20,10 +20,51 @@ type LLMClient interface {
 // CallOption configures a single LLM call.
 type CallOption func(*callOpts)
 
+// usageSink receives the measured token counts of the call it belongs to. A
+// transport may report more than once per call (one step_finish per tool
+// roundtrip on the opencode path), so a sink accumulates instead of replacing.
+// A metering decorator installs one per call, so real usage is booked on the
+// tracker of the path that made the call instead of a daemon-wide default.
+type usageSink func(inputTokens, outputTokens int)
+
 type callOpts struct {
 	maxTokens int    // 0 = use default (8192)
 	sessionID string // opencode session to resume
 	tools     bool   // allow MCP tools in subprocess (sets YESMEM_ALLOW_CHILD_MCP=1)
+
+	usageSink usageSink // set by the metering layer only
+}
+
+// withUsageSink attaches the real-usage sink for this call. Unexported: only
+// BudgetClient sets it, so a caller cannot divert a client's usage accounting.
+func withUsageSink(sink usageSink) CallOption {
+	return func(o *callOpts) { o.usageSink = sink }
+}
+
+// reportMeasuredUsage reports a transport's own token counts, clamped and only
+// when at least one of them is real. The counts come from an external process or
+// a configurable endpoint: a negative value would credit the budget, an absurd
+// one would block the rest of the day, and an all-zero usage block (sent by
+// gateways that do not meter) would mark the call as MEASURED and book it at $0,
+// so the whole call disappears from the budget instead of falling back to the
+// char estimate.
+//
+// The counts go to this call's sink. Without one - clients built outside the
+// metered paths (summarize, briefing refinement, gap review, package main) - they
+// fall back to the package-wide OnUsage hook, which is where those paths have
+// always booked.
+func reportMeasuredUsage(sink usageSink, model string, inputTokens, outputTokens int) {
+	in, out := clampTokens(inputTokens), clampTokens(outputTokens)
+	if in+out == 0 {
+		return
+	}
+	if sink != nil {
+		sink(in, out)
+		return
+	}
+	if OnUsage != nil {
+		OnUsage(model, in, out)
+	}
 }
 
 // WithMaxTokens sets the max output tokens for this call.

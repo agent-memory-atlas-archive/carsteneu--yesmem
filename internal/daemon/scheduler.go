@@ -1,31 +1,39 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/carsteneu/yesmem/internal/storage"
 )
 
 type ScheduledJob struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Cron      string    `json:"cron"`
-	Prompt    string    `json:"prompt"`
-	Enabled   bool      `json:"enabled"`
-	Recurring bool      `json:"recurring"`
-	Mode      string    `json:"mode"` // "agent", "headless", or "bash"
-	CapName     string  `json:"cap_name,omitempty"`
-	ScriptName  string  `json:"script_name,omitempty"`
-	AutoCorrect bool    `json:"auto_correct"`
-	AllowedPorts string         `json:"allowed_ports,omitempty"`
-	Sandbox      SandboxProfile `json:"sandbox"`
-	IntervalSeconds int           `json:"interval_seconds,omitempty"`
-	Model           string        `json:"model,omitempty"`
-	Backend         string        `json:"backend,omitempty"`
-	LastRun         time.Time     `json:"last_run,omitempty"`
-	NextRun         time.Time     `json:"next_run,omitempty"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Cron       string `json:"cron"`
+	Prompt     string `json:"prompt"`
+	Enabled    bool   `json:"enabled"`
+	Recurring  bool   `json:"recurring"`
+	Mode       string `json:"mode"` // "agent", "headless", or "bash"
+	CapName    string `json:"cap_name,omitempty"`
+	ScriptName string `json:"script_name,omitempty"`
+	// Project is the absolute path the job was created from; bashSandboxConfig
+	// hands it to the run as YESMEM_PROJECT (YM-281).
+	Project         string         `json:"project,omitempty"`
+	AutoCorrect     bool           `json:"auto_correct"`
+	AllowedPorts    string         `json:"allowed_ports,omitempty"`
+	AllowedHosts    []string       `json:"allowed_hosts,omitempty"`
+	Sandbox         SandboxProfile `json:"sandbox"`
+	IntervalSeconds int            `json:"interval_seconds,omitempty"`
+	Model           string         `json:"model,omitempty"`
+	Backend         string         `json:"backend,omitempty"`
+	LastRun         time.Time      `json:"last_run,omitempty"`
+	NextRun         time.Time      `json:"next_run,omitempty"`
 }
 
 type JobExecutor func(job ScheduledJob)
@@ -37,16 +45,30 @@ type Scheduler struct {
 	lastFire map[string]time.Time
 	running  map[string]bool
 	executor JobExecutor
+	// onRemove runs when a one-shot job is dropped after firing. Without it the
+	// removal stays in memory and the job fires again after a restart (YM-169).
+	onRemove func(id string)
 }
 
-func NewScheduler(executor JobExecutor) *Scheduler {
-	return &Scheduler{
+// newScheduler builds the job scheduler. It is the only constructor: a scheduler
+// without the persistence hook would silently re-fire one-shot jobs after a
+// restart (YM-169). Tests pass a nil store.
+func newScheduler(store *storage.Store, executor JobExecutor) *Scheduler {
+	s := &Scheduler{
 		jobs:     make(map[string]*ScheduledJob),
 		crons:    make(map[string]cronExpr),
 		lastFire: make(map[string]time.Time),
 		running:  make(map[string]bool),
 		executor: executor,
 	}
+	if store != nil {
+		s.onRemove = func(id string) {
+			if err := store.DeleteScheduledJob(id); err != nil && !errors.Is(err, storage.ErrNotFound) {
+				log.Printf("[scheduler] delete one-shot job %s: %v", id, err)
+			}
+		}
+	}
+	return s
 }
 
 func (s *Scheduler) AddJob(job ScheduledJob) error {
@@ -83,6 +105,14 @@ func (s *Scheduler) JobDone(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.running, id)
+}
+
+// HasJob reports whether the scheduler still knows the job.
+func (s *Scheduler) HasJob(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.jobs[id]
+	return ok
 }
 
 func (s *Scheduler) IsRunning(id string) bool {
@@ -150,6 +180,9 @@ func (s *Scheduler) Tick(now time.Time) {
 	}
 	for _, id := range removeIDs {
 		s.RemoveJob(id)
+		if s.onRemove != nil {
+			s.onRemove(id)
+		}
 	}
 }
 

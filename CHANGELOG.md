@@ -9,7 +9,1391 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A read-only shell predicate, not yet wired into the guard
+- The plan gets its own plugin, the way the todo block has one
+- Draw the plan outline in its own block
+- Summarize structured plans in the ledger
+- Accept plan items in set_plan and update_plan
+- Store a structured outline beside the plan text
+- Let the guard honour a policy BLOCK on shell (YM-469)
+- Restore-rulebased-learnings lists the no-displacer class
+- Let the rule guard block shell calls
+- Run the maintenance window in its own systemd unit
+- Attach agents to an OpenCode server outside the daemon cgroup
+- Judge bundled caps by provenance hash, report conflicts (YM-450)
+- Declare ANTHROPIC_BASE_URL in the daemon unit, migrate existing units (YM-291)
+- Bestandsabfrage fuer verwaiste supersede-Kanten (YM-435)
+- Render an error for a log line with its path quoted (Los 04i)
+- Fehlende strings.yaml-Schluessel beim Daemon-Start in der Dateisprache nachziehen (YM-338)
+- Add --distrust-file-sources and keep imported llm_extracted rows exportable (YM-282)
+- Report skipped unreadable entries in the ingest result
+- Forked_agents.api_format verdrahtet die oberste Rangstufe der Fork-Formatwahl (YM-262)
+- Add clusters-gc for cluster keys no project maps to (YM-273)
+- Sweep run dirs whose job or agent is gone (YM-295)
+- Archive opencode sessions as documents (YM-50)
+- Check config.yaml against the schema (YM-97)
+- Install the opencode plugin version the user's opencode loads (YM-77)
+- Restore-short-session-learnings lists and restores wrongly superseded learnings (YM-48)
+- Deliver channel messages on the OpenAI-format path via the message meta (YM-59)
+- List retired pending_confirmation learnings for review (YM-43)
+- Per-job and per-script egress allowlist (YM-206, D13b)
+- Version-aware flags for ai-jail 2.x (YM-206)
+- Push send_to into an opencode session's inbox
+- Deliver a user turn through session.prompt
+- Rebuild the projects the v0.65 migration blanked
+- Repair learnings attributed to the wrong session
+- Persist the spawn work_dir on the agent row
+- Bind opencode session ids on demand
+- Add v2 server API client
 - Terracotta code blocks and darker thinking surface in yesmem-light
+
+### Changed
+
+- Keep the status plugin out of the install until it is verified
+- Keep the fix prompt and its patch protocol in one file (YM-464)
+- One name for the provenance digest (YM-450)
+- Gojq is a direct dependency (YM-453)
+- One scope definition for all three retiring paths, aligned labels
+- Peer-Test vor der Key-Klassifikation, damit der Proxy-Pfad keine Konfiguration liest (YM-427)
+- Resolve the query provider from the embedding snapshot (YM-432)
+- Id vor dem Projektblock, Aufloesungs-Kommentar praezisiert
+- Gofmt-Rauschen aus dem Fix-Commit entfernen (YM-418)
+- Drop the now-unused state-key helper, name the unreadable status sections (review los 56i)
+- Pin the shared swap recipe, name the metering decision
+- Root-Gate einmal pro Root, Daemon-Test in der Live-Form (YM-382)
+- Schreibpfade in benannte Helfer extrahieren, Verhalten unveraendert (Los 55c, YM-268)
+- Verwaiste Briefing-Pending-Zaehler entfernen (YM-382)
+- Toten passthroughResponse entfernen (YM-293)
+- Gofmt fuer den Snapshot-Helfer (YM-315)
+- String-Konkatenation im Junk-Cleanup gofmt-konform (YM-317)
+- Credential-Pruefung vor die Fork-Wartezeit (YM-326)
+- Eine caps_dir-Ableitung fuer Daemon und Installer (YM-353)
+- Job-Profilkette an einer Stelle, Lock urteilt nur bei Auflösung (YM-346)
+- Read the gate's clock per source, correct a test comment
+- Gofmt the touched files, keep the new helper names cap-specific (YM-264)
+- Kalendertag-Rechnung als deadlineDaysUntil (YM-249)
+- Drop a stray comment anchor (YM-283)
+- Gofmt the los07c docs_search limit test
+- Name the save tool the way opencode exposes it
+- ReportUsage in reportMeasuredUsage falten (YM-301)
+- Importreihenfolge in job_socket_los34b_test.go
+- Pull the short-session cleanup calls into named seams
+- Restore the trailing newline lost in the extraction
+- Keep the resolved flag set free of layer state (YM-136)
+- Remove the opencode v1 plugin and its install path
+- Drop the unreachable ownership belt, keep the cascade gate (YM-274)
+- Sentinel praegnanter benennen, Fabrik-Kommentar nachziehen (YM-233)
+- Rejoin the wrapped applyDetectedCacheTTL comment
+- Drop scratchpad_delete from the job allowance (YM-267)
+- Gofmt the keepalive state comment
+- Refuse a missing auto-correct client before building the sandbox
+- One header sanitizer for proxy and daemon (YM-214)
+- Delegate the log helper directly instead of through a wrapper
+- Gofmt the touched files
+- Drop the production-dead BuildSandboxedCommand (YM-224, DEV-DT39)
+- Revert unrelated gofmt churn from this branch
+- Drop the write-only scanner field from codeGraphEntry
+- Drop a nil-out guard that cannot trigger
+- Restore the formatting of the any-directory capture loop
+- Drop fields the matcher never reads
+- Second-round review follow-ups
+
+### Fixed
+
+- Choose the session table by its newest row, not by its existence
+- Tolerate the NULL columns v2 allows
+- Read the v2 session tables, not the frozen legacy ones
+- Retry the plan snapshot when the writer has not seen the thread
+- Close the round-2 security findings
+- Close the consequence-check findings
+- Close the round-2 review findings
+- Bound the outline, strip control characters, keep the sidebar lookup cheap
+- Keep the plan text when the outline is cleared
+- Assert the sandbox contract on the host that runs it
+- Let the ym297 fixture die between two polls
+- Pin the fake ai-jail release to the running platform
+- Resolve paths the OS canonicalises, skip the ai-jail builds it lacks
+- Skip the sandbox and process paths macOS cannot run
+- Restore macOS parity for the suite the campaign left Linux-only
+- Make the suite run on macOS again
+- Probe that bubblewrap can actually build a sandbox
+- Give the sandbox tests a bubblewrap and skip the docs they cannot read
+- Install the skills the nudge fixtures name
+- Make the public test suite pass on a runner without ai-jail and with a slower clock
+- Call the session rename by its registered tool id
+- Let the citation qualifier ignore case (YM-469 security review)
+- Keep the shell BLOCK gate honest (YM-469 review)
+- Let a spelled-out unknown key beat the merged one (YM-465)
+- Show the content of a no-successor candidate
+- Gate the prompt key walk on the merge tag (YM-465)
+- Keep the command in the guard's view of a shell call
+- The no-successor class is the 0 sentinel, not every non-positive id
+- Decode a prompt layer before walking its keys (YM-465)
+- Prove the shell refusal end to end, name the test claims
+- A substance-free retire spares user-owned learnings
+- A YAML 1.1 false names a prompt flag (YM-465)
+- Mark the patch protocol by line, not by substring (YM-464)
+- The fix prompt cannot quote the whole script, and one reply is one patch (YM-464)
+- Close the ReDoS and sanitize model text on every suggestion path (YM-456)
+- Merge-Keys zaehlen als benannt, unbekannte Keys ueberleben (YM-455)
+- Report the config check outside the spinner and accept the policy's suggestion shape (YM-456, YM-463)
+- Review-Befunde zu YM-455 und YM-461 abgearbeitet
+- Address the cold review of the guard policy, the window log and the setup check (YM-456, YM-460, YM-463)
+- Auto-correct sends the failure, not the cap body (YM-464)
+- Ein Subagent-Praedikat fuer beide Endpunkte (YM-461)
+- Report unreadable config.yaml keys like update does (YM-463)
+- Keep test runs out of the live log and bound the window log (YM-460)
+- Carry the Decision Policy into the guard and enforce its BLOCK set (YM-456)
+- Fehlende Gate-Keys erben aus feature_defaults (YM-455)
+- A clean delivered file is never rewritten (YM-450)
+- A repair on a delivered body survives the next start (YM-450)
+- A delivered cap body is no longer rolled back at startup (YM-450)
+- Provenance digest keeps the case of a cap body (YM-450)
+- Validate manifest values, keep a broken provenance file (YM-450)
+- Name the way out of a cap conflict, keep local caps nothing vouches for (YM-450)
+- Do not serve a stored document that describes another checkout (YM-453)
+- One scan-root rule for both guards, one index per checkout (YM-453)
+- Re-Ingest supersedet keine fremden Projekte mehr (YM-452)
+- Index-Schreibfehler nach dem Render melden (YM-449)
+- Graph-Pfade fuer Subdir-Aufrufe uebersetzen (YM-449)
+- JS-Variante gleichgezogen, JS-Test ergaenzt (YM-447, Review 2)
+- Maskenpfad im Log quoten (YM-448)
+- One statement for the retirement counts, no percentage out of an empty base
+- Farbe und Commit-Zeile im Rahmen beruecksichtigen (YM-447, Review)
+- Scan-Wurzel-Regel aus codescan nutzen, Schreibfehler melden (YM-449)
+- Project_dir auf die Scan-Wurzel normalisieren (YM-449)
+- Proxy_health liest den Writer-Rahmen, nicht den Zeileninhalt (YM-447)
+- Journal-Praefix und Thread-Identitaet sind Tokens (YM-447)
+- Stamp destilled learnings with the canonical repository project
+- Scope both re-ingest chunk sweeps to the source's project
+- One supersede definition for status and stats, print deleted predecessor
+- Merge the installed rocketchat v15 body with the repository line (YM-446)
+- Separate deleted-predecessor sentinel in evolution stats, name legacy -6 sentinel, split replaced from retired
+- Keep a newer installed cap body instead of rolling it back (YM-446)
+- Address the review findings on both keys (YM-442)
+- Name the mount cause instead of blaming a mask in the log (YM-441 review)
+- Treat a closed fd 0 as empty stdin too (YM-439)
+- Close the Anthropic thinking line, keep the provider prefix in tokens (YM-440)
+- Treat socket stdin as empty, keep every other fd on the old read path (YM-439)
+- Projekt-Scope der Loeschkaskade deckt Checkout-Pfade derselben Quelle ab (YM-443)
+- The v2 code_nav guard honours code_nav_mode (YM-442)
+- Loeschkaskade projektgebunden, Sentinel -4 getrennt gezaehlt (YM-443)
+- Route client model and session through journalToken (YM-440)
+- Refuse a scan document rooted below the checkout (YM-442)
+- Do not read a non-pipe stdin in the json wrapper (YM-439)
+- Log a lost required mount behind the mask cause (YM-441)
+- Reparatur meldet geraeumte Zeilen, clusters-gc raeumt vor dem Cluster-Sweep (YM-435)
+- Rueckverweis-Index, Waisen-Abfrage an clusters-gc, Anzeige getrennt (YM-435)
+- Refuse a run without a usable work dir (YM-437)
+- Sanitize the remaining OpenAI journal ids (YM-438)
+- Loeschpfade raeumen eingehende Rueckverweise vor dem Entfernen (YM-435)
+- Nicht aufloesbare positive Kante beendet die Versions-Historie nicht mehr (YM-435)
+- Bindung nur aus eigenen Registern, Umgebungsnamen wie im MCP-Layer, Fehlertexte ohne Scheinbeweis (YM-427)
+- Besitz nur aus Kernel-Evidenz, Delete-Scope beidseitig, Key-Konstante an einer Stelle (YM-427)
+- Refuse a home-covering work dir under strict too (YM-428)
+- Activate_cap-Ablehnung mit Logzeile, Peer-Methoden zusaetzlich im HTTP-Deny-Gate (YM-427)
+- Session-Override in eigener proxy_state-Familie, damit der Modell-Namespace ihn nicht mehr traegt (YM-427)
+- Name only the work dir in the refusal, pin the stand-in ai-jail
+- Sanitize the tool_use_id in the synthesis log too (YM-432)
+- Skip the impossible second index spelling for targets above cwd (YM-431)
+- Ask the cwd-relative index spelling too, gate code-nav on shell tools (YM-431)
+- Refuse a run whose work dir covers the home (YM-428)
+- Harden the plugin-suite guard after review (YM-430)
+- Cap-Proposal trifft die Projektzeile, activate_cap nennt keinen fremden Pfad (YM-427)
+- Proxy_state in allen drei Pfaden besitzgeprueft, Session-Override nur fuer die eigene Session (YM-427)
+- Non-positive superseded_by ends the chain instead of aborting it (YM-426)
+- Sanitize the tool_use_id in the orphan tool_result log (YM-432)
+- Guard the vector-search wiring, drop the dead briefing field (YM-432)
+- Code-nav check runs before the gotcha gate, index rooted at the checkout (YM-431)
+- Commit the override-factory guard, price cache totals once, hold the boundary across re-stubs (YM-411, YM-412, YM-413)
+- Never match the unassigned key on a rename, report applied moves (YM-424 security review)
+- Review round 2 — pattern slot before shape filter, no junk targets, dot files stay files (YM-409)
+- The capture fallback must not read v2 rows without messages (YM-419)
+- Keep model text from forging structure, restore the install inventory (YM-410, YM-421)
+- Skip keyless project groups, guard the rename's legacy key target (YM-423, YM-424 review)
+- Bound what a refused guard request costs (YM-410 consequence review)
+- Close the two ways the guard could still fail wrong (YM-410 review)
+- Stop the guard from passing calls it never judged (YM-410)
+- Ship the plugin as an installable directory (YM-421)
+- Auch das Loeschen threadgebundenen proxy_state nur der Proxy (YM-414)
+- Review round 1 — every source suffix and directory form reaches the index, redirect glue stays out, messages sanitized (YM-409, YM-425)
+- Escape backslashes in the spawn title; review follow-ups (YM-416, YM-419)
+- Review-Befunde zu YM-291 (Symlink-Aufloesung, Logzeile, Kommentare)
+- Publish the LLM wiring under one mutex (YM-413)
+- Price cache reads and writes on the OpenAI path (YM-412)
+- Hold the collapse boundary per thread and repair tool pairs before the freeze (YM-411)
+- Compare path rows by repository key, refuse a keyless rename target (YM-424 review)
+- Threadgebundenen proxy_state nur der Proxy (YM-414)
+- Cap-Zeile fuer Bash-Jobs nach Projekt aufloesen (YM-417)
+- Keep a path row from matching another repo of the same name (YM-424)
+- Claude-Konfiguration maskieren, wenn der cwd-Bind sie verdeckt (YM-291)
+- Keep referenced legacy cluster keys and migrate the provable ones (YM-423)
+- Go code-nav follows cd/pushd/popd, find and directory operands, shared parity fixtures with the plugin (YM-409)
+- Reihenfolge der Batch-Geschwister in der History halten (YM-418)
+- Sanitize spawn labels before they reach a terminal (YM-416)
+- Keep the three project states apart, never mint a basename key (YM-424)
+- Opencode guard honours dismiss_code_nav via daemon read, block message names search_code and a working escape (YM-425)
+- A session without its agent marker is never bound (YM-419)
+- One dismiss_code_nav call lifts the code-nav block, message names the working escape (YM-425)
+- Batch-Supersede in der Version Historie vollstaendig (YM-418)
+- Katalog und Ausfuehrung falten den Aufrufer gleich (Security-Runde)
+- Ein scope=user-Import konvertiert keine Projektkopie (Consequence-Runde)
+- Keep remember's repo fallback for an unresolved short name (YM-300)
+- Stamp the unresolved state on every resolution path, refuse it centrally for an empty result, and require an absolute cwd (YM-300 cold review F1/F2, security review)
+- Review-Runde 2 schliesst die sid-Vorschau und macht Load+Scrub atomar (YM-400, YM-406)
+- Katalograng und Sichtbarkeit ohne Basenname, Mehrdeutigkeit beim projektlosen scope=user (Review-Runde 2)
+- Review-Runde 1 behebt proj-Zeilenumbruch, Lese-Scrub und Redirect-Fehlertext (YM-400, YM-406)
+- Distinguish an unknown run from a literal glob in the protected name pattern (YM-407)
+- Eine Namensauflösung fuer Katalog, activate_cap und Konvertierung (Review-Runde 1)
+- Key a job's log dir, run work dir and sweep entry on one identity (YM-300)
+- Match short names on the basename only, close the cursor before querying, and refuse to store a broadcast under an unresolved name (YM-300)
+- Claude spawns carry the allowlist on the command line instead of writing an allow-all settings.local.json into the repository (YM-300)
+- Consequence review round (YM-405)
+- Read the shell flag word as the shell does, scan backtick spans before the shell branch (YM-407)
+- Cold review round 1 (YM-405)
+- Temp-Datei-Modus nach dem Schreiben, Verzeichnis-fsync, XDG_CONFIG_HOME (YM-376, PRX-P47)
+- ThreadIsSession-Gate, Block-Escaping, Redirect-Sperre, Eskalationsschutz (YM-406, PRX-P54)
+- Remove the dead store_compacted_block write path (YM-405)
+- Projektgrenzen fuer Supersede, Katalogpfade und relative Row-Projekte (YM-402, YM-403, YM-404)
+- Write guard follows clustered shell flags, collapsing dir runs and backtick bodies (YM-407)
+- Journal-Token statt roher Thread-ID in allen Log-Zeilen (YM-400, PRX-P52)
+- Name a guessed session in the log instead of attributing silently (YM-307)
+- Refuse the daemon-owned respawn_claimed status on update_agent (security review of YM-397)
+- Close an abandoned respawn claim, keep the checkout root a floor for project identity, follow an assigned partial path, and keep the sweep going (consequence review)
+- Stop handing out a retired cap's tool code, refuse to guess about a stat error (review los 56i)
+- Hide retired caps in the readers and never overwrite config.yaml without a backup (review los 56i)
+- Preserve legacy databases, guard the lock file, report skipped command links (review los 56i)
+- Close the watcher path for retired caps, report errors the sweeps swallowed (review los 56i)
+- Vollvergleich vor dem Loeschen, TTL im Export, Archivbasis sichtbar (Los 56e Review 2)
+- Close the security findings (briefing marker, escape shape, tool_result order)
+- Retire the wiki_export cap and drop orphaned database files (YM-180, YM-181, YM-197)
+- Keep foreign skills and .mcp.json content on uninstall, stop on a missing home (YM-350)
+- Review-Runde 3 — Fehler-Normalisierung wirklich angewendet (Los 56d)
+- Scan compound substitutions as written and collapsed, and gate the cwd probe on the process identity (review of YM-387, YM-385)
+- Consequence and security review findings (OPS-93/94/96)
+- Close the consequence findings (briefing once, rune stub bound, extra precedence)
+- Install opencode commands on update, guard the install path, drop the unread cwd slot (YM-386, YM-307)
+- Archivpfad aus der Konfiguration, Ausschluss auch im Backfill, TTL-Leser, Semantik-Lane im Fenster (Los 56e Review)
+- Review-Runde 2 — Scrub ohne geteilten Zeiger, Fehler-Identitaet geschaerft (Los 56d)
+- Atomic owner-only migration writes, a write lock and honest runtime slots (YM-392)
+- Review findings for Los 56f
+- Retry a failing release once before skipping it (YM-313)
+- Cap catalog dialect, script names, save_cap scope (YM-319, YM-336)
+- Install lock and atomic replace, cache-aware usage (YM-313)
+- Close the cold-review findings (YM-349, YM-302, YM-275)
+- Cold review findings, no mtime on a refused read and two more set -e sinks (OPS-93/94)
+- Review-Runde 1 — Lesepfad, Load-Deckel, Tail-Fallback (Los 56d)
+- Keep the upstream status in the collapsed read-error line (review los 56b)
+- Keep source names, paths, URLs and git diagnostics on attributable lines (YM-389)
+- Bound the repository-root cache, keep a nested checkout its own project, remove cluster hashes before the rows commit (YM-390, YM-393)
+- Fehlerpfade, per-Thread-Deckel, Redirect-Client (Los 56d, YM-322, YM-331, YM-339)
+- Measure decay in thread turns, take only real stubs, keep the briefing (YM-275)
+- A process that exits during the identity check is stopped (OPS-97)
+- Close waits for a running WAL guard tick (OPS-96)
+- Four set -e sinks and log injection in the command branches (OPS-94)
+- The import path reads CAP.md without following a link (OPS-93)
+- One project rule for catalog visibility and execute_cap (OPS-93)
+- Remove a document's chunks and learnings in one transaction, and name remove-docs for the retained empty tree (YM-395)
+- Loeschpfad raeumt Neben-Tabellen, Supersede meldet die geaenderten Zeilen (YM-367)
+- One journal line per failed raw call, request frame, drop dead status branch (review los 56b)
+- End loop agents in removed trees, refuse a spawn there, and let a stop revoke a respawn claim (YM-385, YM-397)
+- Valid_until aktiver Zeilen ueberlebt das Store-Open (YM-348)
+- Read pattern suggest from the resolved profile, fall back for think min_chars, keep unknown prompt keys (YM-302)
+- Projektmigration verschiebt Archivordner, Ausschlussliste normalisiert (YM-320)
+- Resolve tilde, assigned variables, fallbacks and partial expansions in the write guard (YM-387)
+- Frame upstream read errors, log forwardRaw status, keep ping bodies on one line (YM-380)
+- Guard skill tracking, bound the tracker, align migration gate defaults (YM-349)
+- Zeitfenster auf doc_chunks und fehlende created_at reparieren (YM-308)
+- End Run's waiter, signal registration and timers on every return (YM-399)
+- Keep cache status files inside their directory (YM-398)
+- A short-name caller reaches short-name rows, second worktree layout covered (YM-244 review)
+- Quarantine scope matches explicit project paths, never a shared basename (YM-244)
+- Refresh-Loop rendert den Zeilen-Key, Root-Zeilen nur wenn lesbar (YM-382)
+- Retry the final close once and pin the escalation guard (YM-356)
+- Briefing liest Learnings pfadgebunden statt ueber den Basename (YM-382)
+- Broadcast proves the claimed worktree and the MCP exe, cap token dropped, infra findings named as such
+- Close the exhausted crash conditionally, cover the claim's pid identity and the retry ladder (YM-356)
+- Bulk stop escalates, cascade removes the children sockets, a cap run broadcasts under its own session
+- Review-Findings YM-396: Cleanup in den neuen Tests, Live-Writer-Zaehler statt Stack-Scan, symmetrischer Zero-Value-Pfad (Los 55c/PRX-P49)
+- Lesewurzel aus den Worktree-Markern, nicht aus dem Checkout-Aufstieg (YM-382)
+- CacheStatusWriter mit synchronem Stop, Testkonstruktoren raeumen auf, Run stoppt den Writer (Los 55c/YM-396, PRX-P49)
+- Keep the non-secret row fields in the projection, claim a crash before recovering it (YM-356)
+- Broadcast abstains without peer credentials, escalation on every stop path, stable proxy fixtures, cache scan outside the lock
+- Lesesperre fuer Projektpfade ersetzt den Basename-Fallback (YM-382)
+- Close the second review round — crash-window, pid bypass, capability claim (YM-356, YM-285)
+- Skip the write lock when a pathless source has nothing under the watermark (YM-374)
+- Peer-anchored broadcast label, quarantine tolerance, kill grace, cache touch, shared live statuses
+- Gate im Basename-Fallback auf Eindeutigkeit und Bereichsprädikat (YM-382)
+- Sweep a pathless source through subqueries, surface a failed rollback, pin the read-under-lock property (YM-374)
+- Review-Findings 5.3/5.4 beheben: Defaultwerte beim Nachlesen, 0 als Reset, tolerante rule_guard-Form, Prune nur fuer Zeitstempel-Backups, Temp-Sweep, 0700, gequotete Ausgaben (Los 55c, YM-268)
+- Review findings — keep the ownership capability private, bind the daemon's own spawn without it (YM-356)
+- Sweep a pathless source in one BEGIN IMMEDIATE transaction so the path check cannot be separated from the delete (YM-374)
+- Pfadwertige Zeile bleibt vor dem Basename-Fallback autoritativ (YM-382)
+- Quote the ingest error of add-docs as well (Los 04i review 4)
+- Keep broadcast off the peerless HTTP transport (YM-271 self-review)
+- Keep bare-name members, prefer the checkout over a subagent-only dir
+- Keep the prune assertion aligned with the quoted log, drop the false empty-table claim, widen the retention comment (YM-374)
+- Cover the whole rendering with one recover and quote a path behind a backslash (Los 04i security review 2)
+- Review-Findings 5.2 beheben: Spiegel nur fuer Keys mit Runtime-Leser, kaputte Datei behaelt Schwellwerte, entferntes Modell verliert den Override (Los 55c, YM-268)
+- Keep head and tail of a long error, survive a typed nil from a joined error, replace paths in one pass (Los 04i security review)
+- Keep one key per learnings scope, clear stale sets below the floor
+- Redirect ist kein Operand, Completion-Regel verengt (YM-383)
+- Re-read the source row before the CLI sweep, exclude absolute keys from the foreign probe, pin the incomplete-walk guard (YM-374)
+- Follow joined errors, keep an escaped quote out of the delimiter count, test the failed clone removal (Los 04i review 3)
+- Never judge absolute keys in the sweep; pin the backup advice with an invocation pattern (YM-374, YM-361)
+- Basename-Fallback nur bei Learnings unterhalb des Roots (YM-382)
+- Judge foreign-root keys only under a walked root, keep unattributable keys after an empty walk (YM-374)
+- Sweep the chunks of a source without a path in the CLI sync (YM-374)
+- Bind only the row's own backend process and only for its owner session (YM-356)
+- Budget unit in the reference, DONE-guard evidence fails closed (YM-304)
+- A broadcast is labelled by proven identity, the peer cache prunes (YM-271)
+- Sicherheitsbefunde zu YM-383 (Maskenstatus, Panic, Suffix-Expansion)
+- Quote already quoted paths once, render the wrapper of a typed nil, test the dispatcher and backfill fatals (Los 04i review 2)
+- Scope the crash-recovery quarantine to the agent's project (YM-244)
+- Bound the project-less unattributed session pins by age (YM-325)
+- Resolve the view, read only reachable rows, batch legacy names (YM-325)
+- Collect cluster hashes whose key no longer exists (YM-321)
+- Resolve roots through the checkout and key membership by it (YM-321)
+- Zweite Review-Runde (YM-379)
+- Report process and session on a bulk stop, refuse a resume into a gone work dir (YM-356)
+- Interview-Befunde zu YM-383 (Escapes, &-Redirect, unbekanntes cd)
+- Root ohne eigene Learnings loest auf den kanonischen Basename auf (YM-382)
+- CLI-Set spiegelt den Runtime-Slot, setup schreibt 0600, Proxy liest Modell-Schwellwerte je Fenster aus der Datei (Los 55c, YM-268)
+- Review-Befunde am FTS-Backfill (YM-379)
+- Escalate a stop to SIGKILL when the process ignores SIGTERM (YM-244)
+- Prune the done-guard and stagnation maps, neutralize the evidence detail (YM-285)
+- Set_config erlaubt leeren Wert und lehnt Session plus Modell-Suffix ab (Los 55c, YM-268)
+- Config.yaml atomar schreiben, Backups begrenzen, rule_guard ins Schema (Los 55c, YM-268)
+- Keep the wrapper text of a rendered error, quote the dispatcher fatals (Los 04i review)
+- Cascade releases pid/socket, empty cascade root is refused, exit tail cannot reopen a stopped row (YM-244)
+- Carry max_turns on the agent row so a respawn inherits it (YM-244)
+- Quote the remaining client and path values in output and fatal lines (Los 04i)
+- Worktree-Elternprojekte in die Briefing-Regeneration aufnehmen (YM-382)
+- Pfade in Log und Konsole quoten, Archiv-Vergleich als Pfadvergleich (YM-381)
+- Match the prefix with instr so multi-byte and NUL prefixes behave
+- Refuse a symlinked opencode commands dir in the uninstall sweep (YM-384 security)
+- Variablen-Praefix auch am cp-Ziel und am cd-Operanden aufloesen (YM-383)
+- EnsureBaseDir meldet statt zu chmoden, DryRun legt nichts an, Uninstall nennt ein Archiv ausserhalb (YM-381)
+- Redirect-Ziel lexen statt Woerter vergleichen (YM-383)
+- One derivation for the opencode commands dir in install and uninstall (YM-384 review)
+- Report a failed opencode command sweep, derive the announced path (YM-384 review)
+- Konfiguriertes Archiv bleibt owner-only, Backfill und Status lesen denselben Pfad (YM-381)
+- Caps.db sichern, FTS-Backfill als Werkzeug (YM-379)
+- Uninstall removes the bundled opencode commands (YM-384)
+- Take the prefix length from SQLite and refuse an empty prefix
+- Compare float bits, prefix new helpers, cover the reset error path
+- Opencode.db wird read-only geoeffnet (YM-381)
+- Bleve_index faellt aus der Vorlage (YM-381)
+- ALTER-only-Spalten in den CREATE-TABLE-Konstanten (YM-378)
+- Paths.archive wird gelesen (YM-381)
+- Match proxy_state prefix literally instead of LIKE
+- Keep rendering when the existing marker already names the project
+- Brace-Erkennung sieht die Zeilenfortsetzung zwischen $ und { (YM-375)
+- Drop the home-wide ownership claim on plugin entries (YM-371)
+- Brace-Zaehler endet an der Zeilengrenze (YM-375)
+- Ein Projektfehler bricht den Scan nicht ab, Status erfindet keine Null (YM-372)
+- Anchor the dev fallback at the running binary (YM-371)
+- Kommentar-Regel kennt Operatoren und Brace-Expansion (YM-375)
+- Review-Runde 2 (YM-369)
+- Keep the system-wide plugin entry on install prefixes (YM-371)
+- Skip the wiki render when the ownership marker cannot be written
+- Startpfad meldet einen fehlgeschlagenen Briefing-Scan (YM-372)
+- Log-Glaettung fuer alle Fehlertexte, Pass-2-Ausfall zaehlt (YM-362)
+- Thread-ID ist kein Zaehler-Signal (YM-293)
+- Security-Review-Hinweise (Nil-Guard, UTF-8-Testfall) (YM-357)
+- Fortsetzung ueberlebt Quotes, Escapes und Kommentare (YM-375)
+- Befunde aus dem kalten Review (Testbegruendung, toter Env-Pin) (YM-357)
+- Claim only plugin entries that belong to yesmem (YM-371)
+- Security-Runde: fremder Text steuert keine Zaehler (YM-293)
+- Toten YESMEM_PROJECTS_DIR-Eintrag im Selbst-Spawn entfernen (YM-357)
+- Security-Review-Runde (YM-369)
+- Announce the bundled commands and skills uninstall removes (YM-371)
+- Schreibsperre sieht >|, Zeilenfortsetzung und quotierte Pfade (YM-375)
+- Query-Fehler werden gemeldet statt verschluckt (YM-372)
+- Projektnamen in UTF-16-Codeunits, alle Pfade aus der Config (YM-357)
+- Lesefehler des Upstream-Bodys als Provider-Fehler melden (YM-293)
+- Worktree-Sessions zaehlen im Elternprojekt mit (YM-372)
+- Status zaehlt nur frische refined_briefings (YM-372)
+- Review-Befunde (YM-369)
+- Log-Senke entgiften, Rename-Abgleich und Testschaerfung (YM-362)
+- Abgelaufene refined_briefings zaehlen als fehlend (YM-372)
+- Nachbesserung aus dem Kaltreview (YM-293)
+- Write the autoconf backup without following a symlink
+- Route every provider_targets lookup through one matcher
+- User-eigene Zeilen im Dedup schonen, Fehlertext entgiften (YM-362)
+- Retry-Budget bei Wachstum, Hitcounts und Rename-Pruefung (YM-362)
+- Rueckwaerts-Trivia, Zeilengrenze im Literal, Callee ueber Globals (YM-342)
+- Refuse a symlink at the autoconf backup path
+- SCHED_FAIL zaehlt auch headless-Fehler (YM-293)
+- Upstream-Fehler beider Forward-Pfade landen im Journal (YM-293)
+- Provider target by longest matching prefix instead of map order
+- FIFO-Race und Grossdatei abgelehnt, relativer caps_dir ohne HOME leer (YM-359)
+- Property-Name und Postfix-Operator teilen nicht, Klammergruppe um den Body (YM-342)
+- Judge the source row, not the snapshot, before sweeping; sharpen the sweep comments and tests
+- Review-Befunde, FIFO- und Hardlink-Schutz, caps_dir an HOME verankert (YM-359)
+- Kommentar im sh-Aufruf, Regex nach Schluesselwort, Namensgrenze (YM-342)
+- Keep live documents when the sweep anchor moves, sweep path-less sources in the gate, pass the watermark before listing
+- Keyset-Paging und abgebrochene Kompaktierung beenden (YM-369)
+- CreateSchema meldet echte Migrationsfehler (YM-362)
+- Teilausfall sichtbar, Transport- und Inhaltsfehler getrennt (YM-362)
+- SupersedeSessionLearnings spart alle user-eigenen Quellen (YM-362)
+- Content-Fallback auf content_blob (YM-369)
+- Sichere messages.db mit (YM-369)
+- TTL an Refresh-Kadenz, Fingerprint auf Repository-Root (YM-343)
+- Security-Runde YM-315: threadID im Log gequotet, Marker nur aus Nachrichteninhalt, 1024 Sperr-Slots (YM-315)
+- Quote doc-source log paths, sweep sources that lost their path, sweep multi-path ingests
+- Refined_briefings TTL und pfad-toleranter Fingerprint (YM-343)
+- Session-IDs gebatcht abfragen (YM-343)
+- Review-Befunde, RepositoryRoot im Projektvergleich und linkfreier Lese-/Reparaturpfad (YM-359)
+- Befunde aus Consequence- und Security-Review (Typvalidierung, Prompt-Ordnung, Symlink, Modus-Logging, rohe Agent-IDs) (YM-338)
+- Zweite Review-Runde YM-315: Slot-Sperren je Thread, byte-cleaner Snapshot, Raw-Scan nur auf Textfelder, Marker-Anreicherung, Budget-Log (YM-315)
+- Regex-Literale im REPL-Scanner, Shell-Escapes allgemein aufgeloest (YM-342)
+- REPL-Scanner ueberspringt Kommentare und resynchronisiert, Escape vor der Home-Expansion (YM-342)
+- Migrate-messages loescht nur, was es tatsaechlich kopiert hat (YM-360)
+- REPL-sh nur an Statement-Position, Ops-Aliase weiter geschuetzt (YM-342)
+- Loeschbereich nicht auf Elternverzeichnisse ausdehnen, Retention je Repository, Quarantaene im Regenerate-Pfad (Review los-13d)
+- Verzeichnisbindung, REPL-Schreibweg, Warnzweig und Block vor Cap (YM-342)
+- Migrate-messages prueft die Sperre erneut und laesst messages.db vollstaendig (YM-360)
+- Migrate-messages kopiert die ganze Zeile und macht sie vor dem Loeschen dauerhaft (YM-360)
+- Befunde aus dem kalten Review (Dateimodus, Spalten-Gates, Cooldown-DB, Backup-Sweep, nil-Werte) (YM-338)
+- Review-Runde zu YM-315: Sperre vor der Zustandserfassung, Budget 256, Marker-Fehler bricht die Invalidierung nicht ab, Marker ohne Vollparse (YM-315)
+- Migrate-messages haelt Teilzustand, WAL, Rechte und Env-Variable aus dem Umbau (YM-360)
+- CAP.md-Schreib- und chmod-Pfade folgen keinen Symlinks mehr (YM-359)
+- Caps_dir wird absolut abgeleitet, ~ wird expandiert (YM-359)
+- Execute_cap loest nur Caps des eigenen Projekts auf (YM-359)
+- Bereichsvergleich zaehlt Zeichen statt Bytes (Review los-13d)
+- Migrate-messages verweigert den Lauf auf einer benutzten Datenbank (YM-360)
+- Same sanitizer strength on every wiki error sink (YM-332 security review)
+- Lade-Log beschreibt die Sperre statt eines Laufs, Job-Test mit Verzeichnismaske und Short-Guard (YM-334)
+- Collapse whitespace in the fallback error text, document the progress rendering (YM-332 consequence review)
+- Verwaiste Frozen-Zeilen werden nach 24h reklamiert (YM-315)
+- Globales Budget fuer Session-Override-Refresh, thread-id-Drossel allein begrenzt nichts (YM-315)
+- Invalidate serialisiert gegen laufende Persists, sonst ueberholt ein altes Payload den Tombstone (YM-315)
+- Sweep fasst nur Zeilen innerhalb seiner Basis an (YM-329)
+- Sanitize the fallback error text, pin reason and format characters in the tests (YM-332 re-review)
+- Ausfallklasse nur ohne Antwort, ErrParse behaelt die Fehlerkette (YM-317)
+- Totalausfall der Extraktion bricht den Lauf ab, Restore dedupliziert IDs (YM-317)
+- Extraktionsbudget wird bei Erfolg und Wachstum zurueckgesetzt, Breaker nur ohne Antwort (YM-317)
+- Invalidierung behaelt die Archiv-Marker des Frozen-Prefix (YM-315)
+- OpenAI-Pfad aktualisiert den Frozen-Snapshot wie der Anthropic-Pfad (YM-315)
+- Zweite Review-Runde zu YM-334 (Kommentarzuordnung, gemeinsame Bindungsregel im Lade-Log, Mount-Verlust im Job-Pfad, kanonischer Pfadvergleich)
+- Persist schreibt raw_tokens, sonst ersetzt die Re-Persistenz den Schaetzwert durch 0 (YM-315)
+- Quote the paths inside error texts too, tighten the progress sanitizer (YM-332 cold review)
+- Sweep folgt keiner verschobenen Quellpfad-Angabe, EvalSymlinks-Fehler fail-closed (YM-329)
+- Toter Daemon-Socket scheitert sofort statt nach 15s Kaltstart-Budget (YM-338)
+- Register_pid haelt den opencode-Kanal frei, Fallback ohne Identitaet bleibt leer (YM-338)
+- Dry-Run stempelt auch bei leerer Quelle nicht (YM-329)
+- Review-Befunde zu YM-334 (Profilgrenze des Mount-Checks, Gleichheit im Mountfilter, gemeinsame Bindungsregel, Broadcast-Pfade)
+- Relay- und Stop-Ziel aus der Agent-ID ableiten statt aus agents.sock_path (YM-338)
+- Locomo zaehlt gescheiterte Extraktionen als Fehlschlag (YM-317)
+- Extraktion begrenzt Versuche und zaehlt nur Transportfehler als Ausfall (YM-317)
+- Cleanups schonen mixed-case user-owned Quellen, Junk-Opfer werden auffindbar (YM-317)
+- Rechte-Reparatur folgt keinem Symlink, Daemon repariert das Caps-Root (YM-353)
+- Sweep auch bei leerer Quelle, Watermark gegen parallele Laeufe, Dry-Run schreibt nicht (YM-329)
+- Quote the remaining client values in log and output lines, guard the CBM repo path (YM-332)
+- Verweigerten Lauf mit Cap und Skript protokollieren (YM-334)
+- Masken schlagen den Mount, stille Mount-Verluste brechen ab, Cap-Fehler ohne Host-Pfade (YM-334)
+- Datenverzeichnis-Sweep und Archivkopien auf 0600, chmod-Fehler nur noch Warnung (YM-338)
+- Ingest_docs meldet entfernte Dokumente, handler_docs gofmt-clean (YM-329)
+- Chunks geloeschter Dokumente kehren aus dem Index, Symlink-Quelle wird gelesen, Pfade im Log gequotet (YM-329)
+- Last_sync stempelt nur ein vollstaendiger Durchlauf, chunk_count separat (YM-329)
+- Bestehende DB-Datei beim Haerten nie oeffnen, sonst verliert die laufende Verbindung ihren POSIX-Lock (YM-352)
+- Skip-Schalter der Stopp-Verifikation korrekt verdrahtet (YM-351)
+- Review-Runde 2 zu Agentzeilen (YM-351)
+- Eine Heilung loggt eine Zeile, nicht zwei (YM-352)
+- Security-Review-Auflagen zum WAL-Guard (YM-352)
+- Schreibpfad validiert Cap-Namen und absolute Basis (YM-353)
+- No relative Claude projects path when HOME is unset (YM-354)
+- WAL-Guard legt keine leere Datenbank an und nennt den Log-Stand (YM-352)
+- Security-Review-Punkte zu Agentzeilen (YM-351)
+- Beta-Header auf jedem Fork-Zweig, Start-Patch-Retry, Status im Fork-Fehler (YM-326)
+- Resolve claude_projects once, refuse tilde and relative index roots (YM-354)
+- Review-Befunde zu Agentzeilen (YM-351)
+- Folgen-Runde-2-Restpunkte (YM-353)
+- Review-Auflagen zu Stille, Fehlertext und Testfenster (YM-335)
+- Anthropic-Key bleibt am eigenen Ziel, Config-Schreibvorgang gegen Nutzeränderung abgesichert (YM-326)
+- Cold-review findings — one source for the Claude projects dir, hook wiring tested (YM-354)
+- Credential-freies Fork-Ziel bleibt erreichbar, Patch-Retry begrenzt (YM-326)
+- Review-Runde-1-Restpunkte (YM-353)
+- Let the request context decide what a ping timeout is (review 2 los-29d)
+- Review-Befunde zum WAL-Guard (YM-352)
+- Fork gibt den Pending-Slot frei, Credential vergleicht echtes Quell-Ziel, Patch-Retry (YM-326)
+- Zukunftsstempel, Socket-Pfad im Log, sock_path-Tuer, Resume-Flake (YM-335)
+- Agentzeilen melden ihren wahren Zustand (YM-351)
+- Deklarierter Agententyp im OpenAI-Pfad, Prune-Gate und Warm-Eintraege gepinnt (YM-323)
+- Keep the spent budget visible on the body read (review los-29d)
+- WAL-Guard heilt 522 nach fremdem Eingriff in die Sidecars (YM-352)
+- BaseURL-Patch laeuft bei Provider-Aenderung nach dem Start (YM-326)
+- Cap-Verzeichnisse owner-only anlegen (YM-353)
+- Build MEMORY.md's Claude projects path from the configuration (YM-354)
+- Fork-Credential bleibt bei der eigenen Origin und Familie (YM-326)
+- Cap the encoded project name at 200 with Claude's base36 hash, gate ArchiveFile's project (YM-354)
+- Fork-Body traegt kein familienfremdes Modell (YM-326)
+- Scale the keepalive ping timeout with the context size (YM-347)
+- Subagent-Praezedenz angeglichen, Thread-State-Prunge fuer OpenAI-Pfade, system als String (YM-323)
+- Fork-Budget hebt einen zu kleinen max_tokens-Deckel an (YM-326)
+- Projekt-Binding-Guard auch auf dem Execute-Pfad (YM-353)
+- Security-Review-Punkte und Auditierbarkeit (YM-346)
+- Host-Zustand-Caps nennen sandbox none, gemessen statt vermutet (YM-346)
+- Loeschbereich auf das Repository begrenzen, Spares batchen (Security-Review los-13d)
+- Review-Runde-2-Restpunkte (YM-346)
+- Neueste Schreibungen und Quickstart-Fehlerfall absichern (Review los-13d)
+- Isolation unter 0.9.2 halten, Installer und Zellen nachziehen (YM-346)
+- Apply Claude's full project-dir rule (non-alnum to dash) and align the MEMORY.md fixture (YM-330)
+- Retention einmal pro Lauf, geschonte Zeilen, kohaerente Coverage (Review los-13d)
+- Address the cold, consequence and security reviews of YM-333
+- Review-Runde 1 — zweite Senken, Freeze-Mark-Test, Zeichenfilter (YM-344)
+- Keep remember and scratchpad_delete off the HTTP transport (YM-345 security review)
+- Reject control characters in output_file, no test logging from the watchdog goroutine (YM-341)
+- SetupProject validates the output file name too (YM-341)
+- Review round for YM-318: drop the dead path builder, re-narrow the entry tail, report a retained v1 tree, cover tool-shaped skill keys
+- Widen the rpc allowlist to the memory reads, single Bearer implementation (YM-345 review)
+- Cap hook_auto_learned under distrust, document one-way cap, honest skip text [YM-282]
+- Second review pass on los 27b (YM-290)
+- Review nachziehen — Kommentar-Praezision, TOCTOU-Notiz, Goroutine-Join im Watchdog-Test (YM-341)
+- Session_id nicht mehr per update_agent schreibbar, Freeze-Uhr, Log-Hygiene, Lock-Spanne (YM-344)
+- Make stop and restart work where the process table is missing
+- Projektion, Coverage und Gates der Narrativ-Pflege (YM-316)
+- Review findings on los 27b (YM-290)
+- Fail closed on an empty token, constant-time compare, pin auth ordering (YM-345 review)
+- Fail closed on unknown import arguments [YM-282]
+- Cap-Description kann den Cap-Katalog nicht mehr verlassen (YM-346)
+- Allowlist the rpc methods POST /api/rpc forwards (YM-345)
+- Require the Bearer scheme prefix in BearerAuthFunc (YM-345)
+- Keep proxy on daemon-level errors in proxyCallFormatWithParams (YM-345)
+- Save_cap exportiert in caps_dir, Exportdatei 0600 (YM-346)
+- Encode '+' like Claude Code in ProjectDirName (YM-330)
+- Keep v1 sources until the config is rewritable, refuse an unresolvable config link, match a symlinked home, require the plugin file for status (YM-318)
+- Give the notify migration a way back and bound the reload
+- Keep the reattach marker in a column, not in progress
+- Save-Lock gilt auch auf der Job-Ebene (YM-346)
+- Compare valid_until as time, correct blockThreshold comment (YM-282)
+- Track skill activations outside the skill_eval gate on the OpenAI path (YM-290)
+- Migrate a missing skill_eval to true like the documented default (YM-290)
+- Inject SESSION_ID instead of the German DEINE_SESSION_ID (YM-290)
+- Deterministic id tie-breaker in the session query (YM-341)
+- Fail closed on an unusable HOME and match skill usage by skill name (YM-318)
+- Refuse symlinked .claude, FIFO targets and output_file with a path (YM-341)
+- Bundle-Caps nennen Sandbox-Profil und Egress-Allowlist (YM-346)
+- Security-Befunde zu YM-310 (Los 31d)
+- Keep the DONE-guard relay history across a freeze, report on a clock (YM-270)
+- Security-Review-Befunde zu YM-230 (Log-Quoting, Profil-Test, Export-Bindung)
+- Zweitordnungs-Befunde zu YM-230 (Prompt-Zeile, Kommentare, Export-Helfer)
+- Force_supersede auf dem Job-Socket sperren, Projektwache fail-closed, Begruendung einzeilig (YM-278 Security-Review)
+- Wrapper-Flags in der Schreibpfad-Durchsicht (YM-310, Los 31d)
+- Require two plugin literals before calling a build built-in, bound the scan loop (YM-241, YM-242 review round 3)
+- Projektwache kanonisch vergleichen, not_found getrennt rendern, Nebenwirkung nur bei Konflikt (YM-278 Review Runde 2)
+- Legacy-Zaehler je Worktree, nicht der gefaltete Parent (YM-288)
+- Review-Befunde zu YM-230 (Export bei Default none, Lade-Log je Cap)
+- Freeze leases report themselves, child gate binds on demand (YM-270)
+- Review-Befunde abgearbeitet (YM-328)
+- Enforce the ownership rule at the write, not only at the entry points (YM-266 review)
+- Bound the built-in scan, keep both uninstall errors, treat a blank config as blank (YM-241, YM-242 review round 2)
+- Cover every rendered session and the file coverage in the wiki signal, not only the page window (YM-266 review)
+- Recognize the German header yesmem wrote before afccf1df as its own (YM-266 review)
+- Statuspruefung vor Groessenpruefung im Keepalive-Ping (YM-272)
+- Address the YM-327 review findings
+- Kaltreview-Auflagen aus Phase 5.2 (YM-288)
+- Supersede-Ausgang aus dem Schreibresultat ableiten, Force projektgebunden und mit eigenem Fehlerausgang (YM-278 Review)
+- Review-Runde zu YM-272, Subagenten-Marker praezise, Keepalive-Map begrenzt
+- Cold-Review-Befunde zu YM-310 (Los 31d)
+- Gate the built-in probe, name a redundant plugin copy, report the skip as step detail (YM-241, YM-242 review round 1)
+- Leerer Socket-Pfad wird abgelehnt, Restart leitet ihn aus der Agent-ID ab (YM-328)
+- Ein leeres sandbox-Feld erbt, statt ungesandboxt zu laufen (YM-230)
+- Decay-Skala fuer Altzeilen und die zwei unversorgten Lesepfade (YM-288)
+- Werkzeugabsatz chirurgisch entfernen, statt alles dahinter zu verwerfen (YM-288)
+- Blockierten Supersede als blockiert melden, begruendetes force_supersede ergaenzen (YM-278)
+- No relay into an agent blocked in a task() subagent (YM-270)
+- Kein fremder Session-Fallback, Codex-Registrierung nur bei Wechsel (YM-328)
+- RelativeTime folgt strings.yaml statt hart deutsch zu rendern (YM-328)
+- Agenten-Sockets, Datenbankdateien und Datenverzeichnis nur fuer den Eigentuemer (YM-328)
+- Report an unparseable opencode config on uninstall, write the jsonc migration atomically (YM-242)
+- Skip the external opencode plugin copy on builds that carry it (YM-241)
+- MultiEdit/NotebookEdit, Bash-Schreibwege, REPL-save_count, Tilde-Paritaet (YM-310, Los 31d)
+- Cache-Gate folgt der erkannten TTL, Fork-Budget bleibt beim Eltern, Keepalive gehaertet (YM-272)
+- Review-Auflagen zu Episodenfenster, Turn-Kette und Relay-Text (YM-309)
+- Make the proxy_health bash handler survive the daemon's set -e (YM-327)
+- The wiki session signal measures the rendered sessions instead of every session of the project (YM-266)
+- Refuse to overwrite a .claude target yesmem did not write (YM-266)
+- Keep the local counter monotone, remember the imported script set (YM-264 review round 3)
+- Hintergrund-Guthaben pro Episode, Doku-Anker driftfest (YM-309)
+- An import lands exactly on its source revision (YM-264 review round 2)
+- Opencode-Datenverzeichnis als Ganzes maskiert, Kommentare praezisiert (YM-314)
+- Hintergrund-Job mit eigenem Zeitfenster, Refire-Takt ohne Socket (YM-309)
+- Bind a project scope at the one place every caller passes (YM-264 security review)
+- Masken-Ablehnung als Infrastruktur behandeln, -journal mitmaskiert, weiche WAL-Platzhalter, absolute DB-Pfade (YM-314)
+- Quote the temp-write error and the sessions-dir error, prove the slug guard against a logged call (YM-311 security review)
+- Zweite Review-Runde abarbeiten (Identitaet ohne Override, Migrations-Capability, Guards)
+- An import lands at its source revision, and a project file needs its project (YM-264)
+- Security findings on los 11b (YM-252)
+- Quote backfill errors and append-path session id, keep worktree names out of the submodule scope (YM-311 review 4)
+- Review-Befunde aus Phase 5 abarbeiten (Reap, Watchdog, Unit, Prune, Makefile)
+- Anchor the commit witness in the reflog, scope the resolve at the repo root (YM-279)
+- Consequence findings on los 11b (YM-252)
+- Maske folgt dem konfigurierten Session-DB-Pfad, doppelter XDG-Append entfernt, Tests fuer beide Wurzeln (YM-314)
+- Submodule scope after worktree scope, unwrap link errors, quote scanner session ids (YM-311 review 3)
+- Decide the import on the content, not on a burned counter (YM-264 review)
+- Bound the leading-zero strip in the proxy_health bash handler (YM-299)
+- Keep a future-dated document from holding the doc-sync gate open
+- Review findings on los 11b (YM-252)
+- Witness the commit git reported, encode dots, count the skipped projects (YM-279)
+- Verify submodule key by reference, quote copy/sync errors, quote session ids (YM-311 review 2)
+- Cold-Review-Auflagen zu Turn-Fenster, Stempel-Form und Zeilenanker (YM-309)
+- Quote the skip error, bound the contextual_docs limit from above
+- Session-DB-Maske deckt WAL-Nachbarn und HOME-Wurzel, Symlink-Kette der Projekt-Configs (YM-314)
+- Ohne /proc nichts stoppen und YESMEM_DATA_DIR nicht an den Daemon vererben
+- Review follow-ups for YM-299
+- Bound contextual_docs limit, pdftotext runtime and doc-sync change detection
+- Quote paths in archive errors, drop bidi characters, fold submodule worktrees onto the submodule (YM-311 review)
+- Keep the repository config from running programs and bound the git call (YM-279)
+- Geschlossene Agentenzeilen werden nach 30 Tagen gepruned
+- Backfill the plan project on update_plan (YM-252)
+- Bound the per-thread injection state maps (YM-252)
+- Read file tools in the opencode dialect and flatten control runes (YM-252)
+- Carry the plan nudge on the OpenAI parity path (YM-252)
+- Read deleted_count from the daemon, clamp the bash hours window (YM-299)
+- Idle-Guard Restpunkte, Hintergrund-Jobs und Zukunftsstempel (YM-309)
+- Daemon-Unit meldet READY und haelt einen Watchdog
+- Render dialog headers through channeltext (YM-264)
+- Report failed bash jobs without a model client, bind the pass to the daemon context (YM-264)
+- Keep the bundled revision separate from the local one (YM-264)
+- Deadline-Abstand in Kalendertagen, DST-fest (YM-249)
+- Reap-stale-mcp waehlt Helfer ueber argv-Anker im Binary statt per pgrep
+- Deadline-Datum folgt der Sprachschicht (YM-249)
+- Codex meldet seinen source_agent an den Daemon (YM-249)
+- Stop und restart identifizieren Instanzen ueber argv und Datenverzeichnis statt pgrep -f
+- Quote client paths in logs, rune-safe CBM stderr, own key per submodule, reject flag-shaped project slug (YM-311)
+- Task_type-Filter in der Abfrage, gueltige Kategorie im Cap-Idea-Hinweis (YM-249)
+- Resolve by commit only when the commit landed (YM-279)
+- Map a project to its exact Claude directory, no suffix scan (YM-279)
+- Cap-Mounts durch den Maskenfilter, Elternkette der Projekt-Configs, opencode.db maskiert, fehlendes HOME fail closed (YM-314)
+- Sockets nur fuer den Eigentuemer (YM-250)
+- Fork-Budget im uebersetzten Body, forkPending-Reset, Daemon-Cache-Log (YM-262)
+- Legacy-Kurznamen exakt und fail-closed aufloesen (YM-280)
+- Refresh only the source whose own path yielded nothing, guard NaN (YM-294)
+- The oversized rule must reach agentic tool loops (YM-263)
+- Pin-Sichtbarkeit ueber Projektidentitaet, keine Pfadpraefixe (YM-280)
+- Lesefehler der Discovery behaelt Routen, Fork-Uebersetzung in der Goroutine (YM-262)
+- Skip a missing path, stop doc-sync retrying a dead source, pin the limit cap (YM-294)
+- Read the header through every disguise, keep broadcasts as written (YM-283)
+- Security review follow-ups for YM-263
+- Read the shell notice only for the shell, harden the body check (YM-283)
+- Discovery-Fehler von Leermenge trennen, Daemon-Stempelcache, Duplikat-Guard (YM-262)
+- Report nothing instead of failing when the store is absent (YM-273 review)
+- Keep the current turn, persist the pause signal (YM-263)
+- Fork auf /v1/responses bleibt in der OpenAI-Familie, APIFormat-Rang entfernt (YM-262)
+- Kein Archivdokument ohne Nachrichten schreiben (YM-259 Review Runde 2)
+- Keep the eval bootstrap for Claude Code only
+- Answer a negative docs_search limit with an error, skip unusable sources instead of aborting (YM-294)
+- Guard the cluster sweep, drop its hashes, move them on rename (YM-273 review)
+- Keep caller-defined script names inside the table cell
+- Nachhol-Pfad schreibt kein unvollstaendiges Dokument (YM-259 Review)
+- Review findings for YM-263 rest points
+- Lead with the Code Mode call form in the opencode catalog
+- Keep relative config entries out of the v1 plugin match and pin every branch (YM-296)
+- Bound the thread id in the fixation log line (YM-283)
+- Subagent markers without thinking, sawtooth rest points (YM-263)
+- Auto-Discovery folgt Dateiaenderungen, keine Prozess-Caches mehr (YM-262)
+- Keep the v1 dev-tree plugin entry in scope for status and uninstall (YM-296)
+- Trait-Werte im Profil-Prompt quoten (YM-280)
+- Session-Pins ohne SessionEnd altern und werden geerntet (YM-280)
+- Eine Session-Pin-Loeschung trifft nur die eigene Session (YM-280)
+- Keep one project's verdict prune out of another's keys (YM-273)
+- Opencode-Provider einzeln dekodieren, falsch typisierte ueberspringen (YM-262)
+- Trim the opencode catalog to what the daemon can deliver
+- Keep the channel body from forging a header (YM-283)
+- Read the tool dialect in the fixation analysis (YM-283)
+- Keep global learnings out of clustering and its fingerprint (YM-273)
+- Set is_error on translated tool results (YM-283)
+- Fork ersetzt messages strukturell statt per Bytesuche (YM-262)
+- Fork klont auf /v1/responses den uebersetzten Anthropic-Body (YM-262)
+- Key cluster rows by repository root, not basename (YM-273)
+- Bound what ingest reads, notice a foreign vector rewrite (YM-294)
+- Match only yesmem's own v1 plugin path in status and uninstall (YM-296)
+- Gescheiterte Extraktion meldet Fehler statt Erfolg (YM-265)
+- Junk-Cleanup spart user-owned Learnings (YM-265)
+- Pick the caps catalog by client profile on /v1/messages
+- Projekt-Ausschlussliste an einer Stelle nil-sicher lesen (YM-259)
+- Archive-sessions holt fehlende Archivdokumente nach (YM-259)
+- Name execute_cap and its scripts in the opencode catalog
+- Clamp the docs_search limit and bound the query length (YM-294)
+- Mark a regenerated narrative only after the project prune (YM-298)
+- Scope the narrative marker reset to the short-session cleanups and run it where they run (YM-298)
+- Reset the narrative marker for every superseded narrative, mark only a stored one (YM-298)
+- Name the remedy in the unidentified-daemon refusal (YM-297)
+- Actionable refusals, fail-fast on a systemd-owned daemon, keep rows without evidence (YM-297 review round 2)
+- Log-Rubrik und %q fuer Versionsstring, Shell-Quoting im Deploy, Clamp vor der Summe, Wartezeit an die Haltezeit gebunden (YM-301)
+- Masken-Verweigerung als Infrastrukturfehler, Modellliste aus der effektiven XDG-Wurzel
+- Benutzername im Home-Pfad generisch als Pfad-Rauschen (YM-269), Fallback fuer reine Pfadkommandos nicht mehr namensabhaengig
+- Resolve a named project and refuse symlinks on the read path
+- Teilausfall konserviert Override, Legacy-Gate bleibt prozessweit (YM-130)
+- Abstention window heals with the last readable read, phase report switches the rung-1 wording (YM-306)
+- Give a zero limit one meaning in both search handlers (YM-305)
+- Opencode-Konfigverzeichnis ganz maskieren, Maskenhaertung (YM-303)
+- Security-Review zu YM-269: Punktdatei am Edit-Ziel bleibt dateiartig, settings.json auch ueber relative Pfade erkannt, Pfad im Text gesaeubert
+- Unambiguous stop contract, poll exit, keep unverifiable rows (YM-297 review round)
+- Deploy-Modus 0755, .bak-Exec-Bit, Migrations-Timeout ueber busy_timeout, Cache-Rundung (YM-301)
+- Bound the narrative marker reset, mark regenerated narratives, align the remaining thresholds (YM-298)
+- Only a repository-root scan becomes the repository row
+- Phase-correct relay on every delivery, episode-bound abstention, capped turn signal (YM-306)
+- Fallback fuer reine Pfadkommandos (YM-269): ohne Keyword traf der Hook keine Gotcha mehr und verlor den Hard-Block
+- Clamp the hybrid limit, reject unparsable CLI bounds, parse two more windows (YM-305)
+- Review-Findings - .bak-Haertung, Cache-Reads im claude-Pfad, flock-Fallback, Restart-Fehler loggen (YM-301)
+- Review-Befunde zu Drosselung, Evict-I/O und Tombstone (YM-130, YM-146)
+- Keep the repository identity, migrate every participant
+- XDG-Pins auf die effektiven Wurzeln, abweichende Wurzeln mitmaskieren
+- Review-Auflagen zu YM-269: settings.json nur bei Write blocken, save_count-Verbrauch unveraendert, Kommentare praezisiert
+- Bound the systemd unit probe so a wedged bus cannot hang the call (YM-297)
+- Clear an inherited session id from the shell env (YM-257)
+- Schwelle unter dem Override-Lock aufloesen (YM-130)
+- Stop only the PID file's daemon, keep the unit's daemon, keep resumable agent rows (YM-297)
+- 0/0-Guard in allen HTTP-Transports, Cache-Reads als Input-Aequivalent (YM-301)
+- Clamp the get_learnings limit, scope skip_recent to the caller session (YM-305)
+- One short-session threshold, one finished predicate, logged cleanup errors (YM-298)
+- Keep symlinks from pulling foreign files into the index
+- Befunde aus Los 31b (YM-269): Pfad-Noise auch fuer Befehls-Keywords, versteckte Segmente nicht dateiartig, save_count ohne WebFetch, REPL in fileOpTools, ~/.claude/settings.json geschuetzt
+- Deploy nimmt den Update-Lock (YM-301)
+- Restpunkte aus Los 34e, YM-303
+- Bound and quote foreign CBM text, quote client paths in logs
+- Lock umfasst Migration und Restart, Rollback aus .bak, Download-Grenzen (YM-301)
+- Key the scan cache by repository root, not by repository name
+- Compare expiry and stats windows as instants, batch the allowed-ID lookup (YM-305)
+- Idle guard reads a running tool, an unreadable session and a mid-pipeline agent correctly (YM-306)
+- Praefix nur bei echter Aenderung schreiben, Sawtooth-Maps raeumen (YM-138, YM-146)
+- Sitzungs-Schwelle pro Thread aufloesen, Override-Abfrage drosseln (YM-130)
+- Stop publishing the last-created session id process-wide (YM-257)
+- Harden the quarantine gate and the remaining prompt paths
+- Close a dead pause only while it is still paused (YM-255)
+- Start every run in its work dir so the cwd does not bind the home (YM-291)
+- Stop quarantine from swallowing re-ingested content
+- Pick mask or read-only map for the Claude config by the run's cwd (YM-291)
+- Free a dead pause at the spawn path, sanitize the ping label (YM-254, YM-255)
+- Survive unknown prompt keys and test the last mile (YM-136)
+- Map the Claude global config read-only and keep the opencode plugin dirs masked (YM-291)
+- Close the cold-review gaps on quarantine and time comparisons
+- Harden the prompt-layer overlay and deliver it in production (YM-136, YM-144)
+- Keep cap and in-flight run dirs out of the sweep, fail closed without a cwd (YM-295)
+- Never drop a mask path and keep agent runs working (YM-291)
+- Review-Befunde beheben: echter Redirect-Host, Lock-Degradierung, IDN/Port, Gesamtbudget, Backup-Reste, Token-Clamp
+- Keep the v1 sources while an unremovable config entry names them
+- Refuse an empty data dir, log refusals, cap the window
+- Refuse a symlinked sweep base and quote the path in the log (YM-295)
+- Measurable budget unit, guarded prompt fields, trusted sqlite3, stale pause (YM-254, YM-255)
+- Log short-session cleanup failures inside the cleanup helper (YM-240)
+- Address the job's project and escape LIKE wildcards (YM-295)
+- Quarantine gate for vector_search, parsed bounds and skip_recent
+- Quarantine predicate and parsed time bounds on every read path
+- Key and profile the parity path per client (YM-144)
+- Honour the model feature gates on the Anthropic path (YM-137)
+- Resolve the prompt profile from the client on /v1/messages (YM-136)
+- Mask agent state channels and materialise missing mask paths (YM-291)
+- Let a prompt layer switch off what the parent layer enabled (YM-136)
+- Usage aus CLI-Ausgabe auch bei Exit ungleich 0 buchen, Null-Tokens nicht melden (YM-248)
+- Make hours a number before it reaches the shell
+- Host-Allowlist, Entpack-Limit, Update-Lock und Backup-Temp-Name haerten (YM-247)
+- Keep the assets path inside the projects root
+- Log cleanup errors from finished short sessions (YM-240)
+- Respect quiet period when superseding short-session narratives (YM-239)
+- Guard the home inside the permission helper, test the kept run dir
+- Keep the home out of every work dir, record what was chosen
+- Never run an agent in the daemon's cwd
+- Revalidate the vector snapshot against the database (YM-231)
+- Stop model text at the fork line, order severities, pin K and D (YM-289)
+- Read every daemon timeout label the proxy writes (YM-289)
+- Read status codes where the proxy writes them (YM-289)
+- Refuse guessed work dirs, fail closed without one
+- Translate month names and state the %s contract in the prompt
+- Mask the configured caps dir too (YM-284)
+- Invalidate chunk vectors on delete, guard rules paths, symmetric names (YM-231)
+- Keep keepalive and fork provider errors in the framed set (YM-289)
+- Keep skill tracking independent of the skill_eval gate
+- Keep tool-call syntax and block layout out of the translatable strings
+- Refuse a spawn without a derivable socket path and prove the guards (YM-287)
+- Close review gaps around the sandbox masks (YM-284)
+- Anchor restarts and timeouts to error lines too (YM-289)
+- Document the sanitisation precondition of planNudgeText
+- Ensure the headless allowlist in the run's work dir
+- Give a job without a project its own cwd inside the runtime dir
+- Route every spawn socket path through the id-derived helper (YM-287)
+- Move the remaining hardcoded briefing text into the strings layer
+- Honour the skill_eval gate on the Anthropic path
+- Emit the timestamp hint once in the non-Claude think reminder
+- Derive the socket cleanup path from the agent id in the supervisor (YM-287)
+- Refuse relative paths over MCP, the daemon cwd is not the caller's (YM-231)
+- Validate remove-docs name, flag dead paths, run hybrid search (YM-231)
+- Resolve source paths at registration, guard clone cleanup (YM-231)
+- Delete a doc source in one transaction (YM-231)
+- Address bash error broadcasts and work dirs to the job's project
+- Count only real errors, drop the empty-run tally (YM-289)
+- Mask Claude state in the job sandbox (YM-284)
+- Require a bound socket at every cleanup site (YM-274)
+- Report a failed store at once, bump the bundle one step (YM-281)
+- Always set YESMEM_PROJECT and show the job's project (YM-281)
+- No project guess, no lost alert, no unnoticed error (YM-281)
+- Take a job's project from the job row, not from the work dir (YM-281)
+- Bestands-Backup haerten, Kommentare an die tatsaechlichen Klassen (YM-233)
+- Detect the status field by label; topology limits are conventions (YM-150, YM-153)
+- Keep the derived socket name a plain, non-infrastructure name (YM-274)
+- Sentinel-Restore in einem Durchlauf, dataDir durchgereicht (YM-233)
+- Guard bindet den Wrapper an die Zuweisung, Fehlerpfade, escapte Quotes (YM-233)
+- Harden the job runtime dir and close the review gaps (YM-276)
+- Review findings on the restore path [YM-229]
+- Hold the loop lock per thread, not across the history scan (YM-132)
+- Derive the agent socket path instead of trusting sock_path (YM-274)
+- Name the job project and fail the run on a rejected start (YM-281)
+- Review findings — monotonic id seed, honest marker/config wording, exact relay/doc check (YM-151, YM-203, YM-153)
+- Reset the loop warning count only after consecutive quiet checks (YM-131, YM-132, YM-147)
+- Flatten the loop-warning path and hold the loop lock across detection (YM-131, YM-132)
+- Give a bash job its own project so a cap need not guess a basename (YM-281)
+- Mask the data dir as a whole, move job socket and job dirs beside it (YM-276)
+- ~/.claude.json wird auch als Bestandsdatei auf 0600 gehaertet (YM-233)
+- CLI- und Setup-Pfade fuehren ihre LLM-Clients durch den Redactor (YM-233)
+- Generic_api_key erfasst opake Werte, Allowlist schuetzt Textstelle (YM-233)
+- Unlink agent sockets only inside the data directory (YM-274)
+- Allocate agent ids atomically via agent_id_seq (YM-151)
+- DONE-guard relay names fields not regexes; prune done-verify state; align idle marker wording (YM-150, YM-203)
+- Batch junction load, read-only export, restore runtime fields [YM-229]
+- Record only the newest REPL turn per request (YM-147)
+- Detect loops in the opencode tool dialect, after the subagent decision (YM-131, YM-132)
+- Log a rejected auto-extracted trait instead of dropping it (YM-227)
+- Keep permanent pins global, stop override revival (YM-227)
+- Drop the second isSessionUUID from session_pid.go, Los 12b and Los 29 both added one
+- Report anchor refusals deterministically (YM-260)
+- Keep a unique anchor when another reference is ambiguous (YM-260)
+- Reject forged prompt fields, keep unproven pins project-bound (YM-227)
+- Log-Wortlaut und Cache-Leser aus Review 3 (YM-232)
+- Bound the re-expansion surface and the per-thread decay map (security review)
+- Close the read and identity holes the allowance opened (YM-267, security review)
+- Surface anchor refusals and scope every commit lookup to the project (YM-260, YM-261)
+- Keep changed job names apart, validate the scheduler backend (YM-267, consequence review)
+- Close the LOW security findings on YM-253
+- Restpunkte aus Review 2 (Log-Quoting, Skip-Logs, Kanonisierung)
+- Key the frozen mailbox on sessionhood, not on address equality
+- Bound the keepalive refill and serialize TTL transitions (security review 5.4)
+- Keep verdicts across existing alerts (review round 2)
+- Isolate the MEMORY.md sweep from panics and needless rewrites (YM-261)
+- Only re-expand the proxy's own stub shapes (cold review)
+- Resolve commits only from explicit learning or ticket anchors (YM-260)
+- Upgrade path for both DBs, trusted pin session, prompt-safe trait text (YM-227)
+- Refuse cap rows from a sandboxed run (YM-267, cold review)
+- Align canonical keys, cluster input and recurrence state (review round 1)
+- Do not charge a deferred relay to the refire count (YM-253)
+- Keep subscription credentials in Authorization and report TTL changes once (consequence review 5.3)
+- End the idle stand-down with its window, never block on the delivery lock (YM-253)
+- Match re-expansion hints the same way for string and block content (self-review)
+- Keep codex mail out of the shared thread cache
+- Kanonische Scan-Keys und quotierte Pfade im Log (YM-232 Review)
+- Harden the commit resolver against review findings (YM-260, YM-261)
+- Close the review findings on YM-253
+- Carry the ping's ephemeral_1h and stop retrigger from refilling a spent budget (cold review 5.2)
+- Per-thread decay state with restart-safe ages (YM-128)
+- Deliver the proxy_health broadcast through YESMEM_SOCK (YM-267)
+- Mask the daemon socket inside job sandboxes (YM-267)
+- Count global learnings in the cluster fingerprint (YM-115)
+- Point every sandboxed run at the restricted socket (YM-267)
+- Gate detection on new learnings and remember kein_problem (YM-122)
+- Verify a correction in its job dir, kill headless children (YM-267)
+- Make stub re-expansion reach the hints CompressContext writes (YM-141)
+- Stamp created_at and validate distilled categories (YM-116, YM-117)
+- Check_broadcasts proves its caller like the channel inbox
+- Resolve the codex channel mailbox from the client process
+- Validate the agent backend, tokenise the job name (YM-267)
+- Keep the sandbox work dir and kill the process group (YM-267)
+- Give sandboxed runs a restricted job socket (YM-267)
+- Imported overrides keep full confidence, counters follow rows (YM-227)
+- Close the idle-guard remainder (YM-253)
+- Attribute session pins to their session (YM-227)
+- Keep the tool_use/tool_result pair when the keepRecent clamp moves the cutoff (YM-140)
+- Sample the whole learning population for the cap (YM-125)
+- Key TTL gap detection per thread and move the pause threshold with it (YM-134)
+- Resolve commits against graded coverage and explicit anchors (YM-260)
+- Key clusters by canonical project (YM-115)
+- Derive reminder age from thread position, not the global request counter (YM-139)
+- A keepalive ping only counts as warm with cache accounting (YM-133)
+- Stop worktree paths and action substrings from forcing injections (YM-226)
+- Wire the post-mutation MEMORY.md hook in the production assembly (YM-261)
+- Symlinks und Wurzelformen im Code-Index (YM-232)
+- Recognize Claude Code's bare session UUID as a real user session (YM-127)
+- Teach cap-idea dismiss via resolve(learning_id) (YM-261)
+- Skip quarantined learnings in the unfinished search (YM-261)
+- Owner-only config.yaml, realistic token cap, key length limit (YM-92, YM-97)
+- Harden the input surface (YM-92, YM-96, YM-97)
+- Refuse duplicate ids before writing, keep a running job's log dir
+- Never execute an unreviewed fix, harden the report payloads (security review 5.4)
+- Say that a moved key applies after a restart (YM-97)
+- Forward the job dir env on ai-jail 2.x, keep dir names apart
+- Resolve cycle-4 findings on backup hardening and fork model family check (YM-135, YM-145)
+- Mirror the tail slack in the gate, close the clamp edge cases
+- One normalization for reads, writes and the CLI (YM-96, YM-97)
+- Verify the fix on the body the job runs (consequence review 5.3)
+- Bool 0/1, map section reads, empty segments, session slots (YM-96, YM-97)
+- Persist before scheduling, drop already fired one-shots, clean job dirs
+- Close cycle-3 review findings on backup placement and fork model family (YM-135, YM-145)
+- Clamp coverage bounds, fail closed on coverage write errors
+- Review-Auflagen zu YM-251 (Dedupe, Kappung, Meldung)
+- Close the second review round on config writes (YM-96, YM-97)
+- Review findings on the auto-correct pass (client readiness, refusal reporting, verify timeout, actions, script selection, redaction order)
+- Close cycle-2 review findings on config writes and fork model (YM-135, YM-145)
+- Atomic write for generated files, guard test, honest comments (YM-56, YM-201)
+- Bound the job log, keep token headers ephemeral, drop dead strict mounts
+- Converge distillation, never supersede unread rows, keep range-less forks unmarked
+- Keep a used handoff closed, validate the project part (YM-162, YM-50)
+- Correct calibration units, sample lifetime and collapse floor after review
+- Close the cold-review findings (YM-169..YM-218)
+- Review findings on schema checks and set_config (YM-96, YM-97)
+- Symlink-safe AGENTS.md guard, scan key resolved like the scanner (YM-56, YM-201)
+- Close the review findings (YM-162, YM-50)
+- Close review findings on the JSONC editor and fork effort fix (YM-135, YM-145)
+- Read the guard config without a yaml module, and tighten what the block filter and the logs accept
+- Count profiles on top-level sessions, damp tail re-extraction
+- Honour a script's declared timeout and repair proxy_health_bash (YM-219)
+- Harden the log writers and the block text against the model output they carry
+- Prune keyed by basename, never overwrite a hand-written AGENTS.md (YM-56, YM-201)
+- Sawtooth prefix expiry, collapse budget, estimate calibration, model thresholds, subagent passthrough (YM-236, YM-237, YM-238, YM-129, YM-143)
+- A minimal auto-correct keeps the script set, metadata and binding (YM-166)
+- Skip a proxy section that is not a block (YM-97)
+- Resolve bare model names to the provider the user has credentials for (YM-152)
+- Honour a none default, clean the sandbox stderr, keep job logs (YM-173, YM-209, YM-218)
+- Run the failed-job pass off the heartbeat ticker (YM-167)
+- Profile freshness, fork coverage, FTS trigger, chunk size, cleanup precedence (YM-49, YM-51, YM-53, YM-54, YM-55, YM-228)
+- Patch opencode baseURLs without rewriting the config (YM-145)
+- Auto-correct asks the daemon LLM client, not the claude CLI (YM-168, YM-214)
+- Take the fork wire format from the source request and normalize inherited effort (YM-135)
+- Make the v1 block real, read the branch from both .git shapes, and give the plugin log one rotating writer (YM-79, YM-85, YM-8)
+- Deflate usage only for Claude Code clients (YM-142)
+- Make the /clear handoff one-shot instead of a 30s race (YM-162)
+- Write set_config keys where the loader reads them (YM-96)
+- Resolve_by_text braucht den eindeutigen Volltreffer (YM-251)
+- Read Chat-Completions usage fields (YM-92)
+- Give the rule guard its own model and log why it did not judge (YM-78, YM-22, YM-85)
+- Surface scan errors in the briefing and prune dead scan state (YM-201)
+- Bound headless runs, expose backend/interval/recurring (YM-171, YM-172)
+- Match excluded projects case-insensitively (YM-163)
+- Persist one-shot removal and a parseable last_run (YM-169, YM-170)
+- Detect changes to existing sessions in the render snapshot (YM-198)
+- Make AGENTS.md generation reachable via --opencode (YM-56)
+- Say what 0 means after D18
+- Bound the unfinished-turn window from the first observation (YM-225)
+- 0 means no limit, the default was the bug (D18/YM-67)
+- An unfinished turn is work, bounded in time (YM-225)
+- Security review hardening on Los 21
+- Single-flight the rules interval, keep the plan nudge name on one line (security review)
+- Consequence findings on Los 21
+- Read turns as requests, an open turn as work, and unpause conditionally (YM-225)
+- Start the deadline cooldown only for deadlines in the delivered text (YM-106)
+- Review findings on the Los 21 fixes
+- Log degraded quarantine filter, audit unquarantine_session
+- Meter at configured prices, book reported usage on failure, recover the backup, bound staleness both ways (YM-90, YM-91, YM-93, YM-94)
+- Do not consume the rules interval on a failed fetch (review consequence finding)
+- Filter quarantined candidates in the IVF search path (YM-44)
+- Review findings on hints, deadline window and cooldown scope (YM-105, YM-106, YM-107)
+- End the process on every stop path, bound the replacement policy, and make the abandonment note successor-aware
+- Persist the resolved plan project, memoize restore hints, prune the rules cache (YM-101, YM-26 review fixes)
+- Keep a guessed-unknown version non-destructive, write files without following links
+- Sum multi-step usage per call, keep the previous backup when linking fails, test the ticker decision (YM-90, YM-91, YM-93)
+- Make the spawn exit write a compare-and-set (YM-202)
+- Harden the plugin installer and the config write against the review findings
+- Write learning provenance and recognise the channel format (YM-74)
+- Gate graph neighbours on their own row, not just via the parent
+- End cascaded agent processes, not just their rows (YM-71)
+- Bound the caller-visible restart policy, keep the abandonment notice honest, quote agent text in the new logs
+- Relay answers must not accumulate into progress (YM-225)
+- Read-only finder, shared source list, terminal-safe listing (YM-48)
+- Apply the documented 500000 token budget default (YM-67)
+- Refuse prompt-breaking spawn parameters (YM-211)
+- Bind the parent session id in the opencode child query (YM-216)
+- Project on vector hits, parsed cooldown, single source boost, filtered graph neighbours, quarantine filters (YM-38, YM-39, YM-40, YM-41, YM-44)
+- Collect crashed rows, end the process at a limit, quarantine every address, arm the restart strategy
+- Keep deadlines visible and start the cooldown on delivery only (YM-106)
+- Rebuild the docs hint when plans are reloaded from the DB (YM-101)
+- Cache the condensed rules block per project with a TTL (YM-26)
+- Reset plan/docs checkpoints after a context shrink, recognize plan tools on every backend (YM-99, YM-100)
+- Update ticker waits for the config load and logs its decision (YM-90)
+- Book measured usage on the call's own tracker, once per call (YM-93)
+- Carry the session identity into generate_briefing (YM-105)
+- Short-session cleanup spares user-stated learnings and unfinished sessions (YM-48)
+- Idle guard reads turns and session messages as progress (YM-225)
+- Show user profile and a short persona directive together (YM-112)
+- Installed plugin dir mirrors the bundle, no test files (YM-86)
+- Task_type hints, single get_learnings, readable deadlines, drop dead renderers (YM-107, YM-109)
+- Extract both Puls: and Pulse: from narratives (YM-102)
+- Never overwrite an opencode config that cannot be parsed (YM-87)
+- One throttle rule from proxy.RateLimitInfo, stale snapshots never throttle (YM-94)
+- Write the new binary before touching dest, back up via hardlink (YM-91)
+- Only a verb behind our binary counts as the subcommand (YM-221)
+- Retarget only our segment when the binary path moves (YM-221)
+- Review round 2 — honest prune report, discriminating relative-path test
+- Keep the channel endpoints off the HTTP API and log a refused inbox read (YM-204 cycle 2)
+- Review round 1 — ranking, prune blast radius, worktree pulls, doc-sync skill sources
+- Round-2 review findings — adoption log alive in both directions, canonical binding compare, scope value validated
+- Hold channel readers to the kernel peer only, correct the codex claim, rune-safe labels, legacy broadcast rows (YM-59, YM-62, YM-73, YM-204)
+- Round-2 review follow-ups
+- Close the findings of the cold, consequence and security reviews (YM-220, YM-221, YM-222)
+- Keep an exact match an exact match across the rune bound
+- Review findings on the walk containment (YM-224)
+- Close the remaining guard gaps found in review (YM-42, YM-43, YM-45)
+- Review findings — binding-aware lock, hard chunk bound, honest sync log
+- Review findings — alias prefixes, dedup bookkeeping, ambiguous unpin
+- Lend intensity only from a proven session, log cluster-score failures (review of YM-33/YM-36)
+- Index only briefing entries, drop cited IDs from labels (review of YM-35)
+- Noise only for completed turns, signals.enabled on the API path (review of YM-31/YM-32)
+- Close cold-review findings
+- Count the nested-match bound in runes, test entitiesMatchInput
+- Prune broadcasts in the clock their column is written in (YM-61 self-review)
+- Offer the CronCreate polling hint only to clients that have the tool (YM-73)
+- Bind the walk containment to the path that is read (YM-224)
+- Write the learning export owner-only [YM-47]
+- Hold channel readers to their peer, drop the guessed send_to sender, bound the sender label (YM-60, YM-73, YM-204)
+- Flag and prune doc sources whose path is gone (YM-29)
+- Rune-safe chunks, paged reads, cell limit on claim_and_read (YM-177, YM-213)
+- Disk sync carries the sandbox profile, honours auto_active, refuses stale versions (YM-174, YM-175, YM-176, YM-210, YM-223)
+- Scan guards directory/name mismatch and project scope default (YM-174, YM-179, YM-210)
+- Retire pending_confirmation, guard rule-based dedup by trust (YM-43, YM-45)
+- Actionable error when set_persona cannot auto-detect a dimension (YM-119)
+- Remember learnings inherit their session's intensity (YM-36)
+- Never redirect a supersede chain to an inactive learning (YM-42)
+- Scope docs_search by project before the result limit, vector path included (YM-28)
+- Scope the save_count state per session (YM-161)
+- Keep the learning IDs in the refined briefing (YM-35)
+- Recognise the qualified MCP name of the dialog tools (YM-158)
+- Stop booking non-injections as inject, match cluster IDs exactly (YM-33)
+- Keep generic_api_key redaction JSON-safe and cover the CLI client paths (YM-222)
+- Drop the checkout directory names from the path keywords (YM-160)
+- Show proxy/fork buckets, open the DB read-only [YM-95]
+- Created_at format, source filter, V2 metadata [YM-47]
+- ParseTime understands stored CURRENT_TIMESTAMP [YM-52]
+- Prune unreachable channel rows, match broadcasts across worktrees (YM-61, YM-62)
+- Never pull the repository a source merely lives in (YM-27)
+- Match V2 entities and actions on token boundaries (YM-159)
+- Drop the dead reflection call and honour signals.enabled (YM-32)
+- Project-less session pins die with /clear, unpin searches both scopes (YM-120, YM-121)
+- Keep the condensed rules block alive through doc-sync and empty LLM answers (YM-25)
+- Validate set_persona dimension, stop dropped traits displacing others (YM-119, YM-124)
+- Identify yesmem hooks by binary and subcommand, not by substring (YM-221)
+- Keep user_override traits untouchable and dotted trait keys intact (YM-118, YM-123)
+- Scan the previous assistant answer for inline signals (YM-31)
+- Search_code must not read through a symlink out of the project (YM-224, DEV-DT39)
+- Scope doc-chunk reads to their source so a second ingest cannot wipe another source's chunks (YM-24)
+- Write auth.json and settings.json owner-only (YM-220)
+- Review findings on the 2.x flag set (YM-206)
+- Guard the redactor construction, tighten two doc claims (YM-212 security review)
+- Ignore a work dir that no longer exists
+- Relay the proxy port into a 2.x sandbox for agent runs (YM-206)
+- Keep foreign hooks intact in the SessionEnd and idle-tick migrations
+- Harden the construction guard, pin the metered paths, drop the dead field (YM-212 reviews)
+- Make the install-state and hook fixes reach existing installs
+- Pin the ai-jail download to a tested release with a checksum (YM-205)
+- Keep code tools inside the project directory (YM-199)
+- One factory for every LLM client (YM-212/E2,E4)
+- SetMaxBudgetPerCall sees through a SanitizingClient (YM-212/E5)
+- Install-state permissions and hook registration (YM-21, YM-178, YM-155, YM-156, YM-157)
+- The answer restarts the relay count and the tool name is an allowlist (YM-196/YM-207 reviews 3)
+- Keep the auto-correct body verbatim, tighten the cell whitelist, close the inherited-sandbox escape
+- Give the broken-toolcall case a terminal state and widen detection (YM-196 review round 2)
+- Review round — no config persistence, fail closed on bad profile
+- Close the long-hex-run gap, share the extract budget, check the caller's scripts
+- The idle guard backs off when the agent worked since the relay (YM-207)
+- Latch the broken-toolcall case and count only delivered relays (YM-196 review round 1)
+- D2b profiles — standard without lockdown, strict with lockdown
+- Redact on the four LLM surfaces that had no SanitizingClient (YM-18)
+- Enforce lockdown profiles, fail closed, report non-zero exits, quote cap args (YM-13, YM-14, YM-15, YM-16, YM-165)
+- Detect broken tool calls of loop agents and relay them (YM-196)
+- Keep the channel sender out of the injected send_to instruction (YM-195)
+- Hold save_cap to the scope/sandbox lock, default a scope-less CAP.md to user (YM-17)
+- Recognise fine-grained PATs and uppercase hex secrets, close the cap_store quota bypass (YM-19, YM-20)
+- Third review round — the marker must name a phase, the verdict belongs to a row
+- Second review round — marker forms, exit release, function naming
+- Bound the daemon-keeper stderr as well
+- Second review round minors
+- Resolve the project key from the enclosing repository
+- Marker round-trip keeps the identifier byte for byte
+- Close the review findings on the six fixes
+- Code map reads the resolved dir, CLI never steals, dumps get a byte bound
+- Bound and flatten captured CBM stderr
+- Serve the cached graph when a rebuild fails
+- Make the path index atomic, self-marking and cheap to probe
+- Derive the code-nav project key from the scanner itself
+- Keep collision directories stable, resolve them for readers too
+- The self-check re-arms, verifies the marker it demands, and yields to the done-verify layer (YM-149)
+- Resume_agent places the window on the caller's desktop (YM-193)
+- A replacement comes back with the backend, model and theme it was spawned with (YM-64)
+- Guard unusable project names, drop a redundant local
+- One debug-dump helper, names that cannot collide, bounded directory
+- Answer the code-nav check from an index, not from the scan blob
+- Resolve the wiki directory through one shared package for writer and readers
+- A paused agent with a live process is not resumable; the exit tail owns only its own process (YM-70)
+- Invalidate the code graph when git HEAD or the CBM index moves
+- Scope scan cooldown to the scanned directory
+- Run the ACK-on-ACK check on the proven identity only (YM-194)
+- Mark pinged channel messages delivered (YM-58)
+- Relay-only yesloop guards keep working without a process table
+- Name the real terminal states and stop overstating the trade-offs
+- Shorten the race window and stop mistaking a server error for a refusal
+- Separate refusal from silence, and keep the caller out of the instruction
+- Stop-all uses the same compare-and-set, and a NULL pid is stoppable
+- Close the review findings on the implicit-ack trust check
+- The stop decides on the PID it displaces, not on one it erased
+- The implicit ack only acknowledges the caller's proven identity
+- Guard on a proven caller, claim the row before the push
+- Close the findings of the Loop E review round
+- Test the canonical sender form before skipping the implicit ack
+- A stop inside the restart window is no longer overwritten
+- Log an undeliverable daemon notice instead of re-addressing it
+- A restart comes back in the agent's own work tree
+- Create the agent_messages indexes after the tables
+- The yesloop guards relay only into their own agent's process
+- Daemon notices carry their own sender, not a foreign session
+- The two dead-declaring limits decide on a proven death
+- Close the Phase-5 review findings of round 2
+- Act on the re-review of the round-2 fix batch
+- Surface the send_to delivery warning to the caller
+- Close the restart window, split crash recovery, tighten the skill token
+- The last two raw session readers get the trust decision too
+- Normalise the session id in the binder and sharpen its diagnostics
+- A re-run migration must not blank learnings.project
+- Log the refused adoption so a window without its agent is diagnosable
+- A restart relaunches through the spawn path, so the row gets the backend PID
+- Close the last unguarded writers of the session column
+- Crash recovery decides on the agent own process, not on signal 0
+- A foreign session must not decide the project either
+- Read every skill-reload marker line, and the right spawn response key
+- Close the findings of the fix-cycle verification
+- Fail closed when a session cannot be identified
+- Give each consumer of the identity check its own safe direction
+- Address the Phase-5 review findings
+- Close the review findings on the bind fix
+- Keep a live agent verifiable — bind the spawn marker with the pid
+- Stop signals only verified agent processes
+- Bind an opencode agent to exactly its own session
+- Identify a spawned session by its agent marker, not by section
+- Refuse ambiguous PID mappings and unresolvable project names
+- Close legacy frozen agent rows on migration
+- Stop re-running guards for agents that no longer exist
+- Stop the process-wide session env from outranking the caller
+- Scope the permission kick to live agents' own processes
+- Attribute remember to the caller's session, not the global active one
+- Identify an agent's own process, not just its PID
+- Stop_agent accepts error and crashed agents
+- Get_agent reports opencode_session_id and codex_session_id
+- Stop guessing agent threads, parse RFC3339 created_at for max_runtime
+- Constrain the late-bind fallback to the agent's own tree
+- Keep subagents and out-of-window sessions out of the table fallback
+- Anchor the capture bound on the real agent timestamp
+- Close the review findings on exact-address resolution
+- Bound the session match in time and match agents by session dir
+- Resolve opencode v2 callers by workdir, not PID
+- Read v2 sessions in every projection and bind late
+- Resolve send_to targets at send time, report the full target
+- Capture opencode v2 session ids via the server API
+- Exact channel-address matching instead of the 8-char LIKE net
+
+### Performance
+
+- Index fuer Vorgaenger-Lookup ueber superseded_by (YM-418)
+- Compare the frozen prefix structurally instead of by marshalled hash
+- Index agent_messages target and sender
+
+### Reverted
+
+- Decay-Rueckfall fuer Altzeilen aus Los 16b zuruecknehmen (YM-288)
+- Revert "feat(config): forked_agents.api_format verdrahtet die oberste Rangstufe der Fork-Formatwahl (YM-262)"
+- Revert the v1 plugin fixes: the target is the v2 plugin
+
+### Documentation
+
+- Regenerate CHANGELOG after the merge
+- Regenerate CHANGELOG from the campaign commits
+- Record the 16.10.2026 feature audit that the YM campaign was derived from
+- An explicit false switches off an inherited prompt flag
+- Tighten three claims the re-review measured
+- Name the guard's blockable set after the shell change
+- Describe the agent-safe deployment and record the theme entry
+- Name the read-to-read window the provenance digest has (YM-450)
+- Describe provenance, the three cases and the conflict line (YM-450)
+- The rootless tolerance is the storage guard's, not the CLI save path's (YM-453)
+- Drop the statements the per-checkout key made false (YM-453)
+- The ascent is the same one ScanCacheKey makes, after symlink resolution (YM-453)
+- Gleichstand im Installer und im Skill-Kopf richtigstellen (YM-450)
+- Versionsgate praezise, Skill-Kopf und Gotchas nachziehen (YM-450)
+- Auslieferung an den echten Mechanismus angleichen (YM-450)
+- ScanCacheKey behaelt seinen Kommentar, neue Funktion darunter (YM-449)
+- Drop the overstated refusal claim and the stale line anchor (YM-441 review)
+- Record the work-dir window at runProcess and the caller-text rule (YM-437)
+- Name search_code for call sites, warn that shell search is blocked (YM-433)
+- Reihenfolge der Batch-Geschwister in GetLearningChain nennen (YM-418)
+- State what the fence check and the RPC doc actually guarantee (YM-405)
+- Nest the CAP.md example in a longer fence (YM-405)
+- Template patterns respect exceptions, gated boundary (YM-405)
+- Provider precedence is credential-backed first (YM-405)
+- Describe the session-override scope of set_config and get_config accurately
+- Fix consequence and security review findings
+- Fix cold-review findings in briefing, proxy, cap, yesloop and settings docs
+- Fix dangling code fence and scheduler tick in JobsFeature (YM-189)
+- Align config and settings references, tool counts and binary size with code (YM-190, YM-191)
+- Align operations, caps, jobs and cap-store docs with code (YM-189)
+- Align hooks, opencode v2 plugin, code intelligence and wiki with code (YM-188)
+- Align agent, yesloop and yesresearch docs with code (YM-187)
+- Align feature doc with code (YM-185)
+- Align feature doc with code (YM-184)
+- Align feature doc with code (YM-186)
+- Align feature doc with code (YM-183)
+- The crash close loses to a stop, not to a resume (YM-356)
+- Name yesmem backup instead of copying the live database (YM-361)
+- Akzeptierte Schutzgrenzen im Code benannt (YM-342)
+- Begruendung der gemeinsamen caps_dir-Ableitung korrigiert (YM-359)
+- WAL-Vorfaelle nicht als harmlos bezeichnen (YM-355)
+- Mmap-Grenze auf die gemessene Ursache zurueckfuehren (YM-355)
+- Kommentarverweise auf den aufgeloesten Wrapper nachziehen (YM-346)
+- State the known encoder deviations truthfully (YM-330)
+- Name the allowlisted scratchpad writes in the comment (YM-345)
+- Correct the allowlist comment after removing the write methods (YM-345)
+- Freeze report wording and the reason for the relay marker (YM-270)
+- Wrapper-Flag-Tabelle auf ihren echten Geltungsbereich ziehen (YM-310, Los 31d)
+- Basename-Kollision des Legacy-Zaehlers benennen (YM-288)
+- State the submodule exception and the cooldown exception in the comments (YM-311 review 5)
+- Relay-1-Fassungen in Skill und Architekturnotiz richtigstellen (YM-309)
+- New open tasks carry the ticket key the commit anchor needs (YM-279)
+- Kommentar trennt leere Antwort von Parse-Fehler (YM-265)
+- Quellen-Konstante nennt beide Cleanups (YM-265)
+- Grenzen von --map unter ai-jail-Dotdirs und der Cap-Mount-Flags benennen
+- Veralteten Evict-Kommentar ueber UpdateTTL entfernt
+- State why a missing mask path cannot protect (YM-284)
+- State that the i18n defaults and translation source are English
+- Correct the socket-cleanup comments, pin the cascade gate (YM-274)
+- Stream fields come from get_agent; max_runtime default is 48h (YM-153)
+- Describe max_runtime and list_agents as the daemon implements them (YM-153)
+- Correct the re-expansion and negative-age comments, pin the reminder age band (consequence review)
+- Stop claiming codex mail is unmatched, add the guard's positive case
+- Drop the stale version-check comment
+- Correct comments flagged by the second review round
+- Record the sender trust model and quote logged fields
+- Follow-up loops E/F and opencode fork session-env note (A0b)
+- Post v2-capture bugfix plan (session attribution, bind identity, agent liveness)
+- No preset budgets for generate; cost transparency and loop protection instead
+- Oc catalog visible to every agent, access checked per call by relation to target
+- Brainstorm part E — oc tool with caps-style API catalog
+
+### Testing
+
+- Move the handler opener family into the harness
+- Address cold review findings
+- One reader set for setup fixtures
+- One harness for the shared fixtures and platform guards
+- One daemon socket stub instead of four
+- One harness for the bundled cap fixtures
+- One harness for the store fixtures
+- Pin the walk guard on a cyclic node graph (YM-465)
+- Pin the excerpt narrowing and the marker anchoring (YM-464)
+- A repair on top of the installed bundle still reaches the disk (YM-450)
+- Cover the bundled claim, tighten two assertions (YM-450)
+- A second setup run finds nothing to do (YM-450)
+- Re-Ingest-Scope auf dem Produktionspfad belegen (YM-452)
+- Subdir-Scope von search_code belegen, Kommentare praezisieren (YM-449)
+- Gofmt the sweep scope fixture
+- Cover the keep-branch mode repair and unparseable cap bodies (YM-446)
+- Lock the journal capture buffer for the handlers' async daemon logging (YM-440)
+- Eingehende Kanten pinnen die Bind-Reihenfolge im Projektzweig (YM-443)
+- Globale Quelle deckt den Zweig ohne Projektargument ab (YM-443)
+- Skip comment lines in the poll stdin order check (YM-439)
+- Fingerprint-Fall verweist auf eine echte Nachfolgerzeile (YM-443)
+- Sweep model and session journal keys, add hostile model/session behavior tests (YM-440)
+- Guard gegen Kommentar-Trick, exit 0 und read-all (YM-434, YM-438)
+- Guard deckt beide Drift-Richtungen und den deaktivierten Job (YM-434, YM-438)
+- Guard gegen stille Degradierung des Gates (YM-434, YM-438)
+- Use the real deadline distance instead of a DST-unsafe copy (YM-444)
+- Resolve bindings per block, not per position (YM-438)
+- Scan function literals outside declarations too (YM-438)
+- Pin the joined work-dir cause, sharpen two comments (YM-437)
+- Close the sweep's own holes after cold review (YM-438)
+- Bindungstests von den Verhaltenstests getrennt, gegen die Basis nachspielbar (YM-427)
+- Pin the vector_search boundary, drop the unreachable nil guard (YM-432)
+- Hold the refusal text off a mask cause, log a second cause
+- Cover all three failed statements of a batch supersede (YM-426)
+- Seed clusters under a project path, not a bare name (YM-424)
+- Seed clusters under a project path, not a bare name (YM-424)
+- Follow the installer's rules in the two invariant tests (YM-421, YM-422)
+- Inline the rune count in the label cap check (review cleanup)
+- Rekursionspfad der Batch-History pinnen (YM-418)
+- Take over the opencode fork's plugin suite (YM-422)
+- Deterministic exit-tail state, no teardown race (YM-420)
+- An agent without its own marker stays unbound (YM-419)
+- Wait for the failed spawn before resetting the row (YM-408)
+- Race-Regressionstest fuer TimestampStore.Persist (YM-401, PRX-P53)
+- A checkout root is its own project since YM-393 (YM-382)
+- Name both leak remedies in the ticker guard (review los 56b)
+- Distinguish worktree folding from enclosing checkout (YM-382)
+- Discriminating tests for the cwd gate and the MCP exe check, env-derived label refused
+- Pin the fts-before-content order and the blocked-sweep state, keep the empty-watermark message honest (YM-374)
+- Keep the prune assertion in step with the quoted output (Los 04i review 5)
+- Zwei Worktrees desselben Repos ergeben genau eine Root-Zeile (YM-382)
+- Fixation-Ratio-Test entskippt, manuelle fork-ALTERs entfernt
+- Typ, Default und Ruecklesen der YM-378-Spalten pruefen
+- Prove the allow branch of the wiki marker guard
+- Cover the --reset-cache state reset, extract it from Run
+- Pin literal prefix matching in DeleteProxyStatePrefix
+- Pin the directory refusal at the backup path
+- Regressionspfad fuer den veraenderten Quellbestand (YM-360)
+- Gates-Kommentar an den abgeleiteten Socketpfad angepasst (YM-338)
+- Alt-Tests auf den abgeleiteten Inject-Pfad umstellen (YM-338)
+- Letzte Review-Kleinigkeiten zu YM-355 (Zuschreibung, read-only-Pool, Anker)
+- Review-Befunde zu YM-355 korrigieren (Mechanik, Cap-Pin, Busy-Spalte)
+- WAL-Kuerzung unter offenem Read-Mark zusichern statt protokollieren (YM-355)
+- WAL-Guard-Restpunkte mit Regressionstests festnageln (YM-355)
+- Unvollstaendiger Walk pinnt auch den aktualisierten chunk_count (YM-329)
+- Prune-Aufrufstelle im Anthropic-Pfad mitpinnen (YM-323)
+- Standard-Bash-Job-Mounts fuer ai-jail 2.x pinnen (YM-353)
+- Negativkontrolle der Freeze-Uhr, progress- und Relay-Body-Senke (YM-344)
+- Make the watchdog tests count on atomics and a deadline (YM-341)
+- Pin the early refusal and correct the signal test rationale (YM-266 review)
+- Marker-Subset und Evakuierungsreihenfolge absichern (YM-272)
+- Regressionstests fuer YM-310 (Los 31d)
+- ProcessBashJobErrors nimmt seit Los 32b einen Kontext, Aufruf aus Los 34g nachziehen (YM-264, YM-314)
+- Pin YM-311 findings red (log quoting, cbm stderr, submodule key, cbm slug)
+- Pin the absolute-path gate and the exclusion needle (YM-296)
+- Totalausfall mit mehreren Chunks abdecken, Begruendung praezisiert (YM-265)
+- Pin the YM-297 stop scope to a process-table fixture (YM-297)
+- HOME in den Vorlos-Testdateien pinnen, YM-303
+- Rote Regressionstests fuer YM-301 (Lock, Rollback, download-Grenzen)
+- Red regressions for the short-session cleanup gaps (YM-298)
+- Pin the hours boundaries, drop a dead guard
+- Lock the resolved address a broadcast is stored under (YM-295)
+- Read the result section at the run's address (YM-295)
+- Guard that an existing mask path is never rewritten (YM-291)
+- RED tests for agent state mask paths (YM-291)
+- Pin the v1 removal contract for the opencode plugin install
+- Pin the refusal at the spawn call sites (YM-287)
+- Pin the strings.yaml upgrade path for the new keys
+- Move three fixtures onto the resolved-project contract
+- Pin the transport-failure line shape (YM-289)
+- Log the overload line in the shape the proxy writes (YM-289)
+- Prove the empty-run report exists before asserting its shape (YM-289)
+- Pin end-to-end loop detection for the opencode dialect (YM-131)
+- Cover the agent_id_seq upgrade seed (YM-151)
+- RED tests for caller-chosen sock_path unlink (YM-274)
+- Pin the token rule and guard the .claude segment (YM-226 review)
+- Keep the handler-test server out of the repo and drop the committed cache-status artifact
+- Pin the handler-level subagent wiring and document the per-thread sample race
+- Drei-Begriffe-Regel im Bestand nachziehen (YM-251)
+- Scope the temp HOME to the suite instead of the whole test run
+- Rename the Los-10 daemon stub to fakeDaemonDir, it collided with fakeDaemon from Los 11
+- Cover the single-flight recheck and the cache prune
+- Pin the configured pricing in the meter chain; correct the staleness docs (YM-93, YM-94)
+- Assert the code index probe carries a 2s bound (YM-83)
+- Pin the version probe, cover the v2 model path, accept a v-prefixed version
+- Wait for the process cmdline instead of reading it once (YM-234)
+- State the pin's real coverage (YM-224)
+- Pin the shell-string shape, not just the method name (YM-224)
+- Red regression tests for the broadcast project match and the channel prune (YM-61, YM-62)
+- Pin the layer source, not just the call sites (YM-212 re-review)
+- Pin the wiki root to a temp HOME in the render tests (YM-208)
+- Cover the stale-release safety net of the broken-toolcall guard (YM-196)
+- Red regression tests for YM-13/14/15/16/165
+- Red regression tests for YM-6 wiki path/snapshot and YM-3 dump overwrite
+- Prove daemon-internal reports take the same path
+- Accept the live service's verdict on the request body
+- Cwd-independent plugin paths, deterministic cache test, make vet
+- Spawn_agent persists the work_dir on the row
+- Pin the exact channel address per harness on the live injection path
 
 ## [2.3.19] - 2026-10-15
 

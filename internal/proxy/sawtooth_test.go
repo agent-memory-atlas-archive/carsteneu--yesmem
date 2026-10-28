@@ -294,7 +294,7 @@ func TestSha256hex(t *testing.T) {
 func TestSawtoothTrigger_FirstRequest(t *testing.T) {
 	st := NewSawtoothTrigger(61*time.Minute, 180000, 80000)
 	// No prior data → no trigger
-	reason := st.ShouldTrigger("thread1", 50000)
+	reason := st.ShouldTrigger("thread1", 50000, 0)
 	if reason != TriggerNone {
 		t.Errorf("first request should not trigger, got %s", reason)
 	}
@@ -304,7 +304,7 @@ func TestSawtoothTrigger_TokenThreshold(t *testing.T) {
 	st := NewSawtoothTrigger(61*time.Minute, 180000, 80000)
 	st.UpdateAfterResponse("t1", 185000, 30) // above 180k
 
-	reason := st.ShouldTrigger("t1", 100000)
+	reason := st.ShouldTrigger("t1", 100000, 0)
 	if reason != TriggerTokens {
 		t.Errorf("expected TriggerTokens, got %s", reason)
 	}
@@ -314,7 +314,7 @@ func TestSawtoothTrigger_BelowThreshold(t *testing.T) {
 	st := NewSawtoothTrigger(61*time.Minute, 180000, 80000)
 	st.UpdateAfterResponse("t1", 150000, 25) // below 180k
 
-	reason := st.ShouldTrigger("t1", 100000)
+	reason := st.ShouldTrigger("t1", 100000, 0)
 	if reason != TriggerNone {
 		t.Errorf("expected TriggerNone, got %s", reason)
 	}
@@ -329,7 +329,7 @@ func TestSawtoothTrigger_PauseDetection(t *testing.T) {
 	st.lastRequestTime["t1"] = time.Now().Add(-62 * time.Minute)
 	st.mu.Unlock()
 
-	reason := st.ShouldTrigger("t1", 100000)
+	reason := st.ShouldTrigger("t1", 100000, 0)
 	if reason != TriggerPause {
 		t.Errorf("expected TriggerPause, got %s", reason)
 	}
@@ -344,7 +344,7 @@ func TestSawtoothTrigger_PauseButTooFewTokens(t *testing.T) {
 	st.lastRequestTime["t1"] = time.Now().Add(-6 * time.Minute)
 	st.mu.Unlock()
 
-	reason := st.ShouldTrigger("t1", 50000)
+	reason := st.ShouldTrigger("t1", 50000, 0)
 	if reason != TriggerNone {
 		t.Errorf("expected TriggerNone (too few tokens for pause), got %s", reason)
 	}
@@ -353,7 +353,7 @@ func TestSawtoothTrigger_PauseButTooFewTokens(t *testing.T) {
 func TestSawtoothTrigger_Emergency(t *testing.T) {
 	st := NewSawtoothTrigger(61*time.Minute, 180000, 80000)
 	// No prior data, but raw estimate is too high → emergency
-	reason := st.ShouldTrigger("t1", 195000)
+	reason := st.ShouldTrigger("t1", 195000, 0)
 	if reason != TriggerEmergency {
 		t.Errorf("expected TriggerEmergency, got %s", reason)
 	}
@@ -364,7 +364,7 @@ func TestSawtoothTrigger_EmergencyOverridesTokens(t *testing.T) {
 	st.UpdateAfterResponse("t1", 185000, 30)
 
 	// Both token threshold and emergency would fire — emergency takes precedence
-	reason := st.ShouldTrigger("t1", 195000)
+	reason := st.ShouldTrigger("t1", 195000, 0)
 	if reason != TriggerEmergency {
 		t.Errorf("expected TriggerEmergency (takes precedence), got %s", reason)
 	}
@@ -382,7 +382,7 @@ func TestSawtoothTrigger_TouchPreventsParuseTrigger(t *testing.T) {
 	st.mu.Unlock()
 
 	// Without touch: should trigger pause
-	reason := st.ShouldTrigger("t1", 110000)
+	reason := st.ShouldTrigger("t1", 110000, 0)
 	if reason != TriggerPause {
 		t.Fatalf("precondition: expected TriggerPause without touch, got %s", reason)
 	}
@@ -394,7 +394,7 @@ func TestSawtoothTrigger_TouchPreventsParuseTrigger(t *testing.T) {
 	st.TouchRequestTime("t1")
 
 	// After touch: should NOT trigger pause
-	reason = st.ShouldTrigger("t1", 110000)
+	reason = st.ShouldTrigger("t1", 110000, 0)
 	if reason != TriggerNone {
 		t.Errorf("expected TriggerNone after TouchRequestTime, got %s", reason)
 	}
@@ -438,7 +438,7 @@ func TestSawtoothTrigger_SetTokenThreshold(t *testing.T) {
 	st := NewSawtoothTrigger(61*time.Minute, 200000, 80000)
 
 	// 110k < 200k → no trigger
-	reason := st.ShouldTrigger("t1", 110000)
+	reason := st.ShouldTrigger("t1", 110000, 0)
 	if reason != TriggerNone {
 		t.Fatalf("expected TriggerNone before update, got %s", reason)
 	}
@@ -447,7 +447,7 @@ func TestSawtoothTrigger_SetTokenThreshold(t *testing.T) {
 	st.SetTokenThreshold(100000)
 
 	// 110k > 100k → TriggerTokens (not emergency since 110k <= 110k)
-	reason = st.ShouldTrigger("t1", 110000)
+	reason = st.ShouldTrigger("t1", 110000, 0)
 	if reason != TriggerTokens {
 		t.Fatalf("expected TriggerTokens after update, got %s", reason)
 	}
@@ -457,7 +457,7 @@ func TestSawtoothTrigger_SetTokenThreshold_Emergency(t *testing.T) {
 	st := NewSawtoothTrigger(61*time.Minute, 200000, 80000)
 
 	// 110k < 210k emergency → no trigger
-	reason := st.ShouldTrigger("t1", 110000)
+	reason := st.ShouldTrigger("t1", 110000, 0)
 	if reason != TriggerNone {
 		t.Fatalf("expected TriggerNone, got %s", reason)
 	}
@@ -466,7 +466,7 @@ func TestSawtoothTrigger_SetTokenThreshold_Emergency(t *testing.T) {
 	st.SetTokenThreshold(90000)
 
 	// 110k > 100k emergency → TriggerEmergency
-	reason = st.ShouldTrigger("t1", 110000)
+	reason = st.ShouldTrigger("t1", 110000, 0)
 	if reason != TriggerEmergency {
 		t.Fatalf("expected TriggerEmergency, got %s", reason)
 	}

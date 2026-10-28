@@ -4,12 +4,12 @@ import "sync"
 
 // ForkState tracks per-thread token growth and failure counts for forked agents.
 type ForkState struct {
-	mu                  sync.Mutex
-	tokenGrowthTrigger  int
-	minTotalTokens      int // minimum absolute tokens before any fork is allowed
-	maxFailures         int
-	maxForksPerSession  int
-	threads             map[string]*threadForkState
+	mu                 sync.Mutex
+	tokenGrowthTrigger int
+	minTotalTokens     int // minimum absolute tokens before any fork is allowed
+	maxFailures        int
+	maxForksPerSession int
+	threads            map[string]*threadForkState
 }
 
 type threadForkState struct {
@@ -46,9 +46,14 @@ func (fs *ForkState) getOrCreate(threadID string) *threadForkState {
 // ShouldFork returns true if the thread has accumulated enough token growth, meets
 // the minimum total token threshold, and has cache.
 // totalTokens is the absolute input token count of the current request (not a delta).
-func (fs *ForkState) ShouldFork(threadID string, totalTokens int, hasCache bool) bool {
+// isSubagent marks a request of a subagent that shares the parent's thread ID: it
+// must neither move the parent's baseline nor spend the parent's fork budget.
+func (fs *ForkState) ShouldFork(threadID string, totalTokens int, hasCache bool, isSubagent bool) bool {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if isSubagent {
+		return false
+	}
 	if !hasCache {
 		return false
 	}
@@ -142,4 +147,12 @@ func (fs *ForkState) ForceNextFork(threadID string) {
 	defer fs.mu.Unlock()
 	ts := fs.getOrCreate(threadID)
 	ts.tokensSinceLastFork = fs.tokenGrowthTrigger
+}
+
+// pruneThreads bounds the per-thread fork state. A dropped entry restarts that
+// thread's growth counter and failure streak, which at worst re-arms forking.
+func (fs *ForkState) pruneThreads(keep int) int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return pruneThreadKeyed(fs.threads, keep)
 }

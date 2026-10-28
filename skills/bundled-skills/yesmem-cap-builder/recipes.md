@@ -119,7 +119,7 @@ schema: {"type":"object"}
 sandbox: strict
 
 ```bash
-{ cd "${WORKTREE:-$HOME/projects/yesmem}" && git status --porcelain | head -1; } && stat -c '%y %n' ~/.local/bin/yesmem 2>/dev/null && test -S ~/.claude/yesmem/daemon.sock && echo OK || echo DEGRADED
+{ cd "${WORKTREE:-$HOME/projects/yesmem}" && git status --porcelain | head -1; } && stat -c '%y %n' ~/.local/bin/yesmem 2>/dev/null && test -S "${YESMEM_SOCK:-$HOME/.claude/yesmem/daemon.sock}" && echo OK || echo DEGRADED
 ```
 ```
 
@@ -131,6 +131,7 @@ sandbox: strict
 - `sandbox: strict` overrides the scheduled-job profile and the daemon default. Resolution order: per-script > job > daemon default.
 - `scope: user` is required if you set `sandbox: none` (which this cap doesn't, but worth knowing). `scope: project` + `sandbox: none` is rejected by the parser.
 - Single-line bash. No heredoc. Chain with `&&`/`;`. Output to stdout is the return value; non-zero exit signals error to the scheduler.
+- A sandboxed run reaches only the restricted job socket, and `YESMEM_SOCK` points at it. Check `${YESMEM_SOCK:-$HOME/.claude/yesmem/daemon.sock}`: the full daemon socket is masked inside the sandbox. Under `sandbox: strict` the home is a tmpfs, so neither path exists there.
 
 **Common mistakes**:
 
@@ -403,31 +404,36 @@ await mcp__yesmem__cap_store({
 
 ---
 
-## 6. Bundled cap (lives in `caps/bundled-caps/<name>/CAP.md`, deployed via `make deploy`)
+## 6. Bundled cap (lives in `caps/bundled-caps/<name>/CAP.md`, installed by `yesmem migrate`)
 
-**When**: A cap that ships with yesmem itself, available to every install. `wiki_export`, `cap_search`, `cap_collect` are bundled.
+**When**: A cap that ships with yesmem itself, available to every install. `cap_search`, `cap_collect` and `changelog_check` are bundled.
 
 **Layout**:
 
 ```
-caps/bundled-caps/<name>/CAP.md       ← in repo (source of truth)
-~/.claude/caps/<name>/CAP.md           ← deployed disk copy (daemon reads this at runtime)
-caps.db (learnings row, category="cap") ← daemon-managed, written back to disk on restart
+caps/bundled-caps/<name>/CAP.md         ← in repo (the bundled source; the manifest decides whether it may replace the installed body)
+caps/bundled-caps/manifest.yaml         ← in repo, one derived_from_hash per cap: the body each bundle was cut from
+~/.claude/caps/<name>/CAP.md             ← installed copy (default caps dir, daemon reads this at runtime)
+~/.claude/caps/manifest.yaml             ← the installation's record: the digest of every body the installer delivered
+caps.db (learnings row, category="cap")  ← daemon-managed, written back to disk on restart
 ```
 
 **Lifecycle**:
 
-1. Edit `caps/bundled-caps/<name>/CAP.md` in the repo.
-2. Run `make deploy` — `InstallBundledCaps()` (in `internal/setup/setup.go`) compares SHA256 with `~/.claude/caps/<name>/CAP.md` and copies if different.
-3. Daemon restarts, reads cap from DB at runtime.
-4. On daemon restart, the **DB row is written back to disk**. If a higher DB version exists from a previous `save_cap`, the daemon's writeback overwrites your fresh source edit.
+1. Edit `caps/bundled-caps/<name>/CAP.md` in the repo. `version:` is display only, it gates nothing and only tells the human reader what they are looking at; the manifest entry already names the body your new one descends from, so a normal edit needs no second adjustment.
+2. `make deploy` builds the binary and swaps `~/.local/bin/yesmem`. It installs no cap at all: measured 2026-10-23, the rocketchat cap stood at v15 before and after a deploy.
+3. `yesmem migrate` runs `InstallBundledCaps()` (`internal/setup/setup.go`); `yesmem update` reaches the same path once it has actually installed a release. The installer decides from `derived_from_hash`, never from `version:`. No entry and nothing on disk: install. Entry naming the installed body: the bundle is its successor, install, whatever `version:` says. Entry naming a different body: keep the installed body and print one conflict line with both hashes plus the hash to record.
+4. The daemon imports the file at its next start, and a changed `CAP.md` is re-imported by the 30s watcher (`internal/daemon/daemon.go`). The import gate refuses a version below `cap_imported_version`, the revision the row was imported from, unless the installation's manifest names the file that arrived: that body was delivered on purpose, the row adopts its revision. A row that carries a repair on top of the body it imported is the later state, and the delivery is refused and reported.
+5. On daemon restart, the **DB row is written back to disk**, but not over a delivery the row's own source is behind. Keeping the file is logged with the row's version and the revision it was imported from. Where the manifest names something else, the row still wins on its counter and the write is logged with both digests.
 
-**Required dual-write workflow when DB has a higher version**:
+**Dual-write workflow when the live row is ahead of your edit**:
 
 ```javascript
 // 1. Edit caps/bundled-caps/<name>/CAP.md in the repo
 
-// 2. ALSO call save_cap with the same body, from the REPL
+// 2. If the installation's budget of revisions is what you cannot move (an old
+//    install, a row that no manifest entry vouches for), ALSO call save_cap with the
+//    same body, from the REPL
 const body = await Read({file_path: '/path/to/repo/caps/bundled-caps/my_cap/CAP.md'});
 // (parse out the script body, build the scripts array)
 
@@ -445,26 +451,26 @@ await mcp__yesmem__save_cap({
   auto_active: true   // match frontmatter
 });
 
-// 3. make deploy — both source and DB now agree
+// 3. the export writes the row back to the installed copy when the row's version is above it and the row is the later state (a repair on top of the body it imported); `make deploy` is not part of cap delivery
 ```
 
-**Diagnostic when SHA disagrees**:
+**Diagnostic when the digests disagree**:
 
 ```bash
 sha256sum caps/bundled-caps/<name>/CAP.md
 sha256sum ~/.claude/caps/<name>/CAP.md
+grep -A2 "name: <name>$" ~/.claude/caps/manifest.yaml   # the body this installation was given
 grep '^version:' ~/.claude/caps/<name>/CAP.md
-grep '^version:' caps/bundled-caps/<name>/CAP.md
 ```
 
-If disk SHA != source SHA AND disk version > source version, the daemon wrote back from DB. Fix via `save_cap`.
+`derived_from_hash` is `textutil.BodyDigest`, not plain sha256: it ignores line endings and trailing newlines and keeps everything else. To compare by hand, strip CR and trailing newlines first (`sed 's/\r$//' file | ...`), or trust the conflict line, which prints both digests. If the installed body matches `derived_from_hash`, the installation is intact and the repo file is the older state. If it does not, either the body was edited by hand or the row wrote it back; `save_cap` is the way to make such a body official.
 
 **Common mistakes**:
 
-- Editing `caps/bundled-caps/<name>/CAP.md`, running `make deploy`, observing that the disk file has the OLD version after restart — and assuming the deploy failed. The deploy worked; the daemon overwrote disk from DB. Solution: parallel `save_cap`.
+- Editing `caps/bundled-caps/<name>/CAP.md` and running `make deploy`, then finding the disk file unchanged. Nothing is broken: the deploy installs no cap. The install step is `yesmem migrate`, and it decides from `derived_from_hash`, not from `version:`.
 - Editing `~/.claude/caps/<name>/CAP.md` directly. Daemon overwrites it on restart. Always edit the source-tree file plus `save_cap`.
-- Forgetting to bump the `version:` field in frontmatter. The daemon's auto-supersede picks up the new content regardless, but a stale `version:` field misleads the diagnostic check.
-- Trusting a subagent's summary "no save_cap needed for bundled-cap update" — it was correct only when DB version equals source version. With supersede chains in play, it's wrong.
+- Forgetting the manifest entry after reconciling a conflict. The installer compares against the entry, so an unchanged entry reports the same conflict on every run. The conflict line names the digest to record.
+- Trusting a subagent's summary "no save_cap needed for bundled-cap update" without checking whether the installation's manifest names the body. With an entry naming the live body, the bundle installs on its own; without one, `save_cap` is the only path.
 
 ---
 

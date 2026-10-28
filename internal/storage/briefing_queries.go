@@ -43,12 +43,13 @@ func (s *Store) GetBriefingHealth(project string) (BriefingHealth, error) {
 	}
 	h.Unfinished = count
 
-	// Stale: learnings >90 days old, never cited (use_count=0), not superseded
+	// Stale: learnings >90 days old, never cited (use_count=0), not superseded.
+	// julianday on both sides: created_at carries the writer's zone offset.
 	row = s.db.QueryRow(`
 		SELECT COUNT(*) FROM learnings
 		WHERE superseded_by IS NULL
 		AND use_count = 0
-		AND created_at < datetime('now', '-90 days')
+		AND julianday(created_at) < julianday('now', '-90 days')
 		AND (project = ? OR project = '' OR ? = '')`,
 		project, project)
 	if err := row.Scan(&h.Stale); err != nil {

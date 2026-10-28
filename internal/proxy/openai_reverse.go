@@ -42,14 +42,14 @@ func translateAnthropicToOpenAI(anthReq map[string]any) (map[string]any, error) 
 				if role == "" {
 					role = "system"
 				}
-			msg := map[string]any{
-				"role":    role,
-				"content": text,
-			}
-			if cc, ok := bm["cache_control"]; ok {
-				msg["cache_control"] = cc
-			}
-			result = append(result, msg)
+				msg := map[string]any{
+					"role":    role,
+					"content": text,
+				}
+				if cc, ok := bm["cache_control"]; ok {
+					msg["cache_control"] = cc
+				}
+				result = append(result, msg)
 			}
 		}
 	}
@@ -153,7 +153,7 @@ func translateAnthropicUserMsg(m map[string]any) []any {
 		case "tool_result":
 			toolUseID, _ := bm["tool_use_id"].(string)
 			resultContent := extractToolResultContent(bm["content"])
-			log.Printf("OPENAI-REV: tool_result id=%s content_len=%d", toolUseID, len(resultContent))
+			log.Printf("OPENAI-REV: tool_result id=%s content_len=%d", journalToken(toolUseID), len(resultContent))
 			toolResults = append(toolResults, map[string]any{
 				"role":         "tool",
 				"tool_call_id": toolUseID,

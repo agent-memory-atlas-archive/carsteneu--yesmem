@@ -2,6 +2,7 @@ package extraction
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,19 +10,118 @@ import (
 
 	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
+	"github.com/carsteneu/yesmem/internal/textutil"
 )
 
 // SessionExtractor is the common interface for single-pass and two-pass extractors.
 type SessionExtractor interface {
 	ExtractFromSession(sessionID string, msgs []models.Message) ([]models.Learning, error)
 	ExtractAndStore(sessionID, project string, msgs []models.Message, autoResolve bool) error
+	// SetChunkSize sets the token budget per extraction chunk
+	// (extraction.chunk_size). Zero or negative restores the default.
+	SetChunkSize(tokens int)
+}
+
+// DefaultChunkSize is the token budget per extraction chunk when the config
+// leaves extraction.chunk_size empty.
+const DefaultChunkSize = 25000
+
+// ErrParse marks a failure in which the model answered but the answer could not
+// be read as extraction output. The API is up in that case, so it is not an
+// outage; callers gate the outage breaker on IsOutage and treat every non-nil
+// extraction error as a failed attempt.
+var ErrParse = errors.New("unparseable model output")
+
+// ErrPartial marks a pass in which at least one chunk produced a usable result
+// and at least one failed. What was extracted is real and must be stored, but
+// the pass proved nothing about the failed chunks, so the caller must not
+// certify the session as extracted either.
+var ErrPartial = errors.New("partial extraction")
+
+// chunkFailures carries the failure classes of one extraction pass. A pass can
+// fail in both ways at once: a chunk whose call failed is a transport failure,
+// one that answered unreadably is a content failure. The class stays explicit so
+// a mixed pass is neither reported as a pure content failure nor read as an
+// outage by the breaker.
+type chunkFailures struct {
+	chunks       int
+	succeeded    int
+	transport    int
+	parse        int
+	outage       bool
+	transportErr error
+	parseErr     error
+}
+
+func (f *chunkFailures) Error() string {
+	parts := []string{fmt.Sprintf("%d of %d extraction steps failed (%d transport, %d content)",
+		f.transport+f.parse, f.chunks, f.transport, f.parse)}
+	if f.transportErr != nil {
+		parts = append(parts, "transport: "+textutil.SingleLine(f.transportErr.Error(), 300))
+	}
+	if f.parseErr != nil {
+		parts = append(parts, "content: "+textutil.SingleLine(f.parseErr.Error(), 300))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// Unwrap reports both failure causes, so errors.Is reaches either of them.
+func (f *chunkFailures) Unwrap() []error {
+	out := make([]error, 0, 2)
+	if f.transportErr != nil {
+		out = append(out, f.transportErr)
+	}
+	if f.parseErr != nil {
+		out = append(out, f.parseErr)
+	}
+	return out
+}
+
+// Is answers the classes callers gate on. ErrPartial means at least one chunk
+// produced a usable result. ErrParse means the model answered unreadably and no
+// transport failure occurred in the same pass.
+func (f *chunkFailures) Is(target error) bool {
+	switch target {
+	case ErrPartial:
+		return f.succeeded > 0
+	case ErrParse:
+		return f.parse > 0 && f.transport == 0
+	}
+	return false
+}
+
+// IsOutage reports whether err is evidence that the transport, not the model,
+// failed: every chunk's call failed, or the caller marked a single decisive call
+// as an outage (the two-pass extraction call). A chunk-level answer, even an
+// unparseable one, proves the API is reachable and must not trip the breaker.
+func IsOutage(err error) bool {
+	var f *chunkFailures
+	if !errors.As(err, &f) {
+		return false
+	}
+	return f.outage || (f.chunks > 0 && f.transport == f.chunks)
+}
+
+// chunkBudget resolves a configured chunk size to the token budget the chunker
+// accepts.
+func chunkBudget(tokens int) int {
+	if tokens <= 0 {
+		return DefaultChunkSize
+	}
+	return tokens
 }
 
 // Extractor orchestrates LLM-based knowledge extraction from sessions (single-pass).
 type Extractor struct {
-	client LLMClient
-	store  *storage.Store
-	model  string
+	client    LLMClient
+	store     *storage.Store
+	model     string
+	chunkSize int
+}
+
+// SetChunkSize sets the token budget per extraction chunk.
+func (e *Extractor) SetChunkSize(tokens int) {
+	e.chunkSize = tokens
 }
 
 // NewExtractor creates an extractor with an LLMClient.
@@ -98,9 +198,11 @@ func (e *Extractor) ExtractFromSession(sessionID string, msgs []models.Message) 
 	msgs = PreFilterMessages(msgs)
 
 	// Chunk messages
-	chunks := ChunkMessages(msgs, 25000)
+	chunks := ChunkMessages(msgs, chunkBudget(e.chunkSize))
 
 	var allLearnings []models.Learning
+	var failed, succeeded, transportFailed, parseFailed int
+	var transportErr, parseErr error
 	for i, chunk := range chunks {
 		// Pause between chunks (Haiku: ~60 req/min limit)
 		if i > 0 {
@@ -115,7 +217,10 @@ func (e *Extractor) ExtractFromSession(sessionID string, msgs []models.Message) 
 		// Call LLM with structured output (guaranteed valid JSON)
 		response, err := e.client.CompleteJSON(BuildExtractionSystemPrompt(), content, ExtractionSchema())
 		if err != nil {
-			log.Printf("warn: extraction chunk %d/%d for %s: %v", chunk.Index+1, chunk.Total, sessionID, err)
+			log.Printf("warn: extraction chunk %d/%d for %s: %v", chunk.Index+1, chunk.Total, sessionID, textutil.SingleLine(err.Error(), 300))
+			failed++
+			transportFailed++
+			transportErr = err
 			if strings.Contains(err.Error(), "rate_limit") {
 				log.Printf("  Rate limited on chunk — waiting 60s")
 				time.Sleep(60 * time.Second)
@@ -130,7 +235,10 @@ func (e *Extractor) ExtractFromSession(sessionID string, msgs []models.Message) 
 
 		learnings, err := parseExtractionResponse(response, sessionID, e.model)
 		if err != nil {
-			log.Printf("warn: parse extraction for %s chunk %d: %v", sessionID, chunk.Index+1, err)
+			log.Printf("warn: parse extraction for %s chunk %d: %v", sessionID, chunk.Index+1, textutil.SingleLine(err.Error(), 300))
+			failed++
+			parseFailed++
+			parseErr = err
 			continue
 		}
 
@@ -139,8 +247,38 @@ func (e *Extractor) ExtractFromSession(sessionID string, msgs []models.Message) 
 			learnings[i].SourceMsgFrom = chunk.FromMsgIdx
 			learnings[i].SourceMsgTo = chunk.ToMsgIdx
 		}
+		succeeded++
 
 		allLearnings = append(allLearnings, learnings...)
+	}
+
+	// A pass in which no chunk produced a result proves nothing about the
+	// session. Reported as success, the caller marks the session as extracted
+	// and certifies its message range, so it is never retried and whatever it
+	// held is lost.
+	//
+	// A whitespace-only answer is counted as no result, not as a failure: it
+	// cannot be told apart from a model that was reached and had nothing to
+	// keep, and counting it would keep such a session pending forever. An answer
+	// that arrives but does not parse IS a failure, above. Zero chunks is no
+	// failure either: the pre-filter left nothing to extract, which is a
+	// finished pass rather than a broken one.
+	//
+	// A partly failed pass is reported as well (ErrPartial). The learnings of the
+	// answering chunks are real and are kept, but the failed chunks were never
+	// read, so this pass cannot certify the session.
+	if len(chunks) > 0 && failed > 0 {
+		failure := &chunkFailures{chunks: len(chunks), succeeded: succeeded,
+			transport: transportFailed, parse: parseFailed,
+			transportErr: transportErr, parseErr: parseErr}
+		switch {
+		case failed == len(chunks):
+			return nil, fmt.Errorf("extraction failed for all %d chunks of %s: %w", len(chunks), truncID(sessionID), failure)
+		case succeeded > 0:
+			return allLearnings, fmt.Errorf("partial extraction for %s: %w", truncID(sessionID), failure)
+		default:
+			return nil, fmt.Errorf("extraction produced no result for %s: %w", truncID(sessionID), failure)
+		}
 	}
 
 	return allLearnings, nil
@@ -157,9 +295,13 @@ func mustJSON(s string) string {
 
 // ExtractAndStore extracts learnings and stores them, with optional evolution check.
 func (e *Extractor) ExtractAndStore(sessionID, project string, msgs []models.Message, autoResolve bool) error {
-	learnings, err := e.ExtractFromSession(sessionID, msgs)
-	if err != nil {
-		return err
+	learnings, extractErr := e.ExtractFromSession(sessionID, msgs)
+	// A partial pass still carries the learnings of the chunks that answered.
+	// They are stored, and the failure is returned afterwards so the caller
+	// counts the attempt and retries the session (YM-362).
+	partial := errors.Is(extractErr, ErrPartial)
+	if extractErr != nil && !partial {
+		return extractErr
 	}
 
 	// Filter junk, collect valid learnings for batch insert
@@ -196,7 +338,7 @@ func (e *Extractor) ExtractAndStore(sessionID, project string, msgs []models.Mes
 	}
 
 	log.Printf("Extracted %d learnings from session %s", len(ids), truncID(sessionID))
-	return nil
+	return extractErr
 }
 
 // truncID safely truncates an ID to 8 chars for logging.
@@ -327,8 +469,10 @@ func (e *Extractor) runEvolution(store *storage.Store, onSupersede func(int64), 
 		// Cross-chunk rule-based dedup BEFORE chunking. Bigram sets are prepared
 		// once and only exact sparse candidates involving the extraction delta run.
 		preCleaned := make([]models.Learning, 0, len(learnings))
+		byID := make(map[int64]models.Learning, len(learnings))
 		preSuperseded := make(map[int64]int64)
 		for _, l := range learnings {
+			byID[l.ID] = l
 			if IsSubstanzlos(l.Content) {
 				if afterID == 0 || l.ID > afterID {
 					preSuperseded[l.ID] = 0
@@ -353,7 +497,9 @@ func (e *Extractor) runEvolution(store *storage.Store, onSupersede func(int64), 
 		if len(preSuperseded) > 0 {
 			log.Printf("  Evolution: %s cross-chunk pre-dedup: %d superseded from %d candidates", label, len(preSuperseded), comparisons)
 			for loserID, winnerID := range preSuperseded {
-				if err := store.SupersedeLearning(loserID, winnerID, "rule-based: cross-chunk near-duplicate"); err == nil {
+				if ok, err := supersedeUnlessHighTrust(store, byID[loserID], winnerID, "rule-based: cross-chunk near-duplicate", "relates_to"); err != nil {
+					log.Printf("warn: %v", err)
+				} else if ok {
 					totalSuperseded++
 					if onSupersede != nil {
 						onSupersede(loserID)
@@ -382,7 +528,9 @@ func (e *Extractor) runEvolution(store *storage.Store, onSupersede func(int64), 
 			if len(embDupes) > 0 {
 				log.Printf("  Evolution: %s embedding pre-dedup: %d superseded from %d comparisons", label, len(embDupes), stats.Comparisons)
 				for loserID, winnerID := range embDupes {
-					if err := store.SupersedeLearning(loserID, winnerID, "rule-based: embedding near-duplicate"); err == nil {
+					if ok, err := supersedeUnlessHighTrust(store, byID[loserID], winnerID, "rule-based: embedding near-duplicate", "relates_to"); err != nil {
+						log.Printf("warn: %v", err)
+					} else if ok {
 						totalSuperseded++
 						if onSupersede != nil {
 							onSupersede(loserID)
@@ -414,8 +562,10 @@ func (e *Extractor) runEvolution(store *storage.Store, onSupersede func(int64), 
 			// Defensive chunk-local pass for LLM inputs. The cross-chunk pass above
 			// normally leaves no lexical duplicates here.
 			cleaned := make([]models.Learning, 0, len(chunk))
+			chunkByID := make(map[int64]models.Learning, len(chunk))
 			autoSuperseded := make(map[int64]int64) // loserID -> winnerID (0 = no winner for substanzlos)
 			for _, l := range chunk {
+				chunkByID[l.ID] = l
 				if IsSubstanzlos(l.Content) {
 					if afterID == 0 || l.ID > afterID {
 						autoSuperseded[l.ID] = 0
@@ -439,7 +589,9 @@ func (e *Extractor) runEvolution(store *storage.Store, onSupersede func(int64), 
 			}
 
 			for loserID, winnerID := range autoSuperseded {
-				if err := store.SupersedeLearning(loserID, winnerID, "rule-based: substanzlos or near-duplicate"); err == nil {
+				if ok, err := supersedeUnlessHighTrust(store, chunkByID[loserID], winnerID, "rule-based: substanzlos or near-duplicate", "relates_to"); err != nil {
+					log.Printf("warn: %v", err)
+				} else if ok {
 					totalSuperseded++
 					if onSupersede != nil {
 						onSupersede(loserID)
@@ -834,6 +986,12 @@ type TwoPassExtractor struct {
 	summarizeClient LLMClient // Pass 1: chunk → summary (Haiku)
 	extractClient   LLMClient // Pass 2: summaries → learnings (Sonnet)
 	store           *storage.Store
+	chunkSize       int
+}
+
+// SetChunkSize sets the token budget per extraction chunk.
+func (e *TwoPassExtractor) SetChunkSize(tokens int) {
+	e.chunkSize = tokens
 }
 
 // NewTwoPassExtractor creates a two-pass extractor with separate clients for each pass.
@@ -851,10 +1009,12 @@ func (e *TwoPassExtractor) ExtractFromSession(sessionID string, msgs []models.Me
 	filtered := PreFilterMessages(msgs)
 
 	// Chunk the filtered messages
-	chunks := ChunkMessages(filtered, 25000)
+	chunks := ChunkMessages(filtered, chunkBudget(e.chunkSize))
 
 	// Pass 1: Summarize each chunk with Haiku
 	var summaries []string
+	var failed int
+	var lastErr error
 	for i, chunk := range chunks {
 		if i > 0 {
 			time.Sleep(2 * time.Second)
@@ -867,7 +1027,9 @@ func (e *TwoPassExtractor) ExtractFromSession(sessionID string, msgs []models.Me
 
 		summary, err := e.summarizeClient.Complete(SummarizeSystemPrompt, content, WithMaxTokens(1024))
 		if err != nil {
-			log.Printf("warn: summarize chunk %d/%d for %s: %v", chunk.Index+1, chunk.Total, sessionID, err)
+			log.Printf("warn: summarize chunk %d/%d for %s: %v", chunk.Index+1, chunk.Total, sessionID, textutil.SingleLine(err.Error(), 300))
+			failed++
+			lastErr = err
 			if strings.Contains(err.Error(), "rate_limit") {
 				time.Sleep(60 * time.Second)
 			}
@@ -881,24 +1043,53 @@ func (e *TwoPassExtractor) ExtractFromSession(sessionID string, msgs []models.Me
 	}
 
 	if len(summaries) == 0 {
+		// Same rule as the single-pass extractor: no summary from any chunk
+		// means the pass proved nothing, so pass 2 cannot certify the session.
+		// Nothing was produced here, so this is not a partial success even when
+		// only some chunks failed and the rest answered with nothing.
+		if len(chunks) > 0 && failed > 0 {
+			failure := &chunkFailures{chunks: len(chunks), transport: failed, transportErr: lastErr}
+			if failed == len(chunks) {
+				return nil, fmt.Errorf("summarize failed for all %d chunks of %s: %w", len(chunks), truncID(sessionID), failure)
+			}
+			return nil, fmt.Errorf("no summary for %s: %w", truncID(sessionID), failure)
+		}
 		return nil, nil
 	}
 
 	// Pass 2: Extract from combined summaries with Sonnet
 	combined := strings.Join(summaries, "\n\n")
 
+	// Pass 2 is one more step in the denominator. Pass 1 already answered, so
+	// none of its failures below is an outage: the transport verdict needs every
+	// call to have failed, and one of them succeeded.
+	pass2Chunks := len(chunks) + 1
+
 	response, err := e.extractClient.CompleteJSON(BuildExtractionSystemPrompt(), combined, ExtractionSchema())
 	if err != nil {
-		return nil, fmt.Errorf("extraction pass 2: %w", err)
+		// The extraction call itself failed, so nothing was produced. Unlike a
+		// failed chunk, this is the decisive call of the pass, so it counts as an
+		// outage (the behavior before YM-362).
+		return nil, fmt.Errorf("extraction pass 2: %w",
+			&chunkFailures{chunks: pass2Chunks, transport: failed + 1, outage: true, transportErr: err})
 	}
 
 	if strings.TrimSpace(response) == "" {
+		if failed > 0 {
+			return nil, fmt.Errorf("no learnings from pass 2 for %s: %w", truncID(sessionID),
+				&chunkFailures{chunks: pass2Chunks, transport: failed, transportErr: lastErr})
+		}
 		return nil, nil
 	}
 
 	learnings, err := parseExtractionResponse(response, sessionID, e.extractClient.Model())
 	if err != nil {
-		return learnings, err
+		// Pass 1 already proved the API answers, so this is a parse failure, not
+		// an outage (see ErrParse). Nothing was extracted, so it is no partial
+		// success either.
+		return learnings, fmt.Errorf("extraction pass 2 unreadable for %s: %w", truncID(sessionID),
+			&chunkFailures{chunks: pass2Chunks, transport: failed, parse: 1,
+				transportErr: lastErr, parseErr: err})
 	}
 
 	// Set lineage — two-pass covers the full range of all chunks
@@ -911,6 +1102,13 @@ func (e *TwoPassExtractor) ExtractFromSession(sessionID string, msgs []models.Me
 		}
 	}
 
+	if failed > 0 {
+		// The failed chunks are missing from the combined text, so pass 2 never
+		// saw them. The learnings stay, the pass is not a certification.
+		return learnings, fmt.Errorf("partial summarize for %s: %w", truncID(sessionID),
+			&chunkFailures{chunks: pass2Chunks, succeeded: 1, transport: failed, transportErr: lastErr})
+	}
+
 	return learnings, nil
 }
 
@@ -919,9 +1117,12 @@ func (e *TwoPassExtractor) ExtractFromSession(sessionID string, msgs []models.Me
 // (Phase 3) rather than inline conflict resolution, since the extract client (Sonnet)
 // is different from the evolution client (Haiku).
 func (e *TwoPassExtractor) ExtractAndStore(sessionID, project string, msgs []models.Message, autoResolve bool) error {
-	learnings, err := e.ExtractFromSession(sessionID, msgs)
-	if err != nil {
-		return err
+	learnings, extractErr := e.ExtractFromSession(sessionID, msgs)
+	// Same contract as the single-pass extractor: the learnings of a partial
+	// pass are stored, the failure is returned afterwards (YM-362).
+	partial := errors.Is(extractErr, ErrPartial)
+	if extractErr != nil && !partial {
+		return extractErr
 	}
 
 	// Filter junk, collect valid learnings for batch insert
@@ -950,5 +1151,5 @@ func (e *TwoPassExtractor) ExtractAndStore(sessionID, project string, msgs []mod
 	}
 
 	log.Printf("Extracted %d learnings from session %s (two-pass)", len(ids), truncID(sessionID))
-	return nil
+	return extractErr
 }

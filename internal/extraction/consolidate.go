@@ -62,8 +62,8 @@ func RunClusterDistillation(store *storage.Store, client LLMClient, minClusterSi
 	}
 
 	var result DistillResult
-	for _, p := range projects {
-		clusters, err := store.GetLearningClusters(p.Project)
+	for _, p := range storage.GroupByCanonicalProject(projects) {
+		clusters, err := store.GetLearningClusters(p.ClusterKey)
 		if err != nil {
 			continue
 		}
@@ -92,14 +92,25 @@ func distillCluster(store *storage.Store, client LLMClient, cluster models.Learn
 		return DistillResult{Errors: 1}
 	}
 
-	// Load actual learnings (only active ones)
+	// Load actual learnings (only active ones). activeIDs is the supersede
+	// universe: a row this loop could not read stays out of it, so no unread row
+	// can be superseded on the strength of a cluster id alone.
 	var learnings []models.Learning
+	activeIDs := make([]int64, 0, len(ids))
 	for _, id := range ids {
 		l, err := store.GetLearning(id)
 		if err != nil || l == nil || l.SupersededBy != nil {
 			continue
 		}
+		if storage.IsUserOwnedSource(l.Source) {
+			// Cluster distillation may add knowledge, but it must not replace the
+			// user's own wording. Skipping the whole cluster keeps the active set
+			// unchanged, so the next run does not re-distill a half-drained
+			// cluster forever.
+			return DistillResult{Skipped: 1}
+		}
 		learnings = append(learnings, *l)
+		activeIDs = append(activeIDs, id)
 	}
 
 	if len(learnings) < 2 {
@@ -120,7 +131,7 @@ func distillCluster(store *storage.Store, client LLMClient, cluster models.Learn
 			continue
 		}
 
-		dr := distillBatch(store, client, cluster, batch, ids)
+		dr := distillBatch(store, client, cluster, batch, activeIDs)
 		result.Distilled += dr.Distilled
 		result.Superseded += dr.Superseded
 		result.Skipped += dr.Skipped
@@ -177,20 +188,30 @@ func distillBatch(store *storage.Store, client LLMClient, cluster models.Learnin
 		}
 
 		// Insert consolidated learning
-		cat := action.Category
+		cat := distillCategory(action.Category, learnings)
 		if cat == "" {
-			cat = learnings[0].Category
+			// Every input category was outside the valid set, so there is no
+			// category this row could carry without falling out of all views.
+			result.Skipped++
+			continue
 		}
-		project := cluster.Project
-		if project == "" && len(learnings) > 0 {
+		// Keep a real project path on the row: the cluster carries the canonical
+		// key, but path-keyed consumers (attribution, staleness) expect the source
+		// project value.
+		project := ""
+		if len(learnings) > 0 {
 			project = learnings[0].Project
+		}
+		if project == "" {
+			project = cluster.Project
 		}
 
 		newLearning := &models.Learning{
-			Content:  action.DistilledText,
-			Category: cat,
-			Project:  project,
-			Source:   "consolidated",
+			Content:   action.DistilledText,
+			Category:  cat,
+			Project:   project,
+			Source:    "consolidated",
+			CreatedAt: time.Now(),
 		}
 		newID, err := store.InsertLearning(newLearning)
 		if err != nil {
@@ -214,6 +235,30 @@ func distillBatch(store *storage.Store, client LLMClient, cluster models.Learnin
 	}
 
 	return result
+}
+
+// distillCategory accepts the category proposed by the model only if it is a
+// valid learning category. Free-form values ("Build", "code") would drop the
+// distilled row out of every category-grouped view, so an invalid proposal falls
+// back to the dominant valid category of the batch. Returns "" when the batch has
+// no valid category either.
+func distillCategory(proposed string, learnings []models.Learning) string {
+	proposed = strings.TrimSpace(proposed)
+	if models.IsDistillableCategory(proposed) {
+		return proposed
+	}
+	counts := make(map[string]int, len(learnings))
+	best, bestCount := "", 0
+	for _, l := range learnings {
+		if !models.IsDistillableCategory(l.Category) {
+			continue
+		}
+		counts[l.Category]++
+		if counts[l.Category] > bestCount {
+			best, bestCount = l.Category, counts[l.Category]
+		}
+	}
+	return best
 }
 
 func filterValidIDs(requested, allowed []int64) []int64 {
@@ -319,18 +364,20 @@ func runRuleBasedEvolution(store *storage.Store, onSupersede func(int64), afterI
 
 		// Pass 1: remove new junk and compare only pairs involving new rows.
 		cleaned := make([]models.Learning, 0, len(group))
+		byID := make(map[int64]models.Learning, len(group))
 		for _, l := range group {
+			byID[l.ID] = l
 			if IsSubstanzlos(l.Content) {
 				if afterID > 0 && l.ID <= afterID {
 					continue
 				}
-				if err := store.SupersedeLearning(l.ID, 0, "rule-based: substanzlos"); err == nil {
+				if ok, err := supersedeUnlessHighTrust(store, l, 0, "rule-based: substanzlos", "relates_to"); err != nil {
+					totalErrors++
+				} else if ok {
 					totalSuperseded++
 					if onSupersede != nil {
 						onSupersede(l.ID)
 					}
-				} else {
-					totalErrors++
 				}
 				continue
 			}
@@ -339,13 +386,13 @@ func runRuleBasedEvolution(store *storage.Store, onSupersede func(int64), afterI
 		lexicalDupes, comparisons := findBigramDuplicates(cleaned, 0.85, afterID)
 		totalBigramComparisons += comparisons
 		for loserID, winnerID := range lexicalDupes {
-			if err := store.SupersedeLearning(loserID, winnerID, "rule-based: near-duplicate"); err == nil {
+			if ok, err := supersedeUnlessHighTrust(store, byID[loserID], winnerID, "rule-based: near-duplicate", "relates_to"); err != nil {
+				totalErrors++
+			} else if ok {
 				totalSuperseded++
 				if onSupersede != nil {
 					onSupersede(loserID)
 				}
-			} else {
-				totalErrors++
 			}
 		}
 		if len(lexicalDupes) > 0 {
@@ -375,13 +422,13 @@ func runRuleBasedEvolution(store *storage.Store, onSupersede func(int64), afterI
 				totalEmbeddingComparisons += stats.Comparisons
 				totalEmbeddingDimensions += stats.Dimensions
 				for loserID, winnerID := range embDupes {
-					if err := store.SupersedeLearning(loserID, winnerID, "rule-based: embedding near-duplicate"); err == nil {
+					if ok, err := supersedeUnlessHighTrust(store, byID[loserID], winnerID, "rule-based: embedding near-duplicate", "relates_to"); err != nil {
+						totalErrors++
+					} else if ok {
 						totalSuperseded++
 						if onSupersede != nil {
 							onSupersede(loserID)
 						}
-					} else {
-						totalErrors++
 					}
 				}
 			}

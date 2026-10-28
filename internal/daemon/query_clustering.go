@@ -130,7 +130,9 @@ func updateClusterScoresFromEntry(store *storage.Store, q storage.QueryLogEntry,
 		if err != nil || lid <= 0 {
 			continue
 		}
-		store.IncrementClusterScore(lid, clusterID, "inject")
+		if err := store.IncrementClusterScore(lid, clusterID, "inject"); err != nil {
+			log.Printf("cluster score inject for learning %d (cluster %d): %v", lid, clusterID, err)
+		}
 	}
 }
 

@@ -3,8 +3,33 @@ package codescan
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 )
+
+// maxForeignText bounds text taken from an external process before it reaches
+// an error message or a log line. The payload is not our text: without a bound
+// a single response floods the daemon log.
+const maxForeignText = 200
+
+// quoteForeignText renders text from an external process for an error message:
+// whitespace collapsed so it cannot forge a log line, bounded, and quoted so a
+// reader can tell foreign text from the message around it.
+func quoteForeignText(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return `""`
+	}
+	if len(s) > maxForeignText {
+		cut := maxForeignText
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + "...(truncated)"
+	}
+	return strconv.Quote(s)
+}
 
 // parseCBMResponse extracts the text payload from the MCP content wrapper
 // returned by `cbm cli <tool> ... --json`: {"content":[{"type":"text","text":"..."}]}.
@@ -23,7 +48,7 @@ func parseCBMResponse(out []byte) (string, error) {
 	}
 	text := mcpResp.Content[0].Text
 	if mcpResp.IsError {
-		return "", fmt.Errorf("cbm tool error: %s", strings.TrimSpace(text))
+		return "", fmt.Errorf("cbm tool error: %s", quoteForeignText(text))
 	}
 	return text, nil
 }
@@ -71,7 +96,7 @@ func parseQueryTable(text string) ([][]interface{}, error) {
 		}
 	}
 	if !seenHeader {
-		return nil, fmt.Errorf("no query table in output: %q", strings.TrimSpace(text))
+		return nil, fmt.Errorf("no query table in output: %s", quoteForeignText(text))
 	}
 	return rows, nil
 }

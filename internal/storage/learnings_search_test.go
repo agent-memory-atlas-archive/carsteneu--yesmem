@@ -55,7 +55,7 @@ func insertAnticipatedQuery(t *testing.T, s *Store, learningID int64, value stri
 }
 
 func TestSearchAnticipatedQueries_NoDateFilter(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().UTC()
 	oneDayAgo := now.Add(-24 * time.Hour)
 
@@ -84,7 +84,7 @@ func TestSearchAnticipatedQueries_NoDateFilter(t *testing.T) {
 }
 
 func TestSearchAnticipatedQueries_SinceFilter(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().UTC()
 	oneHourAgo := now.Add(-1 * time.Hour)
 	oneDayAgo := now.Add(-24 * time.Hour)
@@ -117,7 +117,7 @@ func TestSearchAnticipatedQueries_SinceFilter(t *testing.T) {
 }
 
 func TestSearchAnticipatedQueries_BeforeFilter(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().UTC()
 	oneHourAgo := now.Add(-1 * time.Hour)
 
@@ -149,7 +149,7 @@ func TestSearchAnticipatedQueries_BeforeFilter(t *testing.T) {
 }
 
 func TestSearchAnticipatedQueries_EmptyWithDateMismatch(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().UTC()
 
 	oldID := insertTestLearningWithTime(t, s, "very old redis connection pool fix", "gotcha", now.Add(-7*24*time.Hour))
@@ -172,7 +172,7 @@ func TestSearchAnticipatedQueries_EmptyWithDateMismatch(t *testing.T) {
 // the learning must still match. Before the fix the filter compared canonical_project
 // against project via string inequality and filtered everything out.
 func TestSearchLearningsBM25Ctx_ProjectFilter_FullPathMatches(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "hybrid search bm25 project filter regression", "gotcha",
 		"/home/user/code/yesmem", "yesmem")
 
@@ -188,7 +188,7 @@ func TestSearchLearningsBM25Ctx_ProjectFilter_FullPathMatches(t *testing.T) {
 // TestSearchLearningsBM25Ctx_ProjectFilter_ShortNameMatches covers the legacy short-name
 // caller path: project="yesmem" and canonical_project="yesmem" must keep matching.
 func TestSearchLearningsBM25Ctx_ProjectFilter_ShortNameMatches(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "short name hybrid search bm25 match", "gotcha",
 		"/home/user/code/yesmem", "yesmem")
 
@@ -205,7 +205,7 @@ func TestSearchLearningsBM25Ctx_ProjectFilter_ShortNameMatches(t *testing.T) {
 // project passed as "/home/user/code/yesmem/.worktrees/foo", canonical_project is "yesmem".
 // CanonicalProject() strips the worktree suffix so the filter still matches.
 func TestSearchLearningsBM25Ctx_ProjectFilter_WorktreeMatches(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "worktree project filter must match parent canonical", "gotcha",
 		"/home/user/code/yesmem/.worktrees/foo", "yesmem")
 
@@ -221,7 +221,7 @@ func TestSearchLearningsBM25Ctx_ProjectFilter_WorktreeMatches(t *testing.T) {
 // TestSearchLearningsBM25Ctx_ProjectFilter_NoMatchFiltered verifies the filter still
 // excludes genuinely unrelated projects (no false positives from tolerance).
 func TestSearchLearningsBM25Ctx_ProjectFilter_NoMatchFiltered(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "unrelated project must be filtered out bm25", "gotcha",
 		"/home/user/code/yesmem", "yesmem")
 
@@ -240,7 +240,7 @@ func TestSearchLearningsBM25Ctx_ProjectFilter_NoMatchFiltered(t *testing.T) {
 // the same canonical_project != project bug at runAQFTSQuery. Full-path project filter
 // must match against short-name canonical_project.
 func TestSearchAnticipatedQueries_ProjectFilter_Tolerant(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().UTC()
 	id := insertTestLearningWithTime(t, s, "aq tolerant project filter for full path", "gotcha", now)
 	insertAnticipatedQuery(t, s, id, "aq tolerant project filter")
@@ -261,7 +261,7 @@ func TestSearchAnticipatedQueries_ProjectFilter_Tolerant(t *testing.T) {
 // to "foo", but they are different repos and must NOT match each other. This test failed
 // before the both-abs short-circuit was added to projectMatchesTolerant.
 func TestSearchLearningsBM25Ctx_ProjectFilter_SameBasenameDifferentParentNotMatch(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "same basename different parent must not collide", "gotcha",
 		"/home/user/projects/foo", "/home/user/projects/foo")
 
@@ -283,7 +283,7 @@ func TestSearchLearningsBM25Ctx_ProjectFilter_SameBasenameDifferentParentNotMatc
 // discoverable when a project filter is applied (they are old rows that predate the
 // canonical_project column). The empty-empty guard in projectMatchesTolerant handles this.
 func TestSearchLearningsBM25Ctx_ProjectFilter_LegacyEmptyCanonicalMatches(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	// Insert a learning with no project/canonical_project set (legacy shape)
 	id := insertTestLearningWithTime(t, s, "legacy row without project metadata must still be findable", "gotcha", time.Now().UTC())
 	_ = id
@@ -302,7 +302,7 @@ func TestSearchLearningsBM25Ctx_ProjectFilter_LegacyEmptyCanonicalMatches(t *tes
 // AND search previously skipped the 1-term tier entirely, returning 0 hits even when
 // FTS5 had matching rows. Single-token queries are common when searching for identifiers.
 func TestSearchLearningsBM25Ctx_SingleTokenQuery(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningWithTime(t, s, "config field think_reminder_min_chars gates injection by user text length", "decision", time.Now().UTC())
 
 	results, err := s.SearchLearningsBM25Ctx(context.Background(), "min_chars", "", "", "", 10)

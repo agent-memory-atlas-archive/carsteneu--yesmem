@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -34,15 +35,20 @@ func TestResolveMatchingTask_IgnoresCrossProject(t *testing.T) {
 	}
 }
 
+// YM-260 (Los 11d) changed the contract: prose overlap alone no longer resolves,
+// the commit subject has to name the task. This keeps the same-project case.
 func TestResolveMatchingTask_ResolvesSameProject(t *testing.T) {
 	store := mustOpenHooksDB(t)
 
-	store.InsertLearning(&models.Learning{
+	id, err := store.InsertLearning(&models.Learning{
 		Category: "unfinished", Content: "fix autoRestore.js API calls",
 		Project: "/home/testuser/projects/yesmem", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "haiku",
 	})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
 
-	msg := resolveMatchingTask(store, "fix autoRestore API calls", "/home/testuser/projects/yesmem")
+	msg := resolveMatchingTask(store, "fix autoRestore API calls (#"+strconv.FormatInt(id, 10)+")", "/home/testuser/projects/yesmem")
 	if msg == "" {
 		t.Error("same-project item was not resolved")
 	}
@@ -57,7 +63,10 @@ func TestIsGitCommit(t *testing.T) {
 		{"git commit -m \"$(cat <<'EOF'\nFix TTL\nEOF\n)\"", true},
 		{"git status", false},
 		{"git push origin main", false},
-		{"echo 'git commit'", true}, // False positive, but acceptable
+		{"echo 'git commit'", false}, // the quoted token is not a git call
+		{"git -C /other commit -m 'x'", true},
+		{"git -c user.email=t@example.com commit -m 'x'", true},
+		{"git log -1 && git commit -m 'x'", true},
 		{"ls -la", false},
 	}
 	for _, tt := range tests {
@@ -86,5 +95,25 @@ EOF
 		if got != tt.want {
 			t.Errorf("extractCommitMessage(%q) = %q, want %q", tt.cmd, got, tt.want)
 		}
+	}
+}
+
+// YM-279: the message flag also arrives in a combined short-flag cluster or in
+// its long form, next to a git path that is not a bare token.
+func TestExtractCommitMessage_Los11f_FlagShapes(t *testing.T) {
+	cases := []struct{ cmd, want string }{
+		{`git commit -qm "Fix TTL"`, "Fix TTL"},
+		{`git commit -am 'Fix TTL'`, "Fix TTL"},
+		{`git commit --message="Fix TTL"`, "Fix TTL"},
+		{`git commit --message "Fix TTL"`, "Fix TTL"},
+		{`git commit --amend`, ""},
+	}
+	for _, tc := range cases {
+		if got := extractCommitMessage(tc.cmd); got != tc.want {
+			t.Errorf("extractCommitMessage(%q) = %q, want %q", tc.cmd, got, tc.want)
+		}
+	}
+	if !isGitCommit(`/usr/bin/git commit -m "x"`) {
+		t.Errorf("an absolute git path must be detected")
 	}
 }

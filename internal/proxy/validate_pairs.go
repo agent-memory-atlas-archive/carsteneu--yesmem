@@ -14,6 +14,15 @@ import (
 // Returns the repaired messages slice and the total count of repairs.
 // If no repairs are needed, returns the original slice unchanged (zero alloc).
 func validateToolPairs(messages []any, logger *log.Logger) ([]any, int) {
+	return validateToolPairsWith(messages, logger, true)
+}
+
+// validateToolPairsWith is validateToolPairs with the synthesis of missing
+// tool_results under caller control. A caller that persists the result (the
+// sawtooth freeze) must pass false: a synthesized result is an invention, and a
+// frozen invention survives the request that produced it while the real result
+// arriving later in the history becomes the orphan.
+func validateToolPairsWith(messages []any, logger *log.Logger, synthesize bool) ([]any, int) {
 	if len(messages) == 0 {
 		return messages, 0
 	}
@@ -73,7 +82,7 @@ func validateToolPairs(messages []any, logger *log.Logger) ([]any, int) {
 						removed++
 						orphanCount++
 						if logger != nil {
-							logger.Printf("[validate] removed orphan tool_result (tool_use_id=%s)", useID)
+							logger.Printf("[validate] removed orphan tool_result (tool_use_id=%s)", journalToken(useID))
 						}
 						continue
 					}
@@ -105,7 +114,10 @@ func validateToolPairs(messages []any, logger *log.Logger) ([]any, int) {
 	// After Stubify/Collapse/Injection, a tool_use block may end up without
 	// a matching tool_result in the next message. The Anthropic API requires
 	// each tool_use to have a corresponding tool_result immediately after.
-	result, synthesizedCount := synthesizeMissingToolResults(result, logger)
+	synthesizedCount := 0
+	if synthesize {
+		result, synthesizedCount = synthesizeMissingToolResults(result, logger)
+	}
 
 	if orphanCount == 0 && synthesizedCount == 0 {
 		return messages, 0
@@ -193,7 +205,7 @@ func synthesizeMissingToolResults(messages []any, logger *log.Logger) ([]any, in
 			})
 			synthesized++
 			if logger != nil {
-				logger.Printf("[validate] synthesized tool_result for naked tool_use (id=%s)", id)
+				logger.Printf("[validate] synthesized tool_result for naked tool_use (id=%s)", journalToken(id))
 			}
 		}
 

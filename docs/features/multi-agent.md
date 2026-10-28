@@ -31,8 +31,8 @@ Claude Code → API Request → Proxy extracts session_id from metadata.user_id
 - **Session ID extraction:** `metadata.user_id` in every API request contains `{"device_id":"...","account_uuid":"...","session_id":"uuid"}`. No hook dependency — the proxy extracts it directly from the request (`extractSessionID()` in `proxy_helpers.go`)
 - **Thread ID:** Session UUID from `metadata.user_id` is used directly as threadID. No mapping layer — MCP and Proxy share the same key. Fallback to SHA256-hash for requests without metadata (Codex, legacy).
 - **Injection format:** `<channel source="yesmem-dialog">` tags (matches Claude Code's Channel format for forward compatibility)
-- **Idle state:** Active dialog with no new messages shows `[KEINE NEUEN NACHRICHTEN]`
-- **Session ID display:** `DEINE_SESSION_ID: uuid` injected in every proxy think-reminder so Claude always knows its own identity
+- **Idle state:** there is no `[KEINE NEUEN NACHRICHTEN]` placeholder any more — with nothing pending, no channel block is injected at all
+- **Session ID display:** `SESSION_ID: uuid` is prepended to the injected channel block, so an agent knows its own reply target. It only appears when there is actually something to deliver
 
 ### 22.3 Polling (CronCreate)
 
@@ -45,14 +45,20 @@ The proxy can only inject content when a request passes through. For idle sessio
 
 ### 22.4 Session Identity Resolution
 
-Three-tier resolution for mapping tool calls to sessions:
+Six-step resolution (`provenSessionID`) for mapping tool calls to sessions. Every step below counts as *proof*: the caller is identified by something it presents, not by a guess.
 
 | Priority | Method | Source | Reliability |
 |----------|--------|--------|-------------|
-| 1 | Direct `session_id` parameter | Proxy passes to daemon | 100% |
-| 2 | Direct `_session_id` parameter | MCP server passes to daemon | 100% |
-| 3 | PID reverse-lookup | `_caller_pid` → pidMap | High (fails after daemon restart) |
-| 4 | `activeSessionID` fallback | Last registered session | Low (wrong with concurrent sessions) |
+| 1 | Explicit `session_id` parameter | Caller passes it | 100% |
+| 2 | `_session_id` from the MCP layer | MCP server passes it (rejected when env-derived and untrusted) | 100% |
+| 3 | `_caller_pid` → in-memory pidMap | PID reverse-lookup | High (empty after daemon restart) |
+| 4 | `_caller_pid` → PID file on disk | `$dataDir/sessions/$PID` | High (repopulates pidMap) |
+| 5 | `_caller_pid` → `agents` row | `AgentGetByPID` (bridge stores the backend PID) | High, parallel-safe |
+| 6 | Caller working directory → `agents` row | `agentByCallerCWD` | High when the CWD is unique |
+
+Steps 3-5 only run when the PID actually belongs to an agent (`callerPIDIsAgent`). A PID registered for more than one session yields no result rather than a coin flip.
+
+`resolveSessionID` adds one **unproven** last resort on top: `resolveActiveSessionFallback`, the session the proxy or idle tick saw last. That is last-writer-wins across every session on the machine and is not an identification; paths that must hold a caller to its identity use `provenSessionID` directly.
 
 **PID persistence:** `hook-think` writes PID→session_id files to `$dataDir/sessions/$PID` on every `UserPromptSubmit`. Survives daemon restarts — MCP server can read PID files on startup.
 
@@ -119,7 +125,9 @@ Full lifecycle management for sub-agents spawned as PTY subprocesses:
 | `relay_agent` | `to`, `content`, `project?`, `caller_session?` | Inject content into agent's terminal via PTY |
 | `stop_agent` | `to`, `project?` | Graceful shutdown (sends /exit) |
 | `stop_all_agents` | `project` | Stop ALL running agents in a project |
-| `resume_agent` | `to`, `project?` | Resume a frozen agent (reset relay count, restart heartbeat) |
+| `resume_agent` | `to`, `project?` | Resume an agent whose process is gone (relaunch with the stored backend session) |
+
+Note: `spawn_agent` has **no** `max_runtime` parameter. Runtime is a daemon-wide setting (`agents.max_runtime`), and a caller may pass `restart_strategy` / `max_restarts`.
 
 **PTY Bridge Architecture:**
 ```
@@ -127,17 +135,19 @@ Daemon → spawns `claude` or `codex` CLI as PTY subprocess
        → Unix socket pair: main.sock (output) + main.sock.inject (input)
        → Terminal opened via gnome-terminal/xterm for visual monitoring
        → Heartbeat monitors liveness + delivers pending messages
-       → On exit: agent record deleted, sockets cleaned up
+       → On exit: sockets cleaned up, the agent row stays (status error/stopped) for the orchestrator
 ```
 
 **Agent Lifecycle:**
 ```
-pending → spawning → running → [frozen] → stopped/error
+pending → spawning → running → paused → stopped/error
                          ↑          ↓
                          └── resume ─┘
 ```
 
-**Spawn parameters:** `max_turns` (number) caps agent turns before auto-freeze (default 30). `model` (string) overrides the default model for the agent backend (e.g. `claude-sonnet-4-6`).
+There is no `frozen` state written by the limit enforcer: `enforceAgentLimits` stops (status `stopped`), and the idle/done guards pause (status `paused`, process alive).
+
+**Spawn parameters:** `max_turns` has two distinct meanings. As a spawn argument it only reaches the backend argv in the claude non-resume branch (`--max-turns`). The cap the daemon actually enforces for every backend is a **relay-turn** count read from `agents.max_turns` (`heartbeat.relayAgentMessages`, default 30). `model` (string) overrides the default model for the agent backend (e.g. `claude-sonnet-4-6`).
 
 ### 22.11 Multi-Backend Support
 
@@ -145,9 +155,9 @@ Sub-agents can use different LLM backends:
 
 | Backend | CLI | Prompt Injection | MCP Tools | Status |
 |---------|-----|-----------------|-----------|--------|
-| `claude` (default) | Claude Code | PTY inject after 7s delay | Full YesMem proxy integration | Live |
-| `codex` | OpenAI Codex CLI | CLI argument (no PTY inject) | MCP-only (no proxy channel) | Live (MCP-only) |
-| `opencode` | OpenCode CLI | PTY inject | Full YesMem integration | Live |
+| `claude` (default) | Claude Code | PTY inject, 15s after spawn | Full YesMem proxy integration | Live |
+| `codex` | OpenAI Codex CLI | PTY inject, 15s after spawn | MCP-only (no proxy channel) | Live (MCP-only) |
+| `opencode` | OpenCode CLI | PTY inject, 15s after spawn | Full YesMem integration | Live |
 
 ```
 spawn_agent(project="yesmem", section="recherche", backend="codex")
@@ -162,7 +172,7 @@ spawn_agent(project="yesmem", section="recherche", backend="codex")
 **Backend abstraction in `handler_agents.go`:**
 - `buildAgentCommand()` switch on backend for CLI args
 - `ensureAgentPermissions()` only for Claude (pre-approve MCP tools in `.claude/settings.json`)
-- Prompt injection goroutine conditional (Claude: PTY inject after delay, Codex: CLI arg)
+- Initial prompt: one shared goroutine for **all** backends. It waits 15s (opencode's TUI needs that long), accepts the MCP trust dialog with Enter — which selects `1. Use this and all future...`, i.e. lasting trust for that worktree's MCP servers — then writes the prompt body and a separate `\r` 300ms later. Only on initial spawn, never on resume
 
 ### 22.12 Heartbeat & Message Delivery
 
@@ -175,28 +185,29 @@ Agent B sends send_to(target=C) → message stored in agent_messages table
                                 → message marked as delivered
 ```
 
-- **Heartbeat interval:** 1s ticker, monitors agent liveness (heartbeat.go:23: `1 * time.Second`)
-- **Freeze detection:** agents frozen after N unread relay messages
+- **Heartbeat interval:** the daemon runs a 1s ticker that monitors agent liveness (`heartbeat.go`)
+- **`heartbeat_at` is not sent by the agent.** It is written when the agent calls `update_agent_status` or touches its scratchpad, nothing else
+- **Freeze detection:** agents are paused after N unread relay messages (relay counter), not put into a `frozen` state
 - **Delivery tracking:** per-message `delivered`, `delivered_at`, `delivery_retries`, `delivery_failed`
 
 ### 22.12b Agent Supervision
 
 Automatic lifecycle management via the heartbeat system (`internal/daemon/heartbeat.go`):
 
-- **Dead PID detection:** `detectDeadPIDs()` uses `os.FindProcess()` + zero-signal probe (`Signal(0)`) to detect dead processes, marks agent status as "error"
-- **Orphan detection:** `detectOrphanedAgents()` checks `liveness_ping_at` with 5-minute grace period (`livenessPingGrace`), triggers cascade stop after grace expires
+- **Dead PID detection:** `crashRecovery()` (every 5th heartbeat tick) consolidates the former `detectDeadPIDs()` + health-check logic; it writes status `crashed`, and `failed` on its second branch
+- **Orphan detection:** `detectOrphanedAgents()` checks `liveness_ping_at` with a 5-minute grace period (`livenessPingGrace`), triggers cascade stop after grace expires
 - **Cascade stop:** When a parent agent stops, child agents are stopped automatically
-- **Limit enforcement:** `enforceAgentLimits()` freezes (not kills) agents exceeding `max_turns` (default 30), `token_budget`, or `max_runtime` (default 30 minutes) — frozen agents can be resumed later
-- **Auto-restart:** `attemptRestart()` with configurable strategies: `temporary` (capped at `max_restarts`, default 3) and `permanent` (unlimited restarts). 30s guard between restarts to prevent race conditions
+- **Limit enforcement:** `enforceAgentLimits()` (1s ticker) reacts differently per limit. `max_runtime` (default **48h**, `agents.max_runtime` empty means 48h) only stops the agent when the runtime is exceeded **and** the PID provably holds no process of that agent; a live process keeps running past its budget. `token_budget` (output tokens, 0 = unlimited) stops the agent via `stopAgentForLimit`. There is no freeze state and no resumable "frozen" agent: the row ends as `stopped`, which the orchestrator has to respawn
+- **Auto-restart:** `attemptRestart()` only touches rows with status `error`. Strategies: `permanent` restarts without a cap and is a **supervisor-only** policy (`spawn_agent` rejects it), `transient` is the capped one (`max_restarts`, default 3), and the default `temporary` / empty value is not restarted at all. 30s guard between restarts
 
 ### 22.13 Crash Recovery
 
 Strategy-based recovery for crashed agents:
 
-- **Restart strategies:** `temporary` (capped by `max_restarts`, default 3) and `permanent` (unlimited restarts)
+- **Restart strategies:** `permanent` (unlimited, supervisor-only), `transient` (capped by `max_restarts`, default 3), `temporary` / empty (no restart at all)
 - **Crash quarantine:** `quarantine_session()` isolates all learnings from crashed session, taints scratchpad section
 - **Crash context:** error message and stack trace stored in agent record
-- **Graceful daemon restart:** OTP-style hot reload — running agents recovered on daemon restart
+- **Daemon restart:** there is no hot reload. Running agents are not recovered in place — on daemon start, orphaned rows are reconciled, and the orchestrator respawns what it still needs
 
 ### 22.13b Agent Telemetry
 
@@ -212,10 +223,10 @@ Automatic tracking of agent resource usage via proxy SSE interception (`internal
 | `last_activity_at` | timestamp | Updated on each API call |
 | `phase` | text | Set via `update_agent_status` MCP tool (e.g., "implementing", "testing", "idle") |
 
-- **SSE interception:** `parseUsageFromSSE()` captures token usage from streaming events in real-time (not post-hoc)
+- **Telemetry transport:** the proxy posts a `_track_usage` RPC to the daemon (`proxy_forward.go`, `openai_parity.go`), which calls `AgentUpdateTelemetry`. `parseUsageFromSSE` exists but has no production caller — only a test
 - **Atomic updates:** `AgentUpdateTelemetry()` atomically increments counters and updates `last_activity_at`
 - **Stale detection:** Orchestrators monitor `last_activity_at` — agents inactive for 5+ minutes flagged as potentially stuck
-- **Budget enforcement:** `enforceAgentLimits()` compares `input_tokens + output_tokens` against `token_budget`
+- **Budget enforcement:** `enforceAgentLimits()` compares **output tokens only** against `token_budget`. Input tokens are cumulative and include cache reads, so they cannot express work or cost (YM-254)
 
 ### 22.14 /swarm Orchestration Protocol
 
@@ -225,7 +236,7 @@ The `/swarm` skill provides a structured protocol for multi-agent orchestration:
 - **Communication:** scratchpad (primary) + send_to (secondary)
 - **DAG mode:** execution dependencies between agents (B must finish before C starts)
 - **Budget strategies:** quality (all Opus), balanced (Opus orchestrator + Sonnet workers), economy (all Sonnet)
-- **Status ping:** orchestrator checks agent status every 5 minutes
+- **Status ping:** the daemon pushes a status summary to orchestrator agents every 150s (heartbeat `tick%150`), not every 5 minutes
 
 ### 22.14b YesLoop
 

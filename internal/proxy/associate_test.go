@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"strings"
 	"testing"
 )
@@ -717,5 +719,61 @@ func TestContradictionWarning_Empty(t *testing.T) {
 	warning := formatContradictionWarning(0, 0)
 	if warning != "" {
 		t.Errorf("expected empty for zero IDs, got %q", warning)
+	}
+}
+
+// --- YM-40: the daemon owns the source boost ---
+
+func newAssociativeTestServer(dataDir string) *Server {
+	return &Server{
+		cfg:                 Config{DataDir: dataDir},
+		logger:              log.New(io.Discard, "", 0),
+		lastInjectedIDs:     make(map[string]map[int64]string),
+		sessionInjectCounts: make(map[string]map[int64]int),
+		lastTurnInjected:    make(map[string]map[int64]bool),
+	}
+}
+
+// TestAssociativeContextDoesNotRepeatDaemonSourceBoost (YM-40): handleHybridSearch
+// already applies the source boost (user_stated ×1.25) to the score it returns.
+// Applying it a second time in the proxy weighted user_stated at 1.5625 — high
+// enough to lift weak hits over the injection gate.
+func TestAssociativeContextDoesNotRepeatDaemonSourceBoost(t *testing.T) {
+	dir := fakeDaemonDir(t, map[string]json.RawMessage{
+		"hybrid_search": json.RawMessage(`{"results":[{"id":"7","content":"preference about deployment defaults","score":30,"learning_source":"user_stated","origin_tool":"user","project":""}]}`),
+	})
+	s := newAssociativeTestServer(dir)
+
+	got := s.findAssociativeContextFor(
+		"bitte pruefe die sache mit dem deployment",
+		"/home/user/proj",
+		"thread-boost",
+		nil,
+	)
+
+	// A project-less learning at daemon score 30 stays below the 35 gate. The old
+	// proxy boost lifted it to 37.5, which the adaptive fallback then injected.
+	if strings.Contains(got, "[ID:7]") {
+		t.Errorf("project-less learning at daemon score 30 was injected: the proxy repeated the daemon's source boost. context=%q", got)
+	}
+}
+
+// The counter-case: a clearly relevant user_stated learning must still be injected,
+// so the fix cannot be "drop the source class entirely".
+func TestAssociativeContextStillInjectsRelevantUserStatedLearning(t *testing.T) {
+	dir := fakeDaemonDir(t, map[string]json.RawMessage{
+		"hybrid_search": json.RawMessage(`{"results":[{"id":"8","content":"preference about deployment defaults","score":90,"learning_source":"user_stated","origin_tool":"user","project":""}]}`),
+	})
+	s := newAssociativeTestServer(dir)
+
+	got := s.findAssociativeContextFor(
+		"bitte pruefe die sache mit dem deployment",
+		"/home/user/proj",
+		"thread-boost-2",
+		nil,
+	)
+
+	if !strings.Contains(got, "[ID:8]") {
+		t.Errorf("relevant user_stated learning was not injected: context=%q", got)
 	}
 }

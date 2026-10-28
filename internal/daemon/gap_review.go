@@ -64,7 +64,7 @@ func enrichGapWithContext(store *storage.Store, topic, project string) string {
 // Called daily by daemon timer. Respects budget gate.
 // Enriches each gap with existing learnings context so the LLM can determine
 // if the gap has already been answered.
-func runGapReviewDaemon(store *storage.Store, extMu *sync.Mutex, appCfg **config.Config) {
+func runGapReviewDaemon(store *storage.Store, extMu *sync.Mutex, appCfg **config.Config, extractTracker *extraction.BudgetTracker) {
 	extMu.Lock()
 	ac := *appCfg
 	extMu.Unlock()
@@ -81,7 +81,12 @@ func runGapReviewDaemon(store *storage.Store, extMu *sync.Mutex, appCfg **config
 		return
 	}
 
-	client, err := extraction.NewLLMClient(ac.LLM.Provider, apiKey, ac.ModelID(), ac.LLM.ClaudeBinary, ac.ResolvedOpenAIBaseURL())
+	client, err := newDaemonLLMClient(ac, llmClientOpts{
+		apiKey:       apiKey,
+		model:        ac.ModelID(),
+		claudeBinary: ac.LLM.ClaudeBinary,
+		tracker:      extractTracker,
+	})
 	if err != nil {
 		log.Printf("[gap-review] skipped: LLM client: %v", err)
 		return

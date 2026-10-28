@@ -244,6 +244,33 @@ func (s *Store) capsUniqueColumn(fullName string, data map[string]any) string {
 	return ""
 }
 
+// validateCapCellSizes holds every cell to CapsMaxCellBytes. Both write paths
+// need it: an upsert attaches its cells to the INSERT, claim_and_read attaches
+// its set values to the UPDATE, and either one lands the value in the column.
+// A []byte carries as much as a string, so both are held to the limit, and
+// anything that is not a plain value is refused instead of being handed to the
+// driver — a named []byte type (json.RawMessage) would slip past a type switch
+// that lists concrete types and reach the column unbounded.
+func validateCapCellSizes(data map[string]any) error {
+	for k, v := range data {
+		switch val := v.(type) {
+		case string:
+			if len(val) > CapsMaxCellBytes {
+				return fmt.Errorf("cell %q exceeds %d byte limit", k, CapsMaxCellBytes)
+			}
+		case []byte:
+			if len(val) > CapsMaxCellBytes {
+				return fmt.Errorf("cell %q exceeds %d byte limit", k, CapsMaxCellBytes)
+			}
+		case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+			// plain values cannot carry an unbounded payload
+		default:
+			return fmt.Errorf("cell %q has unsupported type %T", k, v)
+		}
+	}
+	return nil
+}
+
 // CapsUpsert inserts a new row or, when data["id"] is set, replaces the row with that id.
 // When the table has UNIQUE or PrimaryKey columns and data contains a matching value,
 // the upsert auto-detects the conflict target for natural-key dedup.
@@ -264,20 +291,26 @@ func (s *Store) CapsUpsert(capName, tableName string, data map[string]any) (int6
 		return 0, fmt.Errorf("table %s.%s does not exist", capName, tableName)
 	}
 
-	// Cell size check
-	for k, v := range data {
-		if s, ok := v.(string); ok && len(s) > CapsMaxCellBytes {
-			return 0, fmt.Errorf("cell %q exceeds %d byte limit", k, CapsMaxCellBytes)
-		}
+	// Cell size check. A []byte carries as much as a string, so both are held to
+	// the limit, and anything that is not a plain value is refused instead of
+	// being handed to the driver — a named []byte type (json.RawMessage) would
+	// slip past a type switch that lists concrete types and reach the column
+	// unbounded.
+	if err := validateCapCellSizes(data); err != nil {
+		return 0, err
 	}
 
-	// Row quota check
+	// Row quota check. Only an update of an existing row is exempt: an id the
+	// table does not know inserts a new row, so a caller-supplied id would
+	// otherwise swallow the limit.
 	var rowCount int
 	if err := s.capStoreDB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", fullName)).Scan(&rowCount); err != nil {
 		return 0, fmt.Errorf("row quota check: %w", err)
 	}
-	if _, hasID := data["id"]; !hasID && rowCount >= CapsMaxRowsPerTable {
-		return 0, fmt.Errorf("quota exceeded: max %d rows per table", CapsMaxRowsPerTable)
+	if rowCount >= CapsMaxRowsPerTable {
+		if id, hasID := data["id"]; !hasID || !s.capStoreRowExists(fullName, id) {
+			return 0, fmt.Errorf("quota exceeded: max %d rows per table", CapsMaxRowsPerTable)
+		}
 	}
 
 	// Build parameterized INSERT ... ON CONFLICT DO UPDATE.
@@ -574,6 +607,17 @@ func (s *Store) capStoreTableExists(fullName string) bool {
 	return count > 0
 }
 
+// capStoreRowExists reports whether a row with the given id is already in the
+// table. That is the line between the update path and a fresh insert when the
+// caller supplied an id; an unresolvable id counts as absent.
+func (s *Store) capStoreRowExists(fullName string, id any) bool {
+	var count int
+	if err := s.capStoreDB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id = ?", fullName), id).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
+}
+
 var validOrderPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:ASC|DESC))?(?:\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:ASC|DESC))?)*$`)
 
 func sanitizeOrderClause(order string) error {
@@ -598,6 +642,9 @@ func (s *Store) CapsClaimAndRead(capName, tableName, where, order string, args [
 		if err := validateCapName(col); err != nil { return nil, fmt.Errorf("returning column %s: %w", col, err) }
 	}
 	if len(set) == 0 { return nil, fmt.Errorf("set columns required for claim_and_read") }
+	if err := validateCapCellSizes(set); err != nil {
+		return nil, err
+	}
 	var setClauses []string
 	var setVals []any
 	for k, v := range set {

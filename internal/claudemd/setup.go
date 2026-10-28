@@ -8,8 +8,13 @@ import (
 	"strings"
 )
 
-// SetupProject injects the @-import into CLAUDE.md and adds to .gitignore.
+// SetupProject injects the @-import into CLAUDE.md and adds to .gitignore. The
+// name lands in CLAUDE.md and in .gitignore, so the generator's name rule holds
+// here too (YM-341).
 func SetupProject(projectDir, outputFileName string) error {
+	if err := outputFileError(outputFileName); err != nil {
+		return err
+	}
 	if outputFileName == "" {
 		outputFileName = "yesmem-ops.md"
 	}

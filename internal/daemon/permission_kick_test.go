@@ -3,7 +3,7 @@ package daemon
 import (
 	"net"
 	"os"
-	"path/filepath"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -110,8 +110,14 @@ func newPermKickHandler(t *testing.T, kickDefault bool) (*Handler, *storage.Stor
 	return h, s
 }
 
+// agentProcCmdlineStub is the /proc cmdline the tests attribute to the test's
+// own PID. C2 gates the kick on the PID being a *verified* agent process, and
+// the test binary cannot present an opencode cmdline of its own.
+const agentProcCmdlineStub = "/home/tester/.opencode/bin/opencode\x00--theme\x00yesmem-loop"
+
 func createKickAgent(t *testing.T, s *storage.Store, id, sockPath, permissionKick string) storage.Agent {
 	t.Helper()
+	stubProcCmdline(t, agentProcCmdlineStub)
 	agent := storage.Agent{
 		ID:             id,
 		Project:        "/tmp/proj-" + id,
@@ -120,6 +126,7 @@ func createKickAgent(t *testing.T, s *storage.Store, id, sockPath, permissionKic
 		PID:            os.Getpid(), // lebt
 		SockPath:       sockPath,
 		Status:         "running",
+		Backend:        "opencode",
 		PermissionKick: permissionKick,
 	}
 	if err := s.AgentCreate(agent); err != nil {
@@ -170,7 +177,7 @@ func shortSockDir(t *testing.T) string {
 // 1. Kein Kick wenn stream aktiv.
 func TestPermissionKick_StreamActiveNoKick(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-active")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-active", sockPath, "")
 	seedActiveStream(agent.SessionID)
@@ -190,7 +197,7 @@ func TestPermissionKick_StreamActiveNoKick(t *testing.T) {
 // 2. Kein Kick vor 3 Min Idle.
 func TestPermissionKick_NoKickBeforeDelay(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-early")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-early", sockPath, "")
 	seedKickStateNeverKicked(t, agent.ID, 1*time.Minute)
@@ -203,7 +210,7 @@ func TestPermissionKick_NoKickBeforeDelay(t *testing.T) {
 // 3. Kick bei >=3 Min Idle, Payload "\r" auf Conn1 + "\r" auf Conn2.
 func TestPermissionKick_KickAfterDelay(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-kick")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-kick", sockPath, "")
 	seedKickStateNeverKicked(t, agent.ID, 4*time.Minute)
@@ -227,7 +234,7 @@ func TestPermissionKick_KickAfterDelay(t *testing.T) {
 // 4. Kein Re-Kick vor 5 Min (Flut-Schutz, Lektion #89414).
 func TestPermissionKick_NoReKickBeforeInterval(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-flood")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-flood", sockPath, "")
 	seedKickState(t, agent.ID, 10*time.Minute, 1*time.Minute)
@@ -240,7 +247,7 @@ func TestPermissionKick_NoReKickBeforeInterval(t *testing.T) {
 // 5. Re-Kick >=5 Min.
 func TestPermissionKick_ReKickAfterInterval(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-rekick")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-rekick", sockPath, "")
 	seedKickState(t, agent.ID, 10*time.Minute, 6*time.Minute)
@@ -253,7 +260,7 @@ func TestPermissionKick_ReKickAfterInterval(t *testing.T) {
 // 6. permission_kick="off" blockt.
 func TestPermissionKick_AgentOffBlocks(t *testing.T) {
 	h, s := newPermKickHandler(t, true) // Config-Default aktiv
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-off")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-off", sockPath, "off")
 	seedKickStateNeverKicked(t, agent.ID, 10*time.Minute)
@@ -265,16 +272,16 @@ func TestPermissionKick_AgentOffBlocks(t *testing.T) {
 
 // 7. Vererbung: Spalte "" + Config true -> Kick; Config false -> kein Kick.
 func TestPermissionKick_Inheritance(t *testing.T) {
-	sockPath := filepath.Join(shortSockDir(t), "agent-on.sock")
-	recOn := startFakeInjectSocket(t, sockPath+".inject")
 	h1, s1 := newPermKickHandler(t, true)
+	sockPath := los24dAgentSock(t, h1, "agent-pk-inh-on")
+	recOn := startFakeInjectSocket(t, sockPath+".inject")
 	agent1 := createKickAgent(t, s1, "agent-pk-inh-on", sockPath, "")
 	seedKickStateNeverKicked(t, agent1.ID, 10*time.Minute)
 	h1.checkPermissionKick()
 
-	sockPath2 := filepath.Join(shortSockDir(t), "agent-off.sock")
-	recOff := startFakeInjectSocket(t, sockPath2+".inject")
 	h2, s2 := newPermKickHandler(t, false)
+	sockPath2 := los24dAgentSock(t, h2, "agent-pk-inh-off")
+	recOff := startFakeInjectSocket(t, sockPath2+".inject")
 	agent2 := createKickAgent(t, s2, "agent-pk-inh-off", sockPath2, "")
 	seedKickStateNeverKicked(t, agent2.ID, 10*time.Minute)
 	h2.checkPermissionKick()
@@ -283,28 +290,44 @@ func TestPermissionKick_Inheritance(t *testing.T) {
 	awaitNoConnection(t, recOff)
 }
 
-// 8. Gates: Gate ist der lebende PID, nicht der Status — kein SockPath oder
-// toter PID blockt; eine Markierung wie "stopped" bei lebendem Prozess nicht.
+// 8d. Auf einer Plattform ohne lesbare Prozesstabelle wird der Kick nicht
+// abgeschaltet: sein Gate ist "der Prozess ist nicht definitiv weg", und die
+// einzige Aktion ist ein Enter in den agenteneigenen Socket. Ein recycelter PID
+// kann das nicht auf einen Fremden umleiten.
+func TestPermissionKick_WithoutProcessTableStillKicksLiveAgent(t *testing.T) {
+	h, s := newPermKickHandler(t, true)
+	sockPath := los24dAgentSock(t, h, "agent-pk-noproc")
+	rec := startFakeInjectSocket(t, sockPath+".inject")
+	agent := createKickAgent(t, s, "agent-pk-noproc", sockPath, "")
+	seedKickStateNeverKicked(t, agent.ID, 10*time.Minute)
+	prev := procTableReadable
+	procTableReadable = false
+	t.Cleanup(func() { procTableReadable = prev })
+
+	h.checkPermissionKick()
+
+	waitForConnections(t, rec, 2)
+}
+
+// 8. Gates: ein Agent wird nur gekickt, wenn sein Status kickbar ist UND sein
+// PID als eigener Backend-Prozess verifiziert ist (C2). "stopped" mit lebendem
+// PID ist damit außerhalb des Scopes, ein toter PID weiter blockierend. Die
+// Spalte sock_path ist seit YM-338 kein Gate mehr: der Pfad kommt aus der ID.
 func TestPermissionKick_Gates(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	tmp := shortSockDir(t)
-	sockPath := filepath.Join(tmp, "agent-gates.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-gate-stopped")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 
-	// stopped mit lebendem PID: wird trotzdem gekickt (Design B — die
-	// Markierung zählt nicht, nur der Prozesszustand).
+	// stopped mit lebendem PID: seit C2 nicht mehr gekickt — die Markierung
+	// zählt hier wieder, weil der Prozess weiterlebt, aber der Agent beendet ist.
 	stopped := createKickAgent(t, s, "agent-pk-gate-stopped", sockPath, "")
 	if err := s.AgentUpdate(stopped.ID, map[string]any{"status": "stopped"}); err != nil {
 		t.Fatalf("update status: %v", err)
 	}
 	seedKickStateNeverKicked(t, stopped.ID, 10*time.Minute)
 
-	// kein SockPath
-	noSock := createKickAgent(t, s, "agent-pk-gate-nosock", "", "")
-	seedKickStateNeverKicked(t, noSock.ID, 10*time.Minute)
-
 	// toter PID
-	dead := createKickAgent(t, s, "agent-pk-gate-deadpid", sockPath, "")
+	dead := createKickAgent(t, s, "agent-pk-gate-deadpid", "", "")
 	if err := s.AgentUpdate(dead.ID, map[string]any{"pid": -1}); err != nil {
 		t.Fatalf("update pid: %v", err)
 	}
@@ -312,13 +335,59 @@ func TestPermissionKick_Gates(t *testing.T) {
 
 	h.checkPermissionKick()
 
+	awaitNoConnection(t, rec)
+}
+
+// 8b. Status "pending" gehört zum Kick-Scope (C2): der Prozess lebt, der Agent
+// ist noch nicht als running markiert.
+func TestPermissionKick_PendingAgentGetsKicked(t *testing.T) {
+	h, s := newPermKickHandler(t, true)
+	sockPath := los24dAgentSock(t, h, "agent-pk-pending")
+	rec := startFakeInjectSocket(t, sockPath+".inject")
+	agent := createKickAgent(t, s, "agent-pk-pending", sockPath, "")
+	if err := s.AgentUpdate(agent.ID, map[string]any{"status": "pending"}); err != nil {
+		t.Fatalf("update status: %v", err)
+	}
+	seedKickStateNeverKicked(t, agent.ID, 10*time.Minute)
+
+	h.checkPermissionKick()
+
 	waitForConnections(t, rec, 2)
+}
+
+// 8c. Ein Fremdprozess auf dem PID des Agenten wird nie gekickt. signal 0 sagt
+// "lebt" (der Bystander läuft), die cmdline sagt "nicht opencode" — genau die
+// Unterscheidung, die isPIDAlive allein nicht treffen kann (C2, C1).
+func TestPermissionKick_BystanderProcessNotKicked(t *testing.T) {
+	requireProcTable(t)
+	h, s := newPermKickHandler(t, true)
+	sockPath := los24dAgentSock(t, h, "agent-pk-bystander")
+	rec := startFakeInjectSocket(t, sockPath+".inject")
+
+	bystander := exec.Command("sleep", "30")
+	if err := bystander.Start(); err != nil {
+		t.Fatalf("start bystander: %v", err)
+	}
+	t.Cleanup(func() { bystander.Process.Kill(); bystander.Wait() })
+
+	if err := s.AgentCreate(storage.Agent{
+		ID: "agent-pk-bystander", Project: "/tmp/proj-bystander", Section: "sec-bystander",
+		SessionID: "sess-bystander", PID: bystander.Process.Pid, SockPath: sockPath,
+		Status: "running", Backend: "opencode",
+	}); err != nil {
+		t.Fatalf("AgentCreate: %v", err)
+	}
+	seedKickStateNeverKicked(t, "agent-pk-bystander", 10*time.Minute)
+
+	h.checkPermissionKick()
+
+	awaitNoConnection(t, rec)
 }
 
 // 9. Paused Agent mit lebendem PID wird gekickt — Status-Markierung ist egal.
 func TestPermissionKick_PausedAgentGetsKicked(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-paused")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-paused", sockPath, "")
 	if err := s.AgentUpdate(agent.ID, map[string]any{"status": "paused"}); err != nil {
@@ -335,7 +404,7 @@ func TestPermissionKick_PausedAgentGetsKicked(t *testing.T) {
 // Stream wird zurück auf running geflippt — Beweis von Leben statt Markierung.
 func TestPermissionKick_PausedAutoUnpauseOnRecovery(t *testing.T) {
 	h, s := newPermKickHandler(t, true)
-	sockPath := filepath.Join(shortSockDir(t), "agent.sock")
+	sockPath := los24dAgentSock(t, h, "agent-pk-unpause")
 	rec := startFakeInjectSocket(t, sockPath+".inject")
 	agent := createKickAgent(t, s, "agent-pk-unpause", sockPath, "")
 	if err := s.AgentUpdate(agent.ID, map[string]any{"status": "paused"}); err != nil {
@@ -365,6 +434,7 @@ func TestHandleSpawnAgent_PermissionKickParam(t *testing.T) {
 
 	resp := h.handleSpawnAgent(map[string]any{
 		"project": "proj", "section": "pk-off", "permission_kick": "off",
+		"work_dir": t.TempDir(),
 	})
 	if resp.Error != "" {
 		t.Fatalf("spawn off: %s", resp.Error)
@@ -378,7 +448,7 @@ func TestHandleSpawnAgent_PermissionKickParam(t *testing.T) {
 		t.Errorf("PermissionKick = %q, want off", agent.PermissionKick)
 	}
 
-	resp = h.handleSpawnAgent(map[string]any{"project": "proj", "section": "pk-on", "permission_kick": "on"})
+	resp = h.handleSpawnAgent(map[string]any{"project": "proj", "work_dir": t.TempDir(), "section": "pk-on", "permission_kick": "on"})
 	if resp.Error != "" {
 		t.Fatalf("spawn on: %s", resp.Error)
 	}
@@ -391,7 +461,7 @@ func TestHandleSpawnAgent_PermissionKickParam(t *testing.T) {
 		t.Errorf("PermissionKick = %q, want on", agent.PermissionKick)
 	}
 
-	resp = h.handleSpawnAgent(map[string]any{"project": "proj", "section": "pk-empty"})
+	resp = h.handleSpawnAgent(map[string]any{"project": "proj", "work_dir": t.TempDir(), "section": "pk-empty"})
 	if resp.Error != "" {
 		t.Fatalf("spawn empty: %s", resp.Error)
 	}
@@ -404,7 +474,7 @@ func TestHandleSpawnAgent_PermissionKickParam(t *testing.T) {
 		t.Errorf("PermissionKick = %q, want empty (inherit)", agent.PermissionKick)
 	}
 
-	resp = h.handleSpawnAgent(map[string]any{"project": "proj", "section": "pk-bad", "permission_kick": "banana"})
+	resp = h.handleSpawnAgent(map[string]any{"project": "proj", "work_dir": t.TempDir(), "section": "pk-bad", "permission_kick": "banana"})
 	if resp.Error != "" {
 		t.Fatalf("spawn invalid: %s", resp.Error)
 	}

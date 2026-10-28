@@ -7,9 +7,10 @@ import (
 )
 
 // isFeatureEnabled checks whether a behavioral feature is active for a given model.
-// Resolution order:
-//  1. Longest matching model prefix in ModelFeatures (case-insensitive)
-//  2. FeatureDefaults (if set)
+// Resolution order, per key:
+//  1. the longest matching model prefix in ModelFeatures, for the keys it names
+//  2. FeatureDefaults, for a key the matching block does not name (and for a
+//     model no block matches at all)
 //  3. false (zero value)
 func isFeatureEnabled(cfg *Config, model, feature string) bool {
 	if cfg == nil {
@@ -20,7 +21,12 @@ func isFeatureEnabled(cfg *Config, model, feature string) bool {
 	if gate == nil {
 		return false
 	}
-	return gateForFeature(gate, feature)
+	if gate.Names(feature) {
+		return gateForFeature(gate, feature)
+	}
+	// A matching block that does not name the key has no opinion on it, so the
+	// default speaks, exactly as it does for a model no block matches (YM-455).
+	return gateForFeature(cfg.FeatureDefaults, feature)
 }
 
 // resolveFeatureGate finds the best-matching FeatureGates for a model.
@@ -78,10 +84,21 @@ func gateForFeature(g *config.FeatureGates, feature string) bool {
 
 // resolveThinkReminderMinChars returns the minimum user text length required to trigger
 // the think_reminder. Resolution: per-model FeatureGates → FeatureDefaults → 0 (always).
+// A per-model block that leaves the minimum unset (0) must not erase a default:
+// the block only states the values it names, and 0 is "no opinion" here, exactly
+// like an absent key.
+// The named key set stays out of this one on purpose: an int has no written-false
+// problem, and the per-key migration writes 0 into blocks, so an explicit 0 must
+// keep meaning "inherit" rather than "always".
 func resolveThinkReminderMinChars(cfg *Config, model string) int {
-	gate := resolveFeatureGate(cfg, model)
-	if gate != nil && gate.ThinkReminderMinChars > 0 {
+	if cfg == nil {
+		return 0
+	}
+	if gate := resolveFeatureGate(cfg, model); gate != nil && gate.ThinkReminderMinChars > 0 {
 		return gate.ThinkReminderMinChars
+	}
+	if cfg.FeatureDefaults != nil && cfg.FeatureDefaults.ThinkReminderMinChars > 0 {
+		return cfg.FeatureDefaults.ThinkReminderMinChars
 	}
 	return 0
 }

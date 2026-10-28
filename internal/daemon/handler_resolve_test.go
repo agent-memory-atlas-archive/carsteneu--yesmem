@@ -88,10 +88,12 @@ func TestHandleResolveByText(t *testing.T) {
 		Project: "myproject", Confidence: 1.0, CreatedAt: time.Now(), ModelUsed: "haiku",
 	})
 
+	// Three words: the search resolves only at or above storage.MinResolveTerms,
+	// and only when one item contains every word (YM-251).
 	resp := h.Handle(Request{
 		Method: "resolve_by_text",
 		Params: map[string]any{
-			"text":    "login authentication",
+			"text":    "login authentication bug",
 			"project": "myproject",
 		},
 	})

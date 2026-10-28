@@ -9,6 +9,7 @@ import (
 
 	"github.com/carsteneu/yesmem/internal/extraction"
 	"github.com/carsteneu/yesmem/internal/models"
+	"github.com/carsteneu/yesmem/internal/repo"
 	"github.com/carsteneu/yesmem/internal/storage"
 	"github.com/carsteneu/yesmem/internal/textutil"
 )
@@ -41,6 +42,13 @@ func DestillChunks(chunks []storage.DocChunk, cfg Config, client extraction.LLMC
 	if len(chunks) == 0 {
 		return 0, nil
 	}
+
+	// Canonicalize the caller's project the way UpsertDocSource does (R3-2): an
+	// ingest started in a checkout must stamp its learnings under the repository
+	// root, or every project-scoped read and sweep misses them while the source
+	// row sits at the root (YM-445). Both insert paths and the dedup read below
+	// take cfg, so one assignment covers them.
+	cfg.Project = repo.RootOrSelf(cfg.Project)
 
 	// Load existing learnings for this project for dedup
 	existingLearnings, _ := store.GetActiveLearnings("", cfg.Project, "", "", 0)

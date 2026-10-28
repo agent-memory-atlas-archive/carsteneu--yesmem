@@ -14,14 +14,20 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
+// searchAllowedBatch bounds the placeholders one statement may bind. SQLite
+// rejects a statement above 32766 variables, so a caller with more allowed IDs
+// than that must be spread over several statements.
+const searchAllowedBatch = 500
+
 // projectMatchesTolerant reports whether a learning belongs to the requested project,
 // accepting any of the four caller/storage combinations (short name, full path, worktree
 // path on either side). Mirrors storage.projectMatchesTolerant — duplicated here to
 // avoid an embedding→storage import cycle. See that function for the full rules.
 // Empty requested matches anything; empty stored values match any requested (legacy rows).
-// Direct equality short-circuits. Otherwise canonicalize both sides via models.CanonicalProject,
-// but skip canonicalization when BOTH sides are absolute paths so /a/foo and /b/foo
-// (different repos sharing a basename) do NOT match each other.
+// Direct equality short-circuits. Otherwise a row that names its repository by PATH is
+// compared through that path: two paths are the same project when their cluster keys agree,
+// which folds a repository's worktrees onto its root while two repositories that share a
+// basename stay apart (YM-424).
 func projectMatchesTolerant(storedProject, storedCanonical, requested string) bool {
 	if requested == "" {
 		return true
@@ -29,24 +35,22 @@ func projectMatchesTolerant(storedProject, storedCanonical, requested string) bo
 	if storedCanonical == "" && storedProject == "" {
 		return true
 	}
-	reqIsAbs := strings.HasPrefix(requested, "/")
-	reqCanon := models.CanonicalProject(requested)
-	for _, stored := range []string{storedCanonical, storedProject} {
-		if stored == "" {
-			continue
-		}
-		if stored == requested {
-			return true
-		}
-		storedIsAbs := strings.HasPrefix(stored, "/")
-		if storedIsAbs && reqIsAbs {
-			continue
-		}
-		if models.CanonicalProject(stored) == reqCanon {
-			return true
-		}
+	if storedProject != "" && storedProject == requested {
+		return true
 	}
-	return false
+	if storedCanonical != "" && storedCanonical == requested {
+		return true
+	}
+	reqCanon := models.CanonicalProject(requested)
+	if models.ClassifyProject(storedProject) == models.ProjectOriginPath {
+		if strings.HasPrefix(requested, "/") {
+			key := models.ClusterProjectKey(storedProject)
+			return key != "" && key == models.ClusterProjectKey(requested)
+		}
+		return models.CanonicalProject(storedProject) == reqCanon
+	}
+	return models.CanonicalProject(storedCanonical) == reqCanon ||
+		models.CanonicalProject(storedProject) == reqCanon
 }
 
 // VectorDoc represents a document to store in the vector store.
@@ -250,7 +254,7 @@ func (s *VectorStore) bruteForceScan(ctx context.Context, queryEmbedding []float
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT CAST(id AS TEXT), content, embedding_vector, COALESCE(project, ''), COALESCE(canonical_project, ''), COALESCE(category, '')
 			 FROM learnings
-			 WHERE embedding_vector IS NOT NULL AND superseded_by IS NULL
+			 WHERE embedding_vector IS NOT NULL AND `+models.RecallableLearningSQL+`
 			   AND (project = ? OR canonical_project = ? OR project = ? OR canonical_project = ?
 			        OR (project = '' AND canonical_project = ''))`,
 			project, project, reqCanon, reqCanon)
@@ -258,7 +262,7 @@ func (s *VectorStore) bruteForceScan(ctx context.Context, queryEmbedding []float
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT CAST(id AS TEXT), content, embedding_vector, COALESCE(project, ''), COALESCE(canonical_project, ''), COALESCE(category, '')
 			 FROM learnings
-			 WHERE embedding_vector IS NOT NULL AND superseded_by IS NULL`)
+			 WHERE embedding_vector IS NOT NULL AND `+models.RecallableLearningSQL)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load vectors: %w", err)
@@ -358,48 +362,62 @@ func (s *VectorStore) SearchAllowed(ctx context.Context, queryEmbedding []float3
 		return nil, nil
 	}
 
-	placeholders := make([]string, 0, len(allowedIDs))
-	args := make([]any, 0, len(allowedIDs))
-	for id := range allowedIDs {
-		placeholders = append(placeholders, "?")
-		args = append(args, id)
-	}
-
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT CAST(id AS TEXT), content, embedding_vector, COALESCE(project, ''), COALESCE(category, '')
-		 FROM learnings
-		 WHERE id IN (`+strings.Join(placeholders, ",")+`)
-		 AND embedding_vector IS NOT NULL
-		 AND superseded_by IS NULL`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("load vectors: %w", err)
-	}
-	defer rows.Close()
-
 	type scored struct {
 		id, content, project, category string
 		similarity                     float32
 	}
 	var all []scored
 
-	for rows.Next() {
-		var id, content, project, category string
-		var blob []byte
-		if err := rows.Scan(&id, &content, &blob, &project, &category); err != nil {
-			return nil, fmt.Errorf("scan: %w", err)
-		}
-		if !allowedIDs[id] {
-			continue
-		}
-		vec := DeserializeFloat32(blob)
-		if len(vec) != len(queryEmbedding) {
-			continue
-		}
-		sim := cosineSimilarity(queryEmbedding, vec)
-		all = append(all, scored{id: id, content: content, project: project, category: category, similarity: sim})
+	// One placeholder per allowed ID would bind tens of thousands of variables in a
+	// single statement, above SQLite's ceiling of 32766; the date prefilter of
+	// hybrid_search routinely reaches that size on a mature corpus.
+	ids := make([]string, 0, len(allowedIDs))
+	for id := range allowedIDs {
+		ids = append(ids, id)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	for start := 0; start < len(ids); start += searchAllowedBatch {
+		end := min(start+searchAllowedBatch, len(ids))
+		batch := ids[start:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT CAST(id AS TEXT), content, embedding_vector, COALESCE(project, ''), COALESCE(category, '')
+			 FROM learnings
+			 WHERE id IN (`+strings.Join(placeholders, ",")+`)
+			 AND embedding_vector IS NOT NULL
+			 AND `+models.RecallableLearningSQL, args...)
+		if err != nil {
+			return nil, fmt.Errorf("load vectors: %w", err)
+		}
+
+		for rows.Next() {
+			var id, content, project, category string
+			var blob []byte
+			if err := rows.Scan(&id, &content, &blob, &project, &category); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan: %w", err)
+			}
+			if !allowedIDs[id] {
+				continue
+			}
+			vec := DeserializeFloat32(blob)
+			if len(vec) != len(queryEmbedding) {
+				continue
+			}
+			sim := cosineSimilarity(queryEmbedding, vec)
+			all = append(all, scored{id: id, content: content, project: project, category: category, similarity: sim})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
 
 	// Also search in-memory AQ docs filtered by allowed IDs
@@ -475,14 +493,14 @@ func (s *VectorStore) Count() int {
 	return count
 }
 
-// ActiveCount returns the number of non-superseded learnings with embeddings.
-// This matches what the IVF index contains (superseded_by IS NULL).
+// ActiveCount returns the number of recallable learnings with embeddings, which
+// is exactly the population the IVF index is built from.
 func (s *VectorStore) ActiveCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var count int
-	s.db.QueryRow(`SELECT COUNT(*) FROM learnings WHERE embedding_vector IS NOT NULL AND superseded_by IS NULL`).Scan(&count)
+	s.db.QueryRow(`SELECT COUNT(*) FROM learnings WHERE embedding_vector IS NOT NULL AND ` + models.RecallableLearningSQL).Scan(&count)
 	return count
 }
 

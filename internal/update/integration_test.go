@@ -12,6 +12,7 @@ import (
 )
 
 func TestFullUpdateFlow(t *testing.T) {
+	allowLocalDownloads(t)
 	binaryContent := []byte("#!/bin/sh\necho 'yesmem v1.1.0'")
 	archive := createTarGz(t, "yesmem", binaryContent)
 	archiveHash := fmt.Sprintf("%x", sha256.Sum256(archive))

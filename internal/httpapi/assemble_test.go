@@ -243,20 +243,22 @@ func TestInjectFreshRemember_Empty(t *testing.T) {
 	}
 }
 
-func TestInjectBriefingMsg_SystemRole(t *testing.T) {
+// The briefing rides in a user message: the assembled array is a messages array
+// and a role:system message is dropped by StripReminders (YM-275).
+func TestInjectBriefingMsg_UserRole(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "user", "content": "hi"},
 	}
 	result := injectBriefingMsg(messages, "test briefing content")
-	if len(result) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(result))
+	if len(result) != 1 {
+		t.Fatalf("the briefing must not add a message (the collapse protects index 0), got %d messages", len(result))
 	}
 	first, ok := result[0].(map[string]any)
 	if !ok {
 		t.Fatal("first message not a map")
 	}
-	if first["role"] != "system" {
-		t.Errorf("expected role=system, got %q", first["role"])
+	if first["role"] != "user" {
+		t.Errorf("expected role=user, got %q", first["role"])
 	}
 	content, _ := first["content"].(string)
 	if content == "" {
@@ -273,25 +275,28 @@ func TestInjectBriefingMsg_SystemRole(t *testing.T) {
 	}
 }
 
-func TestInjectBriefingMsg_AfterExistingSystem(t *testing.T) {
+// The briefing goes to the front regardless of what the caller sent: the handler
+// has already stripped the role:system messages, and a caller-supplied system
+// message must not push the briefing behind itself.
+func TestInjectBriefingMsg_GoesInFrontOfExistingMessages(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "system", "content": "you are a helpful assistant"},
 		map[string]any{"role": "user", "content": "hello"},
 	}
 	result := injectBriefingMsg(messages, "briefing")
-	if len(result) != 3 {
-		t.Fatalf("expected 3 messages, got %d", len(result))
+	if len(result) != 2 {
+		t.Fatalf("the briefing must not add a message, got %d messages", len(result))
 	}
 	first, _ := result[0].(map[string]any)
-	if first["role"] != "system" {
-		t.Errorf("first message should remain system, got %q", first["role"])
-	}
 	if first["content"] != "you are a helpful assistant" {
-		t.Errorf("original system message content was altered: %q", first["content"])
+		t.Errorf("caller system message was altered: %q", first["content"])
 	}
 	second, _ := result[1].(map[string]any)
-	if second["role"] != "system" {
-		t.Errorf("second message should be system (briefing), got %q", second["role"])
+	if second["role"] != "user" {
+		t.Errorf("second message should stay the user turn, got %q", second["role"])
+	}
+	if content, _ := second["content"].(string); !strings.Contains(content, "briefing") || !strings.Contains(content, "hello") {
+		t.Errorf("briefing was not merged into the first user message: %q", content)
 	}
 }
 
@@ -328,8 +333,8 @@ func TestInjectBriefingMsg_EmptyInput(t *testing.T) {
 		t.Fatalf("expected 1 message for empty input, got %d", len(result))
 	}
 	msg := result[0].(map[string]any)
-	if msg["role"] != "system" {
-		t.Errorf("expected role=system, got %q", msg["role"])
+	if msg["role"] != "user" {
+		t.Errorf("expected role=user, got %q", msg["role"])
 	}
 	content, _ := msg["content"].(string)
 	if !strings.Contains(content, "<MANDATORY_BRIEFING>") {
@@ -343,8 +348,16 @@ func TestInjectBriefingMsg_IgnoresRolelessFirstMessage(t *testing.T) {
 		map[string]any{"role": "user", "content": "hello"},
 	}
 	result := injectBriefingMsg(messages, "briefing")
-	first, _ := result[0].(map[string]any)
-	if role := first["role"]; role != "system" {
-		t.Errorf("briefing should be at position 0 when first message has no role, got role=%q at pos 0", role)
+	if len(result) != 2 {
+		t.Fatalf("the briefing must not add a message, got %d messages", len(result))
+	}
+	// The roleless message stays untouched; the briefing rides in the first user
+	// turn behind it.
+	second, _ := result[1].(map[string]any)
+	if role := second["role"]; role != "user" {
+		t.Errorf("first user turn expected at index 1, got role=%q", role)
+	}
+	if content, _ := second["content"].(string); !strings.Contains(content, "briefing") {
+		t.Errorf("briefing was not merged into the user turn: %q", content)
 	}
 }

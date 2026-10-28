@@ -63,7 +63,7 @@ func TestUpsertAndPrune(t *testing.T) {
 	}
 
 	// Prune: 0xa lebt noch, 0xb Fenster weg → verschwindet; Eintrag ohne XID bleibt.
-	UpsertWindow(snap, Window{Emulator: "ghostty", Kind: "shell", WorkDir: "/home/chief"})
+	UpsertWindow(snap, Window{Emulator: "ghostty", Kind: "shell", WorkDir: "/home/tester"})
 	PruneMissing(snap, []string{"0xa"})
 	if len(snap.Windows) != 2 {
 		t.Fatalf("after prune want 2 (0xa + no-xid), got %d", len(snap.Windows))
@@ -83,7 +83,7 @@ func TestJSONRoundtrip(t *testing.T) {
 		SavedAt: time.Now().Format(time.RFC3339),
 		Windows: []Window{
 			{XID: "0x1", Emulator: "ghostty", Workspace: 4, X: 10, Y: 20, W: 800, H: 600,
-				Kind: "opencode", SessionID: "ses_abc", WorkDir: "/home/chief/x", TouchedAt: "2026-08-25T18:00:00+02:00"},
+				Kind: "opencode", SessionID: "ses_abc", WorkDir: "/home/tester/x", TouchedAt: "2026-08-25T18:00:00+02:00"},
 		},
 	}
 	if err := SaveSnapshot(path, snap); err != nil {
@@ -97,7 +97,7 @@ func TestJSONRoundtrip(t *testing.T) {
 		t.Fatalf("roundtrip windows = %d", len(got.Windows))
 	}
 	w := got.Windows[0]
-	if w.XID != "0x1" || w.Kind != "opencode" || w.SessionID != "ses_abc" || w.WorkDir != "/home/chief/x" || w.X != 10 || w.H != 600 {
+	if w.XID != "0x1" || w.Kind != "opencode" || w.SessionID != "ses_abc" || w.WorkDir != "/home/tester/x" || w.X != 10 || w.H != 600 {
 		t.Fatalf("roundtrip mismatch: %+v", w)
 	}
 }
@@ -150,8 +150,8 @@ func TestLaunchArgs(t *testing.T) {
 		},
 		{
 			"shell with workdir -> working-directory only",
-			Window{Kind: "shell", WorkDir: "/home/chief/x"},
-			[]string{"--working-directory=/home/chief/x"},
+			Window{Kind: "shell", WorkDir: "/home/tester/x"},
+			[]string{"--working-directory=/home/tester/x"},
 		},
 		{
 			"shell no workdir -> plain",
