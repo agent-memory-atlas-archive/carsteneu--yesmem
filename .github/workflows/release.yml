@@ -35,7 +35,11 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: "0"
-        run: go test ./... -count=1 -timeout 120s
+          # Same two settings as ci.yml: macOS caps a unix socket path at 104 bytes,
+          # which t.TempDir() under /var/folders exceeds, and the daemon package alone
+          # takes over two minutes, so 120s surfaced as unrelated failures.
+          TMPDIR: /tmp
+        run: go test ./... -count=1 -timeout 600s
 
   release:
     needs: test
