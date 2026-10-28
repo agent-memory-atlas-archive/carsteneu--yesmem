@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A read-only shell predicate, not yet wired into the guard
+- The plan gets its own plugin, the way the todo block has one
+- Draw the plan outline in its own block
+- Summarize structured plans in the ledger
+- Accept plan items in set_plan and update_plan
+- Store a structured outline beside the plan text
 - Let the guard honour a policy BLOCK on shell (YM-469)
 - Restore-rulebased-learnings lists the no-displacer class
 - Let the rule guard block shell calls
@@ -43,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep the status plugin out of the install until it is verified
 - Keep the fix prompt and its patch protocol in one file (YM-464)
 - One name for the provenance digest (YM-450)
 - Gojq is a direct dependency (YM-453)
@@ -93,6 +100,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Choose the session table by its newest row, not by its existence
+- Tolerate the NULL columns v2 allows
+- Read the v2 session tables, not the frozen legacy ones
+- Retry the plan snapshot when the writer has not seen the thread
+- Close the round-2 security findings
+- Close the consequence-check findings
+- Close the round-2 review findings
+- Bound the outline, strip control characters, keep the sidebar lookup cheap
+- Keep the plan text when the outline is cleared
 - Assert the sandbox contract on the host that runs it
 - Let the ym297 fixture die between two polls
 - Pin the fake ai-jail release to the running platform
@@ -1185,6 +1201,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Regenerate CHANGELOG after the merge
 - Regenerate CHANGELOG from the campaign commits
 - Record the 16.10.2026 feature audit that the YM campaign was derived from
 - An explicit false switches off an inherited prompt flag
@@ -1258,6 +1275,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Move the handler opener family into the harness
+- Address cold review findings
+- One reader set for setup fixtures
+- One harness for the shared fixtures and platform guards
+- One daemon socket stub instead of four
+- One harness for the bundled cap fixtures
+- One harness for the store fixtures
 - Pin the walk guard on a cyclic node graph (YM-465)
 - Pin the excerpt narrowing and the marker anchoring (YM-464)
 - A repair on top of the installed bundle still reaches the disk (YM-450)

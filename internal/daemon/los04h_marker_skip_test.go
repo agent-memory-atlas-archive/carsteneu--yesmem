@@ -16,7 +16,7 @@ import (
 // directory may hold another project's wiki whose marker cannot be read. The tick
 // must not render into it (YM-366, escaped from YM-311).
 func TestRunWikiOnce_DoesNotRenderWhenTheMarkerWriteFails(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	projDir := fixtureProjectDir(t, "los04h/marker-owned")
 	insertLearningForProject(t, s, projDir)
 	insertSessionForProject(t, s, projDir, time.Now().Format(time.RFC3339))
@@ -50,7 +50,7 @@ func TestRunWikiOnce_RendersWhenTheMarkerAlreadyNamesTheProject(t *testing.T) {
 		// root-only CI therefore does not exercise the allow branch of the guard.
 		t.Skip("root writes a 0444 file anyway, so the marker write would not fail")
 	}
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	projDir := fixtureProjectDir(t, "los04h/marker-readonly")
 	insertLearningForProject(t, s, projDir)
 	insertSessionForProject(t, s, projDir, time.Now().Format(time.RFC3339))

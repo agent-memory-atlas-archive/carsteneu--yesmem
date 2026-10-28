@@ -19,7 +19,7 @@ func TestLos56dFrozenSessionContentRequiresASessionKey(t *testing.T) {
 		t.Helper()
 		s := los26aHandlerServer(t, "http://127.0.0.1:1")
 		s.cfg.FeatureDefaults = &config.FeatureGates{Timestamps: true, PlanCheckpoint: true, RulesReminder: true, AssocContext: true}
-		los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+		wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 			switch method {
 			case "get_plan":
 				return `{"exists":true,"plan":"LOS56D-PLAN","status":"active"}`
@@ -92,14 +92,14 @@ func TestLos56dFrozenSessionContentRequiresASessionKey(t *testing.T) {
 // while the OpenAI path checked it. A server without a gate panicked on the
 // Anthropic path instead of simply staying uncached.
 func TestLos56dCacheGateNilDoesNotPanic(t *testing.T) {
-	backendURL, _ := los33Upstream(t)
+	backendURL, _ := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
 	s.cacheGate = nil
 	s.cfg.SawtoothEnabled = false
-	los33DaemonSocket(t, s, func(string, map[string]any) string { return "null" })
+	wireFakeDaemon(t, s, func(string, map[string]any) string { return "null" })
 
 	rec := httptest.NewRecorder()
-	s.handleMessages(rec, los33MessagesRequest(los33UserTurn("claude-opus-4-6"),
+	s.handleMessages(rec, messagesRequest(userTurnBody("claude-opus-4-6"),
 		map[string]string{"X-Claude-Code-Session-Id": "ses_los56d_nilgate"}))
 
 	if rec.Code != http.StatusOK {

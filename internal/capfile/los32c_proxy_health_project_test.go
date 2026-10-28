@@ -17,8 +17,6 @@ import (
 // properties the live run got wrong: the project comes from the job, a daemon
 // error answer ends the run non-zero, and the socket call cannot wait forever.
 
-const los32cCapPath = "../../caps/bundled-caps/proxy_health/CAP.md"
-
 type los32cResult struct {
 	exitCode int
 	stderr   string
@@ -29,23 +27,6 @@ type los32cResult struct {
 	// report is the JSON the script handed to store(), empty when it stored
 	// nothing.
 	report string
-}
-
-func los32cBashBody(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile(los32cCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript("proxy_health_bash")
-	if sc == nil {
-		t.Fatal("the bundled proxy_health cap has no proxy_health_bash handler")
-	}
-	return sc.Body
 }
 
 // los32cRunBash runs the handler with stubbed journalctl/nc on PATH and a stub
@@ -59,13 +40,13 @@ func los32cRunBash(t *testing.T, env map[string]string) los32cResult {
 		t.Fatalf("mkdir bin: %v", err)
 	}
 	// One overload line makes the run critical, so the alert path is taken.
-	los32cWriteStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
 case "$*" in
   *yesmem-proxy*) printf 'Oct 17 12:00:00 host yesmem-proxy[1]: upstream error: overload\n' ;;
 esac
 exit 0
 `)
-	los32cWriteStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
 printf '%s\n' "$*" > "$LOS32C_NC_ARGS"
 cat > "$LOS32C_NC_STDIN"
 if [ -n "${LOS32C_NC_REPLY-}" ]; then printf '%s\n' "$LOS32C_NC_REPLY"; fi
@@ -84,7 +65,7 @@ exit "${LOS32C_NC_EXIT:-0}"
   fi
   return 0
 }
-` + los32cBashBody(t)
+` + bundledScript(t, proxyHealthCapPath, "proxy_health_bash")
 	if err := os.WriteFile(script, []byte(body), 0o644); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
@@ -128,13 +109,6 @@ exit "${LOS32C_NC_EXIT:-0}"
 		res.report = strings.TrimSpace(string(data))
 	}
 	return res
-}
-
-func los32cWriteStub(t *testing.T, path, body string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-		t.Fatalf("write stub %s: %v", path, err)
-	}
 }
 
 // The live failure arrived as a daemon error answer. Swallowing it made the run

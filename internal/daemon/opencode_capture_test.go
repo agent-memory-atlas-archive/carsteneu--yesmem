@@ -78,30 +78,6 @@ func v2StubServer(t *testing.T, sessions []v2Session, dir string, firstMsg map[s
 	return srv
 }
 
-// isolateHome gives the test its own HOME and returns it.
-func isolateHome(t *testing.T) string {
-	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	// os.UserConfigDir and os.UserCacheDir prefer XDG_* over HOME, and a CI runner
-	// exports XDG_CONFIG_HOME: without these a test that writes into its temp home
-	// would still read the runner's real config and find nothing there.
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
-	return home
-}
-
-// stubV2Service points the capture seam at a stub service. HOME is left alone.
-func stubV2Service(t *testing.T, srv *httptest.Server) {
-	t.Helper()
-	orig := opencodeV2Service
-	opencodeV2Service = func() *opencode.Client {
-		return opencode.NewClient(opencode.Service{ID: "stub", URL: srv.URL, Password: "secret"})
-	}
-	t.Cleanup(func() { opencodeV2Service = orig })
-}
-
 // withV2Stub points the capture at a stub service. It also isolates HOME so a
 // fallback to the session tables can never touch the developer's real
 // opencode.db.

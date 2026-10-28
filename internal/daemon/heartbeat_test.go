@@ -1048,15 +1048,6 @@ func TestCrashRecovery_ReusedPIDDoesNotHideTheCrash(t *testing.T) {
 	}
 }
 
-// pinProcessTable forces the identity check on, so a test that depends on it does
-// not pass vacuously (or fail) on a platform without a readable process table.
-func pinProcessTable(t *testing.T) {
-	t.Helper()
-	prev := procTableReadable
-	procTableReadable = true
-	t.Cleanup(func() { procTableReadable = prev })
-}
-
 // A zombie answers signal 0 too, and its cmdline is empty: it is not a running
 // agent, so recovery may proceed — and here it proceeds fully, because a zombie
 // is a decided death.
@@ -1552,13 +1543,6 @@ func TestIsAgentProcess_RealProcessWithWrongBackend(t *testing.T) {
 }
 
 // --- C3: the DONE-guard must not act on a paused agent whose process is gone ---
-
-func doneGuardTracked(agentID string) bool {
-	yesloopDoneGuardAgentsMu.Lock()
-	defer yesloopDoneGuardAgentsMu.Unlock()
-	_, ok := yesloopDoneGuardAgents[agentID]
-	return ok
-}
 
 // seedGoneDoneGuardAgent creates a paused, DONE-GUARD-marked yesloop agent whose
 // process does not exist, with a scratchpad that has all 6 phase blocks but

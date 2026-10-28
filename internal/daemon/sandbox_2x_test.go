@@ -171,55 +171,6 @@ func TestSandboxFlagsV09_UnchangedByTheTwoXSupport(t *testing.T) {
 	}
 }
 
-// fetchPinnedAiJail unpacks the pinned release into a temp dir. Never into
-// ~/.local/bin: the host's installed binary is the host's business.
-// requireBubblewrap skips when ai-jail cannot run at all: it refuses to start any
-// profile without bubblewrap, and a runner image does not carry it. A runner can
-// also carry bubblewrap and still be unable to create the namespaces it needs
-// (Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor), which
-// surfaces as "bwrap: loopback: Failed RTM_NEWADDR". Both cases are skipped here
-// instead of reported as a broken sandbox further down.
-func requireBubblewrap(t *testing.T) {
-	t.Helper()
-	bin := os.Getenv("BWRAP_BIN")
-	if bin == "" {
-		found, err := exec.LookPath("bwrap")
-		if err != nil {
-			t.Skip("bubblewrap is not installed; ai-jail cannot run a profile without it")
-		}
-		bin = found
-	}
-	if out, err := exec.Command(bin, "--unshare-net", "--ro-bind", "/", "/", "true").CombinedOutput(); err != nil {
-		t.Skipf("bubblewrap cannot create a sandbox here: %v (%s)", err, strings.TrimSpace(string(out)))
-	}
-}
-
-// requireAiJailPlatform skips a real ai-jail run on a platform the pinned
-// release has no build for. The daemon host is Linux; darwin is not a target.
-func requireAiJailPlatform(t *testing.T) {
-	t.Helper()
-	asset, err := aiJailAssetName(runtime.GOOS, runtime.GOARCH)
-	if err != nil {
-		t.Skipf("ai-jail has no build for this platform: %v", err)
-	}
-	// The release names a darwin asset but pins no checksum for it, and the
-	// installer refuses an unverified build.
-	if _, ok := aiJailAssetDigests[asset]; !ok {
-		t.Skipf("ai-jail v%s ships no pinned build for %s", aiJailPinnedVersion, asset)
-	}
-}
-
-// requireLinuxSandbox skips an assertion about the sandbox as the daemon host
-// runs it. The profiles are a Linux contract (systemd unit, ai-jail under
-// bubblewrap); the same binary on darwin enforces different rules, so these
-// assertions would pin the wrong behaviour there.
-func requireLinuxSandbox(t *testing.T) {
-	t.Helper()
-	if runtime.GOOS != "linux" {
-		t.Skipf("the sandbox contract is asserted for its Linux host, not %s", runtime.GOOS)
-	}
-}
-
 func fetchPinnedAiJail(t *testing.T) string {
 	t.Helper()
 	requireBubblewrap(t)

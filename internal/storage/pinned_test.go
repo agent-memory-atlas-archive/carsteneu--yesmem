@@ -5,19 +5,6 @@ import (
 	"testing"
 )
 
-// mustOpenFiles opens a file-backed store: session pins live in runtime.db and
-// permanent pins in yesmem.db, two separate files as in production. With
-// ":memory:" both scopes share one database and a clear would wipe both.
-func mustOpenFiles(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "yesmem.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 // YM-227: a project-less session pin belongs to the session that created it.
 // Clearing another session's project must not remove it — runtime.db is one
 // file shared by every project and session.

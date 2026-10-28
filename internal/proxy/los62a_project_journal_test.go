@@ -84,7 +84,7 @@ func los62aRunAnthropic(t *testing.T, up *httptest.Server, workdir string) strin
 		t.Fatalf("marshal messages body: %v", err)
 	}
 
-	s.handleMessages(httptest.NewRecorder(), los33MessagesRequest(string(body), nil))
+	s.handleMessages(httptest.NewRecorder(), messagesRequest(string(body), nil))
 	return buf.String()
 }
 
@@ -113,7 +113,7 @@ func TestLos62aThreadIdentityIsAToken(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := los33MessagesRequest("{}", tc.headers)
+			req := messagesRequest("{}", tc.headers)
 			body := map[string]any{}
 			for k, v := range tc.body {
 				body[k] = v
@@ -145,7 +145,7 @@ func TestLos62aThreadIdentityKeepsRealIDsStable(t *testing.T) {
 		"6f1c2b3a-4d5e-6f70-8192-a3b4c5d6e7f8",
 		"opencode:ses_0f3a1c",
 	} {
-		req := los33MessagesRequest("{}", map[string]string{"x-opencode-session": sid})
+		req := messagesRequest("{}", map[string]string{"x-opencode-session": sid})
 		got, _ := anthropicThread(map[string]any{}, req.Header)
 		if got != "opencode:"+sid {
 			t.Errorf("thread id = %q, want %q: a real id must not be rewritten", got, "opencode:"+sid)

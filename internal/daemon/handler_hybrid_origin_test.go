@@ -4,39 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/embedding"
 	"github.com/carsteneu/yesmem/internal/models"
-	"github.com/carsteneu/yesmem/internal/storage"
 )
-
-// mustHandlerWithEmbeddingFile mirrors mustHandlerWithEmbedding but backs the
-// store with a temp-file SQLite path so writer/reader connections observe the
-// same database. Required for cooldown-sensitive tests because :memory: opens a
-// fresh DB image per connection — backdated created_at writes are invisible to
-// the reader-pool query that filters fresh learnings.
-func mustHandlerWithEmbeddingFile(t *testing.T) (*Handler, *storage.Store) {
-	t.Helper()
-	dir := t.TempDir()
-	s, err := storage.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	h := NewHandler(s, nil)
-	h.dataDir = dir
-	return h, s
-}
 
 // TestEnrichRankedResults_EmitsOriginTool guards against the Plan B Critical:
 // without origin_tool in the daemon's hybrid_search JSON response, the proxy's
 // hybridResult.OriginTool stays empty and OriginMultiplier silently falls back
 // to the unknown-default 0.8 for every result, collapsing the spread.
 func TestEnrichRankedResults_EmitsOriginTool(t *testing.T) {
-	h, s := mustHandlerWithEmbeddingFile(t)
+	h, s := mustFileHandler(t)
 
 	l := &models.Learning{
 		Content:    "nginx reverse proxy configuration from external web",

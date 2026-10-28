@@ -32,9 +32,9 @@ func los57bDerivedBody(padding int) string {
 // client, so a frozen checkpoint or docs hint is replayed into a session that
 // never asked for it.
 func TestLos57bMessagesPathDoesNotFreezePerSessionContentOnDerivedThread(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 		switch method {
 		case "get_plan":
 			return `{"plan":"LOS57B-PLAN-TEXT","status":"active","exists":true}`
@@ -51,7 +51,7 @@ func TestLos57bMessagesPathDoesNotFreezePerSessionContentOnDerivedThread(t *test
 	s.cfg.FeatureDefaults = &config.FeatureGates{Timestamps: true, PlanCheckpoint: true}
 
 	body := los57bDerivedBody(900)
-	req := los33MessagesRequest(body, nil)
+	req := messagesRequest(body, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
@@ -101,15 +101,15 @@ func TestLos57bMessagesPathDoesNotFreezePerSessionContentOnDerivedThread(t *test
 // with ScrubPerSessionContent on load; the Anthropic path re-rendered them into
 // the next session that landed on the same key.
 func TestLos57bMessagesPathScrubsFrozenContentOnDerivedThread(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string { return "null" })
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string { return "null" })
 	logBuf := &lockedLogBuffer{}
 	s.logger = log.New(logBuf, "", 0)
 	s.cfg.FeatureDefaults = &config.FeatureGates{Timestamps: true}
 
 	body := los57bDerivedBody(1)
-	req := los33MessagesRequest(body, nil)
+	req := messagesRequest(body, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {

@@ -5,7 +5,7 @@ import (
 )
 
 func TestTrackTokenUsage_WithCache(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.TrackTokenUsage("thread-1", 1000, 200, 800, 100); err != nil {
 		t.Fatal(err)

@@ -23,7 +23,7 @@ func los16dFingerprint(t *testing.T, s *Store, project string) string {
 // there, so work in the worktree never moved the parent project's fingerprint and its
 // briefing was never refreshed.
 func TestProjectChangeFingerprintSeesWorktreeSessionsLos16d(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {

@@ -1,29 +1,9 @@
 package capfile
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
-
-const los38qTelegramCapPath = "../../caps/bundled-caps/telegram/CAP.md"
-
-func los38qTelegramBody(t *testing.T, script string) string {
-	t.Helper()
-	data, err := os.ReadFile(los38qTelegramCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript(script)
-	if sc == nil {
-		t.Fatalf("the bundled telegram cap has no %s script", script)
-	}
-	return sc.Body
-}
 
 // The daemon prepends set -e to a bash handler on the execute_cap path
 // (handler_cap_exec.go, fireCapHandler). The reply handler answers its
@@ -41,7 +21,7 @@ func los38qTelegramBody(t *testing.T, script string) string {
 // JSON through the yesmem CLI, so a full run would need a stub per call and
 // would still not pin this property better than the line itself.
 func TestLos38qTelegramReplyHasNoBareCurl(t *testing.T) {
-	body := los38qTelegramBody(t, "telegram_reply")
+	body := bundledScript(t, telegramCapPath, "telegram_reply")
 
 	if !strings.Contains(body, "sendMessage") {
 		t.Fatal("the reply body has no sendMessage call, the test would be vacuous")

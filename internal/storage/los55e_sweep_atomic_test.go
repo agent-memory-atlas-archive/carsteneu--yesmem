@@ -18,7 +18,7 @@ import (
 // zweiter Schreiber dieselbe Quelle zu registrieren und muss an der Schreibsperre
 // scheitern. Kein sleep, kein Timing.
 func TestSweepPathlessSourceChunksHoldsTheWriteLockAcrossCheckAndDeleteLos55e(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 
 	srcID, err := s.UpsertDocSource(&DocSource{Name: "pathless", Project: "p"})
 	if err != nil {
@@ -98,7 +98,7 @@ func TestSweepPathlessSourceChunksHoldsTheWriteLockAcrossCheckAndDeleteLos55e(t 
 // writer connection to be in use, which is one statement before the blocked
 // BEGIN.
 func TestSweepPathlessSourceChunksReadsThePathUnderTheWriteLockLos55e(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 
 	srcID, err := s.UpsertDocSource(&DocSource{Name: "locked", Project: "p"})
 	if err != nil {
@@ -180,7 +180,7 @@ func TestSweepPathlessSourceChunksReadsThePathUnderTheWriteLockLos55e(t *testing
 // The guard itself: a source that has a path keeps its chunks, because the check
 // runs on the current row and a pathless caller can hold a stale snapshot.
 func TestSweepPathlessSourceChunksIsANoOpForASourceWithAPathLos55e(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 
 	srcID, err := s.UpsertDocSource(&DocSource{Name: "registered", Project: "p", Path: "/srv/docs"})
 	if err != nil {

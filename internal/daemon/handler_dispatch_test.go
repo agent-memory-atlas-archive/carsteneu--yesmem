@@ -233,29 +233,6 @@ func TestResolveProjectParam_PerCallSessionSuppliesTheProject(t *testing.T) {
 	}
 }
 
-// mustHandlerWithAmbiguousProbeProjects seeds two sessions whose projects share
-// the basename "probe" — a short name that cannot be resolved without knowing
-// which session asks — and registers the shared service PID for the first.
-func mustHandlerWithAmbiguousProbeProjects(t *testing.T) *Handler {
-	t.Helper()
-	h, s := mustHandler(t)
-	isolateHome(t)
-	for _, sess := range []struct{ id, project string }{
-		{"opencode:ses_LASTREG", "/elsewhere/probe"},
-		{"opencode:ses_OTHER", "/other/probe"},
-	} {
-		if err := s.UpsertSession(&models.Session{ID: sess.id, Project: sess.project, StartedAt: time.Now()}); err != nil {
-			t.Fatalf("seed session %s: %v", sess.id, err)
-		}
-	}
-	if resp := h.handleRegisterPID(map[string]any{
-		"session_id": "opencode:ses_LASTREG", "pid": float64(opencodeSharedServicePID), "source_agent": "opencode",
-	}); resp.Error != "" {
-		t.Fatalf("register pid: %s", resp.Error)
-	}
-	return h
-}
-
 func TestInjectExcludeSession(t *testing.T) {
 	h, _ := mustHandler(t)
 	params := map[string]any{"_session_id": "my-session"}

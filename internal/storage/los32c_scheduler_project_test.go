@@ -6,7 +6,7 @@ import "testing"
 // in it has to name a project to the daemon, and a bare basename is refused once
 // two projects share it — so the job row has to keep the caller's project.
 func TestLos32cScheduledJobKeepsItsProject(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	const project = "/home/tester/memory/yesmem"

@@ -25,6 +25,7 @@ const {
   failClosedTools,
   featureBranchNote,
   getGitBranch,
+  isReadOnlyShell,
   parseGuardConfig,
   resetGuardState,
   resolveGuardConfig,
@@ -1089,5 +1090,114 @@ describe("shell calls are blockable (YM-466)", () => {
     } finally {
       stub.stop()
     }
+  })
+})
+
+// --- 28.10.2026: a read-only GitHub or git call must never be judged ---
+//
+// `gh pr view 58662 --repo anomalyco/opencode` was rejected under rule 12 with the reason "this session is
+// heading toward posting/commenting/reopening on GitHub". The model read a direction into the call instead
+// of the call: it judged the goal, not the command. Reading writes nothing and notifies nobody, so no rule
+// in the catalogue can be violated by it - and a boundary that moves with the wording of the goal is not a
+// boundary. Hence a deterministic list instead of a sharper prompt.
+
+/** Endpoint that answers BLOCK under rule 12 and counts the requests it saw. */
+function readOnlyStub() {
+  const stub = los58fStub(
+    200,
+    JSON.stringify({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({ decision: "BLOCK", violations: ["Rule 12: posting needs approval"] }),
+          },
+        },
+      ],
+    }),
+  )
+  process.env.YESMEM_GUARD_URL = stub.url
+  process.env.YESMEM_GUARD_KEY = "readonly-key"
+  return stub
+}
+
+function readOnlyProject(): string {
+  return los22Project(
+    "12. Never post, comment, or open a pull request on a public service such as GitHub without the user's explicit approval.",
+  )
+}
+
+describe("read-only GitHub and git calls skip the guard", () => {
+  const readOnly = [
+    "gh pr view 58662 --repo anomalyco/opencode --json state",
+    "gh pr checks 58662",
+    "gh pr diff 58662",
+    "gh issue view 56218",
+    "gh run view 40602511759",
+    "gh api repos/anomalyco/opencode/pulls/58662",
+    "gh api --paginate repos/anomalyco/opencode/issues",
+    "git ls-remote origin refs/pull/58662/head",
+  ]
+
+  for (const command of readOnly) {
+    test(`passes without a request: ${command}`, async () => {
+      const stub = readOnlyStub()
+      try {
+        const guard = ruleGuard(readOnlyProject())
+        const message = await guard.before(los466Shell("readonly", command))
+
+        expect(message).toBeUndefined()
+        expect(stub.bodies.length).toBe(0)
+      } finally {
+        stub.stop()
+      }
+    })
+  }
+
+  // The other half: everything that writes, notifies, or hides behind a chain keeps going to the model.
+  const judged = [
+    "gh pr close 58662 --delete-branch",
+    "gh pr reopen 58662",
+    "gh pr merge 58662 --squash",
+    "gh pr comment 58662 --body hi",
+    "gh issue comment 56218 --body hi",
+    "gh release create v1",
+    "gh api -X POST repos/anomalyco/opencode/issues",
+    "gh api -X DELETE repos/x/y",
+    "gh api graphql -f query='mutation { }'",
+    "gh pr view 1; gh pr close 1",
+    "gh pr view 1 && gh pr close 1",
+    "gh pr view 1 | tee out.txt",
+    "gh pr view 1 > out.txt",
+    "git ls-remote && git push fork main",
+  ]
+
+  for (const command of judged) {
+    test(`is still judged: ${command}`, async () => {
+      const stub = readOnlyStub()
+      try {
+        const guard = ruleGuard(readOnlyProject())
+        const message = await guard.before(los466Shell("judged", command))
+
+        expect(stub.bodies.length).toBe(1)
+        expect(message).toContain("Rule 12")
+      } finally {
+        stub.stop()
+      }
+    })
+  }
+
+  test("the predicate is a list, not a guess", () => {
+    expect(isReadOnlyShell("gh pr view 1")).toBe(true)
+    expect(isReadOnlyShell("gh api repos/x/y")).toBe(true)
+    expect(isReadOnlyShell("  gh pr list  ")).toBe(true)
+    expect(isReadOnlyShell("gh pr close 1")).toBe(false)
+    expect(isReadOnlyShell("gh api -X PATCH repos/x/y")).toBe(false)
+    expect(isReadOnlyShell("gh api -F body=hi repos/x/y/issues")).toBe(false)
+    expect(isReadOnlyShell("$(gh pr view 1)")).toBe(false)
+    expect(isReadOnlyShell("`gh pr view 1`")).toBe(false)
+    expect(isReadOnlyShell("gh pr view 1\ngit push")).toBe(false)
+    expect(isReadOnlyShell("ls -la")).toBe(false)
+    expect(isReadOnlyShell(undefined)).toBe(false)
+    expect(isReadOnlyShell(42)).toBe(false)
   })
 })

@@ -11,7 +11,7 @@ import (
 // only looks at live rows — so the first prune after the upgrade deletes exactly the
 // set the marker exists to protect. The migration has to carry the old marker over.
 func TestMigrateAgentsSchemaKeepsTheLegacyReattachMarker(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now()
 	old := now.Add(-40 * 24 * time.Hour).Format(time.RFC3339)
 
@@ -47,7 +47,7 @@ func TestMigrateAgentsSchemaKeepsTheLegacyReattachMarker(t *testing.T) {
 // narrow carry-over, not a blanket keep-everything. A running row and a normally
 // closed row must stay untouched.
 func TestMigrateAgentsSchemaDoesNotBackfillLiveOrOrdinaryRows(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now()
 	old := now.Add(-40 * 24 * time.Hour).Format(time.RFC3339)
 

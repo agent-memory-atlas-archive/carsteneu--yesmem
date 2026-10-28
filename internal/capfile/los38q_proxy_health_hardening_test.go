@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -21,8 +20,6 @@ import (
 // The telegram leftover is a different class: its reply body is 300 lines and
 // parses JSON through the yesmem CLI, so a full run needs a stub for every
 // call. That one is pinned on the parsed body instead (los38q_telegram_test.go).
-
-const los38qProxyCapPath = "../../caps/bundled-caps/proxy_health/CAP.md"
 
 const los38qProxyLogCritical = `Okt 19 09:00:00 host yesmem-proxy[1]: upstream error: overload
 `
@@ -48,30 +45,6 @@ type los38qReport struct {
 	} `json:"data"`
 }
 
-func los38qBashBody(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile(los38qProxyCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript("proxy_health_bash")
-	if sc == nil {
-		t.Fatal("the bundled proxy_health cap has no proxy_health_bash handler")
-	}
-	return sc.Body
-}
-
-func los38qWriteStub(t *testing.T, path, body string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-		t.Fatalf("write stub %s: %v", path, err)
-	}
-}
-
 // los38qRunHandler runs the handler body under the daemon's prefix and returns
 // what it stored, what it passed to nc, and what it wrote to stderr.
 func los38qRunHandler(t *testing.T, env map[string]string) los38qResult {
@@ -86,7 +59,7 @@ func los38qRunHandler(t *testing.T, env map[string]string) los38qResult {
 	if err := os.WriteFile(proxyLogPath, []byte(los38qProxyLogCritical), 0o644); err != nil {
 		t.Fatalf("write proxy log: %v", err)
 	}
-	los38qWriteStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
 case "$*" in
   *yesmem-proxy*) cat "$LOS38Q_PROXY_LOG" ;;
 esac
@@ -96,7 +69,7 @@ exit 0
 	// first call belongs to the proxy scan, the daemon scan gets a plain zero.
 	// Without a payload the real awk runs, so the log excerpt is still counted.
 	if _, ok := env["LOS38Q_AWK_PAYLOAD"]; ok {
-		los38qWriteStub(t, filepath.Join(bin, "awk"), `#!/bin/sh
+		writeStub(t, filepath.Join(bin, "awk"), `#!/bin/sh
 cat > /dev/null
 n=0
 if [ -f "$LOS38Q_AWK_COUNT" ]; then n=$(cat "$LOS38Q_AWK_COUNT"); fi
@@ -113,7 +86,7 @@ exit 0
 	// An nc that parses its arguments like the real one: an option-shaped word
 	// before "--" is an option, after it the socket. The installed nc is OpenBSD
 	// netcat (getopt), so unknown options exit 1.
-	los38qWriteStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
 printf '%s\n' "$*" > "$LOS38Q_NC_ARGS"
 cat > "$LOS38Q_NC_STDIN"
 sock=""
@@ -145,7 +118,7 @@ store() {
   printf '%s\n' "$1" >> "$LOS38Q_STORE"
   return 0
 }
-` + los38qBashBody(t)
+` + bundledScript(t, proxyHealthCapPath, "proxy_health_bash")
 	if err := os.WriteFile(script, []byte(body), 0o644); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
@@ -383,18 +356,5 @@ func los38qAssertPrefixedLines(t *testing.T, stderr string) {
 		if !strings.HasPrefix(line, "proxy_health: ") {
 			t.Errorf("stderr line %q does not carry the proxy_health prefix", line)
 		}
-	}
-}
-
-// requireLinuxCapHost skips a test that executes a cap body on a machine the
-// bodies do not target: they are bash for the Linux daemon host. The darwin run
-// showed both symptoms at once — GNU date rejects `date -I<s>` (BSD date takes
-// no suffix), and the `${s//[$'\001'-...]/ }` neutralisation left the newline in
-// place, so foreign text kept writing its own log line. Either one makes a
-// log-line assertion meaningless there.
-func requireLinuxCapHost(t *testing.T) {
-	t.Helper()
-	if runtime.GOOS == "darwin" {
-		t.Skip("the cap body is written for the Linux daemon host: it uses GNU date and the host's bash")
 	}
 }

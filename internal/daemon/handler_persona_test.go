@@ -6,21 +6,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
-	"github.com/carsteneu/yesmem/internal/storage"
 )
-
-func mustHandler(t *testing.T) (*Handler, *storage.Store) {
-	t.Helper()
-	s, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	h := NewHandler(s, nil)
-	h.dataDir = t.TempDir()
-	h.disableAgentProcesses = true
-	return h, s
-}
 
 func TestHandleSetPersona(t *testing.T) {
 	h, s := mustHandler(t)

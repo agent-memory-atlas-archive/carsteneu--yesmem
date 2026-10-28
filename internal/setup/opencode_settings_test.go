@@ -1012,15 +1012,6 @@ func TestMigrateOpencodeJsonToJsonc_NoJsonPresent(t *testing.T) {
 // yesmem's keys (plus $schema), which deleted the user's providers and MCP
 // entries.
 
-func readFileOrFail(t *testing.T, path string) []byte {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return data
-}
-
 func TestMergeOpencodeSettingsWith_LeavesUnparseableConfigUntouched(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "home")
 	// JSONC with a comment: valid for opencode, invalid for encoding/json.

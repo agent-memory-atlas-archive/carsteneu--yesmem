@@ -76,6 +76,21 @@ deploy: build
 	fi
 	mkdir -p $(HOME)/.config/opencode/plugins/yesmem-window
 	cp plugins/yesmem-window/tui.tsx $(HOME)/.config/opencode/plugins/yesmem-window/
+	# The plan block is its own plugin, the way the todo plugin is its own entry.
+	# opencode-sidebar (cache status) is deactivated for now: keep the source, do not
+	# install it. Re-enable by adding it back to this list once it is verified.
+	@for plugin in opencode-plan; do \
+		dst=$(HOME)/.config/opencode/plugins/$$plugin; \
+		mkdir -p $$dst; \
+		cp plugins/$$plugin/tui.tsx plugins/$$plugin/package.json $$dst/; \
+		ls plugins/$$plugin/*.ts >/dev/null 2>&1 && cp plugins/$$plugin/*.ts $$dst/ || true; \
+		if command -v bun >/dev/null 2>&1; then \
+			(cd $$dst && bun install --silent) || \
+			echo "warning: bun install failed for $$plugin; that plugin stays unloaded"; \
+		else \
+			echo "warning: bun not found, skipping $$plugin dependencies"; \
+		fi; \
+	done
 	mkdir -p $(HOME)/.config/opencode/themes
 	@for f in plugins/themes/*.json; do \
 		dst=$(HOME)/.config/opencode/themes/$$(basename $$f); \

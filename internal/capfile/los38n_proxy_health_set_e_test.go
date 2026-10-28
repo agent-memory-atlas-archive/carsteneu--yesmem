@@ -73,7 +73,7 @@ func los38nRunHandler(t *testing.T, proxyLog, daemonLog string, env map[string]s
 	if err := os.WriteFile(daemonLogPath, []byte(daemonLog), 0o644); err != nil {
 		t.Fatalf("write daemon log: %v", err)
 	}
-	los32cWriteStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
 case "$*" in
   *yesmem-proxy*) cat "$LOS38N_PROXY_LOG" ;;
   *yesmem*) cat "$LOS38N_DAEMON_LOG" ;;
@@ -84,13 +84,13 @@ exit 0
 	// only exists for the case that exercises the defaulting loop, so the other
 	// cases still count through the real awk.
 	if env["LOS38N_NO_COUNTERS"] == "1" {
-		los32cWriteStub(t, filepath.Join(bin, "awk"), "#!/bin/sh\ncat > /dev/null\nexit 0\n")
+		writeStub(t, filepath.Join(bin, "awk"), "#!/bin/sh\ncat > /dev/null\nexit 0\n")
 	}
 	// The alert path writes its request to nc's stdin; the stub keeps that
 	// request so a test can tell a taken branch from a skipped one, and answers
 	// the way the daemon does, so no socket is needed.
 	ncStdin := filepath.Join(dir, "nc.stdin")
-	los32cWriteStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
 cat > "$LOS38N_NC_STDIN"
 if [ -n "${LOS38N_NC_REPLY-}" ]; then printf '%s\n' "$LOS38N_NC_REPLY"; fi
 exit 0
@@ -103,7 +103,7 @@ exit 0
   printf '%s\n' "$1" >> "$LOS38N_STORE"
   return 0
 }
-` + los32cBashBody(t)
+` + bundledScript(t, proxyHealthCapPath, "proxy_health_bash")
 	if err := os.WriteFile(script, []byte(body), 0o644); err != nil {
 		t.Fatalf("write script: %v", err)
 	}

@@ -43,21 +43,11 @@ func los04gAssertOneQuotedLine(t *testing.T, logged, value string) {
 	}
 }
 
-func los04gOpenStore(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 // The stored jsonl_path of a vanished file is client input: the projects tree is
 // written by the client, and a file name may carry a newline. Dropping that row
 // logs the path, which must not split the line (YM-332).
 func TestSessionIndexedByOtherPath_QuotesTheDroppedPath(t *testing.T) {
-	s := los04gOpenStore(t)
+	s := mustOpen(t)
 	now := time.Now().Format(time.RFC3339)
 
 	forgedPath := "/nonexistent/" + los04gForgedValue + ".jsonl"
@@ -82,7 +72,7 @@ func TestSessionIndexedByOtherPath_QuotesTheDroppedPath(t *testing.T) {
 // an error built with %s carries the newline into whatever logs it (found by the
 // cold review of YM-332).
 func TestSessionIndexedByOtherPath_QuotesThePathInTheDropError(t *testing.T) {
-	s := los04gOpenStore(t)
+	s := mustOpen(t)
 	now := time.Now().Format(time.RFC3339)
 
 	forgedPath := "/nonexistent/" + los04gForgedValue + ".jsonl"
@@ -118,7 +108,7 @@ func TestSessionIndexedByOtherPath_QuotesThePathInTheDropError(t *testing.T) {
 // A project path reaches the storage backfill log from the learnings and sessions
 // tables, which a client fills (YM-332).
 func TestBackfillScanFiles_QuotesTheProjectOnFailure(t *testing.T) {
-	s := los04gOpenStore(t)
+	s := mustOpen(t)
 	project := "proj/" + los04gForgedValue
 	// An empty scan document: the rewrite then reaches its marker insert without
 	// a path insert, and the trigger below makes that insert fail.
@@ -146,7 +136,7 @@ func TestBackfillScanFiles_QuotesTheProjectOnFailure(t *testing.T) {
 // Agent ids come from the agents table, which rows of older versions and foreign
 // writers fill; the recovery sweep logs them (YM-332).
 func TestAgentRecoverOrphaned_QuotesTheRowItCouldNotClose(t *testing.T) {
-	s := los04gOpenStore(t)
+	s := mustOpen(t)
 	agentID := "agent-" + los04gForgedValue
 	if _, err := s.db.Exec(
 		`INSERT INTO agents (id, project, section, status, pid, opencode_session_id) VALUES (?, 'p', 'sec', 'running', 0, ?)`,
@@ -167,7 +157,7 @@ func TestAgentRecoverOrphaned_QuotesTheRowItCouldNotClose(t *testing.T) {
 }
 
 func TestAgentRecoverOrphaned_QuotesTheRowItCouldNotDelete(t *testing.T) {
-	s := los04gOpenStore(t)
+	s := mustOpen(t)
 	agentID := "agent-" + los04gForgedValue
 	if _, err := s.db.Exec(
 		`INSERT INTO agents (id, project, section, status, pid, session_id) VALUES (?, 'p', 'sec', 'running', 0, '')`,

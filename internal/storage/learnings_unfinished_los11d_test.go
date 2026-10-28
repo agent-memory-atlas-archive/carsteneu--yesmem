@@ -16,7 +16,7 @@ func quarantineTestLearning(t *testing.T, s *Store, id int64) {
 }
 
 func TestSearchUnfinishedRanked_Los11d_SkipsQuarantinedItems(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	quarantinedID := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 	quarantineTestLearning(t, s, quarantinedID)
 
@@ -33,7 +33,7 @@ func TestSearchUnfinishedRanked_Los11d_SkipsQuarantinedItems(t *testing.T) {
 }
 
 func TestSearchUnfinished_Los11d_DisplayListSkipsQuarantinedItems(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	quarantinedID := insertTestLearningForProject(t, s, "proxy rules cache cleanup", "unfinished", "yesmem", "yesmem")
 	quarantineTestLearning(t, s, quarantinedID)
 	activeID := insertTestLearningForProject(t, s, "proxy rules cache documentation", "unfinished", "yesmem", "yesmem")
@@ -50,7 +50,7 @@ func TestSearchUnfinished_Los11d_DisplayListSkipsQuarantinedItems(t *testing.T) 
 // A quarantined item must not block the resolution of an unambiguous active one:
 // it simply does not take part in the ranking.
 func TestSearchUnfinishedRanked_Los11d_QuarantinedTwinDoesNotCreateAmbiguity(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	quarantinedID := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 	quarantineTestLearning(t, s, quarantinedID)
 	targetID := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")

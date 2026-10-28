@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 	// lookup queries the developer's live opencode.db. The idle guard reads it on
 	// every sweep (YM-253), so the pin is suite-wide now, not only where a test
 	// exercises the freeze — those stub it explicitly with
-	// ym253StubOpencodeChildActive. Tests of the gate itself restore the real
+	// stubOpencodeChildActive. Tests of the gate itself restore the real
 	// lookup with restoreRealOpencodeChildActive.
 	realOpencodeChildActiveFn = opencodeChildActiveFn
 	opencodeChildActiveFn = func(string) bool { return false }

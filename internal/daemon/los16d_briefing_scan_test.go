@@ -13,7 +13,7 @@ import (
 // per-project loop would cost every healthy project as well, and the next attempt is
 // a 24h tick away. The scan skips the project that failed and keeps the rest.
 func TestBriefingRefreshScanSurvivesOneUnreadableFingerprintLos16d(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 
 	cwd, err := os.Getwd()
 	if err != nil {

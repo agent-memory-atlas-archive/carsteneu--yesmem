@@ -5,18 +5,7 @@ import (
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
-	"github.com/carsteneu/yesmem/internal/storage"
 )
-
-func mustStore(t *testing.T) *storage.Store {
-	t.Helper()
-	s, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
 
 func TestBootstrapPersonaFromLearnings(t *testing.T) {
 	s := mustStore(t)

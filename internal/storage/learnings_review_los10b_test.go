@@ -15,7 +15,7 @@ import (
 // of the bound sorts after the bound lexicographically while its instant is
 // before it, so an out-of-window learning entered the prompt.
 func TestGetLearningsSinceComparesParsedTimestampsLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// 45 minutes old, written in +03:00: its wall clock is 45 minutes AHEAD of a
 	// bound taken 30 minutes ago in +02:00, its instant is 15 minutes behind it.
@@ -56,7 +56,7 @@ func TestGetLearningsSinceComparesParsedTimestampsLos10b(t *testing.T) {
 // row. SearchLearningsBM25 is exported and consumed without a supersede
 // resolution, so the retired row leaked out of it.
 func TestSearchLearningsBM25CtxExcludesSupersededLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	oldID := insertTestLearning(s, "los10b superseded sentinel alpha", "gotcha")
 	newID := insertTestLearning(s, "los10b replacement sentinel beta", "gotcha")
@@ -79,7 +79,7 @@ func TestSearchLearningsBM25CtxExcludesSupersededLos10b(t *testing.T) {
 // quarantines a failed agent's whole session. A cap is tooling, not recall
 // content, so quarantining must not make it silently unexecutable.
 func TestQuarantineSessionKeepsCapsLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los10b-cap"
 	capID, err := s.InsertLearning(&models.Learning{
@@ -135,7 +135,7 @@ func TestQuarantineSessionKeepsCapsLos10b(t *testing.T) {
 // briefing counter counted quarantined open items while the list beside it
 // (GetActiveLearnings) no longer showed them.
 func TestCountActiveUnfinishedExcludesQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	id, err := s.InsertLearning(&models.Learning{
 		SessionID:  "sess-los10b-unfinished",
@@ -172,7 +172,7 @@ func TestCountActiveUnfinishedExcludesQuarantinedLos10b(t *testing.T) {
 // matched the quarantined row: the save was reported as a duplicate, nothing was
 // inserted, and the content was unreachable from both ends.
 func TestContentHashDedupIgnoresQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const content = "los10b duplicate gate sentinel"
 	id := insertQuarantineLos10bLearning(t, s, content, "sess-los10b-dedup", "los10b-proj", "")
@@ -203,7 +203,7 @@ func TestContentHashDedupIgnoresQuarantinedLos10b(t *testing.T) {
 // while the bound is local time, so an item expiring in 90 minutes counted as
 // already expired and the open-work reminder stayed silent.
 func TestCountActiveUnfinishedComparesExpiryAsInstantLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	expires := time.Now().Add(90 * time.Minute).UTC()
 	if _, err := s.InsertLearning(&models.Learning{

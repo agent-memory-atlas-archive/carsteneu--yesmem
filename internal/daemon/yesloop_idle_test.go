@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/carsteneu/yesmem/internal/opencode"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
@@ -1222,17 +1221,6 @@ func (s *idleSessionStub) reset(n int) {
 	s.stale = false
 }
 
-// stubIdleSession points the daemon's v2 service seam at the stub. Hermetic:
-// no session discovery, no opencode.db, no real service.
-func stubIdleSession(t *testing.T, srv *httptest.Server) {
-	t.Helper()
-	orig := opencodeV2Service
-	opencodeV2Service = func() *opencode.Client {
-		return opencode.NewClient(opencode.Service{ID: "stub", URL: srv.URL, Password: "secret"})
-	}
-	t.Cleanup(func() { opencodeV2Service = orig })
-}
-
 // driveBoundYesloopIntoProgression is driveYesloopIntoProgression for an agent
 // that carries an opencode session id, so the guard can read its messages.
 func driveBoundYesloopIntoProgression(t *testing.T, h *Handler, s *storage.Store, id string) {
@@ -1364,7 +1352,7 @@ func TestCheckYesloopIdle_SingleRelayAnswerIsStillNoProgress(t *testing.T) {
 func TestCheckYesloopIdle_AssistantMessagesAreProgressWithoutTurns(t *testing.T) {
 	resetIdleState()
 	stub, srv := newIdleSessionStub(t)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "messages-1")
 
@@ -1389,7 +1377,7 @@ func TestCheckYesloopIdle_AssistantMessagesAreProgressWithoutTurns(t *testing.T)
 func TestCheckYesloopIdle_SingleAssistantMessageIsNoProgress(t *testing.T) {
 	resetIdleState()
 	stub, srv := newIdleSessionStub(t)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "answer-msg")
 	giveIdleAgentASocket(t, h, s, "answer-msg")
@@ -1465,7 +1453,7 @@ func TestCheckYesloopIdle_AnswerWithOneToolCallIsStillNoProgress(t *testing.T) {
 func TestCheckYesloopIdle_OpenTurnIsProgress(t *testing.T) {
 	resetIdleState()
 	stub, srv := newIdleSessionStub(t)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "open-turn")
 	giveIdleAgentASocket(t, h, s, "open-turn")
@@ -1491,7 +1479,7 @@ func TestCheckYesloopIdle_OpenTurnIsProgress(t *testing.T) {
 func TestCheckYesloopIdle_RunningToolIsProgress(t *testing.T) {
 	resetIdleState()
 	stub, srv := newIdleSessionStub(t)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "running-tool")
 	giveIdleAgentASocket(t, h, s, "running-tool")
@@ -1517,7 +1505,7 @@ func TestCheckYesloopIdle_RunningToolIsProgress(t *testing.T) {
 func TestCheckYesloopIdle_StaleOpenTurnIsNoProgress(t *testing.T) {
 	resetIdleState()
 	stub, srv := newIdleSessionStub(t)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "stale-open")
 	giveIdleAgentASocket(t, h, s, "stale-open")
@@ -1546,7 +1534,7 @@ func TestCheckYesloopIdle_StaleOpenTurnIsNoProgress(t *testing.T) {
 func TestCheckYesloopIdle_OpenTurnStopsCountingAfterTheBound(t *testing.T) {
 	resetIdleState()
 	stub, srv := newIdleSessionStub(t)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "stuck-open")
 	giveIdleAgentASocket(t, h, s, "stuck-open")

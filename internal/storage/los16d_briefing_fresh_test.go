@@ -10,7 +10,7 @@ import (
 // is not served by GetRefinedBriefing or GetRefinedBriefingHash, so it must not be
 // reported as a cached briefing either.
 func TestCountFreshRefinedBriefingsSkipsExpiredLos16d(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.SaveRefinedBriefing("/los16d/fresh", "hash-fresh", "text", "test"); err != nil {
 		t.Fatalf("save fresh briefing: %v", err)

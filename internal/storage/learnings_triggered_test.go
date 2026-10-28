@@ -8,21 +8,11 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-func openTriggerStore(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 // YM-106: GetTriggeredLearnings limited to 10 rows without ordering or rule
 // filter, so ten unrelated trigger rules could push every deadline out of the
 // result. The deadline prefix filter must make the deadline rows reachable.
 func TestGetTriggeredLearnings_DeadlineRowsNotCrowdedOut(t *testing.T) {
-	store := openTriggerStore(t)
+	store := mustOpen(t)
 	now := time.Now()
 	project := "proj"
 
@@ -70,7 +60,7 @@ func TestGetTriggeredLearnings_DeadlineRowsNotCrowdedOut(t *testing.T) {
 
 // Rows with an unrelated trigger rule stay invisible to a deadline lookup.
 func TestGetTriggeredLearnings_OnlyMatchingPrefix(t *testing.T) {
-	store := openTriggerStore(t)
+	store := mustOpen(t)
 
 	if _, err := store.InsertLearning(&models.Learning{
 		Category:    "gotcha",
@@ -95,7 +85,7 @@ func TestGetTriggeredLearnings_OnlyMatchingPrefix(t *testing.T) {
 // without a lower bound they consume the LIMIT 10 window and hide the upcoming
 // deadline. The minRule bound keeps the window on relevant dates.
 func TestGetTriggeredLearnings_ExpiredDeadlinesDoNotHideUpcoming(t *testing.T) {
-	store := openTriggerStore(t)
+	store := mustOpen(t)
 	project := "proj"
 	now := time.Now()
 

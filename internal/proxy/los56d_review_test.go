@@ -100,7 +100,7 @@ func TestLos56dScrubDropsForeignSessionContent(t *testing.T) {
 func TestLos56dDerivedKeyCarriesSessionContentOnTheTail(t *testing.T) {
 	s := los26aHandlerServer(t, "http://127.0.0.1:1")
 	s.cfg.FeatureDefaults = &config.FeatureGates{Timestamps: true, RulesReminder: true, PlanCheckpoint: true}
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 		switch method {
 		case "get_plan":
 			return `{"exists":true,"plan":"LOS56D-PLAN","status":"active"}`

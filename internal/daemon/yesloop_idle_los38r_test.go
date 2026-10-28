@@ -18,7 +18,7 @@ const los38rFreezeLogLine = "frozen: a task() subagent is active"
 func TestLos38R_IdleFreezeReportsAgainOnTheNextEpisode(t *testing.T) {
 	resetIdleState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeYesloopAgent(t, h, s, "idle38r", "sess-idle38r", testPID, false, time.Hour)
 	agent, err := s.AgentGet("idle38r")

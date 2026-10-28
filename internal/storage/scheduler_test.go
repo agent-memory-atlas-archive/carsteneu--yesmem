@@ -6,7 +6,7 @@ import (
 )
 
 func TestScheduledJobCapName(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	job := ScheduledJobRow{
@@ -48,7 +48,7 @@ func TestScheduledJobCapName(t *testing.T) {
 }
 
 func TestBashJobRunStorage(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	run := BashJobRun{
@@ -98,7 +98,7 @@ func TestBashJobRunStorage(t *testing.T) {
 }
 
 func TestPurgeBashJobRunsRetention(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	now := time.Now()
@@ -166,7 +166,7 @@ func TestPurgeBashJobRunsRetention(t *testing.T) {
 // The value silently ended up as the zero time, so a reloaded job lost its last
 // run and any "when did this fire" answer was wrong.
 func TestUpdateJobLastRun_IsReadableAfterAReload(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	job := ScheduledJobRow{
@@ -215,7 +215,7 @@ func TestUpdateJobLastRun_IsReadableAfterAReload(t *testing.T) {
 // A job that never ran must not carry a fabricated timestamp: the zero time was
 // written verbatim, and after a restart it read back as year 1.
 func TestSaveScheduledJob_ZeroLastRunStaysNull(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	job := ScheduledJobRow{
@@ -249,7 +249,7 @@ func TestSaveScheduledJob_ZeroLastRunStaysNull(t *testing.T) {
 // second time on the next start. A one-shot that never ran must survive: the old
 // write path gave it the zero time as last_run.
 func TestDeleteFiredOneShotJobs_KeepsPendingOnes(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	rows := []struct {
@@ -296,7 +296,7 @@ func TestDeleteFiredOneShotJobs_KeepsPendingOnes(t *testing.T) {
 }
 
 func TestScheduledJobScriptName(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	job := ScheduledJobRow{
@@ -335,7 +335,7 @@ func TestScheduledJobScriptName(t *testing.T) {
 }
 
 func TestBashJobRunScriptName(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	run := BashJobRun{

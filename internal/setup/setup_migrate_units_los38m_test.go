@@ -145,15 +145,6 @@ WantedBy=default.target
 	}
 }
 
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return string(data)
-}
-
 // TestMigrateDaemonUnitWatchdogRespectsAnExplicitType: the migration upgrades the
 // default type only. A unit the operator set to exec (or anything else) keeps it —
 // silently changing a supervisor decision is not a migration.

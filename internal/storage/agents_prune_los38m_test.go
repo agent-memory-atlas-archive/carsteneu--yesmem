@@ -12,7 +12,7 @@ import (
 // deliberately narrow: a closed row, no process attached, and older than the
 // retention window.
 func TestPruneStoppedAgentsKeepsLiveAndRecentRows(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now()
 	old := now.Add(-40 * 24 * time.Hour).Format(time.RFC3339)
 	recent := now.Add(-2 * 24 * time.Hour).Format(time.RFC3339)
@@ -87,7 +87,7 @@ func TestPruneStoppedAgentsKeepsLiveAndRecentRows(t *testing.T) {
 // TestPruneStoppedAgentsIsBoundedByTheCutoff: the cutoff is the only knob, so a
 // cutoff in the past must not take the rows that are merely older than nothing.
 func TestPruneStoppedAgentsReturnsZeroOnEmptyStore(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	deleted, err := s.PruneStoppedAgents(time.Now().Add(-30 * 24 * time.Hour))
 	if err != nil {
 		t.Fatalf("PruneStoppedAgents: %v", err)
@@ -101,7 +101,7 @@ func TestPruneStoppedAgentsReturnsZeroOnEmptyStore(t *testing.T) {
 // the writer's offset, so a lexical comparison puts rows in the wrong order. A row
 // closed 40 days ago in a +02:00 offset must still be pruned.
 func TestPruneStoppedAgentsComparesTimestampsNotStrings(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now()
 	zone := time.FixedZone("CEST", 2*3600)
 	oldOffset := now.Add(-40 * 24 * time.Hour).In(zone).Format(time.RFC3339)

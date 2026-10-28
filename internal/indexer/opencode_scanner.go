@@ -259,24 +259,69 @@ func (s *OpencodeScanner) normalizeMessages(msgs []models.Message, sessionID str
 	}
 }
 
+// hasV2Tables reports whether the database carries the v2 session storage. The
+// fork moved sessions to session_v2/session_message (migration #40723) and
+// stopped writing the legacy session/message/part tables; reading the legacy
+// names then yields a database frozen at the migration.
+func hasV2Tables(db *sql.DB) bool {
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN ('session_v2', 'session_message')`).Scan(&n); err != nil {
+		return false
+	}
+	return n == 2
+}
+
+// newestTime returns the newest time_updated of a table, 0 when the table is
+// missing or empty. It exists to choose between the two session storages by
+// their content rather than by their presence.
+func newestTime(db *sql.DB, table string) int64 {
+	var newest sql.NullInt64
+	if err := db.QueryRow(`SELECT MAX(time_updated) FROM ` + table).Scan(&newest); err != nil {
+		return 0
+	}
+	if !newest.Valid {
+		return 0
+	}
+	return newest.Int64
+}
+
+// sessionStorage decides which session tables this database really uses. Both
+// generations can be present at once: a migrated database keeps the legacy
+// tables, and the fork stops writing them. Deciding by the newer timestamp
+// covers v1-only, v2-only, and the mixed case where a host still writes v1.
+func sessionStorage(db *sql.DB) string {
+	if !hasV2Tables(db) {
+		return "v1"
+	}
+	if newestTime(db, "session_v2") >= newestTime(db, "session") {
+		return "v2"
+	}
+	return "v1"
+}
+
 func (s *OpencodeScanner) querySessions(db *sql.DB) ([]opencodeDBSession, error) {
+	table := "session"
+	if sessionStorage(db) == "v2" {
+		table = "session_v2"
+	}
 	var rows *sql.Rows
 	var err error
 
 	if s.lastScanAt.IsZero() {
 		rows, err = db.Query(`
-			SELECT id, directory, title,
+			SELECT id, COALESCE(directory, ''), COALESCE(title, ''),
 				time_created, time_updated, parent_id,
 				COALESCE(model, ''), COALESCE(agent, '')
-			FROM session
+			FROM ` + table + `
 			ORDER BY time_updated, id
 		`)
 	} else {
 		rows, err = db.Query(`
-			SELECT id, directory, title,
+			SELECT id, COALESCE(directory, ''), COALESCE(title, ''),
 				time_created, time_updated, parent_id,
 				COALESCE(model, ''), COALESCE(agent, '')
-			FROM session
+			FROM `+table+`
 			WHERE time_updated > ? OR (time_updated = ? AND id > ?)
 			ORDER BY time_updated, id
 		`, s.lastScanAt.UnixMilli(), s.lastScanAt.UnixMilli(), s.lastSessionID)
@@ -310,6 +355,9 @@ func (s *OpencodeScanner) querySessions(db *sql.DB) ([]opencodeDBSession, error)
 }
 
 func (s *OpencodeScanner) queryMessages(db *sql.DB, sessionID string) ([]opencodeDBMessage, error) {
+	if v2 := sessionStorage(db) == "v2"; v2 {
+		return s.queryMessagesV2(db, sessionID)
+	}
 	rows, err := db.Query(`
 		SELECT m.id, m.session_id,
 			json_extract(m.data, '$.role') as role,
@@ -361,4 +409,56 @@ func isExtractionPipelineSession(msgs []models.Message) bool {
 		}
 	}
 	return false
+}
+
+// queryMessagesV2 reads the v2 message rows: one row per turn, with the parts in
+// data.content for an assistant turn and a plain text for a user or system turn.
+// The mapper works one part per entry, so a turn becomes as many entries as it
+// carries parts. Row types that are not conversation (idle, compaction,
+// model-switched, ...) produce no messages.
+func (s *OpencodeScanner) queryMessagesV2(db *sql.DB, sessionID string) ([]opencodeDBMessage, error) {
+	rows, err := db.Query(`
+		SELECT id, type, time_created, data
+		FROM session_message
+		WHERE session_id = ?
+		ORDER BY seq
+	`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query session_message: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []opencodeDBMessage
+	for rows.Next() {
+		var id, typ, data string
+		var createdMs int64
+		if err := rows.Scan(&id, &typ, &createdMs, &data); err != nil {
+			return nil, fmt.Errorf("scan session_message: %w", err)
+		}
+		var payload struct {
+			Text    string           `json:"text"`
+			Content []opencodeDBPart `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			return nil, fmt.Errorf("parse %s row: %w", typ, err)
+		}
+		switch typ {
+		case "user", "system":
+			if payload.Text == "" {
+				continue
+			}
+			msgs = append(msgs, opencodeDBMessage{
+				ID: id, SessionID: sessionID, Role: typ, CreatedMs: createdMs,
+				Part: opencodeDBPart{Type: "text", Text: payload.Text},
+			})
+		case "assistant":
+			for i, part := range payload.Content {
+				msgs = append(msgs, opencodeDBMessage{
+					ID: fmt.Sprintf("%s-%d", id, i), SessionID: sessionID, Role: typ,
+					CreatedMs: createdMs, Part: part,
+				})
+			}
+		}
+	}
+	return msgs, rows.Err()
 }

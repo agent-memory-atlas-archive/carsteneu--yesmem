@@ -6,7 +6,7 @@ import (
 )
 
 func TestAgentPermissionKick_Roundtrip(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	for i, want := range []string{"off", "on", ""} {
 		agent := Agent{
@@ -45,7 +45,7 @@ func TestAgentPermissionKick_Roundtrip(t *testing.T) {
 // without the permission_kick column and verifies the additive migration
 // adds it (test case 9).
 func TestMigrateAgentsSchema_AddsPermissionKick(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Recreate the agents table with the original v1 layout (permission_kick
 	// and the telemetry columns arrived later).

@@ -15,7 +15,7 @@ const los16cSessionIDs = 40000
 // the read built one placeholder per session ID, so a caller with more IDs than
 // SQLite's variable limit got "too many SQL variables" and no rows at all.
 func TestGetActiveLearningsBySessionIDsChunksLos16c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const wanted = "los16c-wanted-session"
 	id, err := s.InsertLearning(&models.Learning{
@@ -51,7 +51,7 @@ func TestGetActiveLearningsBySessionIDsChunksLos16c(t *testing.T) {
 // a single IN list deduplicated repeated IDs implicitly, so batching must not
 // return the same row once per batch.
 func TestGetActiveLearningsBySessionIDsDedupesLos16c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const sessionID = "los16c-duplicate-session"
 	id, err := s.InsertLearning(&models.Learning{

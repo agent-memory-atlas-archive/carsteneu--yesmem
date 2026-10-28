@@ -14,15 +14,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
-// mustHandlerWithEmbedding creates a test handler with embedding_vector column
-// (missing in initial schema, added only via migration v0.26).
-func mustHandlerWithEmbedding(t *testing.T) (*Handler, *storage.Store) {
-	t.Helper()
-	h, s := mustHandler(t)
-	s.DB().Exec(`ALTER TABLE learnings ADD COLUMN embedding_vector BLOB`)
-	return h, s
-}
-
 func TestHandleHybridSearch(t *testing.T) {
 	h, s := mustHandlerWithEmbedding(t)
 

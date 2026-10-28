@@ -17,25 +17,6 @@ import (
 // These tests run the real body from bundle source of truth with a stubbed
 // journalctl on PATH and pin that only a number reaches the shell (OPS-68).
 
-const los38hCapPath = "../../caps/bundled-caps/proxy_health/CAP.md"
-
-func los38hBody(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile(los38hCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript("proxy_health")
-	if sc == nil {
-		t.Fatal("the bundled proxy_health cap has no JS tool script")
-	}
-	return sc.Body
-}
-
 func los38hBunPath(t *testing.T) string {
 	t.Helper()
 	if p, err := exec.LookPath("bun"); err == nil {
@@ -89,7 +70,7 @@ exit 0
 		t.Fatalf("write journalctl stub: %v", err)
 	}
 
-	harness := strings.Replace(los38hHarness, "__BODY__", los38hBody(t), 1)
+	harness := strings.Replace(los38hHarness, "__BODY__", bundledScript(t, proxyHealthCapPath, "proxy_health"), 1)
 	script := filepath.Join(dir, "harness.js")
 	if err := os.WriteFile(script, []byte(harness), 0o644); err != nil {
 		t.Fatalf("write harness: %v", err)

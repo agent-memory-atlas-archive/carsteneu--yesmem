@@ -95,7 +95,7 @@ func newLos38lSessionStub(t *testing.T) *los38lSessionStub {
 	stub := &los38lSessionStub{}
 	srv := httptest.NewServer(stub.handler())
 	t.Cleanup(srv.Close)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 	return stub
 }
 

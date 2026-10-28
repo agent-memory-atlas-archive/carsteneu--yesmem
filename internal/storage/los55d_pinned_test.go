@@ -15,51 +15,24 @@ const (
 	los55dOther   = "/home/testuser/projects/other"
 )
 
-func los55dSeedPin(t *testing.T, s *Store, scope, project, content string) {
-	t.Helper()
-	los28cSeedPin(t, s, scope, project, "", content, time.Now())
-}
-
-func los55dPinContents(t *testing.T, s *Store, scope, project string) []string {
-	t.Helper()
-	pins, err := s.GetPinnedLearnings(scope, project)
-	if err != nil {
-		t.Fatalf("get %s pins for %q: %v", scope, project, err)
-	}
-	out := make([]string, 0, len(pins))
-	for _, p := range pins {
-		out = append(out, p.Content)
-	}
-	return out
-}
-
-func los55dHasContent(contents []string, want string) bool {
-	for _, c := range contents {
-		if c == want {
-			return true
-		}
-	}
-	return false
-}
-
 // YM-325 (3): a short name carries no path, so the view identity stayed empty and
 // every path-bound pin was invisible to a caller that asked with the project name
 // the CLI and the hooks use.
 func TestLos55d_GetPinnedLearningsResolvesAShortNameView(t *testing.T) {
 	s := mustOpenFiles(t)
-	los55dSeedSession(t, s, "los55dsess-app", los55dProject)
+	seedSession(t, s, "los55dsess-app", los55dProject)
 
-	los55dSeedPin(t, s, "permanent", los55dProject+"/internal", "subdirectory pin")
-	los55dSeedPin(t, s, "permanent", "", "global pin")
-	los55dSeedPin(t, s, "permanent", los55dOther, "sibling project pin")
+	seedPinNow(t, s, "permanent", los55dProject+"/internal", "subdirectory pin")
+	seedPinNow(t, s, "permanent", "", "global pin")
+	seedPinNow(t, s, "permanent", los55dOther, "sibling project pin")
 
-	got := los55dPinContents(t, s, "permanent", "myapp")
+	got := pinContents(t, s, "permanent", "myapp")
 	for _, want := range []string{"subdirectory pin", "global pin"} {
-		if !los55dHasContent(got, want) {
+		if !pinHasContent(got, want) {
 			t.Errorf("%q not visible in the short-name view %q, got: %v", want, "myapp", got)
 		}
 	}
-	if los55dHasContent(got, "sibling project pin") {
+	if pinHasContent(got, "sibling project pin") {
 		t.Errorf("sibling project pin leaked into the short-name view, got: %v", got)
 	}
 }
@@ -100,9 +73,9 @@ func TestLos55d_GetPinnedLearningsSeesPinBelowASubagentOnlyProject(t *testing.T)
 	}); err != nil {
 		t.Fatalf("seed subagent session: %v", err)
 	}
-	los55dSeedPin(t, s, "permanent", sub+"/deep", "pin below a subagent-only project")
+	seedPinNow(t, s, "permanent", sub+"/deep", "pin below a subagent-only project")
 
-	if !los55dHasContent(los55dPinContents(t, s, "permanent", sub), "pin below a subagent-only project") {
+	if !pinHasContent(pinContents(t, s, "permanent", sub), "pin below a subagent-only project") {
 		t.Error("pin of a subdirectory is invisible in the project that owns it")
 	}
 }
@@ -114,22 +87,22 @@ func TestLos55d_SubagentOnlyWorktreeStillBelongsToItsCheckout(t *testing.T) {
 	const checkout = "/home/testuser/projects/repo"
 	const worktree = checkout + "/.worktrees/feature/agent-supervision"
 
-	los55dSeedSession(t, s, "los55dsess-checkout", checkout)
+	seedSession(t, s, "los55dsess-checkout", checkout)
 	if err := s.UpsertSession(&models.Session{
 		ID: "los55dsess-agent", Project: worktree, ParentSessionID: "los55dsess-checkout",
 		AgentType: "general",
 	}); err != nil {
 		t.Fatalf("seed subagent session: %v", err)
 	}
-	los55dSeedPin(t, s, "permanent", checkout, "checkout pin")
-	los55dSeedPin(t, s, "permanent", worktree, "worktree pin")
+	seedPinNow(t, s, "permanent", checkout, "checkout pin")
+	seedPinNow(t, s, "permanent", worktree, "worktree pin")
 
 	if got := s.OwningProject(worktree); got != checkout {
 		t.Errorf("OwningProject(%q) = %q, want the checkout %q", worktree, got, checkout)
 	}
-	got := los55dPinContents(t, s, "permanent", worktree)
+	got := pinContents(t, s, "permanent", worktree)
 	for _, want := range []string{"checkout pin", "worktree pin"} {
-		if !los55dHasContent(got, want) {
+		if !pinHasContent(got, want) {
 			t.Errorf("%q not visible in the worktree view, got: %v", want, got)
 		}
 	}
@@ -144,15 +117,15 @@ func TestLos55d_GetPinnedLearningsLogsScanFailures(t *testing.T) {
 		 VALUES ('', '', 'unreadable pin', 'test', 'not-a-timestamp')`); err != nil {
 		t.Fatalf("seed unreadable pin: %v", err)
 	}
-	los55dSeedPin(t, s, "permanent", "", "readable pin")
+	seedPinNow(t, s, "permanent", "", "readable pin")
 
 	var buf bytes.Buffer
 	previous := log.Writer()
 	log.SetOutput(&buf)
 	defer log.SetOutput(previous)
 
-	got := los55dPinContents(t, s, "permanent", los55dProject)
-	if !los55dHasContent(got, "readable pin") {
+	got := pinContents(t, s, "permanent", los55dProject)
+	if !pinHasContent(got, "readable pin") {
 		t.Errorf("the readable pin must still be returned, got: %v", got)
 	}
 	if !strings.Contains(buf.String(), "pinned_learnings") {
@@ -164,10 +137,10 @@ func TestLos55d_GetPinnedLearningsLogsScanFailures(t *testing.T) {
 // sessions table on every turn. All names of one lookup resolve in one query.
 func TestLos55d_LegacyProjectPathsResolveInOneBatch(t *testing.T) {
 	s := mustOpenFiles(t)
-	los55dSeedSession(t, s, "los55dsess-app", los55dProject)
-	los55dSeedSession(t, s, "los55dsess-other", los55dOther)
-	los55dSeedSession(t, s, "los55dsess-second", "/home/other/myapp")
-	los55dSeedSession(t, s, "los55dsess-tools", "/home/testuser/projects/tools/b")
+	seedSession(t, s, "los55dsess-app", los55dProject)
+	seedSession(t, s, "los55dsess-other", los55dOther)
+	seedSession(t, s, "los55dsess-second", "/home/other/myapp")
+	seedSession(t, s, "los55dsess-tools", "/home/testuser/projects/tools/b")
 
 	got := s.legacyProjectPaths([]string{"other", "myapp", "tools/b", "unknown", ""})
 
@@ -194,8 +167,8 @@ func TestLos55d_LegacyProjectPathsResolveInOneBatch(t *testing.T) {
 func TestLos55d_PurgeKeepsPermanentPinsOnACollapsedStore(t *testing.T) {
 	s := mustOpen(t) // :memory:, one handle for both scopes
 	old := time.Now().Add(-30 * 24 * time.Hour)
-	los28cSeedPin(t, s, "permanent", "", "", "old permanent pin", old)
-	los28cSeedPin(t, s, "session", "", "sess-a", "old attributed session pin", old)
+	seedPin(t, s, "permanent", "", "", "old permanent pin", old)
+	seedPin(t, s, "session", "", "sess-a", "old attributed session pin", old)
 
 	if _, err := s.PurgeSessionPinsBefore(time.Now().Add(-SessionPinMaxAge)); err != nil {
 		t.Fatalf("purge: %v", err)
@@ -222,16 +195,16 @@ func TestLos55d_PurgeKeepsPermanentPinsOnACollapsedStore(t *testing.T) {
 // to be the set of rows that can belong to the view, and nothing outside it.
 func TestLos55d_PinReadScopeSelectsOnlyReachableRows(t *testing.T) {
 	s := mustOpenFiles(t)
-	los55dSeedSession(t, s, "los55dsess-app", los55dProject)
-	los55dSeedSession(t, s, "los55dsess-other", los55dOther)
+	seedSession(t, s, "los55dsess-app", los55dProject)
+	seedSession(t, s, "los55dsess-other", los55dOther)
 
-	los55dSeedPin(t, s, "permanent", los55dProject, "exact project pin")
-	los55dSeedPin(t, s, "permanent", los55dProject+"/internal", "subdirectory pin")
-	los55dSeedPin(t, s, "permanent", "myapp", "legacy short-name pin")
-	los55dSeedPin(t, s, "permanent", "", "global pin")
-	los55dSeedPin(t, s, "permanent", los55dOther+"/vendor/deep", "vendored clone pin")
-	los55dSeedPin(t, s, "permanent", los55dOther, "sibling project pin")
-	los55dSeedPin(t, s, "permanent", "/home/testuser/projects", "parent directory pin")
+	seedPinNow(t, s, "permanent", los55dProject, "exact project pin")
+	seedPinNow(t, s, "permanent", los55dProject+"/internal", "subdirectory pin")
+	seedPinNow(t, s, "permanent", "myapp", "legacy short-name pin")
+	seedPinNow(t, s, "permanent", "", "global pin")
+	seedPinNow(t, s, "permanent", los55dOther+"/vendor/deep", "vendored clone pin")
+	seedPinNow(t, s, "permanent", los55dOther, "sibling project pin")
+	seedPinNow(t, s, "permanent", "/home/testuser/projects", "parent directory pin")
 
 	scope := s.pinVisibilityFor(los55dProject)
 	clause, args := pinReadScope(scope)
@@ -254,12 +227,12 @@ func TestLos55d_PinReadScopeSelectsOnlyReachableRows(t *testing.T) {
 	}
 
 	for _, want := range []string{"exact project pin", "subdirectory pin", "legacy short-name pin", "global pin"} {
-		if !los55dHasContent(selected, want) {
+		if !pinHasContent(selected, want) {
 			t.Errorf("read scope misses %q, selected: %v", want, selected)
 		}
 	}
 	for _, unwanted := range []string{"vendored clone pin", "sibling project pin", "parent directory pin"} {
-		if los55dHasContent(selected, unwanted) {
+		if pinHasContent(selected, unwanted) {
 			t.Errorf("read scope reads %q, which cannot be visible in this view", unwanted)
 		}
 	}

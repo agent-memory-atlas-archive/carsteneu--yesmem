@@ -942,25 +942,59 @@ func neutralizePlanBlockClose(text string) string {
 	return strings.ReplaceAll(text, "[/Active Plan]", "[ /Active Plan]")
 }
 
+// planItemsSchema is the item shape of a structured plan, mirroring
+// daemon.PlanItem. Status reuses the todowrite vocabulary so a display needs no
+// translation, depth carries nesting, and reason is the field todowrite lacks.
+func planItemsSchema() mcplib.PropertyOption {
+	return mcplib.Items(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"content": map[string]any{"type": "string", "description": "One step, one line"},
+			"status":  map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed", "cancelled"}},
+			"reason":  map[string]any{"type": "string", "description": "Why this step is on the plan"},
+			"depth":   map[string]any{"type": "integer", "minimum": 0, "maximum": 1, "description": "0 = top level, 1 = sub-step"},
+		},
+		"required": []string{"content"},
+	})
+}
+
+// planItemWire mirrors the item shape the daemon returns. The MCP server must not
+// import the daemon — it talks to it over the socket — so the wire shape is
+// declared here.
+type planItemWire struct {
+	Content string `json:"content"`
+	Status  string `json:"status"`
+	Reason  string `json:"reason"`
+	Depth   int    `json:"depth"`
+}
+
 func formatPlanResult(raw json.RawMessage) string {
 	var r struct {
-		Message string `json:"message"`
-		Plan    string `json:"plan"`
-		Status  string `json:"status"`
-		Exists  bool   `json:"exists"`
+		Message string         `json:"message"`
+		Plan    string         `json:"plan"`
+		Status  string         `json:"status"`
+		Exists  bool           `json:"exists"`
+		Items   []planItemWire `json:"items"`
 	}
 	if json.Unmarshal(raw, &r) != nil {
 		return string(raw)
 	}
-	if r.Message != "" && r.Plan != "" {
-		return fmt.Sprintf("%s\n\n[Active Plan]\n%s\n[/Active Plan]", neutralizePlanBlockClose(r.Message), neutralizePlanBlockClose(r.Plan))
+	// The outline wins over the text: it carries the per-step status, and for a
+	// plan written with both the text is the caller's own words from the same
+	// call. Nothing is lost — the text still arrives in the JSON response.
+	planText := neutralizePlanBlockClose(r.Plan)
+	if len(r.Items) > 0 {
+		planText = formatPlanItems(r.Items)
 	}
-	if r.Plan != "" {
+	if r.Message != "" && planText != "" {
+		return fmt.Sprintf("%s\n\n[Active Plan]\n%s\n[/Active Plan]", neutralizePlanBlockClose(r.Message), planText)
+	}
+	if planText != "" {
 		status := r.Status
 		if status == "" {
 			status = "active"
 		}
-		return fmt.Sprintf("[Active Plan] (status: %s)\n%s\n[/Active Plan]", status, neutralizePlanBlockClose(r.Plan))
+		return fmt.Sprintf("[Active Plan] (status: %s)\n%s\n[/Active Plan]", status, planText)
 	}
 	if !r.Exists {
 		return "No active plan. Use set_plan() to create one."
@@ -969,6 +1003,53 @@ func formatPlanResult(raw json.RawMessage) string {
 		return r.Message
 	}
 	return string(raw)
+}
+
+// formatPlanItems renders the outline as a checklist. Depth carries the nesting
+// and the marker the status; a value outside the two supported levels is clamped
+// so a hand-written plan cannot indent a line into the margin.
+func formatPlanItems(items []planItemWire) string {
+	var b strings.Builder
+	for i, it := range items {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		depth := it.Depth
+		if depth < 0 {
+			depth = 0
+		}
+		if depth > 1 {
+			depth = 1
+		}
+		marker := "[ ]"
+		switch it.Status {
+		case "completed":
+			marker = "[x]"
+		case "in_progress":
+			marker = "[>]"
+		case "cancelled":
+			marker = "[-]"
+		}
+		b.WriteString(strings.Repeat("  ", depth) + "- " + marker + " " + planItemText(it.Content))
+		if it.Reason != "" {
+			b.WriteString(" (" + planItemText(it.Reason) + ")")
+		}
+	}
+	return b.String()
+}
+
+// planItemText flattens one field for print: it becomes a single line, control
+// characters become spaces, and the block-closing markers are defused. Without
+// the flattening a stored item could forge its own bullet line in the plan the
+// model reads back.
+func planItemText(text string) string {
+	stripped := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == 0x2028 || r == 0x2029 {
+			return ' '
+		}
+		return r
+	}, text)
+	return neutralizePlanBlockClose(strings.Join(strings.Fields(stripped), " "))
 }
 
 func formatSendTo(raw json.RawMessage, params map[string]any) string {
@@ -1356,17 +1437,19 @@ func (s *Server) registerTools() {
 	s.srv.AddTool(
 		mcplib.NewTool("set_plan",
 			mcplib.WithDescription("Set the active plan for the current thread — survives context collapse and proxy restarts. Use for any task spanning more than 5 tool cycles, exploring multiple hypotheses, or touching multiple files. Primary anchor against context loss. Pair with update_plan."),
-			mcplib.WithString("plan", mcplib.Required(), mcplib.Description("Plan content (free text or structured list)")),
+			mcplib.WithString("plan", mcplib.Description("Full plan text. Optional when items is given: the text is then derived from the items.")),
 			mcplib.WithString("scope", mcplib.Description("session|permanent")),
+			mcplib.WithArray("items", mcplib.Description("Structured outline of the plan. When set, the items are the source of truth: the ledger summarizes them and the opencode sidebar draws them. Drop depth and numbering from the text, they come from this array."), planItemsSchema()),
 		), s.proxyCallWithThreadID("set_plan", formatPlanResult))
 
 	s.srv.AddTool(
 		mcplib.NewTool("update_plan",
-			mcplib.WithDescription("Update the active plan — mark items completed, add new items, or remove items. Use after each milestone or pivot to keep the plan current. The plan is your primary anchor against context loss."),
+			mcplib.WithDescription("Update the active plan — mark items completed, add new items, or remove items. Use after each milestone or pivot to keep the plan current. The plan is your primary anchor against context loss. When the plan has items, completed/add/remove act on the items and the full text is re-derived."),
 			mcplib.WithString("plan", mcplib.Description("Full replacement")),
 			mcplib.WithArray("completed", mcplib.WithStringItems(), mcplib.Description("Items to mark done (substring match)")),
 			mcplib.WithArray("add", mcplib.WithStringItems(), mcplib.Description("Items to add")),
 			mcplib.WithArray("remove", mcplib.WithStringItems(), mcplib.Description("Items to remove (substring match)")),
+			mcplib.WithArray("items", mcplib.Description("Structured outline as a full replacement of the current items"), planItemsSchema()),
 		), s.proxyCallWithThreadID("update_plan", formatPlanResult))
 
 	s.srv.AddTool(

@@ -17,7 +17,7 @@ import (
 // Holding one tick open makes the window deterministic: Close may not return
 // while a tick is running.
 func TestLos56gCloseWaitsForARunningGuardTick(t *testing.T) {
-	s, _ := los38tOpenStore(t)
+	s, _ := mustOpenWithPath(t)
 	if _, err := s.InsertLearning(los38tLearning(1)); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestLos56gCloseWaitsForARunningGuardTick(t *testing.T) {
 // A store whose guard never started still closes; the wait must not invent a
 // goroutine.
 func TestLos56gCloseWithoutAGuardReturns(t *testing.T) {
-	s, _ := los38tOpenStore(t)
+	s, _ := mustOpenWithPath(t)
 
 	done := make(chan struct{})
 	go func() {

@@ -10,7 +10,7 @@ import (
 // fresh test DBs (built from the CREATE TABLE constant) and on production
 // DBs that arrive via the ALTER TABLE migration list.
 func TestLearningsSchema_HasOriginToolColumn(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	rows, err := s.db.Query(`PRAGMA table_info(learnings)`)
 	if err != nil {

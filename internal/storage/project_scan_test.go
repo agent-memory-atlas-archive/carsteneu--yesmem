@@ -5,7 +5,7 @@ import (
 )
 
 func TestProjectScan_SaveAndLoad(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// The key names the checkout the document was walked from (YM-453), so the
 	// fixture keeps both in agreement.
@@ -40,7 +40,7 @@ func TestProjectScan_SaveAndLoad(t *testing.T) {
 }
 
 func TestProjectScan_Upsert(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	scan1 := &ProjectScanRow{Project: "yesmem", ScanJSON: `{"v":1}`, GitHead: "aaa", CbmMtime: 100}
 	scan2 := &ProjectScanRow{Project: "yesmem", ScanJSON: `{"v":2}`, GitHead: "bbb", CbmMtime: 200}
@@ -58,7 +58,7 @@ func TestProjectScan_Upsert(t *testing.T) {
 }
 
 func TestProjectScan_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	got, err := s.GetProjectScan("nonexistent")
 	if err != nil {

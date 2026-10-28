@@ -18,13 +18,13 @@ func TestPurgeSessionPinsBefore_BoundsEveryUnreachablePin(t *testing.T) {
 	old := time.Now().Add(-30 * 24 * time.Hour)
 	fresh := time.Now().Add(-1 * time.Hour)
 
-	los28cSeedPin(t, s, "session", "", "sess-a", "old attributed project-less", old)
-	los28cSeedPin(t, s, "session", los28cProject, "sess-a", "old attributed project pin", old)
-	los28cSeedPin(t, s, "session", los28cProject, "sess-a", "fresh attributed project pin", fresh)
-	los28cSeedPin(t, s, "session", "", "", "old unattributed project-less", old)
-	los28cSeedPin(t, s, "session", "", "", "fresh unattributed project-less", fresh)
-	los28cSeedPin(t, s, "session", los28cProject, "", "old unattributed project pin", old)
-	los28cSeedPin(t, s, "permanent", "", "sess-a", "old permanent pin", old)
+	seedPin(t, s, "session", "", "sess-a", "old attributed project-less", old)
+	seedPin(t, s, "session", los28cProject, "sess-a", "old attributed project pin", old)
+	seedPin(t, s, "session", los28cProject, "sess-a", "fresh attributed project pin", fresh)
+	seedPin(t, s, "session", "", "", "old unattributed project-less", old)
+	seedPin(t, s, "session", "", "", "fresh unattributed project-less", fresh)
+	seedPin(t, s, "session", los28cProject, "", "old unattributed project pin", old)
+	seedPin(t, s, "permanent", "", "sess-a", "old permanent pin", old)
 
 	removed, err := s.PurgeSessionPinsBefore(time.Now().Add(-SessionPinMaxAge))
 	if err != nil {
@@ -34,24 +34,24 @@ func TestPurgeSessionPinsBefore_BoundsEveryUnreachablePin(t *testing.T) {
 		t.Errorf("removed = %d, want 3 (two attributed pins and the unreachable project-less row)", removed)
 	}
 
-	got := los28cPinContents(t, s, "session", los28cProject)
-	if los28cHasContent(got, "old attributed project pin") || los28cHasContent(got, "old attributed project-less") {
+	got := pinContents(t, s, "session", los28cProject)
+	if pinHasContent(got, "old attributed project pin") || pinHasContent(got, "old attributed project-less") {
 		t.Errorf("expired attributed pins must be purged, got: %v", got)
 	}
-	if los28cHasContent(got, "old unattributed project-less") {
+	if pinHasContent(got, "old unattributed project-less") {
 		t.Errorf("a project-less unattributed pin has no other cleanup path and must expire, got: %v", got)
 	}
-	if !los28cHasContent(got, "fresh attributed project pin") {
+	if !pinHasContent(got, "fresh attributed project pin") {
 		t.Errorf("fresh attributed pin must survive, got: %v", got)
 	}
-	if !los28cHasContent(got, "fresh unattributed project-less") {
+	if !pinHasContent(got, "fresh unattributed project-less") {
 		t.Errorf("fresh unattributed project-less pin must survive, got: %v", got)
 	}
-	if !los28cHasContent(got, "old unattributed project pin") {
+	if !pinHasContent(got, "old unattributed project pin") {
 		t.Errorf("project-bound unattributed pins keep dying with /clear, not by age, got: %v", got)
 	}
-	permanent := los28cPinContents(t, s, "permanent", los28cProject)
-	if !los28cHasContent(permanent, "old permanent pin") {
+	permanent := pinContents(t, s, "permanent", los28cProject)
+	if !pinHasContent(permanent, "old permanent pin") {
 		t.Errorf("permanent pins must never be purged, got: %v", permanent)
 	}
 }

@@ -11,7 +11,7 @@ import (
 // refresh loop (daemon.go, fingerprint vs cached hash) never regenerates the
 // expired row.
 func TestRefinedBriefingCacheExpiresLos16c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const project = "los16c-expiry"
 	if err := s.SaveRefinedBriefing(project, "hash-fresh", "refined prose", "test-model"); err != nil {

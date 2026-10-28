@@ -8,7 +8,7 @@ import (
 )
 
 func TestGetBriefingHealth_Empty(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	h, err := s.GetBriefingHealth("testproject")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -19,7 +19,7 @@ func TestGetBriefingHealth_Empty(t *testing.T) {
 }
 
 func TestGetBriefingHealth_Contradictions(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	id1 := insertLearningWithProject(s, "fact A", "testproject")
 	id2 := insertLearningWithProject(s, "fact B contradicts A", "testproject")
@@ -38,7 +38,7 @@ func TestGetBriefingHealth_Contradictions(t *testing.T) {
 }
 
 func TestGetBriefingHealth_Unfinished(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Insert 3 unfinished tasks (category='unfinished' is the marker)
 	for i := 0; i < 3; i++ {
@@ -62,7 +62,7 @@ func TestGetBriefingHealth_Unfinished(t *testing.T) {
 }
 
 func TestGetBriefingHealth_Stale(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Insert a learning that's old and never cited
 	l := &models.Learning{
@@ -91,7 +91,7 @@ func TestGetBriefingHealth_Stale(t *testing.T) {
 }
 
 func TestGetRecentFiles_Empty(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	files, err := s.GetRecentFiles("testproject", 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -102,7 +102,7 @@ func TestGetRecentFiles_Empty(t *testing.T) {
 }
 
 func TestGetRecentFiles_ReturnsRecent(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Insert file coverage records
 	now := time.Now().Format(time.RFC3339)
@@ -125,7 +125,7 @@ func TestGetRecentFiles_ReturnsRecent(t *testing.T) {
 }
 
 func TestGetRecentFiles_Limit(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	now := time.Now().Format(time.RFC3339)
 	for i := 0; i < 20; i++ {

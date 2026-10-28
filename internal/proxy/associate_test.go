@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"io"
 	"log"
-	"net"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -725,42 +723,6 @@ func TestContradictionWarning_Empty(t *testing.T) {
 }
 
 // --- YM-40: the daemon owns the source boost ---
-
-// fakeDaemonDir serves the daemon JSON-RPC protocol on <dir>/daemon.sock.
-func fakeDaemonDir(t *testing.T, responses map[string]json.RawMessage) string {
-	t.Helper()
-	dir := shortSocketDir(t)
-	ln, err := net.Listen("unix", filepath.Join(dir, "daemon.sock"))
-	if err != nil {
-		t.Fatalf("listen on fake daemon socket: %v", err)
-	}
-	t.Cleanup(func() { ln.Close() })
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				var req struct {
-					Method string         `json:"method"`
-					Params map[string]any `json:"params"`
-				}
-				if err := json.NewDecoder(c).Decode(&req); err != nil {
-					return
-				}
-				result, ok := responses[req.Method]
-				if !ok {
-					result = json.RawMessage(`{}`)
-				}
-				json.NewEncoder(c).Encode(map[string]any{"result": result})
-			}(conn)
-		}
-	}()
-	return dir
-}
 
 func newAssociativeTestServer(dataDir string) *Server {
 	return &Server{

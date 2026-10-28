@@ -95,7 +95,7 @@ func idsOfLearnings(ls []models.Learning) map[int64]bool {
 // written in a zone an hour ahead looked alive, and a row with an hour left
 // written an hour behind looked archived.
 func TestActiveReadPathsHonourExpiryInstantsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	fx := insertExpiryFixtureLos10c(t, s, "sess-los10c-expiry")
 
 	bySession, err := s.GetActiveLearningsBySessionIDs([]string{"sess-los10c-expiry"})
@@ -134,7 +134,7 @@ func TestActiveReadPathsHonourExpiryInstantsLos10c(t *testing.T) {
 // TestSessionFlavorsHonourExpiryInstantsLos10c covers the flavor read path, which
 // returns a different shape than the learning read paths.
 func TestSessionFlavorsHonourExpiryInstantsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertExpiryFixtureLos10c(t, s, "sess-los10c-flavor")
 
 	flavors, err := s.GetSessionFlavorsForSession("sess-los10c-flavor")
@@ -177,7 +177,7 @@ func assertLos10cReadPath(t *testing.T, name string, got map[int64]bool, fx expi
 // its WHERE clause from raw strings, so the same instant written in two offsets
 // landed on different sides of the window.
 func TestStatsFilterHonoursParsedWindowsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	ahead, behind := los10cZones()
 	now := time.Now()
 
@@ -211,7 +211,7 @@ func TestStatsFilterHonoursParsedWindowsLos10c(t *testing.T) {
 // expires_at against datetime('now') as text: an expired row written with an
 // earlier date-time text counted as active and never as archived.
 func TestStatsExpiryCountsUseInstantsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	ahead, _ := los10cZones()
 	now := time.Now()
 
@@ -234,7 +234,7 @@ func TestStatsExpiryCountsUseInstantsLos10c(t *testing.T) {
 // budget compared created_at as text, so a row two hours old written an hour
 // ahead fell inside a one hour window and consumed budget it did not use.
 func TestAutoCorrectGenerationWindowUsesInstantsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	ahead, behind := los10cZones()
 	now := time.Now()
 	outside := now.Add(-2 * time.Hour)
@@ -255,7 +255,7 @@ func TestAutoCorrectGenerationWindowUsesInstantsLos10c(t *testing.T) {
 // created_at as text, so a two hour old row written an hour ahead satisfied a one
 // hour cutoff. No production caller today, but it is the same class of comparison.
 func TestCountLearningSinceUsesInstantsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	ahead, behind := los10cZones()
 	now := time.Now()
 	outside := now.Add(-2 * time.Hour)
@@ -278,7 +278,7 @@ func TestCountLearningSinceUsesInstantsLos10c(t *testing.T) {
 // a zone that pushes its wall clock onto the wrong date. Which direction is used
 // depends on the cutoff's time of day, so the case is always constructible.
 func TestBriefingStaleCountUsesInstantsLos10c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().UTC()
 	cutoff := now.AddDate(0, 0, -90)
 	tod := cutoff.Hour()

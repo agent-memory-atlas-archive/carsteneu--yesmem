@@ -34,7 +34,7 @@ func los41bMultiScriptCap() CapInjection {
 
 func los41bDaemon(t *testing.T, s *Server) {
 	t.Helper()
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 		if method == "get_active_caps" {
 			return los41bCapsJSON
 		}
@@ -45,11 +45,11 @@ func los41bDaemon(t *testing.T, s *Server) {
 // The /v1/messages path is shared by Claude Code and opencode; the catalog in it
 // must follow the client, not the wire.
 func TestLos41bOpencodeMessagesPathCarriesExecuteCapCatalog(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
 	los41bDaemon(t, s)
 
-	req := los33MessagesRequest(los33UserTurn("claude-opus-4-6"), map[string]string{"x-opencode-session": "ses_los41b_oc"})
+	req := messagesRequest(userTurnBody("claude-opus-4-6"), map[string]string{"x-opencode-session": "ses_los41b_oc"})
 	rec := httptest.NewRecorder()
 	s.handleMessages(rec, req)
 
@@ -73,11 +73,11 @@ func TestLos41bOpencodeMessagesPathCarriesExecuteCapCatalog(t *testing.T) {
 
 // The Claude Code REPL still registers tools through activate_cap + eval.
 func TestLos41bClaudeMessagesPathKeepsReplBootstrap(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
 	los41bDaemon(t, s)
 
-	req := los33MessagesRequest(los33UserTurn("claude-opus-4-6"), map[string]string{"X-Claude-Code-Session-Id": "ses_los41b_cc"})
+	req := messagesRequest(userTurnBody("claude-opus-4-6"), map[string]string{"X-Claude-Code-Session-Id": "ses_los41b_cc"})
 	rec := httptest.NewRecorder()
 	s.handleMessages(rec, req)
 
@@ -97,11 +97,11 @@ func TestLos41bClaudeMessagesPathKeepsReplBootstrap(t *testing.T) {
 // the Claude Code REPL must get the execute_cap form. Codex speaks /v1/messages
 // with a codex user agent and lands on ProfileCodex.
 func TestLos41bCodexMessagesPathGetsExecuteCapCatalog(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
 	los41bDaemon(t, s)
 
-	req := los33MessagesRequest(los33UserTurn("claude-opus-4-6"), map[string]string{"User-Agent": "codex_cli_rs/0.9.0"})
+	req := messagesRequest(userTurnBody("claude-opus-4-6"), map[string]string{"User-Agent": "codex_cli_rs/0.9.0"})
 	rec := httptest.NewRecorder()
 	s.handleMessages(rec, req)
 

@@ -7,13 +7,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-func los55dSeedSession(t *testing.T, s *Store, id, project string) {
-	t.Helper()
-	if err := s.UpsertSession(&models.Session{ID: id, Project: project}); err != nil {
-		t.Fatalf("seed session %s: %v", id, err)
-	}
-}
-
 // los55dProxyKeys lists the proxy_state keys that carry the given prefix.
 func los55dProxyKeys(t *testing.T, s *Store, prefix string) []string {
 	t.Helper()
@@ -46,7 +39,7 @@ func TestLos55d_ClusterHashSweepDropsDeadKeys(t *testing.T) {
 	s := mustOpenFiles(t)
 
 	liveRoot := "/home/testuser/projects/live"
-	los55dSeedSession(t, s, "los55dsess-live", liveRoot)
+	seedSession(t, s, "los55dsess-live", liveRoot)
 
 	// A live key with a hash: has to survive.
 	if err := s.SetClusterHash(liveRoot, "hash-live"); err != nil {
@@ -136,7 +129,7 @@ func TestLos55d_ClusterHashSweepLeavesKeysWithRowsAlone(t *testing.T) {
 	s := mustOpenFiles(t)
 	const liveRoot = "/home/testuser/projects/live"
 	const withRows = "/home/testuser/projects/stale"
-	los55dSeedSession(t, s, "los55dsess-live", liveRoot)
+	seedSession(t, s, "los55dsess-live", liveRoot)
 
 	if err := s.ReplaceLearningClusters(withRows, []models.LearningCluster{los25bCluster("stale")}); err != nil {
 		t.Fatalf("seed stale clusters: %v", err)

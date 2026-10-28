@@ -13,7 +13,7 @@ import (
 // carry the path there, so the fingerprint stayed constant and the briefing was
 // never refreshed for them.
 func TestProjectChangeFingerprintSeesNonPathKeyedLearningsLos16c(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {

@@ -277,7 +277,7 @@ func TestInjectCountsDoesNotGrowStability(t *testing.T) {
 }
 
 func TestUseCountsGrowsStabilityOnSpacedAccess(t *testing.T) {
-	store := newTestStore(t)
+	store := mustOpen(t)
 	id := insertTestLearning(store, "test stability growth on use")
 
 	store.IncrementUseCounts([]int64{id})
@@ -687,7 +687,7 @@ func TestUpdateLearningContent_SupersededLearning(t *testing.T) {
 }
 
 func TestUpdateImpactScore(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	id := insertTestLearning(s, "test learning for impact")
 
@@ -721,7 +721,7 @@ func TestUpdateImpactScore(t *testing.T) {
 }
 
 func TestGetForkLearnings(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// Insert fork learnings for session-1
 	id1, _ := s.InsertLearning(&models.Learning{
@@ -756,7 +756,7 @@ func TestGetForkLearnings(t *testing.T) {
 }
 
 func TestForkCoverage(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// No coverage yet
 	if s.IsCoveredByFork("session-1", 0, 25) {

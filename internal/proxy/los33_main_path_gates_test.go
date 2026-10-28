@@ -11,7 +11,7 @@ import (
 // los33GateDaemon answers the daemon calls the four gated features make.
 func los33GateDaemon(t *testing.T, s *Server) {
 	t.Helper()
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 		switch method {
 		case "generate_briefing":
 			return `{"text":"LOS33-BRIEFING","code_map":""}`
@@ -43,7 +43,7 @@ func TestLos33MessagesPathRespectsFeatureGates(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, gateOn := range []bool{false, true} {
-				backendURL, forwarded := los33Upstream(t)
+				backendURL, forwarded := recordingUpstream(t)
 				s := los26aHandlerServer(t, backendURL)
 				s.cfg.FeatureDefaults = los33Gates(tc.gate, gateOn)
 				los33GateDaemon(t, s)
@@ -54,7 +54,7 @@ func TestLos33MessagesPathRespectsFeatureGates(t *testing.T) {
 				} else {
 					session += "_off"
 				}
-				req := los33MessagesRequest(los33UserTurn("claude-opus-4-6"),
+				req := messagesRequest(userTurnBody("claude-opus-4-6"),
 					map[string]string{"X-Claude-Code-Session-Id": session})
 				rec := httptest.NewRecorder()
 
@@ -98,7 +98,7 @@ func TestLos33MessagesPathRespectsRulesReminderGate(t *testing.T) {
 	big := strings.Repeat("x", 4*rulesInjectionInterval)
 
 	for _, gateOn := range []bool{false, true} {
-		backendURL, forwarded := los33Upstream(t)
+		backendURL, forwarded := recordingUpstream(t)
 		s := los26aHandlerServer(t, backendURL)
 		s.cfg.FeatureDefaults = los33Gates("rules_reminder", gateOn)
 		los33GateDaemon(t, s)
@@ -106,7 +106,7 @@ func TestLos33MessagesPathRespectsRulesReminderGate(t *testing.T) {
 		session := "ses_los33_rules_" + map[bool]string{true: "on", false: "off"}[gateOn]
 
 		// First request sets the token baseline; the second crosses the interval.
-		first := los33MessagesRequest(los33UserTurn("claude-opus-4-6"),
+		first := messagesRequest(userTurnBody("claude-opus-4-6"),
 			map[string]string{"X-Claude-Code-Session-Id": session})
 		s.handleMessages(httptest.NewRecorder(), first)
 
@@ -115,7 +115,7 @@ func TestLos33MessagesPathRespectsRulesReminderGate(t *testing.T) {
 			`"messages":[{"role":"user","content":"` + big + `"},` +
 			`{"role":"assistant","content":"on it"},` +
 			`{"role":"user","content":"continue"}]}`
-		second := los33MessagesRequest(secondBody,
+		second := messagesRequest(secondBody,
 			map[string]string{"X-Claude-Code-Session-Id": session})
 		s.handleMessages(httptest.NewRecorder(), second)
 

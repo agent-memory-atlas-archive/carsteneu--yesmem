@@ -8,7 +8,7 @@ import "testing"
 // another session and freeze the guard that is supposed to pause it (YM-344).
 // The row is written once by AgentCreate and never through AgentUpdate.
 func TestLos38R_AgentUpdateRefusesSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "a38r", "")
 
 	if err := s.AgentUpdate("a38r", map[string]any{"session_id": "planted-session"}); err == nil {

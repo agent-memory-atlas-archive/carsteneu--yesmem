@@ -14,20 +14,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-// los38tOpenStore opens a store in a temp directory and returns it with the main
-// database path.
-func los38tOpenStore(t *testing.T) (*Store, string) {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "yesmem.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s, path
-}
-
 func los38tLearning(i int) *models.Learning {
 	return &models.Learning{Content: fmt.Sprintf("los38t row %d", i), Category: "gotcha", Source: "claude_suggested", Project: "/tmp/los38t"}
 }
@@ -62,7 +48,7 @@ func los38tPrepare(t *testing.T, s *Store, dbPath string, cut int64) {
 func TestLos38tCanaryDetectsEveryTruncation(t *testing.T) {
 	for _, cut := range []int64{0, 5, 32, 1024} {
 		t.Run(fmt.Sprintf("%d_bytes", cut), func(t *testing.T) {
-			s, path := los38tOpenStore(t)
+			s, path := mustOpenWithPath(t)
 			if err := walCanary(path); err != nil {
 				t.Fatalf("canary on the healthy database: %v", err)
 			}
@@ -83,7 +69,7 @@ func TestLos38tCanaryDetectsEveryTruncation(t *testing.T) {
 // connections serve reads and writes again. No file is deleted, and the frames
 // that were only in the log survive the close of the old connections.
 func TestLos38tGuardTickHealsWithoutRestart(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	los38tPrepare(t, s, path, 5)
 
 	if err := walCanary(path); err == nil {
@@ -117,7 +103,7 @@ func TestLos38tGuardTickHealsWithoutRestart(t *testing.T) {
 // sidecar files were unlinked while the daemon held them. The alarm must name
 // them and the store must recover.
 func TestLos38tGuardHealsUnlinkedSidecars(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	for i := 0; i < 3; i++ {
 		if _, err := s.InsertLearning(los38tLearning(i)); err != nil {
 			t.Fatalf("insert: %v", err)
@@ -147,7 +133,7 @@ func TestLos38tGuardHealsUnlinkedSidecars(t *testing.T) {
 // pools: after its connections are dropped, a pool must come back with the same
 // per-connection settings, not with the driver defaults.
 func TestLos38tHealKeepsConnectionPragmas(t *testing.T) {
-	s, _ := los38tOpenStore(t)
+	s, _ := mustOpenWithPath(t)
 	if _, err := s.InsertLearning(los38tLearning(1)); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -186,7 +172,7 @@ func TestLos38tHealKeepsConnectionPragmas(t *testing.T) {
 // pool that shares a file has to be dropped together, or the inode state stays
 // pinned.
 func TestLos38tGuardPoolsGroupByFile(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	pools := s.walGuardPools()
 	if len(pools) != 3 {
 		t.Fatalf("guard watches %d pools, want 3", len(pools))
@@ -268,7 +254,7 @@ func TestLos38tGuardWorksThroughSymlinkedDataDir(t *testing.T) {
 // TestLos38tGuardLeavesHealthyDatabaseAlone runs ticks against a database under
 // write load: no heal, no data change, no WAL loss, and no false alarm.
 func TestLos38tGuardLeavesHealthyDatabaseAlone(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	for i := 0; i < 40; i++ {
 		if _, err := s.InsertLearning(los38tLearning(i)); err != nil {
 			t.Fatalf("insert: %v", err)
@@ -336,7 +322,7 @@ func TestLos38tRelativePathAndMissingFile(t *testing.T) {
 // empty file at that path would bury the frames the moved file still holds, so
 // the guard must report and leave everything alone.
 func TestLos38tGuardDoesNotCreateAMissingDatabase(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	for i := 0; i < 3; i++ {
 		if _, err := s.InsertLearning(los38tLearning(i)); err != nil {
 			t.Fatalf("insert: %v", err)
@@ -491,7 +477,7 @@ func TestLos38tIsIOError(t *testing.T) {
 // TestLos38tJournalModeIsReadableAndWAL pins the probe the guard uses to name an
 // external journal mode switch.
 func TestLos38tJournalModeIsReadableAndWAL(t *testing.T) {
-	s, _ := los38tOpenStore(t)
+	s, _ := mustOpenWithPath(t)
 	mode, err := journalModeOf(s.db)
 	if err != nil {
 		t.Fatalf("journalModeOf: %v", err)
@@ -504,7 +490,7 @@ func TestLos38tJournalModeIsReadableAndWAL(t *testing.T) {
 // TestLos38tGuardRunsOnInterval checks the ticker wiring: the guard heals on its
 // own clock and stops with the context.
 func TestLos38tGuardRunsOnInterval(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	if _, err := s.InsertLearning(los38tLearning(1)); err != nil {
 		t.Fatalf("insert: %v", err)
 	}

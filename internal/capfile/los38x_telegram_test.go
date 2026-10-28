@@ -9,8 +9,6 @@ import (
 	"testing"
 )
 
-const los38xTelegramCapPath = "../../caps/bundled-caps/telegram/CAP.md"
-
 // The bundled telegram cap had three blind spots the audit caught (YM-368):
 // telegram_poll read a curl failure through $? after an assignment that set -e
 // already aborted on, telegram_send answered a refused delivery with exit 0
@@ -39,23 +37,6 @@ type los38xResult struct {
 	// is asserted on it: whether a value arrives as a separate field is decided
 	// by curl, not by the stub.
 	curl string
-}
-
-func los38xBody(t *testing.T, script string) string {
-	t.Helper()
-	data, err := os.ReadFile(los38xTelegramCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript(script)
-	if sc == nil {
-		t.Fatalf("the bundled telegram cap has no %s script", script)
-	}
-	return sc.Body
 }
 
 // los38xYesmemStub answers the `yesmem json` calls of the three bodies. It is a
@@ -132,9 +113,9 @@ func los38xRunWithFiles(t *testing.T, script string, env map[string]string, file
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatalf("mkdir bin: %v", err)
 	}
-	los32cWriteStub(t, filepath.Join(bin, "yesmem"), los38xYesmemStub)
+	writeStub(t, filepath.Join(bin, "yesmem"), los38xYesmemStub)
 	curlCalls := filepath.Join(dir, "curl.calls")
-	los32cWriteStub(t, filepath.Join(bin, "curl"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "curl"), `#!/bin/sh
 printf '%s\n' "$*" >> "$LOS38X_CURL_CALLS"
 if [ -n "${LOS38X_CURL_BODY-}" ]; then printf '%s' "$LOS38X_CURL_BODY"; fi
 exit "${LOS38X_CURL_EXIT:-0}"
@@ -156,7 +137,7 @@ store() {
 }
 llm() { printf '%s' "${LOS38X_LLM_RESULT-}"; return "${LOS38X_LLM_EXIT:-0}"; }
 `
-	if err := os.WriteFile(scriptPath, []byte(prelude+los38xBody(t, script)), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(prelude+bundledScript(t, telegramCapPath, script)), 0o644); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 

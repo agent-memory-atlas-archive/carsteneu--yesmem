@@ -31,7 +31,7 @@ func los38yInsertBlobOnlyMessage(t *testing.T, s *Store) int64 {
 // TestSearchSnippetFallsBackToContentBlobLos38y covers YM-369: a message whose
 // body lives only in content_blob must not surface as a hit with an empty snippet.
 func TestSearchSnippetFallsBackToContentBlobLos38y(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 	los38yInsertBlobOnlyMessage(t, s)
 
 	hits, err := s.SearchMessagesCtx("thinking", "", "", 10)

@@ -93,7 +93,7 @@ func sameNameFixtures(t *testing.T) (string, string) {
 // wiki/home/tester/memory/yesmem/ while every reader (code map, wiki-first
 // directive, docs) points at wiki/yesmem/.
 func TestRunWikiOnce_WritesToProjectShortNameDir(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	projDir := fixtureProjectDir(t, "single/yesmemtest")
 	insertLearningForProject(t, s, projDir)
 	insertSessionForProject(t, s, projDir, time.Now().Format(time.RFC3339))
@@ -116,7 +116,7 @@ func TestRunWikiOnce_WritesToProjectShortNameDir(t *testing.T) {
 // the same directory. Each project gets its own directory and a .project
 // marker recording the owner.
 func TestRunWikiOnce_SameNameProjectsDoNotCollide(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	a, b := sameNameFixtures(t)
 	for _, p := range []string{a, b} {
 		insertLearningForProject(t, s, p)
@@ -153,7 +153,7 @@ func TestRunWikiOnce_SameNameProjectsDoNotCollide(t *testing.T) {
 // Regression YM-6: a project identifier without a usable directory name must
 // not make the renderer write into the wiki root itself.
 func TestRunWikiOnce_SkipsUnusableProjectNames(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	insertLearningForProject(t, s, "/")
 	insertSessionForProject(t, s, "/", time.Now().Format(time.RFC3339))
 
@@ -170,7 +170,7 @@ func TestRunWikiOnce_SkipsUnusableProjectNames(t *testing.T) {
 // Regression YM-6: the snapshot compared COUNT and MAX(created_at) only, so an
 // in-place edit of an existing learning never triggered a re-render.
 func TestWikiNeedsRender_ReactsToContentEdit(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "wikineedsrender-project"
 	insertLearningForProject(t, s, project)
 
@@ -202,7 +202,7 @@ func TestWikiNeedsRender_ReactsToContentEdit(t *testing.T) {
 // Regression/cold-review F2b: an unmarked directory (the pre-fix layout) is not
 // the project's own and must be re-rendered, not trusted.
 func TestWikiNeedsRender_UnmarkedDirIsRendered(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "wikineedsrender-unmarked"
 	insertLearningForProject(t, s, project)
 
@@ -220,7 +220,7 @@ func TestWikiNeedsRender_UnmarkedDirIsRendered(t *testing.T) {
 // Regression YM-6: a supersede/replace that keeps the active count and the
 // newest created_at identical must still trigger a re-render.
 func TestWikiSnapshot_DetectsSupersedeWithOlderReplacement(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "wikisnapshot-project"
 	insertLearningForProject(t, s, project)
 

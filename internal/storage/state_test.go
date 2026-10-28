@@ -7,21 +7,8 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-// openTestStore returns a fresh in-memory store. In :memory: mode all logical
-// databases (yesmem/messages/runtime) share one handle, so index_state and
-// messages live in the same schema — good enough for storage-level tests.
-func openTestStore(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 func TestIndexStateRoundtripsIncrementalMarkers(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 
 	mtime := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
 	in := &models.IndexState{
@@ -74,7 +61,7 @@ func TestIndexStateRoundtripsIncrementalMarkers(t *testing.T) {
 }
 
 func TestIndexStateMissingPathReturnsError(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 
 	if _, err := s.GetIndexState("/tmp/never-indexed.jsonl"); err == nil {
 		t.Fatal("expected error for unknown path")
@@ -88,7 +75,7 @@ func TestIndexStateMissingPathReturnsError(t *testing.T) {
 // a grown size (append) still reports reindex=true so the caller decides
 // whether the append fast path applies.
 func TestNeedsReindexOnGrownFile(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 
 	mtime := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
 	if err := s.UpsertIndexState(&models.IndexState{

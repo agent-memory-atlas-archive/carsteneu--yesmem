@@ -15,7 +15,7 @@ import (
 // checkouts therefore never got a briefing, and a session opened at the repository
 // root paid the refinement call on demand, if it got one at all.
 func TestBriefingRefreshIncludesWorktreeParentProjectLos16e(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -69,7 +69,7 @@ func TestBriefingRefreshIncludesWorktreeParentProjectLos16e(t *testing.T) {
 // briefing cached under the root key would never be read; the root is no target.
 // This test states the remaining gap of BRF-B15 instead of hiding it.
 func TestBriefingRefreshSkipsRootBelowOwnedAncestorLos16e(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -108,7 +108,7 @@ func TestBriefingRefreshSkipsRootBelowOwnedAncestorLos16e(t *testing.T) {
 // activity keeps moving its fingerprint. The row's last_active is the only source
 // for this case and must feed the filter.
 func TestBriefingRefreshSkipsDormantWorktreeParentLos16e(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 
 	home, err := os.UserHomeDir()
 	if err != nil {

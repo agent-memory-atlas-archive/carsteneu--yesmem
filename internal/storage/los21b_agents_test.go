@@ -8,7 +8,7 @@ import "testing"
 // a PID-only predicate could overwrite a takeover already under way and two
 // processes would end up owning one section (YM-255 review).
 func TestAgentClosePausedIfDead_RequiresPausedStatusAndPID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "los21b-paused", Project: "p", Section: "s", Status: "paused", PID: 0,
 	}); err != nil {

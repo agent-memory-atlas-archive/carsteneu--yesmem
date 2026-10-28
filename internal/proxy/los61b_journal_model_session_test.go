@@ -240,7 +240,7 @@ func los61bRunAnthropic(t *testing.T, up *httptest.Server, model string) string 
 		t.Fatalf("marshal messages body: %v", err)
 	}
 
-	s.handleMessages(httptest.NewRecorder(), los33MessagesRequest(string(body), nil))
+	s.handleMessages(httptest.NewRecorder(), messagesRequest(string(body), nil))
 	return buf.String()
 }
 

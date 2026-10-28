@@ -11,16 +11,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/wikidir"
 )
 
-func newWikiTickTestStore(t *testing.T) *storage.Store {
-	t.Helper()
-	s, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 func insertLearningForProject(t *testing.T, s *storage.Store, project string) {
 	t.Helper()
 	_, err := s.DB().Exec(
@@ -95,7 +85,7 @@ func TestIsLiveProjectPath(t *testing.T) {
 // --- activeProjects dead-path filtering ---
 
 func TestActiveProjects_FiltersTmpAndMissing(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	// t.TempDir() lives under /tmp on Linux, which the dead-path filter rejects
 	// by design. Use the test process CWD as a guaranteed-existing non-/tmp path.
 	cwd, err := os.Getwd()
@@ -137,7 +127,7 @@ func TestActiveProjects_FiltersTmpAndMissing(t *testing.T) {
 // --- projectTierHot ---
 
 func TestProjectTierHot_HotWithin24h(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := t.TempDir() // unused for stat, just a key
 	recent := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
 	insertSessionForProject(t, s, project, recent)
@@ -148,7 +138,7 @@ func TestProjectTierHot_HotWithin24h(t *testing.T) {
 }
 
 func TestProjectTierHot_ColdAfter24h(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := t.TempDir()
 	old := time.Now().Add(-48 * time.Hour).Format(time.RFC3339)
 	insertSessionForProject(t, s, project, old)
@@ -159,7 +149,7 @@ func TestProjectTierHot_ColdAfter24h(t *testing.T) {
 }
 
 func TestProjectTierHot_NoSessionsIsHot(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := t.TempDir()
 
 	if !projectTierHot(context.Background(), s, project) {
@@ -221,7 +211,7 @@ func renderTestWikiDir(t *testing.T, project string) string {
 }
 
 func TestWikiNeedsRender_ExistingSessionChange(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "proj"
 	// The session has to own a learning, otherwise the renderer never shows it
 	// and its changes are not part of the signal (YM-266).
@@ -249,7 +239,7 @@ func TestWikiNeedsRender_ExistingSessionChange(t *testing.T) {
 }
 
 func TestWikiNeedsRender_StableAfterSessionChange(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "proj"
 	const sessID = "sess-proj-2026-10-01T10:00:00Z"
 	insertSessionRow(t, s, sessID, project, "2026-10-01T10:00:00Z")
@@ -272,7 +262,7 @@ func TestWikiNeedsRender_StableAfterSessionChange(t *testing.T) {
 // (a superset of the rendered set), which re-rendered every hot project on
 // every tick (YM-266 / DEV-DT43).
 func TestWikiNeedsRender_IgnoresSessionsWithoutLearnings(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "proj"
 	// Two real sessions: one grows without ever owning a learning, the other owns
 	// one and keeps the project active. Only the second one is rendered.
@@ -299,7 +289,7 @@ func TestWikiNeedsRender_IgnoresSessionsWithoutLearnings(t *testing.T) {
 // the oldest session is therefore still rendered content and has to move the
 // signal (YM-266 review finding).
 func TestWikiNeedsRender_DetectsSessionBeyondThePageWindow(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "proj"
 	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
 	var oldest string
@@ -328,7 +318,7 @@ func TestWikiNeedsRender_DetectsSessionBeyondThePageWindow(t *testing.T) {
 // the indexer fills from every indexed session. That content has no learning
 // behind it, so the snapshot needs its own component for it (YM-266).
 func TestWikiNeedsRender_DetectsFileCoverageChange(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	project := "proj"
 	insertLearningForProject(t, s, project)
 	if _, err := s.DB().Exec(

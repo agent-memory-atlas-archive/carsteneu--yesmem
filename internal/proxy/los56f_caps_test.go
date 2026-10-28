@@ -71,16 +71,16 @@ func TestLos56fReplPatternSuggestionIsClaudeOnly(t *testing.T) {
 // (no eval bootstrap, execute_cap catalog) on a Claude thread, which then
 // cached the wrong catalog under the Claude thread key.
 func TestLos56fProfileFollowsTheResolvedThread(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 		if method == "get_active_caps" {
 			return los56fCapsJSON
 		}
 		return "null"
 	})
 
-	req := los33MessagesRequest(los33UserTurn("claude-opus-4-6"), map[string]string{
+	req := messagesRequest(userTurnBody("claude-opus-4-6"), map[string]string{
 		"X-Claude-Code-Session-Id": "ses_los56f_cc",
 		"x-opencode-session":       "ses_los56f_oc",
 	})
@@ -125,9 +125,9 @@ func TestLos56fCapabilitiesCatalogIsOrderIndependent(t *testing.T) {
 // had no test at all, which is how the parity path could have started speaking
 // the activate_cap dialect unnoticed.
 func TestLos56fOpenAIParityInjectsExecuteCapCatalog(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string {
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string {
 		if method == "get_active_caps" {
 			return los56fCapsJSON
 		}

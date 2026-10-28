@@ -22,7 +22,7 @@ func TestLos26e_DeleteProxyStatePrefixTreatsUnderscoreLiterally(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("deleted %d rows, want 1", n)
 	}
-	if got := s.los26eCountProxyStateRows(t, "frozenXmarkers:foreign"); got != 1 {
+	if got := s.countProxyStateRows(t, "frozenXmarkers:foreign"); got != 1 {
 		t.Errorf("rows of frozenXmarkers:foreign after the delete = %d, want 1 (the underscore matched a foreign key)", got)
 	}
 	if raw, _ := s.GetProxyState("frozen:a"); raw == "" {
@@ -106,15 +106,4 @@ func TestLos26e_DeleteProxyStatePrefixRejectsEmptyPrefix(t *testing.T) {
 			t.Errorf("empty prefix deleted %s", key)
 		}
 	}
-}
-
-// los26eCountProxyStateRows counts rows by exact key: GetProxyState returns ""
-// for a deleted row and for an emptied one, so it cannot prove a DELETE.
-func (s *Store) los26eCountProxyStateRows(t *testing.T, key string) int {
-	t.Helper()
-	var n int
-	if err := s.proxyStateDB().QueryRow(`SELECT count(*) FROM proxy_state WHERE key = ?`, key).Scan(&n); err != nil {
-		t.Fatalf("count %s: %v", key, err)
-	}
-	return n
 }

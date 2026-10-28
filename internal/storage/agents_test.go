@@ -10,7 +10,7 @@ import (
 )
 
 func TestAgentCreate_And_Get(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	agent := Agent{
 		ID:            "agent-0",
@@ -50,7 +50,7 @@ func TestAgentCreate_And_Get(t *testing.T) {
 // agent-230 misdiagnosis in learning #76675 (created_at read as UTC, interpreted
 // as local, 36min real runtime mistaken for 2.5h).
 func TestAgentCreate_CreatedAtUsesRFC3339WithOffset(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	agent := Agent{
 		ID:      "agent-tz-0",
@@ -88,7 +88,7 @@ func TestAgentCreate_CreatedAtUsesRFC3339WithOffset(t *testing.T) {
 }
 
 func TestAgentUpdate(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "sec", Status: "pending"})
 
@@ -114,7 +114,7 @@ func TestAgentUpdate(t *testing.T) {
 }
 
 func TestAgentGetBySection(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "legal", Status: "finished"})
 	// Push agent-0's timestamp back so agent-1 is clearly newer
@@ -131,7 +131,7 @@ func TestAgentGetBySection(t *testing.T) {
 }
 
 func TestAgentGetActiveBySection(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "legal", Status: "finished"})
 	s.AgentCreate(Agent{ID: "agent-1", Project: "proj", Section: "legal", Status: "stopped"})
@@ -152,7 +152,7 @@ func TestAgentGetActiveBySection(t *testing.T) {
 }
 
 func TestAgentGetActiveBySectionReturnsNilAfterStop(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "legal", Status: "finished"})
 	s.db.Exec("UPDATE agents SET created_at = datetime('now', '-10 seconds') WHERE id = 'agent-0'")
@@ -176,7 +176,7 @@ func TestAgentGetActiveBySectionReturnsNilAfterStop(t *testing.T) {
 }
 
 func TestAgentGetAnyBySession(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "legal", SessionID: "sess-1", Status: "stopped"}); err != nil {
 		t.Fatalf("AgentCreate stopped: %v", err)
@@ -198,7 +198,7 @@ func TestAgentGetAnyBySession(t *testing.T) {
 }
 
 func TestAgentList(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj-a", Section: "sec1", Status: "running"})
 	s.AgentCreate(Agent{ID: "agent-1", Project: "proj-b", Section: "sec2", Status: "running"})
@@ -224,7 +224,7 @@ func TestAgentList(t *testing.T) {
 }
 
 func TestAgentDeleteOrphaned(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "sec1", Status: "running"})
 	s.AgentCreate(Agent{ID: "agent-1", Project: "proj", Section: "sec2", Status: "pending"})
@@ -259,7 +259,7 @@ func TestAgentDeleteOrphaned(t *testing.T) {
 }
 
 func TestAgentNextID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	today := time.Now().UTC().Format("20060102")
 	first := "agent-" + today + "-01"
@@ -285,7 +285,7 @@ func TestAgentNextID(t *testing.T) {
 }
 
 func TestAgentDelete(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "sec", Status: "running"})
 	if err := s.AgentDelete("agent-0"); err != nil {
@@ -299,7 +299,7 @@ func TestAgentDelete(t *testing.T) {
 }
 
 func TestAgentUpdateTelemetry(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "sec", Status: "running"})
 
 	err := s.AgentUpdateTelemetry("agent-0", 5, 1200, 400)
@@ -326,7 +326,7 @@ func TestAgentUpdateTelemetry(t *testing.T) {
 }
 
 func TestAgentTelemetryMigration(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	// Drop new columns to simulate old schema
 	s.db.Exec(`ALTER TABLE agents DROP COLUMN turns_used`)
 	s.db.Exec(`ALTER TABLE agents DROP COLUMN input_tokens`)
@@ -353,7 +353,7 @@ func TestAgentTelemetryMigration(t *testing.T) {
 // and a second migration run must be a no-op (the daemon migrates on every
 // start).
 func TestAgentWorkDirMigration(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if _, err := s.db.Exec(`ALTER TABLE agents DROP COLUMN work_dir`); err != nil {
 		t.Fatalf("simulate old schema: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestAgentWorkDirMigration(t *testing.T) {
 }
 
 func TestAgentTelemetryAccumulates(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	s.AgentCreate(Agent{ID: "agent-0", Project: "proj", Section: "sec", Status: "running"})
 
 	s.AgentUpdateTelemetry("agent-0", 3, 500, 200)
@@ -412,7 +412,7 @@ func TestAgentTelemetryAccumulates(t *testing.T) {
 }
 
 func TestAgentSchemaSupervision(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	err := s.AgentCreate(Agent{
 		ID: "agent-sup-0", Project: "p", Section: "s",
@@ -439,7 +439,7 @@ func TestAgentSchemaSupervision(t *testing.T) {
 }
 
 func TestAgentCascadeStop(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := "2006-01-02 15:04:05"
 
 	s.AgentCreate(Agent{ID: "orch-0", SessionID: "sess-orch", Project: "p", Section: "orch", Status: "running", CreatedAt: now})
@@ -470,7 +470,7 @@ func TestAgentCascadeStop(t *testing.T) {
 }
 
 func TestAgentCascadeStop_StopsPendingChild(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := "2006-01-02 15:04:05"
 
 	s.AgentCreate(Agent{ID: "orch-p", SessionID: "sess-orch-p", Project: "p", Section: "orch", Status: "running", CreatedAt: now})
@@ -491,7 +491,7 @@ func TestAgentCascadeStop_StopsPendingChild(t *testing.T) {
 }
 
 func TestAgentGetByProxyThreadID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	s.AgentCreate(Agent{ID: "agent-pt-1", Project: "proj", Section: "sec", SessionID: "uuid-1", Status: "running", ProxyThreadID: "thread-hash-abc"})
 	s.AgentCreate(Agent{ID: "agent-pt-2", Project: "proj", Section: "sec2", SessionID: "uuid-2", Status: "running", ProxyThreadID: "thread-hash-def"})
 
@@ -512,7 +512,7 @@ func TestAgentGetByProxyThreadID(t *testing.T) {
 }
 
 func TestAgentGetRunningInProject(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	// Agent without proxy_thread_id — should be found
 	s.AgentCreate(Agent{ID: "agent-rp-1", Project: "proj", Section: "sec", SessionID: "uuid-1", Status: "running"})
 	// Agent with proxy_thread_id — should NOT be found
@@ -534,7 +534,7 @@ func TestAgentGetRunningInProject(t *testing.T) {
 }
 
 func TestAgentUpdateProxyThreadID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	s.AgentCreate(Agent{ID: "agent-upd", Project: "proj", Section: "sec", SessionID: "uuid-1", Status: "running"})
 
 	err := s.AgentUpdate("agent-upd", map[string]any{"proxy_thread_id": "new-thread-hash"})
@@ -551,7 +551,7 @@ func TestAgentUpdateProxyThreadID(t *testing.T) {
 // --- Legacy "frozen" status normalization on read ---
 
 func TestAgentGet_NormalizesLegacyFrozenStatus(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	// Insert raw "frozen" status (legacy DB row from before the paused/stopped split)
 	if err := s.AgentCreate(Agent{
 		ID: "legacy-frozen", Project: "p", Section: "s", Status: "frozen",
@@ -568,7 +568,7 @@ func TestAgentGet_NormalizesLegacyFrozenStatus(t *testing.T) {
 }
 
 func TestAgentList_NormalizesLegacyFrozenStatus(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "list-frozen", Project: "p", Section: "s", Status: "frozen",
 	}); err != nil {
@@ -592,7 +592,7 @@ func TestAgentList_NormalizesLegacyFrozenStatus(t *testing.T) {
 // The lookup MUST fall back to those columns or whoami returns is_agent=false.
 
 func TestAgentGetBySession_MatchesOpenCodeSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-oc", Project: "proj", Section: "sec",
 		SessionID: "synthetic-uuid-1", OpencodeSessionID: "ses_real_oc_1",
@@ -619,7 +619,7 @@ func TestAgentGetBySession_MatchesOpenCodeSessionID(t *testing.T) {
 }
 
 func TestAgentGetBySession_MatchesCodexSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-cx", Project: "proj", Section: "sec",
 		SessionID: "synthetic-uuid-2", CodexSessionID: "ses_real_cx_2",
@@ -637,7 +637,7 @@ func TestAgentGetBySession_MatchesCodexSessionID(t *testing.T) {
 }
 
 func TestAgentGetAnyBySession_MatchesOpenCodeSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-oc-any", Project: "proj", Section: "sec",
 		SessionID: "synthetic-uuid-3", OpencodeSessionID: "ses_real_oc_3",
@@ -683,7 +683,7 @@ func TestStripAgentPrefix(t *testing.T) {
 }
 
 func TestAgentGetAnyBySession_MatchesCodexSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-cx-any", Project: "proj", Section: "sec",
 		SessionID: "synthetic-uuid-4", CodexSessionID: "ses_real_cx_4",
@@ -708,7 +708,7 @@ func TestAgentGetAnyBySession_MatchesCodexSessionID(t *testing.T) {
 // death cannot resurrect a stale mapping.
 
 func TestAgentGetByPID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-pid", Project: "proj-pid", Section: "sec-pid",
 		SessionID: "synthetic-pid-1", PID: 4242,
@@ -729,7 +729,7 @@ func TestAgentGetByPID(t *testing.T) {
 }
 
 func TestAgentGetByPID_SkipsStoppedAgents(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-pid-stopped", Project: "proj", Section: "sec",
 		SessionID: "sess-stopped", PID: 7373,
@@ -744,7 +744,7 @@ func TestAgentGetByPID_SkipsStoppedAgents(t *testing.T) {
 }
 
 func TestAgentGetByPID_NoMatch(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	got, err := s.AgentGetByPID(99999)
 	if err == nil && got != nil {
 		t.Errorf("expected no match for unknown PID, got %q", got.ID)
@@ -759,7 +759,7 @@ func TestAgentGetByPID_NoMatch(t *testing.T) {
 // stale PID was signalable by stop_agent and the paused-row guards (permission
 // kick, DONE-guard) kept watching them.
 func TestMigrateAgentsSchema_ClosesLegacyFrozenRows(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	// A frozen row as an old daemon left it: stale PID, stale socket path, no
 	// stopped_at.
@@ -888,7 +888,7 @@ func createAgentForBind(t *testing.T, s *Store, id, sid string) {
 // TestAgentBindSession_RefusesAnOwnedSession: the ownership test lives in the
 // same statement as the write, so no caller can talk it out of the guard.
 func TestAgentBindSession_RefusesAnOwnedSession(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "owner", "ses_taken")
 	createAgentForBind(t, s, "other", "")
 
@@ -911,7 +911,7 @@ func TestAgentBindSession_RefusesAnOwnedSession(t *testing.T) {
 // carries a session keeps it — a bind may fill a gap, never rewrite history.
 // Re-binding the same id stays possible (a retry after a partial failure).
 func TestAgentBindSession_DoesNotReplaceAnExistingSession(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "a", "ses_old")
 
 	if bound, err := s.AgentBindSession("a", "ses_new", ""); err != nil || bound {
@@ -929,7 +929,7 @@ func TestAgentBindSession_DoesNotReplaceAnExistingSession(t *testing.T) {
 // marker does it in the same write, so the row is never left claiming the agent
 // cannot be resumed while it carries a session.
 func TestAgentBindSession_ClearsProgress(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "a", "")
 	if err := s.AgentUpdate("a", map[string]any{"progress": "unresumable: no session"}); err != nil {
 		t.Fatal(err)
@@ -968,7 +968,7 @@ func TestAgentBindSession_ClearsProgress(t *testing.T) {
 // TestAgentBindSession_RefusesEmptyInputs: a path that reports "no match" must
 // not be able to blank a session column.
 func TestAgentBindSession_RefusesEmptyInputs(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "a", "ses_keep")
 
 	for _, tc := range []struct{ id, sid string }{{"a", ""}, {"", "ses_x"}} {
@@ -987,7 +987,7 @@ func TestAgentBindSession_RefusesEmptyInputs(t *testing.T) {
 // would let two of them pass the same ownership test; the single guarded
 // statement leaves exactly one owner.
 func TestAgentBindSession_OneWinnerUnderConcurrency(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	const workers = 8
 	for i := 0; i < workers; i++ {
 		createAgentForBind(t, s, fmt.Sprintf("agent-%d", i), "")
@@ -1024,7 +1024,7 @@ func TestAgentBindSession_OneWinnerUnderConcurrency(t *testing.T) {
 // that could plant a foreign session there would have whoami, send_to and resume
 // follow it. AgentBindSession is the only writer.
 func TestAgentUpdate_RefusesOpencodeSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "a", "")
 
 	if err := s.AgentUpdate("a", map[string]any{"opencode_session_id": "ses_injected"}); err == nil {
@@ -1047,7 +1047,7 @@ func TestAgentUpdate_RefusesOpencodeSessionID(t *testing.T) {
 // prefix. A writer that stored the prefixed form would produce a row that no
 // lookup — and no later bind — can ever resolve.
 func TestAgentBindSession_StripsTheSessionPrefix(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	createAgentForBind(t, s, "owner", "ses_x")
 	createAgentForBind(t, s, "other", "")
 
@@ -1076,7 +1076,7 @@ func TestAgentBindSession_StripsTheSessionPrefix(t *testing.T) {
 // not be revived by it, and the caller learns from the false that the process it
 // just created has no owner.
 func TestAgentBindProcessIfLive_RefusesAFinalizedRow(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().Format("2006-01-02 15:04:05")
 
 	for _, status := range []string{"pending", "spawning", "running", "paused"} {
@@ -1128,7 +1128,7 @@ func TestAgentBindProcessIfLive_RefusesAFinalizedRow(t *testing.T) {
 // "not this agent's process" — and every guard then treats a live agent as gone.
 // The store stamps the marker instead of trusting the caller.
 func TestAgentUpdate_StampsTheSpawnMarkerWithAPID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().Format("2006-01-02 15:04:05")
 	if err := s.AgentCreate(Agent{ID: "marker", Project: "p", Section: "s-marker", Status: "pending", CreatedAt: now}); err != nil {
 		t.Fatalf("AgentCreate: %v", err)
@@ -1167,7 +1167,7 @@ func TestAgentUpdate_StampsTheSpawnMarkerWithAPID(t *testing.T) {
 // relaunch that bound a process in between must not be overwritten silently — the
 // caller has to see the refusal and end the process it displaced.
 func TestAgentFinalizeStop_RefusesAMovedPID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().Format("2006-01-02 15:04:05")
 	if err := s.AgentCreate(Agent{ID: "stop-cas", Project: "p", Section: "s-cas", Status: "spawning", PID: 111, CreatedAt: now}); err != nil {
 		t.Fatalf("AgentCreate: %v", err)
@@ -1212,7 +1212,7 @@ func TestAgentFinalizeStop_RefusesAMovedPID(t *testing.T) {
 // a row too, otherwise it can never be finalized (every retry is refused) and the
 // agent is unstoppable.
 func TestAgentFinalizeStop_MatchesANullPID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now().Format("2006-01-02 15:04:05")
 	if err := s.AgentCreate(Agent{ID: "stop-null", Project: "p", Section: "s-null", Status: "pending", PID: 0, CreatedAt: now}); err != nil {
 		t.Fatalf("AgentCreate: %v", err)
@@ -1236,7 +1236,7 @@ func TestAgentFinalizeStop_MatchesANullPID(t *testing.T) {
 // AgentUpdateIfMatches is the compare-and-set the relay path uses: it decided on
 // a row it read before delivering, so it must not overwrite what landed since.
 func TestAgentUpdateIfMatches_OnlyWritesTheExpectedRow(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{ID: "cas-1", Project: "p", Section: "s", Status: "paused"}); err != nil {
 		t.Fatalf("AgentCreate: %v", err)
 	}
@@ -1282,7 +1282,7 @@ func TestAgentUpdateIfMatches_OnlyWritesTheExpectedRow(t *testing.T) {
 }
 
 func TestAgentUpdateIfMatches_RejectsDisallowedFields(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{ID: "cas-2", Project: "p", Section: "s", Status: "paused"}); err != nil {
 		t.Fatalf("AgentCreate: %v", err)
 	}
@@ -1333,7 +1333,7 @@ func TestAgentCloseIfCrashed_OnlyTouchesCrashedRows(t *testing.T) {
 // held: a caller that only learns "3 stopped" cannot end those processes, and the
 // rows alone leave them running with no relay and no limit (YM-66).
 func TestAgentCascadeStop_ReturnsTheClosedRowsWithTheirPIDs(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := "2006-01-02 15:04:05"
 
 	s.AgentCreate(Agent{ID: "orch-pids", SessionID: "sess-orch-pids", Project: "p", Section: "orch", Status: "running", CreatedAt: now})
@@ -1356,7 +1356,7 @@ func TestAgentCascadeStop_ReturnsTheClosedRowsWithTheirPIDs(t *testing.T) {
 // same moment received the SAME id and the second AgentCreate failed on the
 // primary key. The allocation must be atomic.
 func TestAgentNextIDConcurrent_Unique(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const n = 20
 	ids := make(chan string, n)
@@ -1396,7 +1396,7 @@ func TestAgentNextIDConcurrent_Unique(t *testing.T) {
 // above the highest id that day already carries, otherwise the first spawn after
 // the upgrade collides with an existing row.
 func TestAgentNextIDSeedContinuesAboveExistingDay(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	today := time.Now().UTC().Format("20060102")
 
 	if err := s.AgentCreate(Agent{
@@ -1426,7 +1426,7 @@ func TestAgentNextIDSeedContinuesAboveExistingDay(t *testing.T) {
 // ids that already exist. The seed must raise it on the next open — INSERT OR
 // IGNORE never would, and the next spawn would fail on the primary key.
 func TestAgentNextIDSeedHealsBehindCounter(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	today := time.Now().UTC().Format("20060102")
 
 	if err := s.AgentCreate(Agent{

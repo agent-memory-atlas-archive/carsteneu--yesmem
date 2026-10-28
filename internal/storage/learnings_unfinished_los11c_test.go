@@ -23,7 +23,7 @@ const los11cLiveQuery = "Los 11: Proxy Rules-Cache und Injektionszähler"
 const los11cUnrelatedNote = "Scheduled job proxy-health-check (sched-proxy-health-check-54806) was triggered on 2026-05-11 but the session ends after cap activation"
 
 func TestSearchUnfinishedRanked_Los11c_LiveCaseIsNotAFullMatch(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	unrelatedID := insertTestLearningForProject(t, s, los11cUnrelatedNote, "unfinished", "yesmem", "yesmem")
 
 	got, err := s.SearchUnfinishedRanked(los11cLiveQuery, "yesmem")
@@ -45,7 +45,7 @@ func TestSearchUnfinishedRanked_Los11c_LiveCaseIsNotAFullMatch(t *testing.T) {
 }
 
 func TestSearchUnfinishedRanked_Los11c_PicksTheItemWithEveryTerm(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, los11cUnrelatedNote, "unfinished", "yesmem", "yesmem")
 	targetID := insertTestLearningForProject(t, s, "Los 11: Proxy Rules-Cache und Injektionszähler reparieren", "unfinished", "yesmem", "yesmem")
 	insertTestLearningForProject(t, s, "Add user profile page", "unfinished", "yesmem", "yesmem")
@@ -76,7 +76,7 @@ func TestSearchUnfinishedRanked_Los11c_PicksTheItemWithEveryTerm(t *testing.T) {
 }
 
 func TestSearchUnfinishedRanked_Los11c_SpreadTermsAreNoFullMatch(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "proxy rules work", "unfinished", "yesmem", "yesmem")
 	insertTestLearningForProject(t, s, "cache injektion work", "unfinished", "yesmem", "yesmem")
 
@@ -96,7 +96,7 @@ func TestSearchUnfinishedRanked_Los11c_SpreadTermsAreNoFullMatch(t *testing.T) {
 }
 
 func TestSearchUnfinishedRanked_Los11c_AmbiguousFullMatchesResolveNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	firstID := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 	secondID := insertTestLearningForProject(t, s, "proxy rules cache document", "unfinished", "yesmem", "yesmem")
 
@@ -119,7 +119,7 @@ func TestSearchUnfinishedRanked_Los11c_AmbiguousFullMatchesResolveNothing(t *tes
 }
 
 func TestSearchUnfinishedRanked_Los11c_BelowMinimumTermsResolvesNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := insertTestLearningForProject(t, s, "proxy cache cleanup", "unfinished", "yesmem", "yesmem")
 
 	got, err := s.SearchUnfinishedRanked("proxy cache", "yesmem")
@@ -138,7 +138,7 @@ func TestSearchUnfinishedRanked_Los11c_BelowMinimumTermsResolvesNothing(t *testi
 }
 
 func TestSearchUnfinishedRanked_Los11c_SkipsResolvedItems(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 	if err := s.ResolveLearning(id, "done"); err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -157,7 +157,7 @@ func TestSearchUnfinishedRanked_Los11c_SkipsResolvedItems(t *testing.T) {
 }
 
 func TestSearchUnfinishedRanked_Los11c_PunctuationOnlyQueryDoesNotError(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 
 	got, err := s.SearchUnfinishedRanked("?? --", "yesmem")
@@ -170,7 +170,7 @@ func TestSearchUnfinishedRanked_Los11c_PunctuationOnlyQueryDoesNotError(t *testi
 }
 
 func TestSearchUnfinishedRanked_Los11c_LiveCaseReturnsCandidates(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	unrelatedID := insertTestLearningForProject(t, s, los11cUnrelatedNote, "unfinished", "yesmem", "yesmem")
 
 	got, err := s.SearchUnfinishedRanked(los11cLiveQuery, "yesmem")
@@ -189,7 +189,7 @@ func TestSearchUnfinishedRanked_Los11c_LiveCaseReturnsCandidates(t *testing.T) {
 }
 
 func TestSearchUnfinishedRanked_Los11c_RepeatedWordsDoNotSatisfyTheMinimum(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := insertTestLearningForProject(t, s, "proxy cache cleanup", "unfinished", "yesmem", "yesmem")
 
 	for _, query := range []string{"proxy proxy proxy", "proxy cache cache", "proxy, proxy. proxy!"} {
@@ -210,7 +210,7 @@ func TestSearchUnfinishedRanked_Los11c_RepeatedWordsDoNotSatisfyTheMinimum(t *te
 }
 
 func TestSearchUnfinishedRanked_Los11c_FallbackSurvivesARareTermWithoutOpenTasks(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	candidateID := insertTestLearningForProject(t, s, "proxy cache cleanup", "unfinished", "yesmem", "yesmem")
 	// The rare word only exists in a closed learning: every AND tier over it finds
 	// no open task, which used to leave the caller with an empty candidate list.
@@ -238,7 +238,7 @@ func TestSearchUnfinishedRanked_Los11c_FallbackSurvivesARareTermWithoutOpenTasks
 }
 
 func TestSearchUnfinishedRanked_Los11c_LongTextNeverLooksComplete(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "alpha beta gamma delta epsilon zeta eta theta iota kappa", "unfinished", "yesmem", "yesmem")
 
 	// Twelve distinct words: only the first ten are searched, so the query must not
@@ -262,7 +262,7 @@ func TestSearchUnfinishedRanked_Los11c_LongTextNeverLooksComplete(t *testing.T) 
 }
 
 func TestSearchUnfinishedRanked_Los11c_UnknownWordBlocksTheFullMatch(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	candidateID := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 
 	got, err := s.SearchUnfinishedRanked("proxy rules cache zzzznotinindex", "yesmem")
@@ -287,7 +287,7 @@ func TestSearchUnfinishedRanked_Los11c_UnknownWordBlocksTheFullMatch(t *testing.
 }
 
 func TestReopenLearning_Los11c_ResolutionBecomesActiveAgain(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := insertTestLearningForProject(t, s, "proxy rules cache rebuild", "unfinished", "yesmem", "yesmem")
 	if err := s.ResolveLearning(id, "resolved by text match: whatever"); err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -318,7 +318,7 @@ func TestReopenLearning_Los11c_ResolutionBecomesActiveAgain(t *testing.T) {
 }
 
 func TestReopenLearning_Los11c_RefusesGenuineSupersedeChain(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	oldID := insertTestLearningForProject(t, s, "old proxy cache rule", "pattern", "yesmem", "yesmem")
 	newID, err := s.InsertLearning(&models.Learning{
 		Category: "pattern", Content: "new proxy cache rule", Project: "yesmem",
@@ -345,7 +345,7 @@ func TestReopenLearning_Los11c_RefusesGenuineSupersedeChain(t *testing.T) {
 }
 
 func TestReopenLearning_Los11c_UnknownIDFails(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.ReopenLearning(999999); err == nil {
 		t.Fatal("expected an error for an unknown learning id")
 	}

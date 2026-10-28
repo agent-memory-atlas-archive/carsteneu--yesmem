@@ -5,9 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // YM-353 (OPS-87, key 1): execute_cap resolved the script's effective sandbox
@@ -41,7 +38,7 @@ func TestLos35eProjectColumnAloneRefusesUnsandboxedExecute(t *testing.T) {
 	isolateHome(t)
 	h, _ := mustHandler(t)
 	project := t.TempDir()
-	los35eInsertCapRow(t, h, "los35e_proj_column_none", project, "echo executed-unsandboxed", "none", "user")
+	insertCapRow(t, h, "los35e_proj_column_none", project, "echo executed-unsandboxed", "none", "user")
 
 	resp := h.handleExecuteCap(map[string]any{"name": "los35e_proj_column_none", "fn": "run", "args": "{}", "project": project})
 	if resp.Error == "" {
@@ -92,35 +89,5 @@ func TestLos35eRefusedExecuteLeavesNoSandboxMarks(t *testing.T) {
 	work := filepath.Join(runtimeDir, runWorkDirName, jobDirName("cap:los35e_proj_none_marks"))
 	if _, err := os.Stat(work); err == nil {
 		t.Errorf("a refused run created its work dir %s", work)
-	}
-}
-
-// los35eInsertCapRow seeds one cap with an explicit project column and scope, so a
-// test can take the two halves of the binding apart.
-func los35eInsertCapRow(t *testing.T, h *Handler, name, project, body, sandbox, scope string) {
-	t.Helper()
-	meta := CapMeta{
-		Name:        name,
-		Description: "test cap",
-		Scripts:     []ScriptMeta{{Name: "run", Kind: "handler", Runtime: "bash", Body: body, Sandbox: sandbox}},
-		Version:     1,
-		Tested:      true,
-		Scope:       scope,
-	}
-	ctx, err := meta.ToJSON()
-	if err != nil {
-		t.Fatalf("cap meta json: %v", err)
-	}
-	if _, err := h.store.InsertLearning(&models.Learning{
-		Category:    "cap",
-		Content:     name + " — test cap",
-		Context:     ctx,
-		Confidence:  1,
-		CreatedAt:   time.Now(),
-		ModelUsed:   "test",
-		TriggerRule: "cap:" + name,
-		Project:     project,
-	}); err != nil {
-		t.Fatalf("insert cap: %v", err)
 	}
 }

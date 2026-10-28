@@ -1,0 +1,10 @@
+{
+  "name": "opencode-plan",
+  "version": "0.0.0-dev",
+  "private": true,
+  "type": "module",
+  "description": "The active YesMem plan as its own sidebar block. A v2 TUI plugin; the JSX runtime must match the TUI's own @opentui version.",
+  "dependencies": {
+    "@opentui/solid": "0.6.8"
+  }
+}

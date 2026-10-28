@@ -12,7 +12,6 @@ import (
 
 	"github.com/carsteneu/yesmem/internal/config"
 	"github.com/carsteneu/yesmem/internal/models"
-	"github.com/carsteneu/yesmem/internal/storage"
 )
 
 // --- Proxy State ---
@@ -870,23 +869,6 @@ func TestHandleTrackSessionEnd_CompactKeepsPins(t *testing.T) {
 	if len(pins) != 1 {
 		t.Errorf("expected 1 session pin after compact, got %d", len(pins))
 	}
-}
-
-// mustFileHandler opens a handler on a file-backed store: session pins live in
-// runtime.db, permanent pins in yesmem.db — separate tables with independent ID
-// sequences, as in production.
-func mustFileHandler(t *testing.T) (*Handler, *storage.Store) {
-	t.Helper()
-	dir := t.TempDir()
-	s, err := storage.Open(filepath.Join(dir, "yesmem.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	h := NewHandler(s, nil)
-	h.dataDir = dir
-	h.disableAgentProcesses = true
-	return h, s
 }
 
 // YM-120: session pins without a project must not survive /clear.

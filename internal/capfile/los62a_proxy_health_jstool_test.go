@@ -27,25 +27,14 @@ func los62aJSRunner(t *testing.T) func(proxyLog string) map[string]any {
 	if err != nil {
 		t.Skip("node is not installed: the JS variant of the cap can only be run with it")
 	}
-	data, err := os.ReadFile(los32eCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript("proxy_health")
-	if sc == nil {
-		t.Fatal("the bundled proxy_health cap has no proxy_health tool script")
-	}
+	body := bundledScript(t, proxyHealthCapPath, "proxy_health")
 
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatalf("mkdir bin: %v", err)
 	}
-	los32eWriteStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
 case "$*" in
   *yesmem-proxy*) cat "$LOS62A_PROXY_LOG" ;;
   *) cat "$LOS62A_DAEMON_LOG" ;;
@@ -63,7 +52,7 @@ exit 0
 const sh = (cmd) => execSync(cmd, {encoding: 'utf8'}).toString();
 const mcp__yesmem__cap_store = async () => ({ok: true});
 const mcp__yesmem__broadcast = async () => ({ok: true});
-const handler = ` + sc.Body + `;
+const handler = ` + body + `;
 const out = await handler({hours: 1, alert: true, project: '/home/tester/memory/yesmem'});
 console.log(JSON.stringify(out));
 `

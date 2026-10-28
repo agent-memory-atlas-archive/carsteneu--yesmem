@@ -1,21 +1,10 @@
 package storage
 
 import (
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
-
-func openTrackingStore(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "tracking.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
 
 func seedTrackedEnd(t *testing.T, s *Store, project, sessionID, reason string, at time.Time) {
 	t.Helper()
@@ -30,7 +19,7 @@ func seedTrackedEnd(t *testing.T, s *Store, project, sessionID, reason string, a
 const trackingProject = "/proj/tracked"
 
 func TestGetPendingRecoveryDeliversOnce(t *testing.T) {
-	s := openTrackingStore(t)
+	s := mustOpenFiles(t)
 	if err := s.TrackSessionEnd(trackingProject, "sess-1", "clear"); err != nil {
 		t.Fatalf("TrackSessionEnd: %v", err)
 	}
@@ -56,7 +45,7 @@ func TestGetPendingRecoveryDeliversOnce(t *testing.T) {
 // session never started, are all unconsumed. Delivering whoever is newest and
 // sweeping the rest keeps them from surfacing one per briefing.
 func TestGetPendingRecoverySweepsOlderRows(t *testing.T) {
-	s := openTrackingStore(t)
+	s := mustOpenFiles(t)
 	seedTrackedEnd(t, s, trackingProject, "sess-old", "clear", time.Now().Add(-2*time.Hour))
 	seedTrackedEnd(t, s, trackingProject, "sess-new", "clear", time.Now().Add(-1*time.Minute))
 
@@ -78,7 +67,7 @@ func TestGetPendingRecoverySweepsOlderRows(t *testing.T) {
 }
 
 func TestGetPendingRecoveryStaysWithinProjectAndReason(t *testing.T) {
-	s := openTrackingStore(t)
+	s := mustOpenFiles(t)
 	seedTrackedEnd(t, s, trackingProject, "sess-logout", "logout", time.Now())
 	seedTrackedEnd(t, s, "/proj/elsewhere", "sess-other", "clear", time.Now())
 
@@ -91,7 +80,7 @@ func TestGetPendingRecoveryStaysWithinProjectAndReason(t *testing.T) {
 }
 
 func TestGetPendingRecoveryDropsStaleRows(t *testing.T) {
-	s := openTrackingStore(t)
+	s := mustOpenFiles(t)
 	seedTrackedEnd(t, s, trackingProject, "sess-stale", "clear", time.Now().Add(-48*time.Hour))
 
 	sid, _, err := s.GetPendingRecovery(trackingProject, 24*time.Hour)
@@ -111,7 +100,7 @@ func TestGetPendingRecoveryDropsStaleRows(t *testing.T) {
 // A hook can deliver the same SessionEnd twice. The second delivery must not
 // re-open the handoff a briefing has already used.
 func TestTrackSessionEndDoesNotRearmAUsedHandoff(t *testing.T) {
-	s := openTrackingStore(t)
+	s := mustOpenFiles(t)
 	if err := s.TrackSessionEnd(trackingProject, "sess-again", "clear"); err != nil {
 		t.Fatalf("TrackSessionEnd: %v", err)
 	}
@@ -132,7 +121,7 @@ func TestTrackSessionEndDoesNotRearmAUsedHandoff(t *testing.T) {
 // terminals, a session start next to a proxy refresh). Exactly one of them may
 // receive the handoff.
 func TestGetPendingRecoveryIsAtomicUnderConcurrency(t *testing.T) {
-	s := openTrackingStore(t)
+	s := mustOpenFiles(t)
 	if err := s.TrackSessionEnd(trackingProject, "sess-race", "clear"); err != nil {
 		t.Fatalf("TrackSessionEnd: %v", err)
 	}

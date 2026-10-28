@@ -16,7 +16,7 @@ import (
 func TestLos35fExecuteCapIgnoresAForeignProjectRow(t *testing.T) {
 	isolateHome(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_foreign_row", "/tmp/los35f-proj-a", "echo foreign", "", "project")
+	insertCapRow(t, h, "los35f_foreign_row", "/tmp/los35f-proj-a", "echo foreign", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name":    "los35f_foreign_row",
@@ -39,7 +39,7 @@ func TestLos35fExecuteCapStillReachesItsOwnProjectRow(t *testing.T) {
 	isolateHome(t)
 	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_own_row", "/tmp/los35f-proj-a", "echo own", "", "project")
+	insertCapRow(t, h, "los35f_own_row", "/tmp/los35f-proj-a", "echo own", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name":    "los35f_own_row",
@@ -61,7 +61,7 @@ func TestLos35fExecuteCapStillReachesItsOwnProjectRow(t *testing.T) {
 func TestLos35fUnnamedCallerReachesNoBoundRow(t *testing.T) {
 	isolateHome(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_unnamed", "/tmp/los35f-proj-a", "echo bound", "", "project")
+	insertCapRow(t, h, "los35f_unnamed", "/tmp/los35f-proj-a", "echo bound", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{"name": "los35f_unnamed", "fn": "run", "args": "{}"})
 
@@ -76,7 +76,7 @@ func TestLos35fGlobalCapStaysReachable(t *testing.T) {
 	isolateHome(t)
 	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_global", "", "echo global-body", "", "user")
+	insertCapRow(t, h, "los35f_global", "", "echo global-body", "", "user")
 
 	resp := h.handleExecuteCap(map[string]any{"name": "los35f_global", "fn": "run", "args": "{}"})
 
@@ -94,8 +94,8 @@ func TestLos35fOwnRowWinsOverAGlobalRow(t *testing.T) {
 	isolateHome(t)
 	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_shadowed", "", "echo global-body", "", "user")
-	los35eInsertCapRow(t, h, "los35f_shadowed", "/tmp/los35f-proj-a", "echo project-body", "", "project")
+	insertCapRow(t, h, "los35f_shadowed", "", "echo global-body", "", "user")
+	insertCapRow(t, h, "los35f_shadowed", "/tmp/los35f-proj-a", "echo project-body", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name":    "los35f_shadowed",
@@ -118,7 +118,7 @@ func TestLos35fCwdNamesTheCallersProject(t *testing.T) {
 	isolateHome(t)
 	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_cwd_row", "/tmp/los35f-proj-c", "echo cwd-body", "", "project")
+	insertCapRow(t, h, "los35f_cwd_row", "/tmp/los35f-proj-c", "echo cwd-body", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name": "los35f_cwd_row",
@@ -142,7 +142,7 @@ func TestLos35fTrustedSessionNamesTheCallersProject(t *testing.T) {
 	isolateHome(t)
 	los35fRequireAijail(t)
 	h, store := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_session_row", "/tmp/los35f-proj-s", "echo session-body", "", "project")
+	insertCapRow(t, h, "los35f_session_row", "/tmp/los35f-proj-s", "echo session-body", "", "project")
 	if err := store.UpsertSession(&models.Session{ID: "los35f-session", Project: "/tmp/los35f-proj-s"}); err != nil {
 		t.Fatalf("upsert session: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestLos35fSameBasenameInAnotherRepositoryIsForeign(t *testing.T) {
 	h, _ := mustHandler(t)
 	rowProject := filepath.Join(t.TempDir(), "yesmem")
 	callerProject := filepath.Join(t.TempDir(), "yesmem")
-	los35eInsertCapRow(t, h, "los35f_same_basename", rowProject, "echo elsewhere", "", "project")
+	insertCapRow(t, h, "los35f_same_basename", rowProject, "echo elsewhere", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name":    "los35f_same_basename",
@@ -190,7 +190,7 @@ func TestLos35fWorktreeOfTheSameRepositoryReachesTheRow(t *testing.T) {
 	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
 	root := filepath.Join(t.TempDir(), "yesmem")
-	los35eInsertCapRow(t, h, "los35f_worktree_row", root, "echo worktree-body", "", "project")
+	insertCapRow(t, h, "los35f_worktree_row", root, "echo worktree-body", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name": "los35f_worktree_row",
@@ -213,7 +213,7 @@ func TestLos35fWorktreeOfTheSameRepositoryReachesTheRow(t *testing.T) {
 func TestLos35fBareNameCallerReachesNoPathBoundRow(t *testing.T) {
 	isolateHome(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_path_bound", "/tmp/los35f-elsewhere", "echo elsewhere", "", "project")
+	insertCapRow(t, h, "los35f_path_bound", "/tmp/los35f-elsewhere", "echo elsewhere", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name":    "los35f_path_bound",
@@ -234,7 +234,7 @@ func TestLos35fBareNameCallerReachesANameBoundRow(t *testing.T) {
 	isolateHome(t)
 	los35fRequireAijail(t)
 	h, _ := mustHandler(t)
-	los35eInsertCapRow(t, h, "los35f_name_bound", "los35f-imported", "echo name-body", "", "project")
+	insertCapRow(t, h, "los35f_name_bound", "los35f-imported", "echo name-body", "", "project")
 
 	resp := h.handleExecuteCap(map[string]any{
 		"name":    "los35f_name_bound",

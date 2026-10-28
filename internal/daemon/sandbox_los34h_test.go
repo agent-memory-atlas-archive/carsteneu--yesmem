@@ -7,9 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/carsteneu/yesmem/internal/models"
 )
 
 // YM-334 Befund 3: claudeConfigFlags rendert --map nach dem Maskenfilter, der auf
@@ -254,7 +251,7 @@ func TestLos34hExecuteCapBindingShapes(t *testing.T) {
 			h, _ := mustHandler(t)
 			t.Setenv("HOME", t.TempDir())
 			los35bUnsandboxed(t, h)
-			los34hInsertCapRow(t, h, "los34h_shape", tc.project, tc.scope, "echo ok", "")
+			insertCapRow(t, h, "los34h_shape", tc.project, "echo ok", "", tc.scope)
 
 			resp := h.handleExecuteCap(map[string]any{"name": "los34h_shape"})
 			if tc.wantRefuse {
@@ -306,36 +303,5 @@ func TestLos34hJobSandboxRefusesLostSocketMount(t *testing.T) {
 // scope project).
 func los34hInsertUserCap(t *testing.T, h *Handler, name, body string) {
 	t.Helper()
-	los34hInsertCapRow(t, h, name, "", "user", body, "")
-}
-
-// los34hInsertCapRow seeds one active cap row with the binding, scope and sandbox
-// the caller wants. The save path applies the lock, so a test that needs a legacy
-// shape has to write the row itself.
-func los34hInsertCapRow(t *testing.T, h *Handler, name, project, scope, body, sandbox string) {
-	t.Helper()
-	meta := CapMeta{
-		Name:        name,
-		Description: "test cap",
-		Scripts:     []ScriptMeta{{Name: "run", Kind: "handler", Runtime: "bash", Body: body, Sandbox: sandbox}},
-		Version:     1,
-		Tested:      true,
-		Scope:       scope,
-	}
-	ctx, err := meta.ToJSON()
-	if err != nil {
-		t.Fatalf("cap meta json: %v", err)
-	}
-	if _, err := h.store.InsertLearning(&models.Learning{
-		Category:    "cap",
-		Content:     name + " — test cap",
-		Context:     ctx,
-		Confidence:  1,
-		CreatedAt:   time.Now(),
-		ModelUsed:   "test",
-		TriggerRule: "cap:" + name,
-		Project:     project,
-	}); err != nil {
-		t.Fatalf("insert cap: %v", err)
-	}
+	insertCapRow(t, h, name, "", body, "", "user")
 }

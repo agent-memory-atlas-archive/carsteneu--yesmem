@@ -7,7 +7,7 @@ import (
 )
 
 func TestPruneScanState_RemovesOrphanedRows(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 
 	// The sweep needs at least one resolvable session; otherwise it treats the
 	// session table as untrustworthy and skips pruning on purpose.

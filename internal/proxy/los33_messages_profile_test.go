@@ -14,7 +14,7 @@ import (
 // unconditionally. The wire format is not the client: opencode speaks
 // /v1/messages too, and it must not receive the Claude-only directive blocks.
 func TestLos33MessagesPathUsesClientProfile(t *testing.T) {
-	backendURL, forwarded := los33Upstream(t)
+	backendURL, forwarded := recordingUpstream(t)
 
 	s := los26aHandlerServer(t, backendURL)
 	s.cfg.FeatureDefaults = &config.FeatureGates{Timestamps: true}
@@ -42,7 +42,7 @@ func TestLos33MessagesPathUsesClientProfile(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := los33MessagesRequest(los33UserTurn("claude-opus-4-6"), tc.headers)
+			req := messagesRequest(userTurnBody("claude-opus-4-6"), tc.headers)
 			rec := httptest.NewRecorder()
 
 			s.handleMessages(rec, req)

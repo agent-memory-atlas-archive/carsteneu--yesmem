@@ -5,7 +5,7 @@ import (
 )
 
 func TestScratchpadWrite_And_Read(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	err := s.ScratchpadWrite("proj-a", "plan", "some plan content", "agent-1")
 	if err != nil {
@@ -31,7 +31,7 @@ func TestScratchpadWrite_And_Read(t *testing.T) {
 }
 
 func TestScratchpadWrite_Upsert(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.ScratchpadWrite("proj", "notes", "original content", "agent-1"); err != nil {
 		t.Fatalf("first write: %v", err)
@@ -56,7 +56,7 @@ func TestScratchpadWrite_Upsert(t *testing.T) {
 }
 
 func TestScratchpadRead_AllSections(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj", "plan", "plan content", "")
 	s.ScratchpadWrite("proj", "status", "status content", "")
@@ -72,7 +72,7 @@ func TestScratchpadRead_AllSections(t *testing.T) {
 }
 
 func TestScratchpadRead_SingleSection(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj", "plan", "plan content", "")
 	s.ScratchpadWrite("proj", "status", "status content", "")
@@ -90,7 +90,7 @@ func TestScratchpadRead_SingleSection(t *testing.T) {
 }
 
 func TestScratchpadRead_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	sections, err := s.ScratchpadRead("proj", "nonexistent")
 	if err != nil {
@@ -102,7 +102,7 @@ func TestScratchpadRead_NotFound(t *testing.T) {
 }
 
 func TestScratchpadList_AllProjects(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj-a", "plan", "a plan", "")
 	s.ScratchpadWrite("proj-a", "notes", "a notes", "")
@@ -135,7 +135,7 @@ func TestScratchpadList_AllProjects(t *testing.T) {
 }
 
 func TestScratchpadList_SingleProject(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj-a", "plan", "content", "owner-a")
 	s.ScratchpadWrite("proj-b", "notes", "content", "")
@@ -159,7 +159,7 @@ func TestScratchpadList_SingleProject(t *testing.T) {
 }
 
 func TestScratchpadDelete_SingleSection(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj", "plan", "plan content", "")
 	s.ScratchpadWrite("proj", "status", "status content", "")
@@ -185,7 +185,7 @@ func TestScratchpadDelete_SingleSection(t *testing.T) {
 }
 
 func TestScratchpadDelete_EntireProject(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj", "plan", "plan content", "")
 	s.ScratchpadWrite("proj", "status", "status content", "")
@@ -209,7 +209,7 @@ func TestScratchpadDelete_EntireProject(t *testing.T) {
 }
 
 func TestScratchpadDelete_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	n, err := s.ScratchpadDelete("nonexistent", "section")
 	if err != nil {
@@ -221,7 +221,7 @@ func TestScratchpadDelete_NotFound(t *testing.T) {
 }
 
 func TestScratchpadWrite_EmptyOwner(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.ScratchpadWrite("proj", "section", "content", ""); err != nil {
 		t.Fatalf("ScratchpadWrite empty owner: %v", err)
@@ -240,7 +240,7 @@ func TestScratchpadWrite_EmptyOwner(t *testing.T) {
 }
 
 func TestScratchpadRead_IsolatedByProject(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.ScratchpadWrite("proj-a", "shared-section", "a content", "")
 	s.ScratchpadWrite("proj-b", "shared-section", "b content", "")

@@ -12,7 +12,7 @@ import (
 // (relay, stop, whoami, send_to). Only rows with neither a process nor a session
 // may be deleted.
 func TestYm297RecoverKeepsResumableOpencodeRow(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	live := Agent{
 		ID:                "agent-ym297-live",
@@ -102,7 +102,7 @@ func TestYm297RecoverKeepsResumableOpencodeRow(t *testing.T) {
 // not deleted. Deleting on an infrastructure error would reintroduce the exact
 // YM-297 harm silently.
 func TestYm297RecoverKeepsRowWhenLookupFails(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID:                "agent-ym297-unverifiable",
 		Project:           "p",
@@ -142,7 +142,7 @@ func TestYm297RecoverKeepsRowWhenLookupFails(t *testing.T) {
 // claude-backend rows: no session id means no session evidence, so the row is
 // deleted as before. This pins that the new keep-path does not swallow them.
 func TestYm297RecoverDeletesRowWithoutSessionID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID:      "agent-ym297-claude",
 		Project: "p",

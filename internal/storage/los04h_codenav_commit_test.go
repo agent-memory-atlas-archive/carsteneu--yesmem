@@ -12,7 +12,7 @@ import (
 // commitScanFilesTx is the seam: a failed commit must leave no path index behind
 // and must say where it failed.
 func TestBackfillScanFiles_SurvivesAFailedCommit(t *testing.T) {
-	s := los04gOpenStore(t)
+	s := mustOpen(t)
 	project := "los04h-commit"
 	scanJSON := `{"Packages":[{"Files":[{"Path":"b.go"}]}]}`
 	if _, err := s.db.Exec(

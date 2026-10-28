@@ -77,9 +77,9 @@ func TestLos57bRequestJournalTIDCannotForgeALine(t *testing.T) {
 
 func los57bRequestForge(t *testing.T, session string) {
 	t.Helper()
-	backendURL, _ := los33Upstream(t)
+	backendURL, _ := recordingUpstream(t)
 	s := los26aHandlerServer(t, backendURL)
-	los33DaemonSocket(t, s, func(method string, params map[string]any) string { return "null" })
+	wireFakeDaemon(t, s, func(method string, params map[string]any) string { return "null" })
 	logBuf := &lockedLogBuffer{}
 	s.logger = log.New(logBuf, "", 0)
 
@@ -99,7 +99,7 @@ func los57bRequestForge(t *testing.T, session string) {
 		`{"role":"assistant","content":"on it"},` +
 		`{"role":"user","content":"check the prompt profile routing"}],` +
 		`"metadata":{"user_id":` + string(userID) + `}}`
-	req := los33MessagesRequest(body, nil)
+	req := messagesRequest(body, nil)
 	rec := httptest.NewRecorder()
 	s.handleMessages(rec, req)
 

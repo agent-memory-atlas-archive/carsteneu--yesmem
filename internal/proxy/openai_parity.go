@@ -428,14 +428,15 @@ func (s *Server) runOpenAIParityPipeline(req map[string]any, ctx *openAIRequestC
 			}
 		}
 
+		planCallSeen := s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
 		if isFeatureEnabled(&s.cfg, model, "plan_checkpoint") {
-			s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
 			if checkpoint := s.planCheckpointInject(ctx.ThreadID, totalTokens); checkpoint != "" {
 				req["messages"] = injectAssociativeContext(messages, checkpoint, s.cfg.SawtoothEnabled)
 				messages, _ = req["messages"].([]any)
 				s.logger.Printf("%s[req %d %s tid=%s] plan checkpoint injected%s", colorBlue, ctx.ReqIdx, ctx.Project, ctx.ThreadID, colorReset)
 			}
 		}
+		s.syncPlanSnapshot(ctx.ThreadID, planCallSeen)
 
 		if isFeatureEnabled(&s.cfg, model, "skill_eval") && ctx.ThreadID != "" && ctx.Project != "" && isUserInputTurn(messages) && s.skillTracker != nil {
 			s.syncSkillActivations(messages, daemonProject(ctx.Project, ctx.ProjectDir), ctx.ThreadID)
@@ -765,9 +766,10 @@ func (s *Server) annotateOpenAIMessageMetadata(req map[string]any, ctx *openAIRe
 						tail = append(tail, "[loop-warning] "+ctx.LoopWarning)
 					}
 				}
-				// Plan checkpoint: detect plan tool calls (resets counter), inject reminder if interval fires
+				// Plan checkpoint: detect plan tool calls (resets counter), inject reminder if interval fires.
+				// The sidebar snapshot is synced regardless of the gate: it reads a different channel.
+				planCallSeen := s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
 				if isFeatureEnabled(&s.cfg, model, "plan_checkpoint") {
-					s.detectPlanToolCall(messages, ctx.ThreadID, totalTokens)
 					if checkpoint := s.planCheckpointInject(ctx.ThreadID, totalTokens); checkpoint != "" {
 						if perSession {
 							entry.PlanCheckpoint = checkpoint
@@ -779,6 +781,7 @@ func (s *Server) annotateOpenAIMessageMetadata(req map[string]any, ctx *openAIRe
 						}
 					}
 				}
+				s.syncPlanSnapshot(ctx.ThreadID, planCallSeen)
 
 				// Plan auto-activation: a read plan file without an active plan.
 				// The Anthropic path appends a system block here; this path freezes

@@ -21,15 +21,6 @@ func disableSandbox(t *testing.T) {
 	t.Setenv("YESMEM_DISABLE_AIJAIL_DOWNLOAD", "1")
 }
 
-// neutralizeClaude points PATH at an empty tempdir so that any leftover exec of
-// the `claude` CLI fails fast. The auto-correct pass must not use it any more;
-// these tests keep the PATH clear so a regression to a CLI call fails loudly
-// instead of passing on the dev machine's installation.
-func neutralizeClaude(t *testing.T) {
-	t.Helper()
-	t.Setenv("PATH", t.TempDir())
-}
-
 // When a bash error has no matching scheduled job (or AutoCorrect=false) and
 // CapName is empty, processBashJobErrors falls into diagnoseBashError. When the
 // model call fails, the run must still be marked processed: retrying the same

@@ -5,7 +5,7 @@ import (
 )
 
 func TestSaveAndGetRefinedBriefing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	err := s.SaveRefinedBriefing("testproj", "hash1", "Refined prose text", "opus")
 	if err != nil {
@@ -22,7 +22,7 @@ func TestSaveAndGetRefinedBriefing(t *testing.T) {
 }
 
 func TestGetRefinedBriefing_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	got, err := s.GetRefinedBriefing("nonexistent")
 	if err != nil {
@@ -34,7 +34,7 @@ func TestGetRefinedBriefing_NotFound(t *testing.T) {
 }
 
 func TestSaveRefinedBriefing_Upsert(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.SaveRefinedBriefing("proj", "hash1", "version 1", "haiku")
 	s.SaveRefinedBriefing("proj", "hash2", "version 2", "opus")
@@ -46,7 +46,7 @@ func TestSaveRefinedBriefing_Upsert(t *testing.T) {
 }
 
 func TestGetRefinedBriefingHash(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.SaveRefinedBriefing("proj", "abc123hash", "text", "opus")
 
@@ -60,7 +60,7 @@ func TestGetRefinedBriefingHash(t *testing.T) {
 }
 
 func TestGetRefinedBriefingHash_NotFound(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	got, err := s.GetRefinedBriefingHash("missing")
 	if err != nil {
@@ -72,7 +72,7 @@ func TestGetRefinedBriefingHash_NotFound(t *testing.T) {
 }
 
 func TestProjectChangeFingerprint_Stable(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	fp1 := los16dFingerprint(t, s, "empty")
 	fp2 := los16dFingerprint(t, s, "empty")
@@ -82,7 +82,7 @@ func TestProjectChangeFingerprint_Stable(t *testing.T) {
 }
 
 func TestProjectChangeFingerprint_ChangesWithData(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	fp1 := los16dFingerprint(t, s, "testproj")
 
@@ -96,7 +96,7 @@ func TestProjectChangeFingerprint_ChangesWithData(t *testing.T) {
 }
 
 func TestProjectChangeFingerprint_ChangesWithPersonaDirective(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	fp1 := los16dFingerprint(t, s, "testproj")
 
@@ -118,7 +118,7 @@ func TestProjectChangeFingerprint_ChangesWithPersonaDirective(t *testing.T) {
 }
 
 func TestProjectChangeFingerprint_DifferentProjects(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	s.db.Exec(`INSERT INTO sessions (id, project, project_short, started_at, indexed_at, jsonl_path) VALUES ('s1', '/a', 'projA', datetime('now'), datetime('now'), '/s1.jsonl')`)
 

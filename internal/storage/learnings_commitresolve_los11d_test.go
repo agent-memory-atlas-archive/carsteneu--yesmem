@@ -32,7 +32,7 @@ func openTask(t *testing.T, s *Store, content string) int64 {
 }
 
 func TestResolveTargetForCommit_Los11d_LiveCaseStaysOpen(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	wrongID := openTask(t, s, los11dWrongTarget)
 
 	got, err := s.ResolveTargetForCommit(los11dCommitSubject, "yesmem")
@@ -52,7 +52,7 @@ func TestResolveTargetForCommit_Los11d_LiveCaseStaysOpen(t *testing.T) {
 // Even a subject that covers an open item word for word is no resolve basis:
 // prose overlap was measured to be wrong more often than right.
 func TestResolveTargetForCommit_Los11d_ProseOverlapAloneResolvesNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Los 11: Proxy Rules-Cache und Injektionszähler reparieren")
 
 	got, err := s.ResolveTargetForCommit(los11dCommitSubject, "yesmem")
@@ -68,7 +68,7 @@ func TestResolveTargetForCommit_Los11d_ProseOverlapAloneResolvesNothing(t *testi
 // repository's history. A real learning reference shares words with the work it
 // closes; a foreign number reference shares none.
 func TestResolveTargetForCommit_Los11d_LearningIDAnchorsAMatchingItem(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "Rebuild the proxy cache ruleset")
 	openTask(t, s, "document the release notes")
 
@@ -85,7 +85,7 @@ func TestResolveTargetForCommit_Los11d_LearningIDAnchorsAMatchingItem(t *testing
 }
 
 func TestResolveTargetForCommit_Los11d_ForeignNumberReferenceIsNoAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "Scheduled cleanup of the archive directory")
 
 	got, err := s.ResolveTargetForCommit("feat(proxy): cache rules (#"+strconv.FormatInt(targetID, 10)+")", "yesmem")
@@ -99,7 +99,7 @@ func TestResolveTargetForCommit_Los11d_ForeignNumberReferenceIsNoAnchor(t *testi
 
 // One shared word is exactly the #66092 accident, so an id anchor needs two.
 func TestResolveTargetForCommit_Los11d_LearningIDNeedsTwoSharedTerms(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, los11dWrongTarget)
 
 	got, err := s.ResolveTargetForCommit("fix(ci): tune proxy limits (#"+strconv.FormatInt(id, 10)+")", "yesmem")
@@ -119,7 +119,7 @@ func TestResolveTargetForCommit_Los11d_LearningIDNeedsTwoSharedTerms(t *testing.
 
 // A unique id anchor decides even when another key in the subject is ambiguous.
 func TestResolveTargetForCommit_Los11d_UniqueIDBeatsAConflictingKey(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "Rebuild the proxy cache ruleset")
 	openTask(t, s, "YM-261 part one")
 	openTask(t, s, "YM-261 part two")
@@ -136,7 +136,7 @@ func TestResolveTargetForCommit_Los11d_UniqueIDBeatsAConflictingKey(t *testing.T
 
 // Repeating one reference is not overflow, and it is not ambiguity.
 func TestResolveTargetForCommit_Los11d_ManyRepeatsOfOneIDAreNoOverflow(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Rebuild the proxy cache ruleset")
 	ref := "#" + strconv.FormatInt(id, 10)
 	subject := "fix(proxy): rebuild cache " + strings.Repeat(ref+" ", 9)
@@ -151,7 +151,7 @@ func TestResolveTargetForCommit_Los11d_ManyRepeatsOfOneIDAreNoOverflow(t *testin
 }
 
 func TestResolveTargetForCommit_Los11d_TooManyDistinctKeysResolveNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	openTask(t, s, "Tracked as PROBE-900 in the campaign")
 
 	keys := make([]string, 0, maxAnchorsPerSubject+1)
@@ -171,7 +171,7 @@ func TestResolveTargetForCommit_Los11d_TooManyDistinctKeysResolveNothing(t *test
 }
 
 func TestResolveTargetForCommit_Los11d_UnknownLearningIDResolvesNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	openTask(t, s, los11dWrongTarget)
 
 	got, err := s.ResolveTargetForCommit(los11dCommitSubject+" (#999999)", "yesmem")
@@ -184,7 +184,7 @@ func TestResolveTargetForCommit_Los11d_UnknownLearningIDResolvesNothing(t *testi
 }
 
 func TestResolveTargetForCommit_Los11d_ResolvedItemIsNoAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "something completely different")
 	if err := s.ResolveLearning(id, "done"); err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -200,7 +200,7 @@ func TestResolveTargetForCommit_Los11d_ResolvedItemIsNoAnchor(t *testing.T) {
 }
 
 func TestResolveTargetForCommit_Los11d_TicketKeyAnchorsTheItem(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "Open item tracked as YM-260 in the campaign")
 
 	got, err := s.ResolveTargetForCommit("fix(hooks): graded resolver (YM-260)", "yesmem")
@@ -218,7 +218,7 @@ func TestResolveTargetForCommit_Los11d_TicketKeyAnchorsTheItem(t *testing.T) {
 // The key lookup runs in SQL, so no candidate window can hide the item: this one
 // is the oldest of 506 open tasks.
 func TestResolveTargetForCommit_Los11d_TicketKeyBeyondAnyCandidateWindow(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "Release notes for the PROBE-9 campaign")
 	for i := 0; i < 505; i++ {
 		openTask(t, s, fmt.Sprintf("filler task number %d", i))
@@ -234,7 +234,7 @@ func TestResolveTargetForCommit_Los11d_TicketKeyBeyondAnyCandidateWindow(t *test
 }
 
 func TestResolveTargetForCommit_Los11d_SharedTicketKeyIsNoAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	openTask(t, s, "YM-261 part one")
 	openTask(t, s, "YM-261 part two")
 
@@ -251,7 +251,7 @@ func TestResolveTargetForCommit_Los11d_SharedTicketKeyIsNoAnchor(t *testing.T) {
 }
 
 func TestResolveTargetForCommit_Los11d_TwoAnchorsResolveNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	first := openTask(t, s, "Rebuild the proxy cache ruleset")
 	second := openTask(t, s, "Rewrite the proxy cache loader")
 
@@ -271,7 +271,7 @@ func TestResolveTargetForCommit_Los11d_TwoAnchorsResolveNothing(t *testing.T) {
 
 // Repeating the same reference is not ambiguity.
 func TestResolveTargetForCommit_Los11d_RepeatedAnchorIsOneAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Rebuild the proxy cache ruleset")
 	ref := "#" + strconv.FormatInt(id, 10)
 
@@ -287,7 +287,7 @@ func TestResolveTargetForCommit_Los11d_RepeatedAnchorIsOneAnchor(t *testing.T) {
 // Standards tokens are not tickets: without the denylist an ordinary subject
 // would anchor the single open item that mentions the same standard.
 func TestResolveTargetForCommit_Los11d_StandardTokensAreNoAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Investigate why the log dump is truncated (UTF-8) on Windows")
 
 	got, err := s.ResolveTargetForCommit("fix(text): encode UTF-8 safely", "yesmem")
@@ -302,7 +302,7 @@ func TestResolveTargetForCommit_Los11d_StandardTokensAreNoAnchor(t *testing.T) {
 // A ticket key carried by more items than the lookup window returns cannot be
 // proven unique, so it must not anchor anything.
 func TestResolveTargetForCommit_Los11d_FullKeyWindowIsNoAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "Tracked as PROBE-9 in the campaign")
 	for i := 0; i < keyLookupLimit; i++ {
 		openTask(t, s, fmt.Sprintf("PROBE-90 filler row %d", i))
@@ -321,7 +321,7 @@ func TestResolveTargetForCommit_Los11d_FullKeyWindowIsNoAnchor(t *testing.T) {
 }
 
 func TestResolveTargetForCommit_Los11d_RevertSubjectResolvesNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Tracked as PROBE-9 in the campaign")
 
 	got, err := s.ResolveTargetForCommit(`Revert "fix(hooks): graded resolver (PROBE-9)"`, "yesmem")
@@ -338,7 +338,7 @@ func TestResolveTargetForCommit_Los11d_RevertSubjectResolvesNothing(t *testing.T
 
 // Unknown scope cannot be guessed, so nothing is resolved.
 func TestResolveTargetForCommit_Los11d_UnknownProjectResolvesNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	openTask(t, s, "Tracked as PROBE-9 in the campaign")
 
 	got, err := s.ResolveTargetForCommit("chore: finish (PROBE-9)", "")
@@ -352,7 +352,7 @@ func TestResolveTargetForCommit_Los11d_UnknownProjectResolvesNothing(t *testing.
 
 // The body is prose. A ticket mentioned there must not compete with the subject.
 func TestResolveTargetForCommit_Los11d_BodyDoesNotAnchor(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	openTask(t, s, "Follow-up work for YM-255 remains open")
 	targetID := openTask(t, s, "graded resolver work in hooks, tracked as YM-260")
 
@@ -369,7 +369,7 @@ func TestResolveTargetForCommit_Los11d_BodyDoesNotAnchor(t *testing.T) {
 // The first resolution closes the item, so a retried or amended commit cannot
 // close a second one: the item is simply no longer open.
 func TestResolveCommit_Los11d_RepeatResolvesNothing(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	targetID := openTask(t, s, "graded resolver work in hooks, tracked as YM-260")
 	openTask(t, s, "another iterator task, tracked as YM-261")
 
@@ -394,7 +394,7 @@ func TestResolveCommit_Los11d_RepeatResolvesNothing(t *testing.T) {
 }
 
 func TestResolveCommit_Los11d_TruncatedReasonStaysValidUTF8(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Release notes for the PROBE-9 campaign")
 
 	// 190 ASCII bytes, then a multi-byte character straddling the 200-byte cut.
@@ -436,7 +436,7 @@ func TestTruncateRunes_Los11d_NeverSplitsACharacter(t *testing.T) {
 }
 
 func TestResolveTargetForCommit_Los11d_IgnoresOtherProjects(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	insertTestLearningForProject(t, s, "Tracked as PROBE-9 in another project", "unfinished", "/other/project", "/other/project")
 
 	got, err := s.ResolveTargetForCommit("chore: finish (PROBE-9)", "yesmem")
@@ -449,7 +449,7 @@ func TestResolveTargetForCommit_Los11d_IgnoresOtherProjects(t *testing.T) {
 }
 
 func TestResolveTargetForCommit_Los11d_QuarantinedItemIsNoTarget(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	id := openTask(t, s, "Tracked as PROBE-9 in the campaign")
 	quarantineTestLearning(t, s, id)
 

@@ -7,18 +7,8 @@ import (
 	"github.com/carsteneu/yesmem/internal/models"
 )
 
-func newTestLearningStore(t *testing.T) *Store {
-	t.Helper()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
 func TestProjectSourceColumnExists(t *testing.T) {
-	s := newTestLearningStore(t)
+	s := mustOpen(t)
 	var src string
 	err := s.db.QueryRow(`SELECT COALESCE(project_source,'') FROM learnings LIMIT 1`).Scan(&src)
 	if err != nil && err.Error() != "sql: no rows in result set" {
@@ -27,7 +17,7 @@ func TestProjectSourceColumnExists(t *testing.T) {
 }
 
 func TestProjectSourceRoundtrip(t *testing.T) {
-	s := newTestLearningStore(t)
+	s := mustOpen(t)
 
 	id, err := s.InsertLearning(&models.Learning{
 		Category:      "gotcha",
@@ -50,7 +40,7 @@ func TestProjectSourceRoundtrip(t *testing.T) {
 }
 
 func TestProjectSourceDefaultEmpty(t *testing.T) {
-	s := newTestLearningStore(t)
+	s := mustOpen(t)
 
 	id, err := s.InsertLearning(&models.Learning{
 		Category:  "gotcha",

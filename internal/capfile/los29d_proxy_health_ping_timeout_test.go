@@ -2,7 +2,6 @@ package capfile
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 )
@@ -106,25 +105,14 @@ func TestLos29dHealthMixedWindowKeepsTheKTokenReadable(t *testing.T) {
 // so the source is pinned at the grep statements themselves, which is what runs,
 // not at a comment that merely mentions the pattern.
 func TestLos29dBundledCapSeparatesPingTimeoutInBothVariants(t *testing.T) {
-	data, err := os.ReadFile(los32cCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
+	jsBody := bundledScript(t, proxyHealthCapPath, "proxy_health")
 
-	js := cf.FindScript("proxy_health")
-	if js == nil {
-		t.Fatal("the bundled proxy_health cap has no proxy_health tool script")
-	}
-	if !strings.Contains(js.Body, "timeouts: kaTimeoutLines.length") {
+	if !strings.Contains(jsBody, "timeouts: kaTimeoutLines.length") {
 		t.Error("the JS variant does not report the timeouts as their own field")
 	}
 
 	var apiGrep, timeoutGrep bool
-	for _, line := range strings.Split(js.Body, "\n") {
+	for _, line := range strings.Split(jsBody, "\n") {
 		if !strings.Contains(line, "sh(") {
 			continue
 		}
@@ -147,10 +135,10 @@ func TestLos29dBundledCapSeparatesPingTimeoutInBothVariants(t *testing.T) {
 	// The tolerance is what keeps a single timeout from holding the report at
 	// degraded for a whole 1..168h window, and a quiet window must not degrade on
 	// its own. Both rules live in source only, so they are pinned here.
-	if !strings.Contains(js.Body, "keepalive.timeouts > 2") {
+	if !strings.Contains(jsBody, "keepalive.timeouts > 2") {
 		t.Error("the JS variant has no three-timeout tolerance")
 	}
-	if !strings.Contains(js.Body, "keepalive.total === 0 && otherSignals > 0") {
+	if !strings.Contains(jsBody, "keepalive.total === 0 && otherSignals > 0") {
 		t.Error("the JS variant degrades a quiet window: it lacks the otherSignals guard the bash handler has")
 	}
 }

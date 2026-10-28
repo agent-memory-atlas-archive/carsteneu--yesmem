@@ -5,16 +5,6 @@ import (
 	"time"
 )
 
-// countProxyStateRows returns how many rows carry exactly this key.
-func (s *Store) los26cCountProxyStateRows(t *testing.T, key string) int {
-	t.Helper()
-	var n int
-	if err := s.proxyStateDB().QueryRow(`SELECT count(*) FROM proxy_state WHERE key = ?`, key).Scan(&n); err != nil {
-		t.Fatalf("count %s: %v", key, err)
-	}
-	return n
-}
-
 // TestLos26c_OrphanedFrozenRowsAreReclaimed pins finding 2 of YM-315. A frozen
 // prefix row belongs to a thread that will invalidate it or come back for it;
 // a thread that does neither leaves the row (several megabytes) in proxy_state
@@ -53,7 +43,7 @@ func TestLos26c_OrphanedFrozenRowsAreReclaimed(t *testing.T) {
 	}
 	// Count rows directly: GetProxyState returns "" for a deleted row and for an
 	// emptied one, so it cannot prove a DELETE happened.
-	if n := s.los26cCountProxyStateRows(t, "frozen:old"); n != 0 {
+	if n := s.countProxyStateRows(t, "frozen:old"); n != 0 {
 		t.Fatal("the orphaned frozen row survived the reclaim")
 	}
 }

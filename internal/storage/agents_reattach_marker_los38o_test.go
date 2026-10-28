@@ -11,7 +11,7 @@ import (
 // prune was allowed to delete, and with it the only handle a still-running backend
 // session had (YM-297). The marker moves into a column only the recovery writes.
 func TestRecoverOrphanedSetsTheReattachColumn(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID:                "agent-los38o-kept",
 		Project:           "p",
@@ -45,7 +45,7 @@ func TestRecoverOrphanedSetsTheReattachColumn(t *testing.T) {
 // regression: the identical row is prunable when the marker sits in progress,
 // because the first stop after the recovery rewrites that field.
 func TestPruneStoppedAgentsKeepsAReattachRowWhoseProgressWasOverwritten(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	now := time.Now()
 	old := now.Add(-40 * 24 * time.Hour).Format(time.RFC3339)
 

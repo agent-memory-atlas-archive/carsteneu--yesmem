@@ -270,6 +270,12 @@ type Server struct {
 	threadCWDMu sync.RWMutex
 	threadCWD   map[string]string // threadID → cwd
 
+	// Threads whose plan outline has already been published for the sidebar in
+	// this process. The publish costs a daemon round trip, so it runs once per
+	// thread and again whenever a plan tool call was seen.
+	planSyncedMu sync.Mutex
+	planSynced   map[string]bool
+
 	// Cumulative token savings from collapsing (per threadID)
 	rawSavingsMu sync.Mutex
 	rawSavings   map[string]int
@@ -1903,9 +1909,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 					tail = append(tail, "[loop-warning] "+loopWarning)
 				}
 
-				// Plan checkpoint: detect plan tool calls (resets counter), inject reminder if interval fires
+				// Plan checkpoint: detect plan tool calls (resets counter), inject reminder if interval fires.
+				// The sidebar snapshot is synced regardless of the gate: it reads a different channel.
+				planCallSeen := s.detectPlanToolCall(messages, threadID, totalTokens)
 				if isFeatureEnabled(&s.cfg, model, "plan_checkpoint") {
-					s.detectPlanToolCall(messages, threadID, totalTokens)
 					if checkpoint := s.planCheckpointInject(threadID, totalTokens); checkpoint != "" {
 						if threadIsSession {
 							entry.PlanCheckpoint = checkpoint
@@ -1915,6 +1922,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
+				s.syncPlanSnapshot(threadID, planCallSeen)
 
 				// Docs hint: inject docs-available reminder if interval fires
 				if docsHint := s.docsHintInject(threadID, totalTokens, daemonProject(proj, projPath)); docsHint != "" {

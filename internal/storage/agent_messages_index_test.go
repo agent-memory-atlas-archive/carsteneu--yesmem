@@ -21,7 +21,7 @@ func indexExists(t *testing.T, s *Store, name string) bool {
 // before CREATE TABLE IF NOT EXISTS (and their errors are ignored), so an index
 // listed there never appears on a fresh database.
 func TestAgentMessages_IndexedOnTargetAndSender(t *testing.T) {
-	fresh := newTestStore(t)
+	fresh := mustOpen(t)
 	for _, idx := range []string{"idx_agent_messages_target", "idx_agent_messages_sender"} {
 		if !indexExists(t, fresh, idx) {
 			t.Errorf("fresh store is missing %s", idx)
@@ -30,7 +30,7 @@ func TestAgentMessages_IndexedOnTargetAndSender(t *testing.T) {
 }
 
 func TestAgentMessages_IndexesAreRecreated(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	for _, idx := range []string{"idx_agent_messages_target", "idx_agent_messages_sender"} {
 		if _, err := s.db.Exec("DROP INDEX IF EXISTS " + idx); err != nil {

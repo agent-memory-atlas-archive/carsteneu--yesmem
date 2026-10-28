@@ -69,23 +69,6 @@ func los34fEnvValue(env []string, key string) (string, bool) {
 	return value, found
 }
 
-// los34fMasked reports whether path is masked on the built sandbox.
-// realPathOrSelf resolves symlinks and falls back to p for a path that does not
-// exist. Mask entries are built from what the OS reports, and macOS reaches its
-// temp root through /tmp -> /private/tmp, so a plain string compare misses.
-func realPathOrSelf(p string) string {
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return resolved
-	}
-	// A path that does not exist yet (a sibling file the mask covers, a database
-	// that was never created) is resolved through its nearest existing ancestor.
-	dir := filepath.Dir(p)
-	if dir == p {
-		return p
-	}
-	return filepath.Join(realPathOrSelf(dir), filepath.Base(p))
-}
-
 func los34fMasked(sb *Sandbox, path string) bool {
 	path = realPathOrSelf(path)
 	for _, mask := range sb.cfg.MaskedPaths {

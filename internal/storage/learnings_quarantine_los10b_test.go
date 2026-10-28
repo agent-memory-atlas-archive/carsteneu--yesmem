@@ -33,7 +33,7 @@ func insertQuarantineLos10bLearning(t *testing.T, s *Store, content, sessionID, 
 // read through GetActiveLearnings, which filtered only superseded_by. A
 // quarantined session's learnings were recalled everywhere.
 func TestGetActiveLearningsExcludesQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const project = "los10b-proj"
 	activeID := insertQuarantineLos10bLearning(t, s, "active project rule", "sess-los10b-active", project, "")
@@ -64,7 +64,7 @@ func TestGetActiveLearningsExcludesQuarantinedLos10b(t *testing.T) {
 // metamemory path (proxy_stub) injects GetLearningsSince rows straight into the
 // prompt; a quarantined learning reached the model unfiltered.
 func TestGetLearningsSinceExcludesQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const project = "los10b-proj"
 	activeID := insertQuarantineLos10bLearning(t, s, "active decision", "sess-los10b-active-since", project, "")
@@ -95,7 +95,7 @@ func TestGetLearningsSinceExcludesQuarantinedLos10b(t *testing.T) {
 // session-flavor list is built from learnings rows and is part of the briefing
 // input. A quarantined session's flavor text is content and must not surface.
 func TestGetSessionFlavorsSinceExcludesQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const project = "los10b-proj"
 	insertQuarantineLos10bLearning(t, s, "active flavor row", "sess-los10b-flavor-active", project, "calm debugging")

@@ -18,30 +18,11 @@ import (
 // alarm: real upstream failures yes, log text that merely looks like a status
 // code no.
 
-const los32eCapPath = "../../caps/bundled-caps/proxy_health/CAP.md"
-
 type los32eResult struct {
 	exitCode  int
 	stderr    string
 	broadcast string
 	stored    string
-}
-
-func los32eBashBody(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile(los32eCapPath)
-	if err != nil {
-		t.Fatalf("read bundled cap: %v", err)
-	}
-	cf, err := Parse(data)
-	if err != nil {
-		t.Fatalf("parse bundled cap: %v", err)
-	}
-	sc := cf.FindScript("proxy_health_bash")
-	if sc == nil {
-		t.Fatal("the bundled proxy_health cap has no proxy_health_bash handler")
-	}
-	return sc.Body
 }
 
 // los32eRunBash feeds the handler two canned journal windows. The proxy window
@@ -55,14 +36,14 @@ func los32eRunBash(t *testing.T, proxyLog, daemonLog string) los32eResult {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatalf("mkdir bin: %v", err)
 	}
-	los32eWriteStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "journalctl"), `#!/bin/sh
 case "$*" in
   *yesmem-proxy*) cat "$LOS32E_PROXY_LOG" ;;
   *) cat "$LOS32E_DAEMON_LOG" ;;
 esac
 exit 0
 `)
-	los32eWriteStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
+	writeStub(t, filepath.Join(bin, "nc"), `#!/bin/sh
 cat > "$LOS32E_NC_STDIN"
 printf '%s\n' '{"result":{"status":"broadcast_sent"}}'
 exit 0
@@ -84,7 +65,7 @@ exit 0
   printf '%s\n' "$1" >> "$LOS32E_STORE"
   return 0
 }
-` + los32eBashBody(t)
+` + bundledScript(t, proxyHealthCapPath, "proxy_health_bash")
 	if err := os.WriteFile(script, []byte(body), 0o644); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
@@ -120,13 +101,6 @@ exit 0
 		res.stored = string(data)
 	}
 	return res
-}
-
-func los32eWriteStub(t *testing.T, path, body string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-		t.Fatalf("write stub %s: %v", path, err)
-	}
 }
 
 // los32eProxyLine wraps a payload in the proxy's real log envelope.

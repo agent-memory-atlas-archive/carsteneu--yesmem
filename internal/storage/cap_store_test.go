@@ -8,16 +8,6 @@ import (
 	"time"
 )
 
-func mustOpenCapStore(t *testing.T) *Store {
-	t.Helper()
-	s := mustOpen(t)
-	if err := s.OpenCapsDB(t.TempDir()); err != nil {
-		t.Fatalf("open cap_store: %v", err)
-	}
-	t.Cleanup(func() { s.CloseCapsDB() })
-	return s
-}
-
 func TestCapsCreateTable(t *testing.T) {
 	s := mustOpenCapStore(t)
 	err := s.CapsCreateTable("reddit", "posts", []ColumnDef{

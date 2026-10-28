@@ -7,7 +7,7 @@ import (
 )
 
 func TestInsertLearning_PersistsOriginTool(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	l := &models.Learning{
@@ -35,7 +35,7 @@ func TestInsertLearning_PersistsOriginTool(t *testing.T) {
 }
 
 func TestInsertLearning_DefaultsToEmptyOrigin(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	defer s.Close()
 
 	l := &models.Learning{

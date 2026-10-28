@@ -27,7 +27,7 @@ func insertSessionForResolve(t *testing.T, s *Store, id, project, projectShort s
 // heal: a value that is already set must never be overwritten by a later pass
 // that happens to know less about it.
 func TestUpsertSessionHealsEmptyMetadataOnly(t *testing.T) {
-	s := openTestStore(t)
+	s := mustOpen(t)
 
 	started := time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
 	// First pass: the file had no user turn yet.

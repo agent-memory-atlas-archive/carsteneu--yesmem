@@ -38,7 +38,7 @@ func insertReadPathLos10b(t *testing.T, s *Store, l *models.Learning) int64 {
 // quarantined rows: deadline/trigger rules, session narratives, pulse rows and
 // the consolidation window.
 func TestPromptReadPathsExcludeQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	const project = "los10b-proj"
 	const session = "sess-los10b-readpaths"
 
@@ -115,7 +115,7 @@ func TestPromptReadPathsExcludeQuarantinedLos10b(t *testing.T) {
 // window took the newest IDs regardless of state, so a quarantined row consumed
 // a slot and the protection silently covered one row fewer.
 func TestRecentLearningIDsSkipsQuarantinedLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	olderID := insertReadPathLos10b(t, s, &models.Learning{
 		SessionID: "sess-los10b-skip-old", Category: "gotcha", Content: "older skip candidate",
@@ -146,7 +146,7 @@ func TestRecentLearningIDsSkipsQuarantinedLos10b(t *testing.T) {
 // owns the SQL comparison, so it must not turn an unreadable bound into "no
 // filter" on its own. Before, an unparsable bound was compared as text.
 func TestStorageRejectsInvalidBoundsLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if _, err := s.GetActiveLearnings("gotcha", "los10b-proj", "gestern", "", 0); err == nil {
 		t.Error("GetActiveLearnings accepted since=gestern")

@@ -27,14 +27,6 @@ const (
 	fixtureBtime          = 1700000000
 )
 
-// writeFixtureFile creates a file below the fixture tree.
-func writeFixtureFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-}
-
 // procStatLine renders a /proc/<pid>/stat line carrying the two fields the scan
 // reads: ppid (field 4) and starttime (field 22), both after the comm in
 // parentheses (field 2).

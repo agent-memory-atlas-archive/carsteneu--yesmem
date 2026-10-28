@@ -41,6 +41,37 @@ export const failClosedTools = new Set(["write", "edit", "patch"])
 const suggestableTools = new Set(["write", "edit", "patch", "read", "shell", "grep", "glob"])
 const skipTools = new Set(["skill", "subagent", "todowrite"])
 
+// A read-only GitHub or git call writes nothing and notifies nobody, so no rule in a catalogue about
+// posting, promising, or destroying work can be violated by it. On 28.10.2026 the model answered BLOCK on
+// `gh pr view 58662` with "this session is heading toward posting/commenting/reopening on GitHub": it read
+// a direction into the call and judged the goal instead of the command. A boundary whose position depends
+// on how the goal is worded is not a boundary, so this one is a list.
+const READ_ONLY_SHELL_STARTS = [
+  /^gh\s+pr\s+(view|list|diff|checks|status)\b/,
+  /^gh\s+issue\s+(view|list)\b/,
+  /^gh\s+run\s+(view|list)\b/,
+  /^gh\s+release\s+(view|list)\b/,
+  /^gh\s+repo\s+(view|list)\b/,
+  /^gh\s+branch\s+list\b/,
+  /^gh\s+search\s+(repos|issues|prs|code)\b/,
+  /^git\s+ls-remote\b/,
+]
+// Anything that chains, redirects or substitutes: `gh pr view 1; gh pr close 1` is two calls, and only the
+// first is the one this list knows.
+const SHELL_CHAINING = /[;&|<>`\n]|\$\(/
+// `gh api` is a GET only while it carries neither a method nor a field: `-f key=value` makes it a POST.
+const GH_API_WRITE = /(^|\s)(-X|--method|-f|-F|--field|--raw-field|--input|-d)(\s|=|$)/
+
+/** True only for a single command that provably reads. Everything else keeps going to the model. */
+export function isReadOnlyShell(command: unknown): boolean {
+  if (typeof command !== "string") return false
+  const line = command.trim()
+  if (!line || SHELL_CHAINING.test(line)) return false
+  if (/^gh\s+api\b/.test(line)) return !GH_API_WRITE.test(line)
+  return READ_ONLY_SHELL_STARTS.some((pattern) => pattern.test(line))
+}
+
+
 const GUARD_CACHE_TTL_MS = 5000
 // How long a refused request is remembered. Short on purpose: it only bounds what a broken credential
 // costs per tool call, it is not a verdict about the call.
@@ -676,6 +707,13 @@ export function ruleGuard(directory: string) {
       const args = (event.input ?? {}) as Record<string, any>
       if (skipTools.has(toolName)) return
       if (!suggestableTools.has(toolName)) return
+
+      // Checked before the file-target skips below, because a shell call has no file target: the command
+      // itself is the whole evidence.
+      if (toolName === "shell" && isReadOnlyShell(args?.command)) {
+        debugLog("guard", `SKIP-READONLY shell cmd=${logExcerpt(String(args?.command))}`)
+        return
+      }
 
       // A shell call has no file target: its arguments are a command, so a `path`-shaped field it happens
       // to carry must not excuse the call from the guard (the doc exemption and the two filename skips

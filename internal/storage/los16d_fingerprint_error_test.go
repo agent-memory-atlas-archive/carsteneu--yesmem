@@ -9,7 +9,7 @@ import "testing"
 // stays stale without a single log line.
 func TestProjectChangeFingerprintReportsQueryErrorsLos16d(t *testing.T) {
 	t.Run("sessions", func(t *testing.T) {
-		s := newTestStore(t)
+		s := mustOpen(t)
 		if _, err := s.ProjectChangeFingerprint("/los16d/repo"); err != nil {
 			t.Fatalf("baseline fingerprint: %v", err)
 		}
@@ -22,7 +22,7 @@ func TestProjectChangeFingerprintReportsQueryErrorsLos16d(t *testing.T) {
 	})
 
 	t.Run("learnings", func(t *testing.T) {
-		s := newTestStore(t)
+		s := mustOpen(t)
 		if _, err := s.db.Exec(`DROP TABLE learnings`); err != nil {
 			t.Fatalf("drop learnings: %v", err)
 		}
@@ -32,7 +32,7 @@ func TestProjectChangeFingerprintReportsQueryErrorsLos16d(t *testing.T) {
 	})
 
 	t.Run("persona_directives", func(t *testing.T) {
-		s := newTestStore(t)
+		s := mustOpen(t)
 		if _, err := s.db.Exec(`DROP TABLE persona_directives`); err != nil {
 			t.Fatalf("drop persona_directives: %v", err)
 		}

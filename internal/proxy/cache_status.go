@@ -19,26 +19,44 @@ import (
 // Calibrated: countMessageTokens+overhead=210k vs CC's actual 249k → 1.19.
 const tokenizerDriftFactor = 1.19
 
+// StatusPlanItem is one step of a plan as the opencode sidebar reads it. It
+// mirrors the daemon's PlanItem on the wire: status reuses the todowrite
+// vocabulary, depth carries nesting, reason is the field todowrite lacks.
+type StatusPlanItem struct {
+	Content string `json:"content"`
+	Status  string `json:"status,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Depth   int    `json:"depth,omitempty"`
+}
+
+// StatusPlan is the plan snapshot a thread's status file carries. A nil pointer
+// means "no active plan" and keeps the JSON free of the key, which is what a
+// content-only plan has always looked like.
+type StatusPlan struct {
+	Items []StatusPlanItem `json:"items"`
+}
+
 // CacheStatus is the JSON structure written for the statusline script.
 type CacheStatus struct {
-	TTL                   string  `json:"ttl"`
-	TTLSeconds            int     `json:"ttl_seconds"`
-	RemainingS            int     `json:"remaining_s"`
-	CacheState            string  `json:"cache_state"`
-	CostPerReq            float64 `json:"cost_per_req"`
-	LastRequestTS         int64   `json:"last_request_ts"`
-	TotalTokens           int     `json:"total_tokens"`
-	RawTokenEstimate      int     `json:"raw_token_estimate,omitempty"`
-	CacheReadTokens       int     `json:"cache_read_tokens"`
-	CacheWriteTokens      int     `json:"cache_write_tokens"`
-	ThreadID              string  `json:"thread_id,omitempty"`
-	TokenThreshold        int     `json:"token_threshold,omitempty"`
-	TokenMinimumThreshold int     `json:"token_minimum_threshold,omitempty"`
-	DetectedTTL           string  `json:"detected_ttl"`              // "unknown", "5min", "1h"
-	KeepaliveMode         string  `json:"keepalive_mode"`            // "auto", "5m", "1h"
-	PingIntervalS         int     `json:"ping_interval_s,omitempty"` // seconds between pings
-	PingsRemaining        int     `json:"pings_remaining"`           // pings left in current phase
-	ActiveThreads         int     `json:"active_threads,omitempty"`  // tracked keepalive threads
+	TTL                   string      `json:"ttl"`
+	TTLSeconds            int         `json:"ttl_seconds"`
+	RemainingS            int         `json:"remaining_s"`
+	CacheState            string      `json:"cache_state"`
+	CostPerReq            float64     `json:"cost_per_req"`
+	LastRequestTS         int64       `json:"last_request_ts"`
+	TotalTokens           int         `json:"total_tokens"`
+	RawTokenEstimate      int         `json:"raw_token_estimate,omitempty"`
+	CacheReadTokens       int         `json:"cache_read_tokens"`
+	CacheWriteTokens      int         `json:"cache_write_tokens"`
+	ThreadID              string      `json:"thread_id,omitempty"`
+	TokenThreshold        int         `json:"token_threshold,omitempty"`
+	TokenMinimumThreshold int         `json:"token_minimum_threshold,omitempty"`
+	DetectedTTL           string      `json:"detected_ttl"`              // "unknown", "5min", "1h"
+	KeepaliveMode         string      `json:"keepalive_mode"`            // "auto", "5m", "1h"
+	PingIntervalS         int         `json:"ping_interval_s,omitempty"` // seconds between pings
+	PingsRemaining        int         `json:"pings_remaining"`           // pings left in current phase
+	ActiveThreads         int         `json:"active_threads,omitempty"`  // tracked keepalive threads
+	Plan                  *StatusPlan `json:"plan,omitempty"`            // active plan outline for the sidebar
 }
 
 // CacheStatusWriter writes cache status to disk every second.
@@ -80,6 +98,9 @@ type statusThreadState struct {
 	cacheRead        int
 	cacheWrite       int
 	tokenThreshold   int
+	// plan is replaced wholesale on every publish and never mutated in place,
+	// so the snapshot copy in writeStatus may share the pointer.
+	plan *StatusPlan
 }
 
 // NewCacheStatusWriter creates and starts a background writer. Stop ends it;
@@ -154,6 +175,25 @@ func (w *CacheStatusWriter) UpdateRawForThread(threadID string, raw int) {
 		ts.rawTokenEstimate = raw
 	}
 	w.mu.Unlock()
+}
+
+// SetPlan records the active plan a thread's status file should carry, so the
+// opencode sidebar can draw it. A nil plan clears the snapshot. The value is
+// replaced wholesale, never mutated, so readers may share the pointer.
+//
+// Only a thread the writer has already seen gets a snapshot: creating an entry
+// here would write a zero last-request timestamp and a cold-cache status for a
+// thread that never made a request. It reports whether the value landed, so the
+// caller can retry instead of assuming it did.
+func (w *CacheStatusWriter) SetPlan(threadID string, plan *StatusPlan) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ts := w.threads[threadID]
+	if ts == nil {
+		return false
+	}
+	ts.plan = plan
+	return true
 }
 
 func (w *CacheStatusWriter) tickLoop() {
@@ -303,6 +343,7 @@ func (w *CacheStatusWriter) writeStatus() {
 			PingIntervalS:         pingIntervalS,
 			PingsRemaining:        pingsRemaining,
 			ActiveThreads:         activeThreads,
+			Plan:                  ts.plan,
 		}
 
 		data, err := json.Marshal(status)

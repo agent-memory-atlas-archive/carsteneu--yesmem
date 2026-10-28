@@ -1,12 +1,9 @@
 package proxy
 
 import (
-	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,46 +11,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/config"
 	"gopkg.in/yaml.v3"
 )
-
-// los56cDaemonSock starts a unix-socket daemon stub and reports the method names
-// it was asked for. It is a separate helper from fakeDaemon because the request
-// has to run through the full handler server (which needs the rest of its wired
-// state); only the socket is swapped.
-func los56cDaemonSock(t *testing.T) (dataDir string, seen chan string) {
-	t.Helper()
-	dataDir = shortSocketDir(t)
-	ln, err := net.Listen("unix", filepath.Join(dataDir, "daemon.sock"))
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { ln.Close() })
-
-	seen = make(chan string, 128)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				var req struct {
-					Method string         `json:"method"`
-					Params map[string]any `json:"params"`
-				}
-				if json.NewDecoder(c).Decode(&req) != nil {
-					return
-				}
-				select {
-				case seen <- req.Method:
-				default:
-				}
-				_ = json.NewEncoder(c).Encode(map[string]any{"result": nil})
-			}(conn)
-		}
-	}()
-	return dataDir, seen
-}
 
 // los56cPatternSuggestServer wires a handler server whose daemon socket records
 // the RPC methods, so a side effect of the REPL pattern recording is visible.
@@ -70,8 +27,14 @@ func los56cPatternSuggestServer(t *testing.T, prompt *config.ProxyConfig) (*Serv
 	s := los26aHandlerServer(t, backend.URL)
 	s.cfg.FeatureDefaults = &config.FeatureGates{Timestamps: true}
 	s.cfg.Prompt = prompt
-	dir, seen := los56cDaemonSock(t)
-	s.cfg.DataDir = dir
+	seen := make(chan string, 128)
+	s.cfg.DataDir = startFakeDaemon(t, func(method string, _ map[string]any) string {
+		select {
+		case seen <- method:
+		default:
+		}
+		return ""
+	})
 	s.daemonReady.Store(true)
 	return s, seen
 }

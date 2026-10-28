@@ -2,29 +2,12 @@ package daemon
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/carsteneu/yesmem/internal/models"
 	"github.com/carsteneu/yesmem/internal/storage"
 )
-
-// newLos24bStoreHandler backs the handler with a temp-file store. A :memory:
-// store opens a fresh image per connection, so the reader pool would not see the
-// writer's rows.
-func newLos24bStoreHandler(t *testing.T) (*Handler, *storage.Store) {
-	t.Helper()
-	dir := t.TempDir()
-	s, err := storage.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	h := NewHandler(s, nil)
-	h.dataDir = dir
-	return h, s
-}
 
 func los24bInsert(t *testing.T, s *storage.Store, category, taskType, content string, age time.Duration) {
 	t.Helper()
@@ -44,7 +27,7 @@ func los24bInsert(t *testing.T, s *storage.Store, category, taskType, content st
 // another task_type, every wanted row fell out of that window and the answer was
 // empty. The filter belongs in the query.
 func TestGetLearningsTaskTypeSurvivesNewerOtherTypes(t *testing.T) {
-	h, s := newLos24bStoreHandler(t)
+	h, s := mustFileHandler(t)
 
 	// 200 newer ideas and stale entries crowd the oversampling window.
 	for i := 0; i < 200; i++ {
@@ -79,7 +62,7 @@ func TestGetLearningsTaskTypeSurvivesNewerOtherTypes(t *testing.T) {
 // The same query without a task_type filter must keep returning every newer row:
 // the pushdown must not narrow the unfiltered path.
 func TestGetLearningsWithoutTaskTypeKeepsAllTypes(t *testing.T) {
-	h, s := newLos24bStoreHandler(t)
+	h, s := mustFileHandler(t)
 	los24bInsert(t, s, "unfinished", "idea", "an idea", time.Minute)
 	los24bInsert(t, s, "unfinished", "task", "a task", 2*time.Minute)
 

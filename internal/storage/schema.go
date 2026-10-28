@@ -108,6 +108,14 @@ func (s *Store) createSchema() error {
 		log.Printf("warn: pinned_learnings.session_id not added: %v", err)
 	}
 
+	// Plans gained a structured outline beside their free text. An empty items
+	// column is the pre-migration state and means "render content alone", so a
+	// database that predates the column keeps working unchanged.
+	if err := ensureColumn(s.db, "plans", "items",
+		`ALTER TABLE plans ADD COLUMN items TEXT NOT NULL DEFAULT ''`); err != nil {
+		log.Printf("warn: plans.items not added: %v", err)
+	}
+
 	for _, idx := range indices {
 		if _, err := s.db.Exec(idx); err != nil {
 			return err
@@ -1210,6 +1218,7 @@ const tableEmbeddingCache = `CREATE TABLE IF NOT EXISTS embedding_cache (
 const tablePlans = `CREATE TABLE IF NOT EXISTS plans (
 	thread_id  TEXT PRIMARY KEY,
 	content    TEXT NOT NULL,
+	items      TEXT NOT NULL DEFAULT '',
 	status     TEXT NOT NULL DEFAULT 'active',
 	scope      TEXT NOT NULL DEFAULT 'session',
 	project    TEXT DEFAULT '',

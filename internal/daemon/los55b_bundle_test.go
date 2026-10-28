@@ -14,16 +14,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
-// los55bDoneGuardTracked reports whether the done-guard keeps bookkeeping for an
-// agent id. Separate helper from hasDoneGuardState because the prune question is
-// about the entry existing at all, not about which state it reached.
-func los55bDoneGuardTracked(agentID string) bool {
-	yesloopDoneGuardAgentsMu.Lock()
-	defer yesloopDoneGuardAgentsMu.Unlock()
-	_, ok := yesloopDoneGuardAgents[agentID]
-	return ok
-}
-
 // los55bStagnationTracked reports whether the stagnation guard keeps bookkeeping
 // for an agent id.
 func los55bStagnationTracked(agentID string) bool {
@@ -43,7 +33,7 @@ func TestLos55bDoneGuardStateIsPrunedWithTheRow(t *testing.T) {
 	makeDoneGuardAgent(t, h, s, "los55b-dg-prune", "sess-los55b-dg", allPhasesPhase4Invalid)
 
 	h.checkYesloopDoneGuard()
-	if !los55bDoneGuardTracked("los55b-dg-prune") {
+	if !doneGuardTracked("los55b-dg-prune") {
 		t.Fatal("the guard did not track the failing agent at all — the test cannot observe the prune")
 	}
 
@@ -54,7 +44,7 @@ func TestLos55bDoneGuardStateIsPrunedWithTheRow(t *testing.T) {
 	}
 	h.checkYesloopDoneGuard()
 
-	if los55bDoneGuardTracked("los55b-dg-prune") {
+	if doneGuardTracked("los55b-dg-prune") {
 		t.Error("done-guard kept bookkeeping for a row that no longer exists")
 	}
 }
@@ -205,20 +195,11 @@ func los55bForeignProcess(t *testing.T) int {
 	return cmd.Process.Pid
 }
 
-// los55bProcTable forces the process-table conjunct on: the identity gates read
-// /proc, and a test must not pass vacuously on a platform that cannot.
-func los55bProcTable(t *testing.T) {
-	t.Helper()
-	prev := procTableReadable
-	procTableReadable = true
-	t.Cleanup(func() { procTableReadable = prev })
-}
-
 // TestLos55bBindRefusesAForeignProcess: a bind only ever records a process that
 // is the agent's own backend. register_agent takes the PID from its caller, and
 // the existence check alone accepted any live process (YM-356).
 func TestLos55bBindRefusesAForeignProcess(t *testing.T) {
-	los55bProcTable(t)
+	pinProcessTable(t)
 	h, s := mustHandler(t)
 	if err := s.AgentCreate(storage.Agent{
 		ID: "los55b-bind-foreign", Project: "los55b-project", Section: "bind-foreign",
@@ -247,7 +228,7 @@ func TestLos55bBindRefusesAForeignProcess(t *testing.T) {
 // TestLos55bBindAcceptsItsOwnBackendProcess: the negative control. A process whose
 // command line names the row's backend is exactly what the spawn path binds.
 func TestLos55bBindAcceptsItsOwnBackendProcess(t *testing.T) {
-	los55bProcTable(t)
+	pinProcessTable(t)
 	// The cmdline gate wants an argv element named like the backend binary; the
 	// helper script is named claude-*, which is exactly what the tighter match
 	// rejects.
@@ -274,7 +255,7 @@ func TestLos55bBindAcceptsItsOwnBackendProcess(t *testing.T) {
 // capability. A caller that does not present it must not take the row over, even
 // with a matching PID (YM-356).
 func TestLos55bBindRequiresTheRowsOwner(t *testing.T) {
-	los55bProcTable(t)
+	pinProcessTable(t)
 	// The cmdline gate wants an argv element named like the backend binary; the
 	// helper script is named claude-*, which is exactly what the tighter match
 	// rejects.
@@ -303,7 +284,7 @@ func TestLos55bBindRequiresTheRowsOwner(t *testing.T) {
 // ownership check any socket caller could close another agent's spawning row
 // (YM-356).
 func TestLos55bRegisterCannotCloseAForeignRow(t *testing.T) {
-	los55bProcTable(t)
+	pinProcessTable(t)
 	// The cmdline gate wants an argv element named like the backend binary; the
 	// helper script is named claude-*, which is exactly what the tighter match
 	// rejects.
@@ -341,7 +322,7 @@ func TestLos55bRegisterCannotCloseAForeignRow(t *testing.T) {
 
 // TestLos55bRegisterAcceptsItsOwner: the negative control at the handler level.
 func TestLos55bRegisterAcceptsItsOwner(t *testing.T) {
-	los55bProcTable(t)
+	pinProcessTable(t)
 	// The cmdline gate wants an argv element named like the backend binary; the
 	// helper script is named claude-*, which is exactly what the tighter match
 	// rejects.

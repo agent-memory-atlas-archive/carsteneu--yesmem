@@ -33,7 +33,7 @@ func los04gCaptureLog(t *testing.T) *bytes.Buffer {
 // fills through remember(). A newline in it must not split a daemon log line
 // (YM-332).
 func TestRunWikiOnce_QuotesTheProjectInEveryLogLine(t *testing.T) {
-	store := newWikiTickTestStore(t)
+	store := mustStore(t)
 	insertLearningForProject(t, store, los04gForgedProject)
 	insertSessionForProject(t, store, los04gForgedProject, time.Now().Format(time.RFC3339))
 
@@ -64,7 +64,7 @@ func TestRunWikiOnce_QuotesTheProjectInEveryLogLine(t *testing.T) {
 // %v of an *os.PathError prints it unquoted. A name at the file-name limit passes
 // the wiki naming and then fails the marker write with ENAMETOOLONG.
 func TestRunWikiOnce_QuotesTheErrorPathOfAFailedMarkerWrite(t *testing.T) {
-	store := newWikiTickTestStore(t)
+	store := mustStore(t)
 	project := strings.Repeat("a", 250) + "\nwarn: forged mark line"
 	insertLearningForProject(t, store, project)
 	insertSessionForProject(t, store, project, time.Now().Format(time.RFC3339))

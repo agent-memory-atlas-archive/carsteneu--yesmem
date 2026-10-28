@@ -25,7 +25,7 @@ func readProvenance(t *testing.T, s *Store, id int64) (string, int64) {
 // code path ever wrote them. A learning stored by a spawned agent now carries the
 // kind of agent that produced it.
 func TestInsertLearningBatch_RecordsAgentRole(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.AgentCreate(Agent{
 		ID: "agent-prov-1", Project: "p", Section: "yesloop-prov",
 		SessionID: "uuid-prov", OpencodeSessionID: "ses_prov", Status: "running",
@@ -58,7 +58,7 @@ func TestInsertLearningBatch_RecordsAgentRole(t *testing.T) {
 // TestInsertLearningBatch_RecordsDialogID pins the second half: a learning from a
 // session that is in a dialog records that dialog as its context.
 func TestInsertLearningBatch_RecordsDialogID(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.UpsertSession(&models.Session{ID: "sess-in-dialog", Project: "p", StartedAt: time.Now()}); err != nil {
 		t.Fatalf("UpsertSession: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestInsertLearningBatch_RecordsDialogID(t *testing.T) {
 // TestInsertLearningBatch_KeepsExplicitProvenance: a caller that knows better (an
 // import, a backfill) keeps its values.
 func TestInsertLearningBatch_KeepsExplicitProvenance(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	if err := s.UpsertSession(&models.Session{ID: "sess-explicit", Project: "p", StartedAt: time.Now()}); err != nil {
 		t.Fatalf("UpsertSession: %v", err)
 	}

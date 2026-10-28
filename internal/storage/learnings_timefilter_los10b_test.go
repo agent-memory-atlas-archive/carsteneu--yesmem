@@ -38,7 +38,7 @@ func insertTimedLos10bLearning(t *testing.T, s *Store, content string, createdAt
 // created_at in +02:00 and a UTC bound the row was kept although its instant was
 // outside the window.
 func TestSearchLearningsBM25CtxComparesParsedTimestampsLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 	ctx := context.Background()
 
 	id := insertTimedLos10bLearning(t, s, "los10b timestamp sentinel", time.Now().Add(-time.Hour).In(los10bOffset))
@@ -75,7 +75,7 @@ func TestSearchLearningsBM25CtxComparesParsedTimestampsLos10b(t *testing.T) {
 // get_learnings passed since/before straight into SQLite, which compares the
 // column as text. Offsets in created_at made the window shift by hours.
 func TestGetActiveLearningsComparesParsedTimestampsLos10b(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	insideID := insertTimedLos10bLearning(t, s, "los10b inside window", time.Now().Add(-5*time.Minute).In(los10bOffset))
 	outsideID := insertTimedLos10bLearning(t, s, "los10b outside window", time.Now().Add(-2*time.Hour).In(los10bOffset))

@@ -1,7 +1,6 @@
 package setup
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -49,7 +48,7 @@ func TestLos63cCapDeliveryDocsMatchTheMechanism(t *testing.T) {
 		"yesmem migrate",    // the command that runs InstallBundledCaps; `make deploy` does not install caps
 	}
 	for _, d := range docs {
-		doc := los63cReadDoc(t, d.path)
+		doc := readFile(t, d.path)
 		for _, s := range stale {
 			if strings.Contains(doc, s) {
 				t.Errorf("%s still claims %q; the installer decides from derived_from_hash", d.name, s)
@@ -64,7 +63,7 @@ func TestLos63cCapDeliveryDocsMatchTheMechanism(t *testing.T) {
 
 	// The conflict line is the whole point of the report: it must name both digests,
 	// or the operator has no hash to record.
-	ops := los63cReadDoc(t, docs[0].path)
+	ops := readFile(t, docs[0].path)
 	if !strings.Contains(ops, "hashes to") {
 		t.Error("operations.md does not describe the conflict line that names both digests")
 	}
@@ -72,17 +71,8 @@ func TestLos63cCapDeliveryDocsMatchTheMechanism(t *testing.T) {
 		t.Error("operations.md does not name cap_imported_version, the watermark the import gate still compares against")
 	}
 
-	recipes := los63cReadDoc(t, docs[1].path)
+	recipes := readFile(t, docs[1].path)
 	if !strings.Contains(recipes, "~/.claude/caps/manifest.yaml") {
 		t.Error("recipes.md does not point at the installation's own manifest, the file a conflict is reconciled in")
 	}
-}
-
-func los63cReadDoc(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return string(data)
 }

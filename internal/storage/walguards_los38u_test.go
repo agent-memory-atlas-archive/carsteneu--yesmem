@@ -12,7 +12,7 @@ import (
 // safety boundary of the two pragmas that los-38t left unchecked (YM-355):
 // journal_size_limit and mmap_size in the presence of an external writer.
 //
-// The store fixtures come from walhealth_los38t_test.go (los38tOpenStore,
+// The store fixtures come from walhealth_los38t_test.go (mustOpenWithPath,
 // los38tLearning, los38tPragmaInt): a rename or removal of that file breaks
 // this one.
 
@@ -129,7 +129,7 @@ func TestLos38uReadOnlyRefusesNonFileNames(t *testing.T) {
 // journal_mode is its own statement in openSQLite and absent from
 // openSQLiteReadOnly.
 func TestLos38uReadOnlyInheritsTheWritersJournalMode(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	if _, err := s.InsertLearning(los38tLearning(1)); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestLos38uReadOnlyInheritsTheWritersJournalMode(t *testing.T) {
 // pool through the DSN, so a pool without read_uncommitted still gets its busy
 // wait, its WAL cap and its page cache.
 func TestLos38uMessagesReadPoolKeepsWriterPragmas(t *testing.T) {
-	s, _ := los38tOpenStore(t)
+	s, _ := mustOpenWithPath(t)
 	if s.messagesReadDB == nil || s.messagesDB == nil {
 		t.Fatalf("the store has no messages pool pair")
 	}
@@ -192,7 +192,7 @@ func TestLos38uMessagesReadPoolKeepsWriterPragmas(t *testing.T) {
 // pool the guard watches. The size of the log is not the subject here, only
 // that its disappearance does not cost the store a read.
 func TestLos38uExternalWriterKeepsOurPoolsReadable(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	los38uProbeTable(t, s)
 	los38uFill(t, s.db, 50, []byte("own"))
 	if busy, _, _ := los38uCheckpoint(t, s.db, "TRUNCATE"); busy != 0 {
@@ -235,7 +235,7 @@ func TestLos38uExternalWriterKeepsOurPoolsReadable(t *testing.T) {
 // red; a value that is too small only shows up in the pragma assertions above.
 func TestLos38uOurNextWriteCapsTheExternalWAL(t *testing.T) {
 	const walLimit = 10 * 1024 * 1024
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	los38uProbeTable(t, s)
 
 	ext := los38uExternal(t, path, "30000")
@@ -275,7 +275,7 @@ func TestLos38uOurNextWriteCapsTheExternalWAL(t *testing.T) {
 // the same call truncates it. Asserting on the busy column matters: the call
 // returns no error either way.
 func TestLos38uExternalCheckpointWaitsForOurReader(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	los38uProbeTable(t, s)
 	los38uFill(t, s.db, 10, []byte("own"))
 	los38uCheckpoint(t, s.db, "TRUNCATE")
@@ -341,7 +341,7 @@ func TestLos38uExternalCheckpointWaitsForOurReader(t *testing.T) {
 // itself: it does not survive mmap (SIGBUS, measured 19.10.2026) and a crash
 // cannot be asserted in-process. The pragma comment names the boundary.
 func TestLos38uExternalRewriteKeepsOurReadsCorrect(t *testing.T) {
-	s, path := los38tOpenStore(t)
+	s, path := mustOpenWithPath(t)
 	if got := los38tPragmaInt(t, s.db, "mmap_size"); got != 268435456 {
 		t.Fatalf("mmap_size on the writer pool = %d, want 268435456 (the case this test covers)", got)
 	}

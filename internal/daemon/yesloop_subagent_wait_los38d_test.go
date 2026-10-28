@@ -8,16 +8,6 @@ import (
 	"github.com/carsteneu/yesmem/internal/storage"
 )
 
-// stubLos38DSubagentActive pins the opencode child-session lookup: while the
-// stub is in place every agent counts as blocked inside a task() subagent
-// (#89428).
-func stubLos38DSubagentActive(t *testing.T, active bool) {
-	t.Helper()
-	orig := opencodeChildActiveFn
-	opencodeChildActiveFn = func(string) bool { return active }
-	t.Cleanup(func() { opencodeChildActiveFn = orig })
-}
-
 // los38dDoneClaim is a scratchpad that carries a DONE-claim: the structural
 // Phase 6 indicator is what puts an agent into the done-verify protocol.
 const los38dDoneClaim = "### Phase 1: ANALYZE\n**Status:** IN PROGRESS\n\n" +
@@ -40,7 +30,7 @@ func los38dProvenDone() string {
 func TestLos38D_StagnationFrozenWhileSubagentRuns(t *testing.T) {
 	resetYesloopStagnationState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeStagnationAgent(t, h, s, "stag-sub38d", "### Phase 1: ANALYZE\n**Status:** IN PROGRESS\nworking\n")
 
@@ -84,7 +74,7 @@ func TestLos38D_StagnationFrozenWhileSubagentRuns(t *testing.T) {
 func TestLos38D_StagnationResumesAfterSubagentEnds(t *testing.T) {
 	resetYesloopStagnationState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeStagnationAgent(t, h, s, "stag-resume38d", "### Phase 1: ANALYZE\n**Status:** IN PROGRESS\nworking\n")
 	h.checkYesloopStagnation()
@@ -95,7 +85,7 @@ func TestLos38D_StagnationResumesAfterSubagentEnds(t *testing.T) {
 	h.checkYesloopStagnation()
 
 	// The child ends; the agent produces nothing for another three hours.
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 	yesloopStagnationAgentsMu.Lock()
 	st := yesloopStagnationAgents["stag-resume38d"]
 	st.lastChangedAt = time.Now().Add(-3 * time.Hour)
@@ -121,7 +111,7 @@ func TestLos38D_StagnationResumesAfterSubagentEnds(t *testing.T) {
 func TestLos38D_DoneVerifyFrozenWhileSubagentRuns(t *testing.T) {
 	resetDoneVerifyState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneVerifyAgent(t, h, s, "dv-sub38d", "sess-dv-sub38d", los38dDoneClaim)
 
@@ -153,7 +143,7 @@ func TestLos38D_DoneVerifyFrozenWhileSubagentRuns(t *testing.T) {
 func TestLos38D_DoneVerifyNoEscalationWhileSubagentRuns(t *testing.T) {
 	resetDoneVerifyState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneVerifyAgent(t, h, s, "dv-esc38d", "sess-dv-esc38d", los38dDoneClaim)
 
@@ -192,7 +182,7 @@ func TestLos38D_DoneVerifyNoEscalationWhileSubagentRuns(t *testing.T) {
 func TestLos38D_DoneVerifySettlesWhileSubagentRuns(t *testing.T) {
 	resetDoneVerifyState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneVerifyAgent(t, h, s, "dv-ok38d", "sess-dv-ok38d", los38dProvenDone())
 
@@ -219,7 +209,7 @@ func TestLos38D_DoneVerifySettlesWhileSubagentRuns(t *testing.T) {
 func TestLos38D_DoneVerifyResumesAfterSubagentEnds(t *testing.T) {
 	resetDoneVerifyState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneVerifyAgent(t, h, s, "dv-resume38d", "sess-dv-resume38d", los38dDoneClaim)
 
@@ -243,7 +233,7 @@ func TestLos38D_DoneVerifyResumesAfterSubagentEnds(t *testing.T) {
 	}
 
 	// Child gone, interval still elapsed → the refire runs.
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 	yesloopDoneVerifyAgentsMu.Lock()
 	yesloopDoneVerifyAgents["dv-resume38d"].lastRelayAt = time.Now().Add(-2 * yesloopDoneVerifyRefireInterval)
 	yesloopDoneVerifyAgentsMu.Unlock()
@@ -260,7 +250,7 @@ func TestLos38D_DoneVerifyResumesAfterSubagentEnds(t *testing.T) {
 func TestLos38D_DoneGuardFrozenWhileSubagentRuns(t *testing.T) {
 	resetDoneGuardState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneGuardAgent(t, h, s, "dg-sub38d", "sess-dg-sub38d", allPhasesPhase4Invalid)
 
@@ -298,7 +288,7 @@ func TestLos38D_DoneGuardFrozenWhileSubagentRuns(t *testing.T) {
 func TestLos38D_DoneGuardNoEscalationWhileSubagentRuns(t *testing.T) {
 	resetDoneGuardState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneGuardAgent(t, h, s, "dg-esc38d", "sess-dg-esc38d", allPhasesPhase4Invalid)
 
@@ -330,14 +320,14 @@ func TestLos38D_DoneGuardNoEscalationWhileSubagentRuns(t *testing.T) {
 func TestLos38D_DoneGuardResumesAfterSubagentEnds(t *testing.T) {
 	resetDoneGuardState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneGuardAgent(t, h, s, "dg-resume38d", "sess-dg-resume38d", allPhasesPhase4Invalid)
 	h.checkYesloopDoneGuard()
 
 	// The child ends; the freeze mark and a stale relay time are what a frozen
 	// episode leaves behind.
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 	yesloopDoneGuardAgentsMu.Lock()
 	st := yesloopDoneGuardAgents["dg-resume38d"]
 	if st == nil {
@@ -380,7 +370,7 @@ func TestLos38D_DoneGuardResumesAfterSubagentEnds(t *testing.T) {
 func TestLos38D_DoneGuardKeepsRelayHistoryAcrossFreeze(t *testing.T) {
 	resetDoneGuardState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 
 	makeDoneGuardAgent(t, h, s, "dg-hist38d", "sess-dg-hist38d", allPhasesPhase4Invalid)
 
@@ -394,9 +384,9 @@ func TestLos38D_DoneGuardKeepsRelayHistoryAcrossFreeze(t *testing.T) {
 	}
 
 	// The child runs, then ends.
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 	h.checkYesloopDoneGuard()
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 	h.checkYesloopDoneGuard()
 
 	yesloopDoneGuardAgentsMu.Lock()
@@ -424,7 +414,7 @@ func TestLos38D_DoneGuardKeepsRelayHistoryAcrossFreeze(t *testing.T) {
 func TestLos38D_DoneGuardRecoverySurvivesChild(t *testing.T) {
 	resetDoneGuardState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	makeDoneGuardAgent(t, h, s, "dg-recv38d", "sess-dg-recv38d", validV3Content)
 	if err := s.AgentUpdate("dg-recv38d", map[string]any{
@@ -450,7 +440,7 @@ func TestLos38D_DoneGuardRecoverySurvivesChild(t *testing.T) {
 func TestLos38D_MarkerAloneFreezesTheGuard(t *testing.T) {
 	resetDoneGuardState()
 	h, s := mustHandler(t)
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 
 	makeDoneGuardAgent(t, h, s, "dg-marker38d", "sess-dg-marker38d", allPhasesPhase4Invalid)
 	streamStatesMu.Lock()
@@ -485,14 +475,14 @@ func TestLos38D_MarkerAloneFreezesTheGuard(t *testing.T) {
 // die on a row whose agent session is empty but whose opencode session is bound.
 func TestLos38D_ChildGateWithoutAgentSessionID(t *testing.T) {
 	h, _ := mustHandler(t)
-	stubLos38DSubagentActive(t, true)
+	stubOpencodeChildActive(t, true)
 
 	agent := storage.Agent{ID: "dg-nosess38d", Backend: "opencode", OpencodeSessionID: "ses-nosess38d"}
 	if !h.agentWaitingInSubagent(agent) {
 		t.Error("a bound opencode session must gate the guard even without agent.session_id")
 	}
 
-	stubLos38DSubagentActive(t, false)
+	stubOpencodeChildActive(t, false)
 	if h.agentWaitingInSubagent(agent) {
 		t.Error("without a signal the gate must be open")
 	}

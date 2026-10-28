@@ -22,7 +22,7 @@ func insertSessionRow(t *testing.T, s *storage.Store, id, projectPath, startedAt
 }
 
 func TestListProjectsNeedingBriefingRefresh_FiltersDeadAndInactive(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
@@ -94,7 +94,7 @@ func TestListProjectsNeedingBriefingRefresh_FiltersDeadAndInactive(t *testing.T)
 }
 
 func TestListProjectsNeedingBriefingRefresh_InactiveThreshold(t *testing.T) {
-	s := newWikiTickTestStore(t)
+	s := mustStore(t)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("userhomedir: %v", err)

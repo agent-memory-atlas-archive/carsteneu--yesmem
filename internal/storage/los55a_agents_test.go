@@ -11,7 +11,7 @@ import (
 // crash: respawnAgent handed spawn_agent no max_turns, and the replacement came
 // back on the daemon's config default (or on the CLI's own default).
 func TestAgentsTableHasMaxTurnsColumnLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	rows, err := s.db.Query(`PRAGMA table_info(agents)`)
 	if err != nil {
@@ -44,7 +44,7 @@ func TestAgentsTableHasMaxTurnsColumnLos55a(t *testing.T) {
 // respawnAgent reads the crashed row back from the store and hands its MaxTurns
 // to spawn_agent.
 func TestAgentMaxTurnsRoundTripLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.AgentCreate(Agent{
 		ID: "agent-20261020-01", Project: "los55a-proj", Section: "los55a-sec",
@@ -85,7 +85,7 @@ func TestAgentMaxTurnsRoundTripLos55a(t *testing.T) {
 // the stop path and the paused-row guards all read the pair), and a recycled pid
 // could be signalled as if it were the child's.
 func TestAgentCascadeStop_ClearsProcessBindingLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.AgentCreate(Agent{
 		ID: "agent-20261020-10", Project: "los55a-proj", Section: "root",
@@ -136,7 +136,7 @@ func TestAgentCascadeStop_ClearsProcessBindingLos55a(t *testing.T) {
 // and AgentCascadeStop matched every agent whose caller_session is empty — every
 // root agent of the installation.
 func TestAgentCascadeStop_EmptyRootStopsNothingLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	for _, row := range []Agent{
 		{ID: "agent-20261020-20", Project: "los55a-proj", Section: "root-a", SessionID: "root-a-session", Status: "running", PID: 5001},
@@ -169,7 +169,7 @@ func TestAgentCascadeStop_EmptyRootStopsNothingLos55a(t *testing.T) {
 // refused. It also matched a row a stop had deliberately closed, so a late exit
 // flipped "stopped" to "failed" and wrote an error onto a finished agent.
 func TestAgentFinalizeExit_DoesNotOverwriteStoppedRowLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	if err := s.AgentCreate(Agent{
 		ID: "agent-20261020-30", Project: "los55a-proj", Section: "stopped-by-operator",
@@ -208,7 +208,7 @@ func TestAgentFinalizeExit_DoesNotOverwriteStoppedRowLos55a(t *testing.T) {
 // appears in another project quarantined that project's rows with it — the
 // quarantine is a recall-wide write, so the scope has to travel with it.
 func TestQuarantineSessionProjectScopeLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los55a-shared"
 	inAlpha := insertQuarantineLos10bLearning(t, s, "alpha rule", session, "/home/tester/memory/alpha", "")
@@ -250,7 +250,7 @@ func quarantineStampLos55a(t *testing.T, s *Store, id int64) string {
 // session id: crash recovery must not turn into a silent no-op because the ingest
 // wrote no project.
 func TestQuarantineSessionInProject_KeepsUnscopedRowsLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los55a-noproject"
 	id := insertQuarantineLos10bLearning(t, s, "row without a project", session, "", "")
@@ -272,7 +272,7 @@ func TestQuarantineSessionInProject_KeepsUnscopedRowsLos55a(t *testing.T) {
 // so it must not widen to a row that names another project — that is exactly the
 // cross-project write YM-244 is about.
 func TestQuarantineSessionInProject_DoesNotSpareAProjectWithoutCanonicalLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los55a-legacy"
 	inAlpha := insertQuarantineLos10bLearning(t, s, "alpha rule", session, "/home/tester/memory/alpha", "")
@@ -302,7 +302,7 @@ func TestQuarantineSessionInProject_DoesNotSpareAProjectWithoutCanonicalLos55a(t
 // given, so the directory basename has to match too — otherwise crash recovery
 // quarantines nothing for exactly those rows.
 func TestQuarantineSessionInProject_MatchesAPathOnlyRowByBasenameLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los55a-pathonly"
 	inAlpha := insertQuarantineLos10bLearning(t, s, "path-only alpha rule", session, "/home/tester/memory/alpha_x", "")
@@ -323,7 +323,7 @@ func TestQuarantineSessionInProject_MatchesAPathOnlyRowByBasenameLos55a(t *testi
 // The basename match must not become a wildcard: a project name with "_" would
 // otherwise match more paths than its own.
 func TestQuarantineSessionInProject_BasenameIsNotAWildcardLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los55a-wildcard"
 	other := insertQuarantineLos10bLearning(t, s, "other project", session, "/home/tester/memory/alphaXx", "")
@@ -353,7 +353,7 @@ func TestQuarantineSessionInProject_SameBasenameIsNotTheSameProjectLos55a(t *tes
 		{"path only, canonical cleared", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore(t)
+			s := mustOpen(t)
 			base := t.TempDir()
 			first := filepath.Join(base, "first", "repo")
 			second := filepath.Join(base, "second", "repo")
@@ -389,7 +389,7 @@ func TestQuarantineSessionInProject_SameBasenameIsNotTheSameProjectLos55a(t *tes
 // Eine Zeile aus einem Worktree desselben Repositories gehört zum Scope, ohne dass
 // dafür der Basename über Repository-Grenzen hinweg greift.
 func TestQuarantineSessionInProject_MatchesItsOwnWorktreesLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
@@ -422,7 +422,7 @@ func TestQuarantineSessionInProject_MatchesItsOwnWorktreesLos55a(t *testing.T) {
 // die Kurzform SELBST ist — sonst ist die Quarantäne für genau diese Klasse ein
 // stiller No-Op (Review-Befund zum Projektgrenzen-Fix).
 func TestQuarantineSessionInProject_ShortNameMatchesAShortNameRowLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	const session = "sess-los55a-shortrow"
 	short := insertQuarantineLos10bLearning(t, s, "row keyed by the short name", session, "alpha_x", "")
@@ -442,7 +442,7 @@ func TestQuarantineSessionInProject_ShortNameMatchesAShortNameRowLos55a(t *testi
 // Beide Worktree-Layouts gehören zum Repository (models.worktreeMarkers): yesmem
 // spawnt unter .worktrees/, anderes Tooling unter .claude/worktrees/.
 func TestQuarantineSessionInProject_MatchesTheSecondWorktreeLayoutLos55a(t *testing.T) {
-	s := newTestStore(t)
+	s := mustOpen(t)
 
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")

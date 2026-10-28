@@ -23,15 +23,6 @@ import (
 //  3. every relay buys the agent a new window, without a ceiling (anti-flap),
 //  4. relay_agent sleeps three seconds on the caller's path before it submits.
 
-// ym253StubOpencodeChildActive pins the child-session lookup, so the tests never
-// read the developer's opencode.db.
-func ym253StubOpencodeChildActive(t *testing.T, active bool) {
-	t.Helper()
-	orig := opencodeChildActiveFn
-	opencodeChildActiveFn = func(string) bool { return active }
-	t.Cleanup(func() { opencodeChildActiveFn = orig })
-}
-
 // ym253InjectSink is an inject socket that records one payload per connection,
 // so a test can count relays and inspect the content/submit split.
 type ym253InjectSink struct {
@@ -103,7 +94,7 @@ func TestIdleGuard_YM253_SubagentIsNotRelayed(t *testing.T) {
 	h, s := mustHandler(t)
 	driveBoundYesloopIntoProgression(t, h, s, "ym253-sub")
 
-	ym253StubOpencodeChildActive(t, true)
+	stubOpencodeChildActive(t, true)
 	expireIdleRelay("ym253-sub")
 	h.checkYesloopIdle()
 
@@ -168,7 +159,7 @@ func TestIdleGuard_YM253_SessionReadHoldsNoLock(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"data": []any{}, "cursor": map[string]any{}})
 	}))
 	t.Cleanup(srv.Close)
-	stubIdleSession(t, srv)
+	stubV2Service(t, srv)
 
 	driveBoundYesloopIntoProgression(t, h, s, "ym253-lock")
 
@@ -284,7 +275,7 @@ func TestIdleGuard_YM253_StreamActivityStillRearmsWhileASubagentRuns(t *testing.
 	h, s := mustHandler(t)
 	driveYesloopIntoProgression(t, h, s, "ym253-rearm")
 
-	ym253StubOpencodeChildActive(t, true)
+	stubOpencodeChildActive(t, true)
 	streamStatesMu.Lock()
 	st := streamStates["sess-ym253-rearm"]
 	st.mu.Lock()
