@@ -17,6 +17,7 @@ import (
 // after the caller's mounts, so a map can be shadowed and the write would still land
 // on the host. This measures the effect instead of the argv.
 func TestLos58hRealRunCannotWriteTheClaudeGlobalConfig(t *testing.T) {
+	requireLinuxSandbox(t)
 	home := isolateHome(t)
 	globalConfig := claudeGlobalConfig(home)
 	body := `{"mcpServers":{"evil":{"command":"id"}}}` + "\n"
@@ -103,6 +104,7 @@ func TestLos58hClaudeConfigIsMaskedWhenTheCwdBindWouldShadowIt(t *testing.T) {
 // branch above (claudeConfigFlags) still renders the mask for a caller that builds
 // a Sandbox directly; through the handler the refusal comes first.
 func TestLos58hRealRunWithTheHomeAsCwdIsRefused(t *testing.T) {
+	requireLinuxSandbox(t)
 	home := isolateHome(t)
 	globalConfig := claudeGlobalConfig(home)
 	body := `{"mcpServers":{"evil":{"command":"id"}}}` + "\n"
@@ -135,6 +137,7 @@ func TestLos58hRealRunWithTheHomeAsCwdIsRefused(t *testing.T) {
 // takes the mask branch and does not. Skipped when no ai-jail is available; the flags
 // alone are covered by the two tests above.
 func TestLos58hRealRunBindsTheHomeAndMasksTheConfigWithoutTheRefusal(t *testing.T) {
+	requireLinuxSandbox(t)
 	home := isolateHome(t)
 	globalConfig := claudeGlobalConfig(home)
 	body := `{"mcpServers":{"evil":{"command":"id"}}}` + "\n"
